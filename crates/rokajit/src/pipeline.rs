@@ -189,12 +189,14 @@ pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
     crate::morph::morph(method)
 }
 
-/// Stage 3 (step_07.4): HIR → LIR lowering. The generic driver lives here;
-/// the target parameterizes it (rule tables, capabilities — `Target`
-/// extensions frozen by step_07.4).
+/// Stage 3 (step_07.4): HIR → LIR lowering. The generic driver lives in
+/// [`crate::lower`]; the target parameter gates legality (register-class
+/// coverage). Instruction selection is a separate, backend-owned step:
+/// backend rule sets (written in `rokajit::lower_rules!`, e.g.
+/// `rokajit_x64::lower`) map `lir` statements to machine-instruction
+/// descriptors; codegen (07.5) drives them.
 pub fn lower(method: hir::Method, target: &dyn Target) -> CompileResult<lir::Method> {
-    let _ = (method, target);
-    Err(CompileError::Unsupported("lower: implemented in step_07.4"))
+    crate::lower::lower(method, target)
 }
 
 /// Stage 4 (step_07.5, encoding via step_07.6's `Target` extension):

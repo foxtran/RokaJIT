@@ -7,3 +7,7 @@ description = "RokaJIT x86-64 (SysV AMD64) backend"
 
 [dependencies]
 rokajit = { path = "../rokajit" }
+rokajit-ee = { path = "../rokajit-ee" }
+
+[dev-dependencies]
+rokajit-ee = { path = "../rokajit-ee", features = ["mock"] }

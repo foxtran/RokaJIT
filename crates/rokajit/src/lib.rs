@@ -35,6 +35,7 @@ pub mod config_table;
 pub mod error;
 pub mod import;
 pub mod ir;
+pub mod lower;
 pub mod morph;
 pub mod pipeline;
 mod spot_check;

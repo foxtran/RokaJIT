@@ -3,14 +3,18 @@
 //! A thin backend crate, the first customer of the generic core's
 //! interfaces (docs/porting-strategy.md, "Target independence"). It
 //! contains target description data ([`regs`]: register tables and SysV
-//! ABI constants) and implements [`rokajit::target::Target`]; later
-//! sub-steps add the instruction-selection rule tables (07.4), the
-//! byte-level encoder (07.6), and the GC-info/unwind encoders (07.7).
+//! ABI constants), the instruction-descriptor contract ([`inst`], produced
+//! by lowering, consumed by the step_07.6 encoder), the lowering rule set
+//! ([`lower`], step_07.4), and implements [`rokajit::target::Target`];
+//! later sub-steps add the byte-level encoder (07.6) and the
+//! GC-info/unwind encoders (07.7).
 //!
 //! No CIL knowledge appears here: the crate speaks [`rokajit::ir`] types
 //! and [`rokajit::target`] vocabulary only, and names not a single IL
 //! opcode.
 
+pub mod inst;
+pub mod lower;
 pub mod regs;
 
 use rokajit::error::{CompileError, CompileResult};
