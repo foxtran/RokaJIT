@@ -89,7 +89,7 @@ pub use pgo::{Pgo, PgoResults, PgoSchemaItem, PgoSource};
 pub use real::GasketEeInfo;
 pub use relocations::Relocations;
 pub use tokens_and_signatures::TokensAndSignatures;
-pub use wrap::{const_lookup_addr, zeroed_out};
+pub use wrap::{const_lookup_addr, const_lookup_slot, zeroed_out};
 
 // Kept in scope so the module docs above resolve their intra-doc links
 // exactly as they did in the single-file layout.

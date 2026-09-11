@@ -210,6 +210,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rokajit-cdy"
+version = "0.1.0"
+dependencies = [
+ "rokajit",
+ "rokajit-ee",
+ "rokajit-ffi",
+ "rokajit-x64",
+]
+
+[[package]]
 name = "rokajit-ee"
 version = "0.1.0"
 dependencies = [

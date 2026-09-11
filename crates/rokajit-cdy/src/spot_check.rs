@@ -6,9 +6,9 @@
 //! group — through the safe `EeInfo` surface against the live EE and logs
 //! the returned values, so they can be hand-verified against the compiled
 //! method's metadata. It runs for the first few distinct methods only (the
-//! compile spine is re-entered thousands of times on the graceful-failure
-//! retry path) and changes no behavior: `rokajit_compile_method` still
-//! returns `CORJIT_INTERNALERROR` after logging.
+//! compile spine is re-entered for every method the EE jits) and changes no
+//! behavior: since step_07.7, `rokajit_compile_method` proceeds to really
+//! compile after logging.
 //!
 //! Contract findings baked into this code (step_05, verified against the
 //! live EE; see `docs/step_05-completion.md`):

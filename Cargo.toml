@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rokajit",
+    "crates/rokajit-cdy",
     "crates/rokajit-ee",
     "crates/rokajit-ffi",
     "crates/rokajit-x64",

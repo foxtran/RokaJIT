@@ -535,10 +535,25 @@ impl Asm {
     /// `call rel32` to a resolved method. The displacement is a
     /// placeholder; the recorded [`CallReloc`] is patched once the EE
     /// supplies the target address (see [`FinalizedCode`]).
+    /// `call rel32` (E8): direct call to a method. The rel32 field stays
+    /// zero here; it is patched by [`CallReloc::patch`] once the target
+    /// address is known (07.7: by the EE, via the recorded relocation).
     pub fn call(&mut self, method: MethodHandle) {
         self.emit_u8(0xE8);
         let offset = self.offset();
         self.call_relocs.push(CallReloc { method, offset });
+        self.emit_u32(0);
+    }
+
+    /// `call qword ptr [rip + rel32]` (FF /2, mod=00 r/m=101): the
+    /// IAT_PVALUE form — the disp32 field points at the EE's entry-point
+    /// *slot* (a precode target slot, whose contents the EE keeps current),
+    /// patched by the EE through the recorded RELATIVE32 relocation exactly
+    /// like the direct form. No [`CallReloc`] entry: the relocation is the
+    /// drain's, keyed by offset, not by method handle.
+    pub fn call_indirect(&mut self) {
+        self.emit_u8(0xFF);
+        self.emit_u8(0x15);
         self.emit_u32(0);
     }
 

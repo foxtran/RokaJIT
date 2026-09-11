@@ -7,12 +7,16 @@ use crate::enums::{CorInfoArch, RelocType};
 impl Relocations for MockEe {
     fn record_relocation(
         &self,
-        _location: NonNull<u8>,
+        location: NonNull<u8>,
         _location_rw: Option<NonNull<u8>>,
-        _target: usize,
-        _reloc: RelocType,
+        target: usize,
+        reloc: RelocType,
         _addl_delta: i32,
     ) {
+        self.sink_log.borrow_mut().push(format!(
+            "record_relocation(loc={:#x}, target={target:#x}, {reloc:?})",
+            location.as_ptr() as usize
+        ));
     }
 
     fn get_reloc_type_hint(&self, _target: usize) -> RelocType {

@@ -43,6 +43,11 @@ impl Helpers for MockEe {
         let mut lookup: ffi::CORINFO_CONST_LOOKUP = crate::ee_info::wrap::zeroed_out(|_| ());
         if let Some(&addr) = self.entry_points.get(&(ftn.as_raw() as usize)) {
             lookup.__bindgen_anon_1.addr = addr as *mut c_void;
+        } else if let Some(&slot) = self.entry_point_slots.get(&(ftn.as_raw() as usize)) {
+            // Not-yet-compiled callee: the entry-point slot (precode target
+            // slot), IAT_PVALUE (jitinterface.cpp getFunctionEntryPoint).
+            lookup.accessType = ffi::InfoAccessType_IAT_PVALUE;
+            lookup.__bindgen_anon_1.addr = slot as *mut c_void;
         }
         lookup
     }

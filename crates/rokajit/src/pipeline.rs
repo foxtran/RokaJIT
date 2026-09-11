@@ -23,8 +23,8 @@
 //! assembled from stage outputs in exactly one place.
 //!
 //! Only the signatures and the data crossing the boundaries are frozen
-//! here. Stages land one sub-step at a time; unlanded stages are stubs
-//! returning `CompileError::Unsupported` naming their sub-step.
+//! here. Stages landed one sub-step at a time (07.2–07.7); every stage now
+//! delegates to its implementing module.
 
 use rokajit_ee::ee_info::EeInfo;
 use rokajit_ee::handles::MethodHandle;
@@ -33,7 +33,7 @@ use rokajit_ffi::CORINFO_SIG_INFO;
 use crate::artifact::{
     CallSite, CodeChunks, CompilationArtifact, DataChunk, EhClause, Relocation, UnwindBlob,
 };
-use crate::error::{CompileError, CompileResult};
+use crate::error::CompileResult;
 use crate::ir::{hir, lir};
 use crate::target::Target;
 
@@ -128,9 +128,9 @@ pub struct GcRootSlot {
 }
 
 /// What [`build_metadata`] produces: the remaining artifact fields, in the
-/// target's EE-facing encodings. The encoding entry points themselves are
-/// `Target` extensions frozen by step_07.7 (the "metadata builder API"
-/// decision), not here.
+/// target's EE-facing encodings (GC info, unwind — the `Target` extension
+/// methods frozen by step_07.7's "metadata builder API" decision) plus the
+/// target-independent sections (EH clauses, IL-offset map).
 pub struct MetadataOutput {
     /// Unwind blobs, one per function fragment (see
     /// [`CompilationArtifact::unwind`]).
@@ -141,16 +141,18 @@ pub struct MetadataOutput {
     pub gc_info: Vec<u8>,
     /// Native-offset EH clauses (see [`CompilationArtifact::eh_clauses`]).
     pub eh_clauses: Vec<EhClause>,
+    /// The IL→native offset map (see [`CompilationArtifact::il_map`]).
+    pub il_map: Vec<crate::artifact::IlMapEntry>,
 }
 
 /// The pipeline driver: the core's one entry point, called by the FFI edge
 /// in `lib.rs`.
 ///
-/// `target` is a parameter — not a global — because the `rokajit` cdylib
+/// `target` is a parameter — not a global — because the compiler core
 /// cannot name a concrete backend (Cargo forbids the rokajit ↔ rokajit-x64
 /// dependency cycle), and because a parameter keeps every stage testable
-/// against mock targets. Wiring the concrete target into the cdylib is a
-/// later integration step (see the decisions file).
+/// against mock targets. The cdylib edge (`rokajit-cdy`) wires in the
+/// concrete `X64Target` (step_07.7).
 pub fn compile(
     info: &MethodInfo,
     ee: &dyn EeInfo,
@@ -170,6 +172,7 @@ pub fn compile(
         unwind: metadata.unwind,
         gc_info: metadata.gc_info,
         eh_clauses: metadata.eh_clauses,
+        il_map: metadata.il_map,
     })
 }
 
@@ -213,17 +216,15 @@ pub fn codegen(
     crate::codegen::codegen(method, ee, target, tier)
 }
 
-/// Stage 5 (step_07.7): encode GC info, unwind, and EH tables from the
-/// facts codegen recorded, in the target's EE-facing encodings. The stage
-/// boundary is frozen here; the encoding API on `Target` is step_07.7's
-/// "metadata builder API" decision.
+/// Stage 5 (step_07.7): encode GC info, unwind, EH tables, and the
+/// IL-offset map from the facts codegen recorded. All four sections drain
+/// through the one metadata channel ([`crate::metadata::MetadataBuilder`]);
+/// the EE-facing encodings (GC info, unwind) are `Target` extensions.
+/// Implemented in [`crate::metadata`].
 pub fn build_metadata(
     output: &CodegenOutput,
     method: &lir::Method,
     target: &dyn Target,
 ) -> CompileResult<MetadataOutput> {
-    let _ = (output, method, target);
-    Err(CompileError::Unsupported(
-        "metadata: implemented in step_07.7",
-    ))
+    crate::metadata::build_metadata(output, method, target)
 }

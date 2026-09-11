@@ -3,7 +3,7 @@
 //!
 //! Uses the same defines and include paths as rokajit-ffi's bindgen build so
 //! both sides see identical headers. The archive is emitted without cargo
-//! metadata; the `rokajit` cdylib links it via an explicit
+//! metadata; the `rokajit-cdy` cdylib links it via an explicit
 //! `#[link(kind = "static", modifiers = "+whole-archive,+export-symbols")]`
 //! so that the gasket's `jitStartup`/`getJit` exports survive into the final
 //! `.so`'s dynamic symbol table.

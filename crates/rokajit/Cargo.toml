@@ -6,7 +6,7 @@ license = "MIT"
 description = "RokaJIT — a Rust reimplementation of RyuJIT (CoreCLR JIT)"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 rokajit-ee = { path = "../rokajit-ee" }

@@ -129,4 +129,34 @@ pub trait Target {
             "this target has no tier-0 emitter",
         ))
     }
+
+    /// Stage 5 encoding (step_07.7; extension recorded in
+    /// `decisions/2026-09-11-metadata-builder-api.md`): render the GC-info
+    /// blob in the target's EE-facing encoding (x64: the GcInfoEncoder
+    /// format, GCINFO_VERSION 5) from the generic facts. Called by
+    /// [`crate::metadata::MetadataBuilder::finish`]. The blob must be valid
+    /// even for a method with no GC roots: the EE requires a parseable
+    /// minimal encoding for every method. The default body is the "no
+    /// GC-info encoder on this target" answer.
+    fn encode_gc_info(&self, input: &crate::metadata::GcInfoInput) -> CompileResult<Vec<u8>> {
+        let _ = input;
+        Err(CompileError::Unsupported(
+            "this target has no GC-info encoder",
+        ))
+    }
+
+    /// Stage 5 encoding (step_07.7, same decision as
+    /// [`Target::encode_gc_info`]): render the unwind blobs — one per
+    /// function fragment, root first — in the target's EE-facing encoding
+    /// (x64: Windows AMD64 `UNWIND_INFO`, consumed by `allocUnwindInfo`).
+    /// The default body is the "no unwind encoder on this target" answer.
+    fn encode_unwind_info(
+        &self,
+        input: &crate::metadata::UnwindInput,
+    ) -> CompileResult<Vec<crate::artifact::UnwindBlob>> {
+        let _ = input;
+        Err(CompileError::Unsupported(
+            "this target has no unwind encoder",
+        ))
+    }
 }

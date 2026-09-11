@@ -59,6 +59,10 @@ pub struct MockEe {
     /// (step_07.5 codegen tests), keyed by the method handle's raw value.
     /// Absent handles get a zeroed lookup (`IAT_VALUE`, null address).
     pub entry_points: HashMap<usize, usize>,
+    /// Canned entry-point *slots* for `get_function_entry_point` (step_07.7
+    /// codegen tests of the IAT_PVALUE indirect-call form), keyed like
+    /// [`Self::entry_points`] and consulted after it.
+    pub entry_point_slots: HashMap<usize, usize>,
     /// Registered signature argument lists. Fake `ArgListHandle` cursors
     /// encode `(list, index)` — the mock never dereferences handles.
     arg_lists: Vec<Vec<CorInfoType>>,

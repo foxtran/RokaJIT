@@ -34,6 +34,20 @@ pub fn const_lookup_addr(lookup: &ffi::CORINFO_CONST_LOOKUP) -> Option<usize> {
     }
 }
 
+/// The indirection-cell address of an `IAT_PVALUE` const lookup (the cell
+/// holds the entry point; the EE keeps it current — e.g. a fixup precode's
+/// target slot for a not-yet-compiled callee), `None` for any other access
+/// kind. Same safe-union-read rationale as [`const_lookup_addr`] (step_07.7:
+/// codegen resolving call targets for methods not yet compiled).
+pub fn const_lookup_slot(lookup: &ffi::CORINFO_CONST_LOOKUP) -> Option<usize> {
+    if lookup.accessType == ffi::InfoAccessType_IAT_PVALUE {
+        // SAFETY: accessType IAT_PVALUE means the `addr` union member is live.
+        Some(unsafe { lookup.__bindgen_anon_1.addr } as usize)
+    } else {
+        None
+    }
+}
+
 /// The `printObjectDescription` string contract (corinfo.h:2444,
 /// 2463-2466): a null buffer with size 0 queries the required size, which
 /// INCLUDES the NUL terminator; the fetch call returns the byte count

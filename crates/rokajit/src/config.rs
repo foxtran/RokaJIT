@@ -301,6 +301,15 @@ pub(crate) fn install(config: JitConfig) {
     let _ = JIT_CONFIG.set(config);
 }
 
+/// The `jitStartup` config ritual (step_06), called once by the FFI edge's
+/// `rokajit_on_startup`: resolve the snapshot through the host, print the
+/// unsupported-knob warnings, install it process-wide.
+pub fn init_from_host(host: &dyn EeHost) {
+    let config = JitConfig::resolve(host);
+    warn_unsupported_set(&config);
+    install(config);
+}
+
 /// The startup warning scan (step_06 task 4): one line per knob that is set
 /// (differs from its declared default) but not honored by RokaJIT. Returns
 /// the lines so tests can assert without capturing stderr;

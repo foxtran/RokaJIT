@@ -1,0 +1,24 @@
+[package]
+name = "rokajit-cdy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "RokaJIT cdylib edge — the librokajit.so the EE loads"
+
+# The artifact name stays `rokajit` (target/debug/librokajit.so) — the
+# harness swaps that file in for libclrjit.so. The compiler core keeps the
+# `rokajit` package name as an rlib; this crate is the thin top the frozen
+# pipeline decision anticipated ("a thin cdylib crate at the top depending
+# on rokajit + rokajit-x64").
+[lib]
+name = "rokajit"
+crate-type = ["cdylib"]
+
+[dependencies]
+rokajit = { path = "../rokajit" }
+rokajit-ee = { path = "../rokajit-ee" }
+rokajit-ffi = { path = "../rokajit-ffi" }
+rokajit-x64 = { path = "../rokajit-x64" }
+
+[dev-dependencies]
+rokajit-ee = { path = "../rokajit-ee", features = ["mock"] }

@@ -33,7 +33,7 @@ use rokajit::ir::{hir, lir, CallSig, LocalId, Type};
 use rokajit::lower::{Cx, Label};
 use rokajit::pipeline::{CodegenOutput, FrameInfo};
 use rokajit::target::{ArgLocation, CallAbi, PhysReg};
-use rokajit_ee::ee_info::{const_lookup_addr, EeInfo};
+use rokajit_ee::ee_info::{const_lookup_addr, const_lookup_slot, EeInfo};
 use rokajit_ee::enums::RelocType;
 use rokajit_ee::handles::MethodHandle;
 
@@ -60,6 +60,12 @@ const SCRATCH_GPRS: [Gpr; 9] = [
 
 /// Hot-code chunk alignment requested from `allocMem` (≤ 32, corjit.h:81).
 const HOT_CODE_ALIGNMENT: u32 = 16;
+
+/// Call instruction lengths: `call rel32` (E8 + 4) and `call [rip+rel32]`
+/// (FF 15 + 4). Recorded in [`CallSite::size`]; the GC safepoint of a call
+/// is the byte after it.
+const DIRECT_CALL_LEN: u32 = 5;
+const INDIRECT_CALL_LEN: u32 = 6;
 
 /// `PhysReg` → `Gpr` (the registers codegen handles are always GPRs;
 /// the tables in [`regs`] number them by hardware encoding).
@@ -716,27 +722,45 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// A direct call: spill every register-resident temp (the pool is
-    /// caller-saved), resolve the target through the EE, emit `call
-    /// rel32`, and record the safepoint + relocation for 07.7.
+    /// A direct IL call: spill every register-resident temp (the pool is
+    /// caller-saved), resolve the target through the EE, emit the call, and
+    /// record the safepoint + relocation for 07.7. Two machine forms:
+    ///
+    /// - **IAT_VALUE** (already-compiled target): `call rel32` (E8), the
+    ///   relocation's rel32 field right after the opcode, targeting the
+    ///   entry point.
+    /// - **IAT_PVALUE** (target not yet compiled — e.g. fib's recursive
+    ///   call when `Main` is jitted first): `call [rip+rel32]` (FF /2), the
+    ///   relocation targeting the EE's entry-point *slot* (a fixup
+    ///   precode's target slot the EE keeps current). This is RyuJIT's
+    ///   `EC_FUNC_TOKEN_INDIR` form (codegenxarch.cpp:10785,
+    ///   jitinterface.cpp `getFunctionEntryPoint`).
     fn emit_call(&mut self, method: MethodHandle) -> CompileResult<()> {
         let moves = self.vs.spill_registers();
         self.apply(moves)?;
         let lookup = self.ee.get_function_entry_point(method);
-        let target = const_lookup_addr(&lookup).ok_or(CompileError::Unsupported(
-            "call target requires an indirect lookup (non-IAT_VALUE)",
-        ))?;
         let instr_offset = self.asm.offset();
-        self.asm.call(method);
+        let (size, reloc_offset, target) = if let Some(target) = const_lookup_addr(&lookup) {
+            self.asm.call(method);
+            (DIRECT_CALL_LEN, instr_offset + 1, target)
+        } else if let Some(slot) = const_lookup_slot(&lookup) {
+            self.asm.call_indirect();
+            (INDIRECT_CALL_LEN, instr_offset + 2, slot)
+        } else {
+            return Err(CompileError::Unsupported(
+                "call target with more than one indirection (IAT_PPVALUE/IAT_RELPVALUE)",
+            ));
+        };
         self.call_sites.push(CallSite {
             chunk: ChunkRef::HotCode,
             offset: instr_offset,
+            size,
             sig: self.call_sig.clone(),
             method: Some(method),
         });
         self.relocations.push(Relocation {
             chunk: ChunkRef::HotCode,
-            offset: instr_offset + 1, // the rel32 field follows the E8 opcode
+            offset: reloc_offset,
             target,
             reloc_type: RelocType::RELATIVE32,
             addl_delta: 0,
@@ -761,6 +785,7 @@ mod tests {
     use rokajit::ir::lir::{Block, BranchCond, Operand, Stmt, StmtKind};
     use rokajit::ir::{BinaryOp, BlockId, Const, IL_OFFSET_NONE};
     use rokajit::pipeline::Tier;
+    use rokajit_ee::enums::CorJitFuncKind;
     use rokajit_ee::mock::MockEe;
 
     fn local(ty: Type, kind: LocalKind) -> Local {
@@ -1016,6 +1041,68 @@ mod tests {
         assert_eq!(out.relocations[0].chunk, ChunkRef::HotCode);
         assert_eq!(out.relocations[0].offset, 23, "the rel32 field");
         assert_eq!(out.relocations[0].target, 0x5000);
+        assert_eq!(out.relocations[0].reloc_type, RelocType::RELATIVE32);
+    }
+
+    /// The IAT_PVALUE form of the call test: the callee is not yet
+    /// compiled, so the EE answers with an entry-point *slot* — the emitter
+    /// produces `call [rip+rel32]` (one byte longer; the tail shifts) and
+    /// the relocation targets the slot, which the EE keeps current.
+    #[test]
+    fn indirect_call_method_bytes() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_point_slots.insert(0xF00, 0x9000);
+        let m = method(
+            vec![int_arg(0), int_temp(), int_temp()],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Binary {
+                        dst: LocalId(1),
+                        op: BinaryOp::Sub,
+                        lhs: Operand::Local(LocalId(0)),
+                        rhs: Operand::Const(Const::Int32(1)),
+                    }),
+                    stmt(StmtKind::Call {
+                        dst: Some(LocalId(2)),
+                        target: rokajit::ir::CallTarget::Direct(f),
+                        sig: int_sig(),
+                        args: vec![Operand::Temp(LocalId(1))],
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(2))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &ee);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)  — arg n
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax
+            0x83, 0xE8, 0x01, // subl $1, %eax        — t1 = n-1
+            0x89, 0xC7, // movl %eax, %edi           — arg setup
+            0x89, 0x45, 0xF8, // movl %eax, -8(%rbp) — call spill of t1
+            0xFF, 0x15, 0, 0, 0, 0, // call [rip+rel32] (patched by 07.7)
+            0x89, 0x45, 0xF4, // movl %eax, -12(%rbp) — spill for the
+            0x8B, 0x45, 0xF4, // movl -12(%rbp), %eax — return-value move
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].offset, 22, "the FF opcode offset");
+        assert_eq!(out.call_sites[0].size, 6);
+        assert_eq!(out.relocations.len(), 1);
+        assert_eq!(out.relocations[0].offset, 24, "the disp32 field");
+        assert_eq!(out.relocations[0].target, 0x9000, "the slot, not the entry");
         assert_eq!(out.relocations[0].reloc_type, RelocType::RELATIVE32);
     }
 
@@ -1330,5 +1417,30 @@ mod tests {
             .call_sites
             .iter()
             .all(|c| c.method == Some(fib_handle) && c.sig.is_some()));
+
+        // Stage 5 (07.7): the metadata channel renders the EE-facing
+        // encodings. Byte-exact expectations are derived bit-by-bit in
+        // gcinfo.rs/unwind.rs's tests.
+        let meta =
+            rokajit::pipeline::build_metadata(&out, &lir, &crate::X64Target).expect("metadata");
+        assert_eq!(meta.gc_info, [0x26, 0x51, 0x09, 0x07]);
+        assert_eq!(meta.unwind.len(), 1);
+        assert_eq!(meta.unwind[0].func_kind, CorJitFuncKind::Root);
+        assert_eq!(
+            (meta.unwind[0].start_offset, meta.unwind[0].end_offset),
+            (0, 73)
+        );
+        assert_eq!(
+            meta.unwind[0].bytes,
+            [0x01, 0x08, 0x03, 0x05, 0x08, 0x32, 0x04, 0x03, 0x01, 0x50]
+        );
+        assert!(meta.eh_clauses.is_empty() && meta.il_map.is_empty());
+
+        // The whole driver, one call, as the FFI edge runs it.
+        let artifact = rokajit::pipeline::compile(&info, &ee, &crate::X64Target, Tier::Tier0)
+            .expect("compile()");
+        assert_eq!(artifact.code.hot.bytes, out.code.hot.bytes);
+        assert_eq!(artifact.gc_info, meta.gc_info);
+        assert_eq!(artifact.unwind.len(), 1);
     }
 }

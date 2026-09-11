@@ -53,6 +53,9 @@ impl OutputSinks for MockEe {
     }
 
     fn alloc_gc_info(&self, size: usize) -> NonNull<u8> {
+        self.sink_log
+            .borrow_mut()
+            .push(format!("alloc_gc_info({size})"));
         self.fake_alloc(size)
     }
 

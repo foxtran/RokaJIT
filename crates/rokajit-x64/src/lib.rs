@@ -5,9 +5,8 @@
 //! contains target description data ([`regs`]: register tables and SysV
 //! ABI constants), the instruction-descriptor contract ([`inst`], produced
 //! by lowering, consumed by the step_07.6 encoder), the lowering rule set
-//! ([`lower`], step_07.4), and implements [`rokajit::target::Target`];
-//! later sub-steps add the byte-level encoder (07.6) and the
-//! GC-info/unwind encoders (07.7).
+//! ([`lower`], step_07.4), the GC-info/unwind encoders ([`gcinfo`],
+//! [`unwind`], step_07.7), and implements [`rokajit::target::Target`].
 //!
 //! No CIL knowledge appears here: the crate speaks [`rokajit::ir`] types
 //! and [`rokajit::target`] vocabulary only, and names not a single IL
@@ -15,9 +14,11 @@
 
 pub mod codegen;
 pub mod encode;
+pub mod gcinfo;
 pub mod inst;
 pub mod lower;
 pub mod regs;
+pub mod unwind;
 
 use rokajit::error::CompileResult;
 use rokajit::ir::{lir, CallSig, Type};
@@ -61,6 +62,17 @@ impl Target for X64Target {
 
     fn emit_tier0(&self, method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<CodegenOutput> {
         codegen::emit_tier0(method, ee)
+    }
+
+    fn encode_gc_info(&self, input: &rokajit::metadata::GcInfoInput) -> CompileResult<Vec<u8>> {
+        gcinfo::encode(input)
+    }
+
+    fn encode_unwind_info(
+        &self,
+        input: &rokajit::metadata::UnwindInput,
+    ) -> CompileResult<Vec<rokajit::artifact::UnwindBlob>> {
+        unwind::encode(input)
     }
 }
 

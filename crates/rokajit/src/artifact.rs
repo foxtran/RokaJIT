@@ -13,6 +13,7 @@
 //! | [`CompilationArtifact::unwind`] | `reserveUnwindInfo` (sizes, before `allocMem`), `allocUnwindInfo` |
 //! | [`CompilationArtifact::gc_info`] | `allocGCInfo` (size), then the blob is copied in |
 //! | [`CompilationArtifact::eh_clauses`] | `setEHcount` (len), `setEHinfo` (each) |
+//! | [`CompilationArtifact::il_map`] | `setBoundaries` (when non-empty) |
 //! | [`CompilationArtifact::relocations`] | `recordRelocation` (each) |
 //! | [`CompilationArtifact::call_sites`] | `recordCallSite` (each) |
 //!
@@ -44,6 +45,11 @@ pub struct CompilationArtifact {
     /// Native-offset EH clauses, in `setEHinfo` order (`index` = position
     /// in this vec).
     pub eh_clauses: Vec<EhClause>,
+    /// The IL→native offset map for the debugger, in `setBoundaries` order.
+    /// Empty means no debug info is emitted (the edge skips the sink call);
+    /// codegen does not produce mappings yet — the channel exists and is
+    /// drained, the contents arrive with the debug-info step.
+    pub il_map: Vec<IlMapEntry>,
     /// Relocations to record, in native-offset order.
     pub relocations: Vec<Relocation>,
     /// Managed call sites to record, in native-offset order.
@@ -106,6 +112,15 @@ pub enum ClassTokenOrFilter {
     FilterOffset(u32),
 }
 
+/// One IL→native offset pair (the row shape of `setBoundaries`'
+/// `ICorDebugInfo::OffsetMapping`, cordebuginfo.h, minus the raw
+/// `SourceTypes` word the edge fills with 0).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct IlMapEntry {
+    pub il_offset: u32,
+    pub native_offset: u32,
+}
+
 /// One relocation for `recordRelocation` (corjit.h:435).
 pub struct Relocation {
     /// Native offset of the slot within its chunk…
@@ -126,6 +141,12 @@ pub struct CallSite {
     /// Native offset of the call instruction within its chunk.
     pub chunk: ChunkRef,
     pub offset: u32,
+    /// The call instruction's length in bytes. The GC safepoint for the
+    /// call is `offset + size` (the return address — the encoder's
+    /// `callSite += callSiteSizes[...]`, gcinfoencoder.cpp:1100); the
+    /// target's codegen records it (x64: 5 for `call rel32`, 6 for
+    /// `call [rip+rel32]`).
+    pub size: u32,
     /// The signature and method used to lay out the call site; both absent
     /// for helper calls and signature-less calli (C++ nullptrs).
     pub sig: Option<crate::ir::CallSig>,
