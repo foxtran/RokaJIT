@@ -47,5 +47,5 @@ pub mod ee_info;
 pub mod handles;
 pub mod host;
 
-#[cfg(test)]
-mod mock;
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;

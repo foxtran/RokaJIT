@@ -23,8 +23,8 @@
 //! assembled from stage outputs in exactly one place.
 //!
 //! Only the signatures and the data crossing the boundaries are frozen
-//! here. The stage bodies are stubs returning `CompileError::Unsupported`
-//! until their sub-steps land.
+//! here. Stages land one sub-step at a time; unlanded stages are stubs
+//! returning `CompileError::Unsupported` naming their sub-step.
 
 use rokajit_ee::ee_info::EeInfo;
 use rokajit_ee::handles::MethodHandle;
@@ -176,11 +176,9 @@ pub fn compile(
 /// Stage 1 (step_07.2): CIL → HIR. Resolves every token through
 /// `EeInfo::resolve_token`; guarantees the `ir::hir` invariants (well-typed
 /// trees, stack-height discipline, control flow only on terminators).
+/// Implemented in [`crate::import`].
 pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> {
-    let _ = (info, ee);
-    Err(CompileError::Unsupported(
-        "import: implemented in step_07.2",
-    ))
+    crate::import::import(info, ee)
 }
 
 /// Stage 2 (step_07.3): morph-lite — call-argument and return

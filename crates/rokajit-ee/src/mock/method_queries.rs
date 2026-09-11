@@ -15,11 +15,14 @@ impl MethodQueries for MockEe {
 
     fn get_method_sig(
         &self,
-        _ftn: MethodHandle,
+        ftn: MethodHandle,
         _member_parent: Option<ClassHandle>,
     ) -> ffi::CORINFO_SIG_INFO {
-        // Zeroed mirror struct: all handles null, retType = UNDEF.
-        unsafe { std::mem::zeroed() }
+        match self.methods.values().find(|m| m.handle == ftn) {
+            Some(method) => self.method_sig_info(method),
+            // Zeroed mirror struct: all handles null, retType = UNDEF.
+            None => unsafe { std::mem::zeroed() },
+        }
     }
 
     fn get_method_class(&self, ftn: MethodHandle) -> ClassHandle {

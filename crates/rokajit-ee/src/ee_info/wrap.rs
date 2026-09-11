@@ -7,8 +7,11 @@
 /// the struct (so an EE that short-circuits still yields a defined value),
 /// runs `call` with a mutable reference to it, and returns the filled
 /// struct. Only for the bindgen mirror structs — plain data, no ownership,
-/// where an all-zero bit pattern is a valid value.
-pub(crate) fn zeroed_out<T>(call: impl FnOnce(&mut T)) -> T {
+/// where an all-zero bit pattern is a valid value. Also the compiler core's
+/// safe way to *build* an out-struct it must pass to the EE (step_07.2's
+/// importer constructs `CORINFO_RESOLVED_TOKEN` through it), keeping the
+/// `unsafe { zeroed() }` in this crate.
+pub fn zeroed_out<T>(call: impl FnOnce(&mut T)) -> T {
     // SAFETY: callers pass only FFI-mirror POD structs (the bindgen
     // CORINFO_* / CORJIT_* aggregates), for which zero-init is valid.
     let mut value: T = unsafe { std::mem::zeroed() };

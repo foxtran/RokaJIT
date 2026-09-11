@@ -11,3 +11,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rokajit-ee = { path = "../rokajit-ee" }
 rokajit-ffi = { path = "../rokajit-ffi" }
+
+[dev-dependencies]
+rokajit-ee = { path = "../rokajit-ee", features = ["mock"] }

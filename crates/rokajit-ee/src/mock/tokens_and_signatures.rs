@@ -12,7 +12,13 @@ use crate::handles::{
 };
 
 impl TokensAndSignatures for MockEe {
-    fn resolve_token(&self, _token: &mut ffi::CORINFO_RESOLVED_TOKEN) {}
+    fn resolve_token(&self, token: &mut ffi::CORINFO_RESOLVED_TOKEN) {
+        if let Some(method) = self.methods.get(&token.token) {
+            token.hMethod = method.handle.as_raw();
+            // One mock class per method: reuse the method handle's address.
+            token.hClass = method.handle.as_raw() as ffi::CORINFO_CLASS_HANDLE;
+        }
+    }
 
     fn find_sig(
         &self,
@@ -52,16 +58,23 @@ impl TokensAndSignatures for MockEe {
         String::new()
     }
 
-    fn get_arg_next(&self, _args: ArgListHandle) -> Option<ArgListHandle> {
-        None
+    fn get_arg_next(&self, args: ArgListHandle) -> Option<ArgListHandle> {
+        let (list, index) = Self::decode_cursor(args);
+        let next = index + 1;
+        if next < self.arg_lists[list].len() {
+            Self::cursor(list, next)
+        } else {
+            None
+        }
     }
 
     fn get_arg_type(
         &self,
         _sig: &ffi::CORINFO_SIG_INFO,
-        _args: ArgListHandle,
+        args: ArgListHandle,
     ) -> (CorInfoType, Option<ClassHandle>) {
-        (CorInfoType::Int, None)
+        let (list, index) = Self::decode_cursor(args);
+        (self.arg_lists[list][index], None)
     }
 
     fn get_exact_classes(
@@ -136,12 +149,18 @@ impl TokensAndSignatures for MockEe {
 
     fn get_call_info(
         &self,
-        _token: &mut ffi::CORINFO_RESOLVED_TOKEN,
+        token: &mut ffi::CORINFO_RESOLVED_TOKEN,
         _constrained: Option<&ffi::CORINFO_RESOLVED_TOKEN>,
         _caller: MethodHandle,
         _flags: CallInfoFlags,
     ) -> ffi::CORINFO_CALL_INFO {
-        unsafe { std::mem::zeroed() }
+        let mut info: ffi::CORINFO_CALL_INFO = unsafe { std::mem::zeroed() };
+        if let Some(method) = self.methods.get(&token.token) {
+            info.hMethod = method.handle.as_raw();
+            info.kind = ffi::CORINFO_CALL_KIND_CORINFO_CALL;
+            info.sig = self.method_sig_info(method);
+        }
+        info
     }
 
     fn get_var_args_handle(

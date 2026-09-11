@@ -10,3 +10,7 @@ rokajit-ffi = { path = "../rokajit-ffi" }
 
 [build-dependencies]
 cc = "1"
+
+[features]
+# Exposes the `mock` module (`MockEe`) to downstream crates' tests.
+mock = []
