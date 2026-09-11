@@ -203,17 +203,14 @@ pub fn lower(method: hir::Method, target: &dyn Target) -> CompileResult<lir::Met
 /// LIR → machine code. Tier 0 is Winch-style: single pass, no liveness,
 /// round-robin registers, GC refs frame-resident. The EE parameter exists
 /// because emission resolves call/helper addresses whose results land in
-/// [`CodegenOutput::relocations`].
+/// [`CodegenOutput::relocations`]. Implemented in [`crate::codegen`].
 pub fn codegen(
     method: &lir::Method,
     ee: &dyn EeInfo,
     target: &dyn Target,
     tier: Tier,
 ) -> CompileResult<CodegenOutput> {
-    let _ = (method, ee, target, tier);
-    Err(CompileError::Unsupported(
-        "codegen: implemented in step_07.5",
-    ))
+    crate::codegen::codegen(method, ee, target, tier)
 }
 
 /// Stage 5 (step_07.7): encode GC info, unwind, and EH tables from the

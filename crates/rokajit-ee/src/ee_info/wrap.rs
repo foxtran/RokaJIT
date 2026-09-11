@@ -3,6 +3,8 @@
 //! for the patterns eleven parallel authors would otherwise spell eleven
 //! ways. Group files keep everything else explicit.
 
+use rokajit_ffi as ffi;
+
 /// Fills an FFI-mirror struct through an out-parameter: zero-initializes
 /// the struct (so an EE that short-circuits still yields a defined value),
 /// runs `call` with a mutable reference to it, and returns the filled
@@ -17,6 +19,19 @@ pub fn zeroed_out<T>(call: impl FnOnce(&mut T)) -> T {
     let mut value: T = unsafe { std::mem::zeroed() };
     call(&mut value);
     value
+}
+
+/// The target address of an `IAT_VALUE` const lookup (a directly callable
+/// entry point), `None` for any other access kind — the safe read of the
+/// `CORINFO_CONST_LOOKUP` union, so the compiler core (step_07.5 codegen
+/// resolving call targets) stays `unsafe`-free.
+pub fn const_lookup_addr(lookup: &ffi::CORINFO_CONST_LOOKUP) -> Option<usize> {
+    if lookup.accessType == ffi::InfoAccessType_IAT_VALUE {
+        // SAFETY: accessType IAT_VALUE means the `addr` union member is live.
+        Some(unsafe { lookup.__bindgen_anon_1.addr } as usize)
+    } else {
+        None
+    }
 }
 
 /// The `printObjectDescription` string contract (corinfo.h:2444,

@@ -13,14 +13,17 @@
 //! and [`rokajit::target`] vocabulary only, and names not a single IL
 //! opcode.
 
+pub mod codegen;
 pub mod encode;
 pub mod inst;
 pub mod lower;
 pub mod regs;
 
-use rokajit::error::{CompileError, CompileResult};
-use rokajit::ir::{CallSig, Type};
+use rokajit::error::CompileResult;
+use rokajit::ir::{lir, CallSig, Type};
+use rokajit::pipeline::CodegenOutput;
 use rokajit::target::{CallAbi, RegClassId, RegisterClass, Target};
+use rokajit_ee::ee_info::EeInfo;
 
 /// The x86-64 System V AMD64 target. A unit struct: everything it reports
 /// lives in the [`regs`] tables.
@@ -49,14 +52,15 @@ impl Target for X64Target {
     }
 
     fn classify_call(&self, sig: &CallSig) -> CompileResult<CallAbi> {
-        let _ = sig;
-        Err(CompileError::Unsupported(
-            "classify_call: implemented in step_07.5",
-        ))
+        codegen::classify_call(sig)
     }
 
     fn call_site_stack_alignment(&self) -> u32 {
         regs::CALL_SITE_STACK_ALIGNMENT
+    }
+
+    fn emit_tier0(&self, method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<CodegenOutput> {
+        codegen::emit_tier0(method, ee)
     }
 }
 

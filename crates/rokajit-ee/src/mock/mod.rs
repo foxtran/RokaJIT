@@ -55,6 +55,10 @@ pub struct MockEe {
     /// Canned methods for `resolve_token`/`get_call_info`/`get_method_sig`,
     /// keyed by metadata token.
     pub methods: HashMap<u32, MockMethod>,
+    /// Canned directly-callable entry points for `get_function_entry_point`
+    /// (step_07.5 codegen tests), keyed by the method handle's raw value.
+    /// Absent handles get a zeroed lookup (`IAT_VALUE`, null address).
+    pub entry_points: HashMap<usize, usize>,
     /// Registered signature argument lists. Fake `ArgListHandle` cursors
     /// encode `(list, index)` — the mock never dereferences handles.
     arg_lists: Vec<Vec<CorInfoType>>,

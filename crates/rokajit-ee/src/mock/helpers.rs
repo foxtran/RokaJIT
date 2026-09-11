@@ -39,8 +39,12 @@ impl Helpers for MockEe {
         CorInfoHelpFunc::BOX
     }
 
-    fn get_function_entry_point(&self, _ftn: MethodHandle) -> ffi::CORINFO_CONST_LOOKUP {
-        unsafe { std::mem::zeroed() }
+    fn get_function_entry_point(&self, ftn: MethodHandle) -> ffi::CORINFO_CONST_LOOKUP {
+        let mut lookup: ffi::CORINFO_CONST_LOOKUP = crate::ee_info::wrap::zeroed_out(|_| ());
+        if let Some(&addr) = self.entry_points.get(&(ftn.as_raw() as usize)) {
+            lookup.__bindgen_anon_1.addr = addr as *mut c_void;
+        }
+        lookup
     }
 
     fn get_new_arr_helper(&self, _array_cls: ClassHandle) -> CorInfoHelpFunc {

@@ -15,8 +15,11 @@
 //! encoders (step_07.7) extend this trait when their consumers arrive, each
 //! with its own `decisions/` entry.
 
-use crate::error::CompileResult;
-use crate::ir::{CallSig, Type};
+use rokajit_ee::ee_info::EeInfo;
+
+use crate::error::{CompileError, CompileResult};
+use crate::ir::{lir, CallSig, Type};
+use crate::pipeline::CodegenOutput;
 
 /// A physical register, as an opaque target-local index. The core compares,
 /// copies, and stores these but never interprets the value; the mapping to
@@ -111,4 +114,19 @@ pub trait Target {
     /// Required stack-pointer alignment in bytes at every call instruction
     /// (SysV AMD64: 16).
     fn call_site_stack_alignment(&self) -> u32;
+
+    /// Stage 4 emission (step_07.5; extension recorded in
+    /// `decisions/2026-09-11-tier0-winch-codegen.md`): single-pass
+    /// Winch-style codegen over LIR → machine code, driving the generic
+    /// value-stack machinery in [`crate::codegen`]. Called by
+    /// [`crate::pipeline::codegen`] after its tier gate. The EE parameter
+    /// resolves call-target addresses (results land in
+    /// [`CodegenOutput::relocations`]). The default body is the "no tier-0
+    /// emitter on this target" answer.
+    fn emit_tier0(&self, method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<CodegenOutput> {
+        let _ = (method, ee);
+        Err(CompileError::Unsupported(
+            "this target has no tier-0 emitter",
+        ))
+    }
 }

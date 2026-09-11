@@ -49,7 +49,7 @@ pub struct LoweredBlock {
 /// The machine width a value of IR type `ty` occupies in a GPR, or
 /// `None` when the type does not live in GPRs (floats: XMM, out of the
 /// lowering subset; structs/void: no class at all).
-fn width_of_ty(ty: Type) -> Option<Width> {
+pub(crate) fn width_of_ty(ty: Type) -> Option<Width> {
     match ty {
         Type::Int32 => Some(Width::W32),
         Type::Int64 | Type::NativeInt | Type::Ref | Type::ByRef => Some(Width::W64),

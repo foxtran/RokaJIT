@@ -30,6 +30,7 @@
 //!   this crate depends on it, never the other way.
 
 pub mod artifact;
+pub mod codegen;
 pub mod config;
 pub mod config_table;
 pub mod error;
