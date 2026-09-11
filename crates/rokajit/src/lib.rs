@@ -25,14 +25,17 @@
 //!   this crate depends on it, never the other way.
 
 pub mod artifact;
+pub mod config;
+pub mod config_table;
 pub mod error;
 pub mod ir;
 mod spot_check;
 
 use rokajit_ee::ee_info::{EeInfo, GasketEeInfo};
+use rokajit_ee::host::GasketEeHost;
 use rokajit_ffi::{
     CorJitResult, CorJitResult_CORJIT_INTERNALERROR, CORINFO_METHOD_INFO, CORINFO_OS, ICorJitInfo,
-    ICorStaticInfo,
+    ICorJitHost, ICorStaticInfo,
 };
 
 // Link the gasket archive whole: its `jitStartup`/`getJit` exports are
@@ -94,6 +97,25 @@ fn compile_method(info: &CORINFO_METHOD_INFO, flags: std::ffi::c_uint, ee: &dyn 
     );
     let _ = ee;
     CorJitResult_CORJIT_INTERNALERROR
+}
+
+/// Startup hook called by the gasket's `jitStartup` after the host is
+/// stored (step_06 task 4). Resolves the config snapshot through the host
+/// and runs the unsupported-knob warning scan — it fires at JIT load,
+/// before any `compileMethod`.
+#[no_mangle]
+pub extern "C" fn rokajit_on_startup(host: *mut ICorJitHost) {
+    // A panic crossing the FFI boundary is UB; log and swallow like the
+    // other info-less entry points (error-model decision).
+    let _ = std::panic::catch_unwind(|| {
+        let Some(host) = GasketEeHost::new(host) else {
+            eprintln!("rokajit: null ICorJitHost in jitStartup");
+            return;
+        };
+        let config = config::JitConfig::resolve(&host);
+        config::warn_unsupported_set(&config);
+        config::install(config);
+    });
 }
 
 #[no_mangle]

@@ -1,0 +1,13 @@
+# The support registry (step_06 task 3): knobs RokaJIT honors.
+#
+# One C++ knob name per line (the first macro argument in
+# jitconfigvalues.h, e.g. `JitOrder`); `#` starts a comment. The generator
+# (RokaJIT-internal/harness/gen_config_table.py) bakes these into the
+# generated table as `supported: true` and fails on any name the header
+# does not declare (drift detection). Flipping a knob to supported is part
+# of every future "implement feature X" task: add a line here, regenerate
+# (`python3 RokaJIT-internal/harness/gen_config_table.py`), and the startup
+# warning for that knob goes silent.
+#
+# Step_06 implements no compiler features, so this list is intentionally
+# empty.

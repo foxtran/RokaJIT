@@ -89,6 +89,11 @@ extern "C" void rokajit_set_target_os(CORINFO_OS os);
 
 extern "C" void rokajit_process_shutdown_work(ICorStaticInfo* info);
 
+// Defined in the rokajit crate (`lib.rs`): step_06's startup hook — resolves
+// the config snapshot through the host and prints the unsupported-knob
+// warnings. Called from jitStartup below, after the host is stored.
+extern "C" void rokajit_on_startup(ICorJitHost* jitHost);
+
 // Defined in rokajit-ee (`ee_info/real.rs`): captures the process-lifetime
 // ICorJitHost for GasketEeInfo. Called once from jitStartup below.
 extern "C" void rokajit_ee_set_jit_host(ICorJitHost* jitHost);

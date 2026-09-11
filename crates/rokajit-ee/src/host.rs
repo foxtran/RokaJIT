@@ -82,34 +82,93 @@ extern "C" {
 impl EeHost for GasketEeInfo {
     fn allocate_memory(&self, size: usize) -> Option<NonNull<u8>> {
         // `None` host = jitStartup never ran; there is nobody to ask.
-        let host = self.host_raw()?;
-        NonNull::new(unsafe { rokajit_host_allocate_memory(host, size) })
+        self.host()?.allocate_memory(size)
     }
 
     fn free_memory(&self, block: NonNull<u8>) {
         // A `None` host is unreachable here: the block could only have come
         // from this host. Leak rather than call through a null vtable.
-        if let Some(host) = self.host_raw() {
-            unsafe { rokajit_host_free_memory(host, block.as_ptr()) };
+        if let Some(host) = self.host() {
+            host.free_memory(block);
         }
     }
 
     fn get_int_config_value(&self, name: &str, default: i32) -> i32 {
-        // `None` host (jitStartup never ran) and names with interior NULs
-        // both degrade to the caller's default.
-        let Some(host) = self.host_raw() else {
+        // `None` host (jitStartup never ran) degrades to the caller's default.
+        let Some(host) = self.host() else {
             return default;
         };
-        let Ok(name) = CString::new(name) else {
-            return default;
-        };
-        unsafe { rokajit_host_get_int_config_value(host, name.as_ptr(), default) }
+        host.get_int_config_value(name, default)
     }
 
     fn get_string_config_value(&self, name: &str) -> Option<String> {
-        let host = self.host_raw()?;
+        self.host()?.get_string_config_value(name)
+    }
+
+    fn free_string_config_value(&self, value: NonNull<c_char>) {
+        // `None` host is unreachable: the pointer came from this host.
+        if let Some(host) = self.host() {
+            host.free_string_config_value(value);
+        }
+    }
+
+    fn allocate_slab(&self, size: usize) -> Option<(NonNull<u8>, usize)> {
+        self.host()?.allocate_slab(size)
+    }
+
+    fn free_slab(&self, slab: NonNull<u8>, actual_size: usize) {
+        // `None` host is unreachable: the slab came from this host.
+        if let Some(host) = self.host() {
+            host.free_slab(slab, actual_size);
+        }
+    }
+}
+
+impl GasketEeInfo {
+    /// The process-lifetime host as a `GasketEeHost`, for delegation.
+    fn host(&self) -> Option<GasketEeHost> {
+        GasketEeHost::new(self.host_raw()?)
+    }
+}
+
+/// The startup-time view of `ICorJitHost`: everything `jitStartup` can use
+/// before any `compileMethod` exists. `GasketEeInfo` carries the same host
+/// pointer for the compilation-scoped surface; this type exists so the
+/// startup path (step_06's `rokajit_on_startup`) can resolve config without
+/// fabricating an `ICorJitInfo`. The wrapper bodies live here;
+/// `GasketEeInfo`'s `EeHost` impl delegates.
+pub struct GasketEeHost {
+    host: NonNull<ffi::ICorJitHost>,
+}
+
+impl GasketEeHost {
+    /// Wrap the raw `ICorJitHost*` the gasket's `jitStartup` received.
+    /// `None` = null pointer (never happens with a conforming EE).
+    pub fn new(host: *mut ffi::ICorJitHost) -> Option<Self> {
+        Some(Self { host: NonNull::new(host)? })
+    }
+}
+
+impl EeHost for GasketEeHost {
+    fn allocate_memory(&self, size: usize) -> Option<NonNull<u8>> {
+        NonNull::new(unsafe { rokajit_host_allocate_memory(self.host.as_ptr(), size) })
+    }
+
+    fn free_memory(&self, block: NonNull<u8>) {
+        unsafe { rokajit_host_free_memory(self.host.as_ptr(), block.as_ptr()) };
+    }
+
+    fn get_int_config_value(&self, name: &str, default: i32) -> i32 {
+        // Names with interior NULs degrade to the caller's default.
+        let Ok(name) = CString::new(name) else {
+            return default;
+        };
+        unsafe { rokajit_host_get_int_config_value(self.host.as_ptr(), name.as_ptr(), default) }
+    }
+
+    fn get_string_config_value(&self, name: &str) -> Option<String> {
         let name = CString::new(name).ok()?;
-        let raw = unsafe { rokajit_host_get_string_config_value(host, name.as_ptr()) };
+        let raw = unsafe { rokajit_host_get_string_config_value(self.host.as_ptr(), name.as_ptr()) };
         if raw.is_null() {
             return None;
         }
@@ -117,28 +176,21 @@ impl EeHost for GasketEeInfo {
         // before returning. Config values are ASCII in practice; invalid
         // UTF-8 degrades to U+FFFD rather than failing the query.
         let value = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
-        unsafe { rokajit_host_free_string_config_value(host, raw) };
+        unsafe { rokajit_host_free_string_config_value(self.host.as_ptr(), raw) };
         Some(value)
     }
 
     fn free_string_config_value(&self, value: NonNull<c_char>) {
-        // `None` host is unreachable: the pointer came from this host.
-        if let Some(host) = self.host_raw() {
-            unsafe { rokajit_host_free_string_config_value(host, value.as_ptr()) };
-        }
+        unsafe { rokajit_host_free_string_config_value(self.host.as_ptr(), value.as_ptr()) };
     }
 
     fn allocate_slab(&self, size: usize) -> Option<(NonNull<u8>, usize)> {
-        let host = self.host_raw()?;
         let mut actual_size = 0usize;
-        let slab = unsafe { rokajit_host_allocate_slab(host, size, &mut actual_size) };
+        let slab = unsafe { rokajit_host_allocate_slab(self.host.as_ptr(), size, &mut actual_size) };
         NonNull::new(slab).map(|slab| (slab, actual_size))
     }
 
     fn free_slab(&self, slab: NonNull<u8>, actual_size: usize) {
-        // `None` host is unreachable: the slab came from this host.
-        if let Some(host) = self.host_raw() {
-            unsafe { rokajit_host_free_slab(host, slab.as_ptr(), actual_size) };
-        }
+        unsafe { rokajit_host_free_slab(self.host.as_ptr(), slab.as_ptr(), actual_size) };
     }
 }
