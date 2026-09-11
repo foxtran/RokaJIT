@@ -61,6 +61,9 @@ static GASKET_ANCHOR: unsafe extern "C" fn() -> *mut std::ffi::c_void = getJit;
 /// The one entry point that matters for milestone M1: log what the EE asked
 /// us to compile, then fail gracefully so the EE reports a JIT error instead
 /// of a load failure.
+// `info` (and `comp`) are EE-issued pointers the EE guarantees valid for the
+// duration of this call — the standard ICorJitInfo entry-point contract.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn rokajit_compile_method(
     comp: *mut ICorJitInfo,

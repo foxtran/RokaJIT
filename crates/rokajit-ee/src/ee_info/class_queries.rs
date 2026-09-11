@@ -532,8 +532,13 @@ extern "C" {
     ) -> ffi::CORINFO_WASM_TYPE_SYMBOL_HANDLE;
 }
 
-/// Copies an EE-lifetime C string into an owned `String`. Null-checked by
-/// the callers before this is invoked.
+/// Copies an EE-lifetime C string into an owned `String`.
+///
+/// # Safety
+///
+/// `raw` must be non-null (the callers null-check before invoking) and
+/// point to a valid, NUL-terminated C string whose EE-owned storage
+/// outlives this call.
 unsafe fn copy_c_str(raw: *const c_char) -> String {
     unsafe { CStr::from_ptr(raw) }
         .to_string_lossy()
@@ -960,6 +965,11 @@ impl ClassQueries for GasketEeInfo {
         CorInfoWasmType::from_raw(raw).unwrap_or(CorInfoWasmType::Void)
     }
 
+    // `address` is an EE-issued pointer to EE-owned data (a static, RVA, or
+    // frozen-data blob) that the EE guarantees stays valid for the duration
+    // of the current compilation — the same convention as the handle
+    // newtypes, so the safe trait surface is honest here.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn get_address_alignment(&self, address: *mut c_void) -> u32 {
         unsafe { rokajit_ee_get_address_alignment(self.comp_raw(), address) }
     }

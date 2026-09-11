@@ -375,6 +375,11 @@ impl Helpers for GasketEeInfo {
         })
     }
 
+    // `parameter` is an opaque pass-through the EE forwards verbatim to
+    // `function` — both are supplied by the caller, and the EE never
+    // dereferences it itself, so the wrapper carries no safety burden of
+    // its own. The unsafe contract lives at the callback's definition.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn run_with_error_trap(
         &self,
         function: extern "C" fn(*mut c_void),
@@ -383,6 +388,8 @@ impl Helpers for GasketEeInfo {
         unsafe { rokajit_ee_run_with_error_trap(self.comp_raw(), Some(function), parameter) }
     }
 
+    // Same opaque pass-through guarantee as `run_with_error_trap`.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn run_with_spmi_error_trap(
         &self,
         function: extern "C" fn(*mut c_void),

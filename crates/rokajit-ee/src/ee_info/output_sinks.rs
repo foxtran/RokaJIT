@@ -92,13 +92,18 @@ pub trait OutputSinks {
     /// logged the message. Levels: 2 = error, 3 = warning, N >= 4 means the
     /// event happens roughly 10^(N-3) times per run.
     ///
-    /// `unsafe` because `args` is the C `va_list` state for `fmt`, which
-    /// stable Rust cannot construct: the caller must own valid
-    /// `__builtin_va_list` storage (a `[__va_list_tag; 1]`) prepared with
-    /// C-side varargs machinery and pass a pointer to it. On the C ABI a
-    /// `va_list` parameter decays to a pointer to that storage, which is
-    /// what the forwarder receives. Present for surface completeness; the
-    /// core formats its own diagnostics instead of calling through.
+    /// Present for surface completeness; the core formats its own
+    /// diagnostics instead of calling through.
+    ///
+    /// # Safety
+    ///
+    /// `args` is the C `va_list` state for `fmt`, which stable Rust cannot
+    /// construct: the caller must own valid `__builtin_va_list` storage (a
+    /// `[__va_list_tag; 1]`) prepared with C-side varargs machinery and pass
+    /// a pointer to it. On the C ABI a `va_list` parameter decays to a
+    /// pointer to that storage, which is what the forwarder receives.
+    /// `fmt` must be a valid, NUL-terminated C string, and both pointers
+    /// must stay valid for the duration of the call.
     unsafe fn log_msg(&self, level: u32, fmt: *const c_char, args: *mut ffi::__va_list_tag)
         -> bool;
 
