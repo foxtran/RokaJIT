@@ -1,0 +1,9 @@
+[package]
+name = "rokajit-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "JIT/EE interface (corinfo.h / corjit.h) definitions for RokaJIT"
+
+[build-dependencies]
+bindgen = "0.72"

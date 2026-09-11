@@ -1,0 +1,9 @@
+[package]
+name = "rokajit-ee"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "C++ ABI gasket between CoreCLR's EE and the RokaJIT Rust core"
+
+[build-dependencies]
+cc = "1"

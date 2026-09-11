@@ -1,0 +1,13 @@
+[package]
+name = "rokajit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "RokaJIT — a Rust reimplementation of RyuJIT (CoreCLR JIT)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rokajit-ee = { path = "../rokajit-ee" }
+rokajit-ffi = { path = "../rokajit-ffi" }
