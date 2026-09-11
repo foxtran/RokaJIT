@@ -1,0 +1,114 @@
+//! The `Target` trait — the single extension point through which all target
+//! knowledge enters the compiler (frozen;
+//! `decisions/2026-09-11-pipeline-and-target-contracts.md`).
+//!
+//! Following `docs/porting-strategy.md` ("Target independence"): the core is
+//! generic code; everything machine-specific — pointer size, registers,
+//! register classes, ABI rules — lives behind [`Target`], implemented once
+//! per backend crate (`rokajit-x64` is the first). The core never names a
+//! physical register: [`PhysReg`] is an opaque, target-local index whose
+//! meaning only the target's own tables define.
+//!
+//! The trait is deliberately small. Capability queries (addressing-mode
+//! folds, div-by-constant rules, …), the instruction-selection rule tables
+//! (step_07.4), the byte-level encoder (step_07.6), and the GC/unwind
+//! encoders (step_07.7) extend this trait when their consumers arrive, each
+//! with its own `decisions/` entry.
+
+use crate::error::CompileResult;
+use crate::ir::{CallSig, Type};
+
+/// A physical register, as an opaque target-local index. The core compares,
+/// copies, and stores these but never interprets the value; the mapping to
+/// hardware registers is defined entirely by the target's register tables.
+///
+/// Invariant: indices are unique across **all** of a target's register
+/// classes, so a bare `PhysReg` unambiguously names one hardware register
+/// (e.g. rokajit-x64 numbers GPRs 0–15 and XMM registers 16–31).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct PhysReg(pub u8);
+
+/// The only distinction between register classes the core needs: integer
+/// (pointers included) vs floating-point/vector.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum RegClassKind {
+    Int,
+    Float,
+}
+
+/// A register class: a set of interchangeable, allocatable registers. This
+/// is data, not code — the generic allocator and emitter consume it, the
+/// target's backend crate supplies it as constants.
+pub struct RegisterClass {
+    /// Stable name for diagnostics and tests (e.g. `"x64-gpr"`).
+    pub name: &'static str,
+    pub kind: RegClassKind,
+    /// The allocatable registers of this class, in allocation-preference
+    /// order (caller-saved first, so a naive allocator avoids callee-saved
+    /// traffic until forced). Registers with fixed duties (stack pointer,
+    /// reserved frame pointer) are **not** listed here.
+    pub registers: &'static [PhysReg],
+    /// The subset of `registers` that survives calls (callee-saved).
+    /// Invariant: every entry also appears in `registers`.
+    pub callee_saved: &'static [PhysReg],
+}
+
+/// Identifies one of a target's register classes: an index into the slice
+/// returned by [`Target::register_classes`].
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct RegClassId(pub u8);
+
+/// Where one call argument or return value lives, in target terms.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ArgLocation {
+    /// In a physical register.
+    Reg(PhysReg),
+    /// On the stack, at a byte offset from the stack pointer at the call
+    /// instruction.
+    Stack { offset: u32 },
+}
+
+/// The ABI assignment for one call: where every argument and the return
+/// value live. Produced by [`Target::classify_call`].
+pub struct CallAbi {
+    /// One entry per argument, in signature order. When
+    /// [`CallSig::has_this`] is set, entry 0 is the implicit `this`, so this
+    /// vector has `sig.args.len() + 1` entries.
+    pub args: Vec<ArgLocation>,
+    /// The return value's location; `None` for `Type::Void`.
+    pub ret: Option<ArgLocation>,
+    /// Total bytes of outgoing stack argument space the caller must reserve
+    /// (0 when every argument fits in registers).
+    pub stack_arg_bytes: u32,
+}
+
+/// A compilation target (an OS/arch pair's machine model). Object-safe by
+/// construction: the pipeline holds `&dyn Target` and concrete targets are
+/// expected to be unit structs (e.g. `rokajit_x64::X64Target`).
+///
+/// Everything here is a query over target *description*; compilation
+/// algorithms stay in the core. Implementations return
+/// `Err(CompileError::Unsupported(..))` for IR features the backend does not
+/// cover yet.
+pub trait Target {
+    /// Native pointer width in bytes — the width of [`Type::NativeInt`] (and
+    /// of `Ref`/`ByRef` slots).
+    fn pointer_size(&self) -> u8;
+
+    /// The target's register classes. An entry's position in this slice is
+    /// its [`RegClassId`].
+    fn register_classes(&self) -> &'static [RegisterClass];
+
+    /// The register class values of `ty` live in, or `None` when the target
+    /// does not keep the type in registers (e.g. `Type::Struct`, until
+    /// struct support lands).
+    fn class_of(&self, ty: Type) -> Option<RegClassId>;
+
+    /// Assign a call's arguments and return value to registers/stack per
+    /// the target's ABI (SysV AMD64 on x64-Unix).
+    fn classify_call(&self, sig: &CallSig) -> CompileResult<CallAbi>;
+
+    /// Required stack-pointer alignment in bytes at every call instruction
+    /// (SysV AMD64: 16).
+    fn call_site_stack_alignment(&self) -> u32;
+}

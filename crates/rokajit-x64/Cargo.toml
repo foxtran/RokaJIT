@@ -1,0 +1,9 @@
+[package]
+name = "rokajit-x64"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "RokaJIT x86-64 (SysV AMD64) backend"
+
+[dependencies]
+rokajit = { path = "../rokajit" }

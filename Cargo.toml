@@ -4,4 +4,5 @@ members = [
     "crates/rokajit",
     "crates/rokajit-ee",
     "crates/rokajit-ffi",
+    "crates/rokajit-x64",
 ]

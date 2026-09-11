@@ -21,6 +21,11 @@
 //! - [`ir`] — the HIR/LIR IR shapes (docs: `RokaJIT-internal/docs/ir-design.md`).
 //! - [`artifact`] — what a successful `compileMethod` produces and hands to
 //!   the EE's output sinks.
+//! - [`pipeline`] — the compilation pipeline: stage boundaries (import →
+//!   morph → lower → codegen → metadata) and the [`pipeline::compile`]
+//!   driver.
+//! - [`target`] — the `Target` trait; everything machine-specific lives
+//!   behind it, in backend crates (`rokajit-x64`).
 //! - The safe EE surface (`EeInfo`, handles, enums) lives in `rokajit-ee`;
 //!   this crate depends on it, never the other way.
 
@@ -29,7 +34,9 @@ pub mod config;
 pub mod config_table;
 pub mod error;
 pub mod ir;
+pub mod pipeline;
 mod spot_check;
+pub mod target;
 
 use rokajit_ee::ee_info::{EeInfo, GasketEeInfo};
 use rokajit_ee::host::GasketEeHost;
