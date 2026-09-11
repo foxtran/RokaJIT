@@ -269,7 +269,8 @@ impl DebugInfo for super::GasketEeInfo {
             let buf = if vars.is_empty() {
                 std::ptr::null_mut()
             } else {
-                match self.allocate_array(vars.len() * size_of::<ffi::ICorDebugInfo_NativeVarInfo>())
+                match self
+                    .allocate_array(vars.len() * size_of::<ffi::ICorDebugInfo_NativeVarInfo>())
                 {
                     Some(p) => p.as_ptr().cast::<ffi::ICorDebugInfo_NativeVarInfo>(),
                     None => return,
@@ -283,7 +284,8 @@ impl DebugInfo for super::GasketEeInfo {
                 // assertions). No transmutes anywhere.
                 let mut loc: ffi::ICorDebugInfo_VarLoc = std::mem::zeroed();
                 loc.vlType = v.loc_type;
-                let words = (&mut loc.__bindgen_anon_1 as *mut ffi::ICorDebugInfo_VarLoc__bindgen_ty_1)
+                let words = (&mut loc.__bindgen_anon_1
+                    as *mut ffi::ICorDebugInfo_VarLoc__bindgen_ty_1)
                     .cast::<u32>();
                 words.add(0).write(v.loc_words[0]);
                 words.add(1).write(v.loc_words[1]);
@@ -384,12 +386,12 @@ impl DebugInfo for super::GasketEeInfo {
     ) {
         unsafe {
             let mut indirection: *mut ffi::CORINFO_JUST_MY_CODE_HANDLE = std::ptr::null_mut();
-            let raw =
-                rokajit_ee_get_just_my_code_handle(self.comp_raw(), method.as_raw(), &mut indirection);
-            (
-                JustMyCodeHandle::from_raw(raw),
-                NonNull::new(indirection),
-            )
+            let raw = rokajit_ee_get_just_my_code_handle(
+                self.comp_raw(),
+                method.as_raw(),
+                &mut indirection,
+            );
+            (JustMyCodeHandle::from_raw(raw), NonNull::new(indirection))
         }
     }
 
@@ -425,7 +427,10 @@ fn copy_to_ee_array<T: Copy>(ee: &super::GasketEeInfo, items: &[T]) -> Option<*m
     if items.is_empty() {
         return Some(std::ptr::null_mut());
     }
-    let buf = ee.allocate_array(std::mem::size_of_val(items))?.as_ptr().cast::<T>();
+    let buf = ee
+        .allocate_array(std::mem::size_of_val(items))?
+        .as_ptr()
+        .cast::<T>();
     unsafe { std::ptr::copy_nonoverlapping(items.as_ptr(), buf, items.len()) };
     Some(buf)
 }

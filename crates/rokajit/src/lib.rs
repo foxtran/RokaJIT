@@ -34,8 +34,8 @@ mod spot_check;
 use rokajit_ee::ee_info::{EeInfo, GasketEeInfo};
 use rokajit_ee::host::GasketEeHost;
 use rokajit_ffi::{
-    CorJitResult, CorJitResult_CORJIT_INTERNALERROR, CORINFO_METHOD_INFO, CORINFO_OS, ICorJitInfo,
-    ICorJitHost, ICorStaticInfo,
+    CorJitResult, CorJitResult_CORJIT_INTERNALERROR, ICorJitHost, ICorJitInfo, ICorStaticInfo,
+    CORINFO_METHOD_INFO, CORINFO_OS,
 };
 
 // Link the gasket archive whole: its `jitStartup`/`getJit` exports are
@@ -43,7 +43,11 @@ use rokajit_ffi::{
 // so without +whole-archive the linker would discard the gasket object
 // entirely, and without +export-symbols rustc's cdylib version script
 // (`local: *`) would keep them out of the dynamic symbol table.
-#[link(name = "rokajit_ee_gasket", kind = "static", modifiers = "+whole-archive,+export-symbols")]
+#[link(
+    name = "rokajit_ee_gasket",
+    kind = "static",
+    modifiers = "+whole-archive,+export-symbols"
+)]
 extern "C" {
     fn getJit() -> *mut std::ffi::c_void;
 }
@@ -90,7 +94,11 @@ pub extern "C" fn rokajit_compile_method(
 /// The compiler spine: receives the safe EE surface and the method to
 /// compile. No compiler work yet (step 04) — log the request and report a
 /// graceful failure to the EE.
-fn compile_method(info: &CORINFO_METHOD_INFO, flags: std::ffi::c_uint, ee: &dyn EeInfo) -> CorJitResult {
+fn compile_method(
+    info: &CORINFO_METHOD_INFO,
+    flags: std::ffi::c_uint,
+    ee: &dyn EeInfo,
+) -> CorJitResult {
     eprintln!(
         "rokajit: compileMethod ftn={:p} ILCodeSize={} maxStack={} EHcount={} flags={:#x}",
         info.ftn, info.ILCodeSize, info.maxStack, info.EHcount, flags

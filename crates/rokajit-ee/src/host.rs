@@ -145,7 +145,9 @@ impl GasketEeHost {
     /// Wrap the raw `ICorJitHost*` the gasket's `jitStartup` received.
     /// `None` = null pointer (never happens with a conforming EE).
     pub fn new(host: *mut ffi::ICorJitHost) -> Option<Self> {
-        Some(Self { host: NonNull::new(host)? })
+        Some(Self {
+            host: NonNull::new(host)?,
+        })
     }
 }
 
@@ -168,14 +170,17 @@ impl EeHost for GasketEeHost {
 
     fn get_string_config_value(&self, name: &str) -> Option<String> {
         let name = CString::new(name).ok()?;
-        let raw = unsafe { rokajit_host_get_string_config_value(self.host.as_ptr(), name.as_ptr()) };
+        let raw =
+            unsafe { rokajit_host_get_string_config_value(self.host.as_ptr(), name.as_ptr()) };
         if raw.is_null() {
             return None;
         }
         // Copy out, then discharge the C++ obligation (corjithost.h:34-38)
         // before returning. Config values are ASCII in practice; invalid
         // UTF-8 degrades to U+FFFD rather than failing the query.
-        let value = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let value = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { rokajit_host_free_string_config_value(self.host.as_ptr(), raw) };
         Some(value)
     }
@@ -186,7 +191,8 @@ impl EeHost for GasketEeHost {
 
     fn allocate_slab(&self, size: usize) -> Option<(NonNull<u8>, usize)> {
         let mut actual_size = 0usize;
-        let slab = unsafe { rokajit_host_allocate_slab(self.host.as_ptr(), size, &mut actual_size) };
+        let slab =
+            unsafe { rokajit_host_allocate_slab(self.host.as_ptr(), size, &mut actual_size) };
         NonNull::new(slab).map(|slab| (slab, actual_size))
     }
 

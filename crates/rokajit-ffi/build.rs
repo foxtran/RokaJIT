@@ -23,7 +23,11 @@ fn clang_args(runtime: &Path) -> Vec<String> {
     let pal_inc = runtime.join("src/coreclr/pal/inc");
     let native = runtime.join("src/native");
     for dir in [&inc, &pal_inc, &native] {
-        assert!(dir.is_dir(), "runtime include dir missing: {}", dir.display());
+        assert!(
+            dir.is_dir(),
+            "runtime include dir missing: {}",
+            dir.display()
+        );
     }
     vec![
         "-x".into(),
@@ -50,9 +54,18 @@ fn main() {
         "CoreCLR headers not found under {} — set ROKAJIT_RUNTIME",
         runtime.display()
     );
-    println!("cargo:rerun-if-changed={}", runtime.join("src/coreclr/inc/corjit.h").display());
-    println!("cargo:rerun-if-changed={}", runtime.join("src/coreclr/inc/corinfo.h").display());
-    println!("cargo:rerun-if-changed={}", runtime.join("src/coreclr/inc/jiteeversionguid.h").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        runtime.join("src/coreclr/inc/corjit.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        runtime.join("src/coreclr/inc/corinfo.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        runtime.join("src/coreclr/inc/jiteeversionguid.h").display()
+    );
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let wrapper = out_dir.join("wrapper.h");
@@ -68,7 +81,9 @@ fn main() {
         // C ABI mirror: structs, enums, constants. C++ classes (the vtable
         // interfaces) come out as opaque blobs — the rokajit-ee gasket owns
         // everything vtable-shaped.
-        .allowlist_item("CORINFO.*|CorJit.*|ICorJit.*|ICor.*Info|JITEE.*|GUID|AllocMem.*|CorInfo.*|CORJIT.*")
+        .allowlist_item(
+            "CORINFO.*|CorJit.*|ICorJit.*|ICor.*Info|JITEE.*|GUID|AllocMem.*|CorInfo.*|CORJIT.*",
+        )
         // Layout assertions stay on: bindgen 0.72 emits them as compile-time
         // array-size tricks (const _ = [...]) in the generated file, so a
         // layout drift fails the build rather than a unit test.

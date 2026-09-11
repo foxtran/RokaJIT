@@ -1,7 +1,9 @@
 use std::ffi::{c_char, CString};
 
 use rokajit_ffi as ffi;
-use rokajit_ffi::{CORINFO_CONST_LOOKUP, CORINFO_RESOLVED_TOKEN, CORINFO_SIG_INFO, CORINFO_TAILCALL_HELPERS};
+use rokajit_ffi::{
+    CORINFO_CONST_LOOKUP, CORINFO_RESOLVED_TOKEN, CORINFO_SIG_INFO, CORINFO_TAILCALL_HELPERS,
+};
 
 use super::wrap::zeroed_out;
 use super::GasketEeInfo;
@@ -111,7 +113,8 @@ extern "C" {
 
 impl InliningAndTailCall for GasketEeInfo {
     fn can_inline(&self, caller: MethodHandle, callee: MethodHandle) -> CorInfoInline {
-        let raw = unsafe { rokajit_ee_can_inline(self.comp_raw(), caller.as_raw(), callee.as_raw()) };
+        let raw =
+            unsafe { rokajit_ee_can_inline(self.comp_raw(), caller.as_raw(), callee.as_raw()) };
         // A conforming EE only returns the six defined values; an
         // out-of-enum value can only come from headers that grew variants.
         // All failure verdicts are negative, so Fail is the safe fallback.

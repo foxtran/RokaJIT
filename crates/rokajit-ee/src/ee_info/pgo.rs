@@ -92,10 +92,7 @@ pub struct PgoResults {
 /// raw `JITINTERFACE_HRESULT` is the `Err` payload.
 pub trait Pgo {
     /// C++ `ICorJitInfo::getPgoInstrumentationResults` (corjit.h:387).
-    fn get_pgo_instrumentation_results(
-        &self,
-        ftn: MethodHandle,
-    ) -> Result<PgoResults, i32>;
+    fn get_pgo_instrumentation_results(&self, ftn: MethodHandle) -> Result<PgoResults, i32>;
 
     /// C++ `ICorJitInfo::allocPgoInstrumentationBySchema` (corjit.h:409).
     /// The EE fills in `offset` on each schema row; the returned pointer is
@@ -141,20 +138,16 @@ extern "C" {
 /// exactly like the EE's release-build fallback.
 fn instrumentation_kind_size(kind: u32) -> usize {
     match kind & 0xF {
-        1 => 4,                                      // FourByte
-        2 => 8,                                      // EightByte
-        3 | 4 => std::mem::size_of::<usize>(),       // TypeHandle / MethodHandle
-        _ => 0,                                      // None / unknown
+        1 => 4,                                // FourByte
+        2 => 8,                                // EightByte
+        3 | 4 => std::mem::size_of::<usize>(), // TypeHandle / MethodHandle
+        _ => 0,                                // None / unknown
     }
 }
 
 impl Pgo for GasketEeInfo {
-    fn get_pgo_instrumentation_results(
-        &self,
-        ftn: MethodHandle,
-    ) -> Result<PgoResults, i32> {
-        let mut schema_ptr: *mut ffi::ICorJitInfo_PgoInstrumentationSchema =
-            std::ptr::null_mut();
+    fn get_pgo_instrumentation_results(&self, ftn: MethodHandle) -> Result<PgoResults, i32> {
+        let mut schema_ptr: *mut ffi::ICorJitInfo_PgoInstrumentationSchema = std::ptr::null_mut();
         let mut count_schema_items: u32 = 0;
         let mut data_ptr: *mut u8 = std::ptr::null_mut();
         let mut pgo_source: ffi::ICorJitInfo_PgoSource = ffi::ICorJitInfo_PgoSource_Unknown;
@@ -201,7 +194,8 @@ impl Pgo for GasketEeInfo {
             .iter()
             .map(|item| {
                 item.offset.saturating_add(
-                    (item.count.max(0) as usize).saturating_mul(instrumentation_kind_size(item.kind)),
+                    (item.count.max(0) as usize)
+                        .saturating_mul(instrumentation_kind_size(item.kind)),
                 )
             })
             .max()
@@ -262,8 +256,9 @@ impl Pgo for GasketEeInfo {
             item.count = raw.Count;
             item.other = raw.Other;
         }
-        Ok(NonNull::new(data_ptr)
-            .expect("EE contract: allocPgoInstrumentationBySchema succeeded but returned a null buffer"))
+        Ok(NonNull::new(data_ptr).expect(
+            "EE contract: allocPgoInstrumentationBySchema succeeded but returned a null buffer",
+        ))
     }
 
     fn record_wasm_managed_call_sig(&self, call_sig: &ffi::CORINFO_SIG_INFO) {

@@ -112,7 +112,12 @@ impl MethodSet {
     pub fn parse(raw: Option<String>) -> Self {
         let patterns = raw
             .as_deref()
-            .map(|list| list.split(' ').filter(|p| !p.is_empty()).map(MethodPattern::parse).collect())
+            .map(|list| {
+                list.split(' ')
+                    .filter(|p| !p.is_empty())
+                    .map(MethodPattern::parse)
+                    .collect()
+            })
             .unwrap_or_default();
         Self { raw, patterns }
     }
@@ -138,7 +143,9 @@ impl MethodSet {
     /// responsible for formatting the name with the parts the pattern
     /// demands (assembly/class/instantiation/signature flags).
     pub fn matches(&self, printed_name: &str) -> bool {
-        self.patterns.iter().any(|p| glob_match(&p.glob, printed_name))
+        self.patterns
+            .iter()
+            .any(|p| glob_match(&p.glob, printed_name))
     }
 }
 
@@ -148,9 +155,15 @@ impl MethodPattern {
         let bytes = pattern.as_bytes();
         let exclamation = bytes.iter().position(|&c| c == b'!');
         let class_start = exclamation.map(|i| i + 1).unwrap_or(0);
-        let colon = bytes[class_start..].iter().position(|&c| c == b':').map(|i| class_start + i);
+        let colon = bytes[class_start..]
+            .iter()
+            .position(|&c| c == b':')
+            .map(|i| class_start + i);
         let method_start = colon.map(|i| i + 1).unwrap_or(class_start);
-        let parens = bytes[method_start..].iter().position(|&c| c == b'(').map(|i| method_start + i);
+        let parens = bytes[method_start..]
+            .iter()
+            .position(|&c| c == b'(')
+            .map(|i| method_start + i);
         let method_name_end = parens.unwrap_or(bytes.len());
         Self {
             glob: pattern.to_owned(),
@@ -158,7 +171,8 @@ impl MethodPattern {
             contains_class_name: colon.is_some(),
             class_name_contains_instantiation: colon
                 .is_some_and(|colon| bytes[..colon].contains(&b'[')),
-            method_name_contains_instantiation: bytes[method_start..method_name_end].contains(&b'['),
+            method_name_contains_instantiation: bytes[method_start..method_name_end]
+                .contains(&b'['),
             contains_signature: parens.is_some(),
         }
     }
@@ -225,7 +239,9 @@ impl JitConfig {
             .map(|knob| {
                 let info = knob.info();
                 match info.kind {
-                    KnobKind::Int => Value::Int(host.get_int_config_value(info.key, info.default_int)),
+                    KnobKind::Int => {
+                        Value::Int(host.get_int_config_value(info.key, info.default_int))
+                    }
                     KnobKind::String => Value::Str(host.get_string_config_value(info.key)),
                     KnobKind::MethodSet => {
                         Value::MethodSet(MethodSet::parse(host.get_string_config_value(info.key)))
@@ -261,7 +277,10 @@ impl JitConfig {
         match &self.values[knob.index()] {
             Value::MethodSet(value) => value,
             _ => {
-                static EMPTY: MethodSet = MethodSet { raw: None, patterns: Vec::new() };
+                static EMPTY: MethodSet = MethodSet {
+                    raw: None,
+                    patterns: Vec::new(),
+                };
                 &EMPTY
             }
         }
@@ -387,7 +406,9 @@ mod tests {
 
     #[test]
     fn method_set_pattern_flags() {
-        let set = MethodSet::parse(Some("mscorlib!System.Span[int]:Copy[T](void*) Plain".to_owned()));
+        let set = MethodSet::parse(Some(
+            "mscorlib!System.Span[int]:Copy[T](void*) Plain".to_owned(),
+        ));
         assert_eq!(set.patterns.len(), 2);
         let full = &set.patterns[0];
         assert!(full.contains_assembly_name);
@@ -453,7 +474,10 @@ mod tests {
     #[cfg(debug_assertions)] // JitOrder is a debug-tier knob
     #[test]
     fn set_but_unsupported_int_warns() {
-        let host = StubHost { ints: vec![("JitOrder", 1)], ..Default::default() };
+        let host = StubHost {
+            ints: vec![("JitOrder", 1)],
+            ..Default::default()
+        };
         let config = JitConfig::resolve(&host);
         assert_eq!(
             unsupported_set_warnings(&config),
@@ -467,7 +491,10 @@ mod tests {
     fn explicit_set_to_default_is_indistinguishable_from_unset() {
         // JitOrder's default is 0: an explicit "set to 0" reads exactly like
         // unset through ICorJitHost. Accepted set-detection semantics.
-        let host = StubHost { ints: vec![("JitOrder", 0)], ..Default::default() };
+        let host = StubHost {
+            ints: vec![("JitOrder", 0)],
+            ..Default::default()
+        };
         let config = JitConfig::resolve(&host);
         assert_eq!(unsupported_set_warnings(&config), Vec::<String>::new());
     }
@@ -517,24 +544,90 @@ mod tests {
 
         let cases: &[(Knob, &str, KnobKind, Tier, i32)] = &[
             (Knob::JitOrder, "JitOrder", KnobKind::Int, Tier::Debug, 0),
-            (Knob::JitHashBreak, "JitHashBreak", KnobKind::Int, Tier::Debug, -1),
+            (
+                Knob::JitHashBreak,
+                "JitHashBreak",
+                KnobKind::Int,
+                Tier::Debug,
+                -1,
+            ),
             // 0xffffffff wraps to -1 in the 32-bit int the JIT stores.
-            (Knob::BreakOnDumpToken, "BreakOnDumpToken", KnobKind::Int, Tier::Debug, -1),
-            (Knob::AltJitLimit, "AltJitLimit", KnobKind::Int, Tier::Debug, 0),
+            (
+                Knob::BreakOnDumpToken,
+                "BreakOnDumpToken",
+                KnobKind::Int,
+                Tier::Debug,
+                -1,
+            ),
+            (
+                Knob::AltJitLimit,
+                "AltJitLimit",
+                KnobKind::Int,
+                Tier::Debug,
+                0,
+            ),
             // Name != key: the lookup string is the second macro argument.
-            (Knob::DisplayLoopHoistStats, "JitLoopHoistStats", KnobKind::Int, Tier::Debug, 0),
-            (Knob::EnableAVX2, "EnableAVX2", KnobKind::Int, Tier::Retail, 1),
+            (
+                Knob::DisplayLoopHoistStats,
+                "JitLoopHoistStats",
+                KnobKind::Int,
+                Tier::Debug,
+                0,
+            ),
+            (
+                Knob::EnableAVX2,
+                "EnableAVX2",
+                KnobKind::Int,
+                Tier::Retail,
+                1,
+            ),
             // The non-LOONGARCH64 branch of the #if.
-            (Knob::EnableHWIntrinsic, "EnableHWIntrinsic", KnobKind::Int, Tier::Retail, 1),
+            (
+                Knob::EnableHWIntrinsic,
+                "EnableHWIntrinsic",
+                KnobKind::Int,
+                Tier::Retail,
+                1,
+            ),
             // DEFAULT_INLINE_BUDGET (compiler.h:12616).
-            (Knob::JitInlineBudget, "JitInlineBudget", KnobKind::Int, Tier::Retail, 22),
+            (
+                Knob::JitInlineBudget,
+                "JitInlineBudget",
+                KnobKind::Int,
+                Tier::Retail,
+                22,
+            ),
             // DEFAULT_MAX_LOOPSIZE_FOR_ALIGN = DEFAULT_ALIGN_LOOP_BOUNDARY * 3 = 0x20*3.
-            (Knob::JitAlignLoopMaxCodeSize, "JitAlignLoopMaxCodeSize", KnobKind::Int, Tier::Debug, 96),
+            (
+                Knob::JitAlignLoopMaxCodeSize,
+                "JitAlignLoopMaxCodeSize",
+                KnobKind::Int,
+                Tier::Debug,
+                96,
+            ),
             // DEFAULT_MIN_OPTS_CODE_SIZE (compiler.h:11266).
-            (Knob::JitMinOptsCodeSize, "JITMinOptsCodeSize", KnobKind::Int, Tier::Debug, 60000),
+            (
+                Knob::JitMinOptsCodeSize,
+                "JITMinOptsCodeSize",
+                KnobKind::Int,
+                Tier::Debug,
+                60000,
+            ),
             // The FEATURE_ON_STACK_REPLACEMENT branch.
-            (Knob::TC_OnStackReplacement, "TC_OnStackReplacement", KnobKind::Int, Tier::Retail, 1),
-            (Knob::JitEnableNoWayAssert, "JitEnableNoWayAssert", KnobKind::Int, Tier::Retail, no_way_assert_default),
+            (
+                Knob::TC_OnStackReplacement,
+                "TC_OnStackReplacement",
+                KnobKind::Int,
+                Tier::Retail,
+                1,
+            ),
+            (
+                Knob::JitEnableNoWayAssert,
+                "JitEnableNoWayAssert",
+                KnobKind::Int,
+                Tier::Retail,
+                no_way_assert_default,
+            ),
         ];
         assert_eq!(cases.len(), 12);
         for (knob, key, kind, tier, default) in cases {
@@ -543,13 +636,22 @@ mod tests {
             assert_eq!(info.kind, *kind, "{knob:?} kind");
             assert_eq!(info.tier, *tier, "{knob:?} tier");
             assert_eq!(info.default_int, *default, "{knob:?} default");
-            assert!(!info.supported, "{knob:?} supported (step_06 supports nothing)");
+            assert!(
+                !info.supported,
+                "{knob:?} supported (step_06 supports nothing)"
+            );
         }
         // The two non-int kinds.
         let disasm = Knob::JitDisasm.info();
-        assert_eq!((disasm.kind, disasm.tier), (KnobKind::MethodSet, Tier::Retail));
+        assert_eq!(
+            (disasm.kind, disasm.tier),
+            (KnobKind::MethodSet, Tier::Retail)
+        );
         let stdout_file = Knob::JitStdOutFile.info();
-        assert_eq!((stdout_file.kind, stdout_file.tier), (KnobKind::String, Tier::Retail));
+        assert_eq!(
+            (stdout_file.kind, stdout_file.tier),
+            (KnobKind::String, Tier::Retail)
+        );
     }
 
     /// The cfg-dependent default's release branch (debug branch covered by
@@ -595,9 +697,9 @@ mod tests {
     ];
 
     fn header_path() -> PathBuf {
-        let runtime = std::env::var("ROKAJIT_RUNTIME").map(PathBuf::from).unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../runtime")
-        });
+        let runtime = std::env::var("ROKAJIT_RUNTIME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../runtime"));
         runtime.join("src/coreclr/jit/jitconfigvalues.h")
     }
 
@@ -619,7 +721,10 @@ mod tests {
                     i += 1;
                 }
                 b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                    i += bytes[i..].iter().position(|&b| b == b'\n').unwrap_or(bytes.len() - i);
+                    i += bytes[i..]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .unwrap_or(bytes.len() - i);
                 }
                 b'/' if bytes.get(i + 1) == Some(&b'*') => {
                     i += 2;
@@ -642,10 +747,16 @@ mod tests {
     fn eval_if(expr: &str) -> bool {
         fn operand(term: &str) -> bool {
             let term = term.trim();
-            if let Some(name) = term.strip_prefix("defined(").and_then(|t| t.strip_suffix(')')) {
+            if let Some(name) = term
+                .strip_prefix("defined(")
+                .and_then(|t| t.strip_suffix(')'))
+            {
                 return TEST_DEFINES.contains(&name);
             }
-            if let Some(name) = term.strip_prefix("!defined(").and_then(|t| t.strip_suffix(')')) {
+            if let Some(name) = term
+                .strip_prefix("!defined(")
+                .and_then(|t| t.strip_suffix(')'))
+            {
                 return !TEST_DEFINES.contains(&name);
             }
             assert!(
@@ -654,8 +765,7 @@ mod tests {
             );
             TEST_DEFINES.contains(&term)
         }
-        expr.split("||")
-            .any(|group| group.split("&&").all(operand))
+        expr.split("||").any(|group| group.split("&&").all(operand))
     }
 
     /// Count knob-macro invocations per tier exactly as the generator does:
@@ -668,11 +778,18 @@ mod tests {
         let mut active = true;
         for line in text.lines() {
             let line = line.trim();
-            if let Some(rest) = line.strip_prefix("#if ").map(str::to_string).or_else(|| {
-                line.strip_prefix("#ifdef ").map(|name| format!("defined({})", name.trim()))
-            }).or_else(|| {
-                line.strip_prefix("#ifndef ").map(|name| format!("!defined({})", name.trim()))
-            }) {
+            if let Some(rest) = line
+                .strip_prefix("#if ")
+                .map(str::to_string)
+                .or_else(|| {
+                    line.strip_prefix("#ifdef ")
+                        .map(|name| format!("defined({})", name.trim()))
+                })
+                .or_else(|| {
+                    line.strip_prefix("#ifndef ")
+                        .map(|name| format!("!defined({})", name.trim()))
+                })
+            {
                 let cond = eval_if(&rest);
                 stack.push((active, active && cond, active && cond));
                 active = active && cond;
@@ -692,9 +809,7 @@ mod tests {
                 active = stack.last().map(|f| f.1).unwrap_or(true);
             } else if active {
                 for (mac, tier) in TIER_MACROS {
-                    if line.starts_with(mac)
-                        && line[mac.len()..].trim_start().starts_with('(')
-                    {
+                    if line.starts_with(mac) && line[mac.len()..].trim_start().starts_with('(') {
                         counts[*tier as usize] += 1;
                         break;
                     }
@@ -734,7 +849,11 @@ mod tests {
             // the table is the deliberate compile-out, so the expectation
             // here is zero by construction.
             let _ = (debug, opt);
-            assert_eq!((table[1], table[2]), (0, 0), "debug/opt knobs must compile out in release");
+            assert_eq!(
+                (table[1], table[2]),
+                (0, 0),
+                "debug/opt knobs must compile out in release"
+            );
             assert_eq!(Knob::ALL.len(), retail);
         }
     }

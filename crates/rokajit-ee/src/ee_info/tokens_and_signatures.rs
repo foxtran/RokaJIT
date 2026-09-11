@@ -8,8 +8,8 @@ use super::wrap::{print_object_string, zeroed_out};
 use super::GasketEeInfo;
 use crate::enums::{CallInfoFlags, CorInfoHFAElemType, CorInfoType, InfoAccessType};
 use crate::handles::{
-    ArgListHandle, ClassHandle, ContextHandle, FieldHandle, MethodHandle, ModuleHandle, ObjectHandle,
-    VarArgsHandle,
+    ArgListHandle, ClassHandle, ContextHandle, FieldHandle, MethodHandle, ModuleHandle,
+    ObjectHandle, VarArgsHandle,
 };
 
 /// Token resolution and signature walking (C++ `ICorModuleInfo` +
@@ -51,8 +51,7 @@ pub trait TokensAndSignatures {
     /// C++ `ICorStaticInfo::getTokenTypeAsHandle` (corinfo.h:2426): the class
     /// of the resolved token (owning type for field/method tokens, the type
     /// itself for type tokens). The C++ nullptr becomes `None`.
-    fn get_token_type_as_handle(&self, token: &CORINFO_RESOLVED_TOKEN)
-        -> Option<ClassHandle>;
+    fn get_token_type_as_handle(&self, token: &CORINFO_RESOLVED_TOKEN) -> Option<ClassHandle>;
 
     /// C++ `ICorStaticInfo::getStringLiteral` (corinfo.h:2434). Returns the
     /// (sub)string starting at `start_index` for the `ldstr` token
@@ -102,11 +101,7 @@ pub trait TokensAndSignatures {
 
     /// C++ `ICorSigInfo::getArgClass` (corinfo.h:3122). The nullptr failure
     /// sentinel becomes `None`.
-    fn get_arg_class(
-        &self,
-        sig: &CORINFO_SIG_INFO,
-        args: ArgListHandle,
-    ) -> Option<ClassHandle>;
+    fn get_arg_class(&self, sig: &CORINFO_SIG_INFO, args: ArgListHandle) -> Option<ClassHandle>;
 
     /// C++ `ICorArgInfo::getHFAType` (corinfo.h:3128): the HFA element kind
     /// of the valuetype `class_`, or [`CorInfoHFAElemType::None`] if it is
@@ -163,8 +158,10 @@ pub trait TokensAndSignatures {
     /// interpreter. The C++ nullptr becomes `None`. The cookie is an
     /// opaque EE-owned pointer with no handle newtype, so it crosses as
     /// `NonNull<c_void>`.
-    fn get_cookie_for_interpreter_calli_sig(&self, sig: &CORINFO_SIG_INFO)
-        -> Option<NonNull<c_void>>;
+    fn get_cookie_for_interpreter_calli_sig(
+        &self,
+        sig: &CORINFO_SIG_INFO,
+    ) -> Option<NonNull<c_void>>;
 
     /// C++ `ICorDynamicInfo::getCallInfo` (corinfo.h:3415): the EE's verdict
     /// on how to perform a call to a resolved token.
@@ -365,20 +362,11 @@ impl TokensAndSignatures for GasketEeInfo {
     ) -> CORINFO_SIG_INFO {
         let context = context.map_or(std::ptr::null_mut(), |c| c.as_raw());
         zeroed_out(|sig| unsafe {
-            rokajit_ee_find_call_site_sig(
-                self.comp_raw(),
-                module.as_raw(),
-                meth_tok,
-                context,
-                sig,
-            )
+            rokajit_ee_find_call_site_sig(self.comp_raw(), module.as_raw(), meth_tok, context, sig)
         })
     }
 
-    fn get_token_type_as_handle(
-        &self,
-        token: &CORINFO_RESOLVED_TOKEN,
-    ) -> Option<ClassHandle> {
+    fn get_token_type_as_handle(&self, token: &CORINFO_RESOLVED_TOKEN) -> Option<ClassHandle> {
         // C++ takes a mutable pointer for an `[IN]` parameter; the EE does
         // not write through it.
         let token = token as *const CORINFO_RESOLVED_TOKEN as *mut CORINFO_RESOLVED_TOKEN;
@@ -456,9 +444,8 @@ impl TokensAndSignatures for GasketEeInfo {
     ) -> (CorInfoType, Option<ClassHandle>) {
         let sig = sig as *const CORINFO_SIG_INFO as *mut CORINFO_SIG_INFO;
         let mut vc_type: ffi::CORINFO_CLASS_HANDLE = std::ptr::null_mut();
-        let raw = unsafe {
-            rokajit_ee_get_arg_type(self.comp_raw(), sig, args.as_raw(), &mut vc_type)
-        };
+        let raw =
+            unsafe { rokajit_ee_get_arg_type(self.comp_raw(), sig, args.as_raw(), &mut vc_type) };
         // Strip the CorInfoTypeWithMod modifiers (the trait contract drops
         // them); the mask leaves a plain CorInfoType.
         let ty = CorInfoType::from_raw(raw & ffi::CorInfoTypeWithMod_CORINFO_TYPE_MASK)
@@ -490,11 +477,7 @@ impl TokensAndSignatures for GasketEeInfo {
         buf.into_iter().map(ClassHandle::from_raw).collect()
     }
 
-    fn get_arg_class(
-        &self,
-        sig: &CORINFO_SIG_INFO,
-        args: ArgListHandle,
-    ) -> Option<ClassHandle> {
+    fn get_arg_class(&self, sig: &CORINFO_SIG_INFO, args: ArgListHandle) -> Option<ClassHandle> {
         let sig = sig as *const CORINFO_SIG_INFO as *mut CORINFO_SIG_INFO;
         let raw = unsafe { rokajit_ee_get_arg_class(self.comp_raw(), sig, args.as_raw()) };
         ClassHandle::from_raw(raw)
@@ -568,11 +551,7 @@ impl TokensAndSignatures for GasketEeInfo {
 
     fn get_location_of_this_type(&self, context: MethodHandle) -> ffi::CORINFO_LOOKUP_KIND {
         zeroed_out(|lookup_kind| unsafe {
-            rokajit_ee_get_location_of_this_type(
-                self.comp_raw(),
-                context.as_raw(),
-                lookup_kind,
-            )
+            rokajit_ee_get_location_of_this_type(self.comp_raw(), context.as_raw(), lookup_kind)
         })
     }
 
@@ -615,12 +594,7 @@ impl TokensAndSignatures for GasketEeInfo {
         let sig = sig as *const CORINFO_SIG_INFO as *mut CORINFO_SIG_INFO;
         let mut indirection: *mut c_void = std::ptr::null_mut();
         let raw = unsafe {
-            rokajit_ee_get_var_args_handle(
-                self.comp_raw(),
-                sig,
-                meth.as_raw(),
-                &mut indirection,
-            )
+            rokajit_ee_get_var_args_handle(self.comp_raw(), sig, meth.as_raw(), &mut indirection)
         };
         (VarArgsHandle::from_raw(raw), NonNull::new(indirection))
     }
@@ -632,7 +606,12 @@ impl TokensAndSignatures for GasketEeInfo {
     ) -> (InfoAccessType, Option<NonNull<c_void>>) {
         let mut value: *mut c_void = std::ptr::null_mut();
         let raw = unsafe {
-            rokajit_ee_construct_string_literal(self.comp_raw(), module.as_raw(), meta_tok, &mut value)
+            rokajit_ee_construct_string_literal(
+                self.comp_raw(),
+                module.as_raw(),
+                meta_tok,
+                &mut value,
+            )
         };
         let access = InfoAccessType::from_raw(raw).unwrap_or(InfoAccessType::Value);
         (access, NonNull::new(value))

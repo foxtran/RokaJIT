@@ -236,8 +236,10 @@ extern "C" {
         sig: *mut CORINFO_SIG_INFO,
         member_parent: ffi::CORINFO_CLASS_HANDLE,
     );
-    fn rokajit_ee_is_intrinsic(info: *mut ffi::ICorJitInfo, ftn: ffi::CORINFO_METHOD_HANDLE)
-        -> bool;
+    fn rokajit_ee_is_intrinsic(
+        info: *mut ffi::ICorJitInfo,
+        ftn: ffi::CORINFO_METHOD_HANDLE,
+    ) -> bool;
     fn rokajit_ee_can_value_class_instance_pointer_escape(
         info: *mut ffi::ICorJitInfo,
         ftn: ffi::CORINFO_METHOD_HANDLE,
@@ -433,7 +435,9 @@ impl MethodQueries for GasketEeInfo {
     }
 
     fn method_must_be_loaded_before_code_is_run(&self, ftn: MethodHandle) {
-        unsafe { rokajit_ee_method_must_be_loaded_before_code_is_run(self.comp_raw(), ftn.as_raw()) };
+        unsafe {
+            rokajit_ee_method_must_be_loaded_before_code_is_run(self.comp_raw(), ftn.as_raw())
+        };
     }
 
     fn get_method_name_from_metadata(&self, ftn: MethodHandle) -> Option<String> {
@@ -454,7 +458,11 @@ impl MethodQueries for GasketEeInfo {
             return None;
         }
         // EE-lifetime storage: copy, nothing to free.
-        Some(unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned())
+        Some(
+            unsafe { std::ffi::CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     fn is_intrinsic(&self, ftn: MethodHandle) -> bool {
@@ -485,7 +493,11 @@ impl MethodQueries for GasketEeInfo {
                 rokajit_ee_get_method_info(self.comp_raw(), ftn.as_raw(), method_info, context)
             };
         });
-        if ok { Some(method_info) } else { None }
+        if ok {
+            Some(method_info)
+        } else {
+            None
+        }
     }
 
     fn have_same_method_definition(&self, meth1: MethodHandle, meth2: MethodHandle) -> bool {
@@ -528,7 +540,8 @@ impl MethodQueries for GasketEeInfo {
     }
 
     fn get_default_comparer_class(&self, elem_type: ClassHandle) -> Option<ClassHandle> {
-        let raw = unsafe { rokajit_ee_get_default_comparer_class(self.comp_raw(), elem_type.as_raw()) };
+        let raw =
+            unsafe { rokajit_ee_get_default_comparer_class(self.comp_raw(), elem_type.as_raw()) };
         ClassHandle::from_raw(raw)
     }
 
@@ -598,7 +611,11 @@ impl MethodQueries for GasketEeInfo {
 
     fn satisfies_method_constraints(&self, parent: ClassHandle, method: MethodHandle) -> bool {
         unsafe {
-            rokajit_ee_satisfies_method_constraints(self.comp_raw(), parent.as_raw(), method.as_raw())
+            rokajit_ee_satisfies_method_constraints(
+                self.comp_raw(),
+                parent.as_raw(),
+                method.as_raw(),
+            )
         }
     }
 
@@ -632,7 +649,12 @@ impl MethodQueries for GasketEeInfo {
         let mut raw = std::ptr::null_mut();
         let inst_arg = zeroed_out(|inst_arg| {
             raw = unsafe {
-                rokajit_ee_get_await_return_call(self.comp_raw(), caller.as_raw(), &mut context, inst_arg)
+                rokajit_ee_get_await_return_call(
+                    self.comp_raw(),
+                    caller.as_raw(),
+                    &mut context,
+                    inst_arg,
+                )
             };
         });
         MethodHandle::from_raw(raw).map(|m| (m, ContextHandle::from_raw(context), inst_arg))
@@ -662,8 +684,13 @@ impl MethodQueries for GasketEeInfo {
     }
 
     fn get_method_def_from_method(&self, method: MethodHandle) -> Option<u32> {
-        let raw = unsafe { rokajit_ee_get_method_def_from_method(self.comp_raw(), method.as_raw()) };
-        if raw == MD_METHOD_DEF_NIL { None } else { Some(raw) }
+        let raw =
+            unsafe { rokajit_ee_get_method_def_from_method(self.comp_raw(), method.as_raw()) };
+        if raw == MD_METHOD_DEF_NIL {
+            None
+        } else {
+            Some(raw)
+        }
     }
 
     fn print_method_name(&self, ftn: MethodHandle) -> String {
@@ -674,7 +701,8 @@ impl MethodQueries for GasketEeInfo {
 
     fn get_async_resumption_stub(&self) -> Option<(MethodHandle, NonNull<c_void>)> {
         let mut entry_point: *mut c_void = std::ptr::null_mut();
-        let raw = unsafe { rokajit_ee_get_async_resumption_stub(self.comp_raw(), &mut entry_point) };
+        let raw =
+            unsafe { rokajit_ee_get_async_resumption_stub(self.comp_raw(), &mut entry_point) };
         match (MethodHandle::from_raw(raw), NonNull::new(entry_point)) {
             (Some(method), Some(entry)) => Some((method, entry)),
             _ => None,

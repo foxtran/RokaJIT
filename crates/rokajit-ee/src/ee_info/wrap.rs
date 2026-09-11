@@ -22,7 +22,9 @@ pub(crate) fn zeroed_out<T>(call: impl FnOnce(&mut T)) -> T {
 /// EXCLUDING the terminator. `call` performs one forwarder invocation
 /// (buffer, buffer size, required-size out-slot) and returns the C++
 /// return value. Copies into an owned `String` (lossy on invalid UTF-8).
-pub(crate) fn print_object_string(mut call: impl FnMut(*mut u8, usize, *mut usize) -> usize) -> String {
+pub(crate) fn print_object_string(
+    mut call: impl FnMut(*mut u8, usize, *mut usize) -> usize,
+) -> String {
     let mut required = 0usize;
     call(std::ptr::null_mut(), 0, &mut required);
     if required == 0 {

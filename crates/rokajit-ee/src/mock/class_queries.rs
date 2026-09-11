@@ -245,10 +245,9 @@ impl ClassQueries for MockEe {
         _p_resolved_token: &CORINFO_RESOLVED_TOKEN,
         _caller_handle: MethodHandle,
     ) -> (CorInfoIsAccessAllowedResult, CORINFO_HELPER_DESC) {
-        (
-            CorInfoIsAccessAllowedResult::Allowed,
-            unsafe { std::mem::zeroed() },
-        )
+        (CorInfoIsAccessAllowedResult::Allowed, unsafe {
+            std::mem::zeroed()
+        })
     }
 
     fn get_system_v_amd64_pass_struct_in_register_descriptor(
@@ -262,10 +261,7 @@ impl ClassQueries for MockEe {
         unsafe { std::mem::zeroed() }
     }
 
-    fn get_fp_struct_lowering(
-        &self,
-        _struct_hnd: ClassHandle,
-    ) -> ffi::CORINFO_FPSTRUCT_LOWERING {
+    fn get_fp_struct_lowering(&self, _struct_hnd: ClassHandle) -> ffi::CORINFO_FPSTRUCT_LOWERING {
         unsafe { std::mem::zeroed() }
     }
 
@@ -287,10 +283,7 @@ impl ClassQueries for MockEe {
         false
     }
 
-    fn get_wasm_type_symbol(
-        &self,
-        _types: &mut [CorInfoWasmType],
-    ) -> Option<WasmTypeSymbolHandle> {
+    fn get_wasm_type_symbol(&self, _types: &mut [CorInfoWasmType]) -> Option<WasmTypeSymbolHandle> {
         None
     }
 }

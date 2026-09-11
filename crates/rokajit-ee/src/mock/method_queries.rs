@@ -174,7 +174,9 @@ impl MethodQueries for MockEe {
     }
 
     fn print_method_name(&self, _ftn: MethodHandle) -> String {
-        self.method_name.clone().unwrap_or_else(|| "mockMethod".into())
+        self.method_name
+            .clone()
+            .unwrap_or_else(|| "mockMethod".into())
     }
 
     fn get_async_resumption_stub(&self) -> Option<(MethodHandle, NonNull<c_void>)> {

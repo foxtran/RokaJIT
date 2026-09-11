@@ -7,8 +7,8 @@ use super::MockEe;
 use crate::ee_info::TokensAndSignatures;
 use crate::enums::{CallInfoFlags, CorInfoHFAElemType, CorInfoType, InfoAccessType};
 use crate::handles::{
-    ArgListHandle, ClassHandle, ContextHandle, FieldHandle, MethodHandle, ModuleHandle, ObjectHandle,
-    VarArgsHandle,
+    ArgListHandle, ClassHandle, ContextHandle, FieldHandle, MethodHandle, ModuleHandle,
+    ObjectHandle, VarArgsHandle,
 };
 
 impl TokensAndSignatures for MockEe {

@@ -78,7 +78,10 @@ impl FieldQueries for MockEe {
         (None, false)
     }
 
-    fn get_field_thread_local_store_id(&self, _field: FieldHandle) -> (u32, Option<NonNull<c_void>>) {
+    fn get_field_thread_local_store_id(
+        &self,
+        _field: FieldHandle,
+    ) -> (u32, Option<NonNull<c_void>>) {
         (0, None)
     }
 }

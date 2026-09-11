@@ -7,10 +7,7 @@ use crate::ee_info::{Pgo, PgoResults, PgoSchemaItem};
 use crate::handles::MethodHandle;
 
 impl Pgo for MockEe {
-    fn get_pgo_instrumentation_results(
-        &self,
-        _ftn: MethodHandle,
-    ) -> Result<PgoResults, i32> {
+    fn get_pgo_instrumentation_results(&self, _ftn: MethodHandle) -> Result<PgoResults, i32> {
         // E_INVALIDARG-ish: the mock has no profile data.
         Err(-2147024809)
     }

@@ -43,7 +43,11 @@ macro_rules! handle_newtype {
             /// null. This is the only way to construct the newtype from FFI.
             #[inline]
             pub const fn from_raw(raw: $raw) -> Option<Self> {
-                if raw.is_null() { None } else { Some(Self(raw)) }
+                if raw.is_null() {
+                    None
+                } else {
+                    Some(Self(raw))
+                }
             }
 
             /// Unwraps to the raw bindgen alias, for calls into the gasket

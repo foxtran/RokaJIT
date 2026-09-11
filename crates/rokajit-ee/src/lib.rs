@@ -43,8 +43,8 @@
 
 #[macro_use]
 pub mod enums;
-pub mod handles;
 pub mod ee_info;
+pub mod handles;
 pub mod host;
 
 #[cfg(test)]

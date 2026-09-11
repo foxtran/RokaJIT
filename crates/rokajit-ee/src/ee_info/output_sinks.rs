@@ -99,12 +99,8 @@ pub trait OutputSinks {
     /// `va_list` parameter decays to a pointer to that storage, which is
     /// what the forwarder receives. Present for surface completeness; the
     /// core formats its own diagnostics instead of calling through.
-    unsafe fn log_msg(
-        &self,
-        level: u32,
-        fmt: *const c_char,
-        args: *mut ffi::__va_list_tag,
-    ) -> bool;
+    unsafe fn log_msg(&self, level: u32, fmt: *const c_char, args: *mut ffi::__va_list_tag)
+        -> bool;
 
     /// C++ `ICorJitInfo::doAssert` (corjit.h:254). Returns `true` when the
     /// EE asks the JIT to retry (DebugBreak), `false` when the assert should

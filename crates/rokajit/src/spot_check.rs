@@ -34,8 +34,12 @@ use rokajit_ffi::{self as ffi, CORINFO_METHOD_INFO, CORINFO_RESOLVED_TOKEN, CORI
 
 /// Spot-check the first N distinct methods the EE hands us.
 const SPOT_CHECK_METHODS: usize = 4;
-static SEEN: [AtomicUsize; SPOT_CHECK_METHODS] =
-    [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static SEEN: [AtomicUsize; SPOT_CHECK_METHODS] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 
 /// Runs the sample for the first few distinct methods. Everything here is
 /// a query the EE answers during a normal compilation; sinks and
@@ -54,7 +58,11 @@ pub fn run(info: &CORINFO_METHOD_INFO, ee: &GasketEeInfo) {
         if seen == ftn_addr {
             return; // already spot-checked this method
         }
-        if seen == 0 && slot.compare_exchange(0, ftn_addr, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        if seen == 0
+            && slot
+                .compare_exchange(0, ftn_addr, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
             break; // claimed: run the sample below
         }
         if slot as *const _ == &SEEN[SPOT_CHECK_METHODS - 1] as *const _ {
@@ -124,7 +132,10 @@ pub fn run(info: &CORINFO_METHOD_INFO, ee: &GasketEeInfo) {
     );
 
     // output sinks (the one pure query in the group)
-    eprintln!("rokajit: spot: jit_flags={:#x}", ee.get_jit_flags().corJitFlags);
+    eprintln!(
+        "rokajit: spot: jit_flags={:#x}",
+        ee.get_jit_flags().corJitFlags
+    );
 
     // PGO
     match ee.get_pgo_instrumentation_results(ftn) {
@@ -160,7 +171,10 @@ pub fn run(info: &CORINFO_METHOD_INFO, ee: &GasketEeInfo) {
             None => eprintln!("rokajit: spot: no decodable call token in IL"),
         }
     }
-    eprintln!("rokajit: spot: can_inline(self, self)={:?}", ee.can_inline(ftn, ftn));
+    eprintln!(
+        "rokajit: spot: can_inline(self, self)={:?}",
+        ee.can_inline(ftn, ftn)
+    );
 }
 
 fn log_sig(label: &str, sig: &CORINFO_SIG_INFO, ee: &GasketEeInfo) {

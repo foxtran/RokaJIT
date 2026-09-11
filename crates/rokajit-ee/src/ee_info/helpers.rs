@@ -2,8 +2,8 @@ use std::ffi::c_void;
 
 use rokajit_ffi as ffi;
 use rokajit_ffi::{
-    CORINFO_CONST_LOOKUP, CORINFO_EE_INFO, CORINFO_LOOKUP, CORINFO_RESOLVED_TOKEN,
-    CORINFO_WASM_WELLKNOWN_GLOBALS, DelegateCtorArgs,
+    DelegateCtorArgs, CORINFO_CONST_LOOKUP, CORINFO_EE_INFO, CORINFO_LOOKUP,
+    CORINFO_RESOLVED_TOKEN, CORINFO_WASM_WELLKNOWN_GLOBALS,
 };
 
 use super::wrap::zeroed_out;
@@ -40,11 +40,8 @@ pub trait Helpers {
     ) -> (CorInfoHelpFunc, Option<bool>);
 
     /// C++ `ICorClassInfo::getCastingHelper` (corinfo.h:2669).
-    fn get_casting_helper(
-        &self,
-        token: &CORINFO_RESOLVED_TOKEN,
-        throwing: bool,
-    ) -> CorInfoHelpFunc;
+    fn get_casting_helper(&self, token: &CORINFO_RESOLVED_TOKEN, throwing: bool)
+        -> CorInfoHelpFunc;
 
     /// C++ `ICorClassInfo::getBoxHelper` (corinfo.h:2687).
     fn get_box_helper(&self, cls: ClassHandle) -> CorInfoHelpFunc;

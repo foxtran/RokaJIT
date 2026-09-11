@@ -184,7 +184,11 @@ pub mod hir {
         /// Assignment to a local/temp (`stloc`, `starg`, temp defs).
         Store { dst: LocalId, value: Expr },
         /// Store through a byref (`stind.*`, `stfld`, `stelem`, `stobj`).
-        StoreInd { addr: Expr, offset: u32, value: Expr },
+        StoreInd {
+            addr: Expr,
+            offset: u32,
+            value: Expr,
+        },
         /// Evaluate and discard (expression statements: `pop` of a call
         /// result, etc.).
         Eval(Expr),
@@ -193,13 +197,29 @@ pub mod hir {
     pub enum Terminator {
         /// Conditional branch; operands are HIR expressions (the compare is
         /// still a tree at this level).
-        Branch { cond: Expr, then: BlockId, else_: BlockId },
-        Jump { target: BlockId },
-        Switch { value: Expr, targets: Vec<BlockId>, default: BlockId },
-        Return { value: Option<Expr> },
-        Throw { exception: Expr },
+        Branch {
+            cond: Expr,
+            then: BlockId,
+            else_: BlockId,
+        },
+        Jump {
+            target: BlockId,
+        },
+        Switch {
+            value: Expr,
+            targets: Vec<BlockId>,
+            default: BlockId,
+        },
+        Return {
+            value: Option<Expr>,
+        },
+        Throw {
+            exception: Expr,
+        },
         /// `leave` out of a protected region.
-        Leave { target: BlockId },
+        Leave {
+            target: BlockId,
+        },
         /// `endfinally` / `endfilter` at the end of a funclet.
         EndFinally,
     }
@@ -214,31 +234,74 @@ pub mod hir {
         /// Address of a local (`ldloca`, `ldarga`) — a `ByRef`.
         LocalAddr(LocalId),
         /// Load through a byref (`ldind.*`, `ldfld`, `ldelem`, `ldobj`).
-        Load { addr: Box<Expr>, offset: u32, ty: Type },
+        Load {
+            addr: Box<Expr>,
+            offset: u32,
+            ty: Type,
+        },
         /// Instance field access: object plus the EE-supplied offset.
-        FieldAddr { obj: Box<Expr>, field: FieldHandle },
+        FieldAddr {
+            obj: Box<Expr>,
+            field: FieldHandle,
+        },
         /// Static field address, as resolved by the EE.
-        StaticFieldAddr { field: FieldHandle },
-        Unary { op: UnaryOp, arg: Box<Expr> },
-        Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr> },
+        StaticFieldAddr {
+            field: FieldHandle,
+        },
+        Unary {
+            op: UnaryOp,
+            arg: Box<Expr>,
+        },
+        Binary {
+            op: BinaryOp,
+            lhs: Box<Expr>,
+            rhs: Box<Expr>,
+        },
         /// Numeric conversion (`conv.*`); `overflow`/`unsigned` from the IL
         /// opcode suffixes.
-        Conv { to: Type, overflow: bool, unsigned: bool, arg: Box<Expr> },
+        Conv {
+            to: Type,
+            overflow: bool,
+            unsigned: bool,
+            arg: Box<Expr>,
+        },
         /// **A call in HIR is an expression node** (`Expr::Call`) that may
         /// nest anywhere a value is legal. Compare `lir::StmtKind::Call`.
-        Call { target: CallTarget<Expr>, sig: CallSig, args: Vec<Expr> },
+        Call {
+            target: CallTarget<Expr>,
+            sig: CallSig,
+            args: Vec<Expr>,
+        },
         /// Explicit null check (`ldfld` receiver rules).
-        NullCheck { arg: Box<Expr> },
-        ArrLen { array: Box<Expr> },
+        NullCheck {
+            arg: Box<Expr>,
+        },
+        ArrLen {
+            array: Box<Expr>,
+        },
         /// `ldelema`-style element address.
-        ArrElemAddr { array: Box<Expr>, index: Box<Expr>, elem: Type },
+        ArrElemAddr {
+            array: Box<Expr>,
+            index: Box<Expr>,
+            elem: Type,
+        },
         /// `isinst`/`castclass`.
-        Cast { arg: Box<Expr>, class: ClassHandle, throwing: bool },
+        Cast {
+            arg: Box<Expr>,
+            class: ClassHandle,
+            throwing: bool,
+        },
         /// `box`.
-        Box { arg: Box<Expr>, class: ClassHandle },
+        Box {
+            arg: Box<Expr>,
+            class: ClassHandle,
+        },
         /// A struct-typed value produced by copying `size` bytes from
         /// `addr` (value of `ldobj`).
-        StructVal { addr: Box<Expr>, class: ClassHandle },
+        StructVal {
+            addr: Box<Expr>,
+            class: ClassHandle,
+        },
     }
 
     /// An EH region over a contiguous block range (half-open).
@@ -251,11 +314,16 @@ pub mod hir {
     }
 
     pub enum EhRegionKind {
-        Catch { class: ClassHandle },
+        Catch {
+            class: ClassHandle,
+        },
         Finally,
         Fault,
         /// The filter itself is a separate block range.
-        Filter { filter_start: BlockId, filter_end: BlockId },
+        Filter {
+            filter_start: BlockId,
+            filter_end: BlockId,
+        },
     }
 }
 
@@ -303,14 +371,41 @@ pub mod lir {
     }
 
     pub enum StmtKind {
-        Copy { dst: LocalId, src: Operand },
-        Unary { dst: LocalId, op: UnaryOp, src: Operand },
-        Binary { dst: LocalId, op: BinaryOp, lhs: Operand, rhs: Operand },
-        Conv { dst: LocalId, to: Type, overflow: bool, unsigned: bool, src: Operand },
+        Copy {
+            dst: LocalId,
+            src: Operand,
+        },
+        Unary {
+            dst: LocalId,
+            op: UnaryOp,
+            src: Operand,
+        },
+        Binary {
+            dst: LocalId,
+            op: BinaryOp,
+            lhs: Operand,
+            rhs: Operand,
+        },
+        Conv {
+            dst: LocalId,
+            to: Type,
+            overflow: bool,
+            unsigned: bool,
+            src: Operand,
+        },
         /// Load through a byref operand at a constant offset.
-        Load { dst: LocalId, addr: Operand, offset: u32, ty: Type },
+        Load {
+            dst: LocalId,
+            addr: Operand,
+            offset: u32,
+            ty: Type,
+        },
         /// Store through a byref operand at a constant offset.
-        Store { addr: Operand, offset: u32, src: Operand },
+        Store {
+            addr: Operand,
+            offset: u32,
+            src: Operand,
+        },
         /// **A call in LIR is always a top-level statement** whose result,
         /// if any, lands in a fresh temp. Arguments are operands — any
         /// computation that fed an argument is an earlier statement.
@@ -320,20 +415,54 @@ pub mod lir {
             sig: CallSig,
             args: Vec<Operand>,
         },
-        ArrLen { dst: LocalId, array: Operand },
-        ArrElemAddr { dst: LocalId, array: Operand, index: Operand, elem: Type },
-        Cast { dst: LocalId, src: Operand, class: ClassHandle, throwing: bool },
-        Box { dst: LocalId, src: Operand, class: ClassHandle },
-        NullCheck { arg: Operand },
+        ArrLen {
+            dst: LocalId,
+            array: Operand,
+        },
+        ArrElemAddr {
+            dst: LocalId,
+            array: Operand,
+            index: Operand,
+            elem: Type,
+        },
+        Cast {
+            dst: LocalId,
+            src: Operand,
+            class: ClassHandle,
+            throwing: bool,
+        },
+        Box {
+            dst: LocalId,
+            src: Operand,
+            class: ClassHandle,
+        },
+        NullCheck {
+            arg: Operand,
+        },
         /// Conditional branch to `target`; fallthrough is the next
         /// statement (the compare is folded into the branch — the one
         /// permitted two-input operation besides `Binary`).
-        Branch { cond: BranchCond, target: BlockId },
-        Jump { target: BlockId },
-        Switch { value: Operand, targets: Vec<BlockId>, default: BlockId },
-        Return { value: Option<Operand> },
-        Throw { exception: Operand },
-        Leave { target: BlockId },
+        Branch {
+            cond: BranchCond,
+            target: BlockId,
+        },
+        Jump {
+            target: BlockId,
+        },
+        Switch {
+            value: Operand,
+            targets: Vec<BlockId>,
+            default: BlockId,
+        },
+        Return {
+            value: Option<Operand>,
+        },
+        Throw {
+            exception: Operand,
+        },
+        Leave {
+            target: BlockId,
+        },
         EndFinally,
     }
 
@@ -341,6 +470,10 @@ pub mod lir {
     pub enum BranchCond {
         True(Operand),
         False(Operand),
-        Cmp { op: BinaryOp, lhs: Operand, rhs: Operand },
+        Cmp {
+            op: BinaryOp,
+            lhs: Operand,
+            rhs: Operand,
+        },
     }
 }

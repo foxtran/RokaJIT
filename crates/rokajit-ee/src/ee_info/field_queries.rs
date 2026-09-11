@@ -100,7 +100,8 @@ pub trait FieldQueries {
     /// `field` must refer to a thread-local-store static (header
     /// precondition). The second element is the `ppIndirection` out-param,
     /// as in [`FieldQueries::get_thread_tls_index`].
-    fn get_field_thread_local_store_id(&self, field: FieldHandle) -> (u32, Option<NonNull<c_void>>);
+    fn get_field_thread_local_store_id(&self, field: FieldHandle)
+        -> (u32, Option<NonNull<c_void>>);
 }
 
 extern "C" {
@@ -228,7 +229,9 @@ impl FieldQueries for GasketEeInfo {
     }
 
     fn get_thread_local_field_info(&self, field: FieldHandle, is_gc_type: bool) -> u32 {
-        unsafe { rokajit_ee_get_thread_local_field_info(self.comp_raw(), field.as_raw(), is_gc_type) }
+        unsafe {
+            rokajit_ee_get_thread_local_field_info(self.comp_raw(), field.as_raw(), is_gc_type)
+        }
     }
 
     fn get_thread_local_static_blocks_info(&self) -> CORINFO_THREAD_STATIC_BLOCKS_INFO {
@@ -245,7 +248,11 @@ impl FieldQueries for GasketEeInfo {
 
     fn get_array_or_string_length(&self, obj: ObjectHandle) -> Option<u32> {
         let len = unsafe { rokajit_ee_get_array_or_string_length(self.comp_raw(), obj.as_raw()) };
-        if len < 0 { None } else { Some(len as u32) }
+        if len < 0 {
+            None
+        } else {
+            Some(len as u32)
+        }
     }
 
     fn get_thread_tls_index(&self) -> (u32, Option<NonNull<c_void>>) {
@@ -256,8 +263,9 @@ impl FieldQueries for GasketEeInfo {
 
     fn get_addr_of_capture_thread_global(&self) -> (Option<NonNull<i32>>, Option<NonNull<c_void>>) {
         let mut indirection: *mut c_void = std::ptr::null_mut();
-        let addr =
-            unsafe { rokajit_ee_get_addr_of_capture_thread_global(self.comp_raw(), &mut indirection) };
+        let addr = unsafe {
+            rokajit_ee_get_addr_of_capture_thread_global(self.comp_raw(), &mut indirection)
+        };
         (NonNull::new(addr), NonNull::new(indirection))
     }
 
@@ -292,7 +300,10 @@ impl FieldQueries for GasketEeInfo {
         (ClassHandle::from_raw(raw), is_speculative)
     }
 
-    fn get_field_thread_local_store_id(&self, field: FieldHandle) -> (u32, Option<NonNull<c_void>>) {
+    fn get_field_thread_local_store_id(
+        &self,
+        field: FieldHandle,
+    ) -> (u32, Option<NonNull<c_void>>) {
         let mut indirection: *mut c_void = std::ptr::null_mut();
         let id = unsafe {
             rokajit_ee_get_field_thread_local_store_id(

@@ -49,11 +49,7 @@ pub trait ClassQueries {
 
     /// C++ `ICorClassInfo::getTypeInstantiationArgument` (corinfo.h:2496).
     /// `None` when the EE returns a null handle.
-    fn get_type_instantiation_argument(
-        &self,
-        cls: ClassHandle,
-        index: u32,
-    ) -> Option<ClassHandle>;
+    fn get_type_instantiation_argument(&self, cls: ClassHandle, index: u32) -> Option<ClassHandle>;
 
     /// C++ `ICorClassInfo::getMethodInstantiationArgument` (corinfo.h:2503).
     /// `None` when the EE returns a null handle.
@@ -201,11 +197,7 @@ pub trait ClassQueries {
     ) -> TypeCompareState;
 
     /// C++ `ICorClassInfo::compareTypesForEquality` (corinfo.h:2829).
-    fn compare_types_for_equality(
-        &self,
-        cls1: ClassHandle,
-        cls2: ClassHandle,
-    ) -> TypeCompareState;
+    fn compare_types_for_equality(&self, cls1: ClassHandle, cls2: ClassHandle) -> TypeCompareState;
 
     /// C++ `ICorClassInfo::isMoreSpecificType` (corinfo.h:2839). An
     /// optimization hint only; no correctness implications.
@@ -246,8 +238,7 @@ pub trait ClassQueries {
     /// C++ `ICorClassInfo::getArrayInitializationData` (corinfo.h:2901).
     /// `None` when there is no static initialization blob (the C++ nullptr).
     /// The returned buffer is EE-owned, `size` bytes.
-    fn get_array_initialization_data(&self, field: FieldHandle, size: u32)
-        -> Option<NonNull<u8>>;
+    fn get_array_initialization_data(&self, field: FieldHandle, size: u32) -> Option<NonNull<u8>>;
 
     /// C++ `ICorClassInfo::canAccessClass` (corinfo.h:2907). The
     /// `CORINFO_HELPER_DESC` is the C++ `pAccessHelper` out-param; it is
@@ -270,8 +261,7 @@ pub trait ClassQueries {
     fn get_swift_lowering(&self, struct_hnd: ClassHandle) -> ffi::CORINFO_SWIFT_LOWERING;
 
     /// C++ `ICorStaticInfo::getFpStructLowering` (corinfo.h:3254).
-    fn get_fp_struct_lowering(&self, struct_hnd: ClassHandle)
-        -> ffi::CORINFO_FPSTRUCT_LOWERING;
+    fn get_fp_struct_lowering(&self, struct_hnd: ClassHandle) -> ffi::CORINFO_FPSTRUCT_LOWERING;
 
     /// C++ `ICorStaticInfo::getWasmLowering` (corinfo.h:3258).
     /// [`CorInfoWasmType::Void`] means the struct must be passed/returned by
@@ -286,20 +276,12 @@ pub trait ClassQueries {
     /// C++ `ICorDynamicInfo::getObjectContent` (corinfo.h:3453). Copies the
     /// frozen object's bytes into `buffer` at `value_offset`; returns false
     /// when the content was unavailable.
-    fn get_object_content(
-        &self,
-        obj: ObjectHandle,
-        buffer: &mut [u8],
-        value_offset: i32,
-    ) -> bool;
+    fn get_object_content(&self, obj: ObjectHandle, buffer: &mut [u8], value_offset: i32) -> bool;
 
     /// C++ `ICorDynamicInfo::getWasmTypeSymbol` (corinfo.h:3557). `types`
     /// describes the signature; `None` when the EE returns a null symbol
     /// handle.
-    fn get_wasm_type_symbol(
-        &self,
-        types: &mut [CorInfoWasmType],
-    ) -> Option<WasmTypeSymbolHandle>;
+    fn get_wasm_type_symbol(&self, types: &mut [CorInfoWasmType]) -> Option<WasmTypeSymbolHandle>;
 }
 
 // ---------------------------------------------------------------------------
@@ -496,8 +478,7 @@ extern "C" {
         cls_hnd: ffi::CORINFO_CLASS_HANDLE,
         cls_ret: *mut ffi::CORINFO_CLASS_HANDLE,
     ) -> ffi::CorInfoType;
-    fn rokajit_ee_is_sd_array(info: *mut ffi::ICorJitInfo, cls: ffi::CORINFO_CLASS_HANDLE)
-        -> bool;
+    fn rokajit_ee_is_sd_array(info: *mut ffi::ICorJitInfo, cls: ffi::CORINFO_CLASS_HANDLE) -> bool;
     fn rokajit_ee_get_array_rank(
         info: *mut ffi::ICorJitInfo,
         cls: ffi::CORINFO_CLASS_HANDLE,
@@ -536,10 +517,7 @@ extern "C" {
         info: *mut ffi::ICorJitInfo,
         struct_hnd: ffi::CORINFO_CLASS_HANDLE,
     ) -> ffi::CorInfoWasmType;
-    fn rokajit_ee_get_address_alignment(
-        info: *mut ffi::ICorJitInfo,
-        address: *mut c_void,
-    ) -> u32;
+    fn rokajit_ee_get_address_alignment(info: *mut ffi::ICorJitInfo, address: *mut c_void) -> u32;
     fn rokajit_ee_get_object_content(
         info: *mut ffi::ICorJitInfo,
         obj: ffi::CORINFO_OBJECT_HANDLE,
@@ -557,7 +535,9 @@ extern "C" {
 /// Copies an EE-lifetime C string into an owned `String`. Null-checked by
 /// the callers before this is invoked.
 unsafe fn copy_c_str(raw: *const c_char) -> String {
-    unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 impl ClassQueries for GasketEeInfo {
@@ -605,11 +585,7 @@ impl ClassQueries for GasketEeInfo {
         Some((name, namespace))
     }
 
-    fn get_type_instantiation_argument(
-        &self,
-        cls: ClassHandle,
-        index: u32,
-    ) -> Option<ClassHandle> {
+    fn get_type_instantiation_argument(&self, cls: ClassHandle, index: u32) -> Option<ClassHandle> {
         let raw = unsafe {
             rokajit_ee_get_type_instantiation_argument(self.comp_raw(), cls.as_raw(), index)
         };
@@ -666,7 +642,11 @@ impl ClassQueries for GasketEeInfo {
                 )
             };
         });
-        if ok { Some((addr, offset)) } else { None }
+        if ok {
+            Some((addr, offset))
+        } else {
+            None
+        }
     }
 
     fn get_class_static_dynamic_info(&self, cls: ClassHandle) -> Option<NonNull<u8>> {
@@ -692,7 +672,11 @@ impl ClassQueries for GasketEeInfo {
                 rokajit_ee_get_static_base_address(self.comp_raw(), cls.as_raw(), is_gc, addr)
             };
         });
-        if ok { Some(addr) } else { None }
+        if ok {
+            Some(addr)
+        } else {
+            None
+        }
     }
 
     fn get_heap_class_size(&self, cls: ClassHandle) -> u32 {
@@ -780,7 +764,11 @@ impl ClassQueries for GasketEeInfo {
         let ok = unsafe {
             rokajit_ee_get_string_char(self.comp_raw(), str_obj.as_raw(), index, &mut value)
         };
-        if ok { Some(value) } else { None }
+        if ok {
+            Some(value)
+        } else {
+            None
+        }
     }
 
     fn get_object_type(&self, obj_ptr: ObjectHandle) -> ClassHandle {
@@ -796,14 +784,13 @@ impl ClassQueries for GasketEeInfo {
     ) -> CorInfoInitClassResult {
         let field = field.map_or(std::ptr::null_mut(), |f| f.as_raw());
         let method = method.map_or(std::ptr::null_mut(), |m| m.as_raw());
-        let raw = unsafe { rokajit_ee_init_class(self.comp_raw(), field, method, context.as_raw()) };
+        let raw =
+            unsafe { rokajit_ee_init_class(self.comp_raw(), field, method, context.as_raw()) };
         CorInfoInitClassResult::from_raw(raw)
     }
 
     fn class_must_be_loaded_before_code_is_run(&self, cls: ClassHandle) {
-        unsafe {
-            rokajit_ee_class_must_be_loaded_before_code_is_run(self.comp_raw(), cls.as_raw())
-        }
+        unsafe { rokajit_ee_class_must_be_loaded_before_code_is_run(self.comp_raw(), cls.as_raw()) }
     }
 
     fn get_builtin_class(&self, class_id: CorInfoClassId) -> Option<ClassHandle> {
@@ -812,9 +799,8 @@ impl ClassQueries for GasketEeInfo {
     }
 
     fn get_type_for_primitive_value_class(&self, cls: ClassHandle) -> Option<CorInfoType> {
-        let raw = unsafe {
-            rokajit_ee_get_type_for_primitive_value_class(self.comp_raw(), cls.as_raw())
-        };
+        let raw =
+            unsafe { rokajit_ee_get_type_for_primitive_value_class(self.comp_raw(), cls.as_raw()) };
         CorInfoType::from_raw(raw).filter(|&t| t != CorInfoType::Undef)
     }
 
@@ -828,18 +814,18 @@ impl ClassQueries for GasketEeInfo {
         to_class: ClassHandle,
     ) -> TypeCompareState {
         let raw = unsafe {
-            rokajit_ee_compare_types_for_cast(self.comp_raw(), from_class.as_raw(), to_class.as_raw())
+            rokajit_ee_compare_types_for_cast(
+                self.comp_raw(),
+                from_class.as_raw(),
+                to_class.as_raw(),
+            )
         };
         // Unknown values mean the headers grew; May (runtime check) is the
         // conservative fallback.
         TypeCompareState::from_raw(raw).unwrap_or(TypeCompareState::May)
     }
 
-    fn compare_types_for_equality(
-        &self,
-        cls1: ClassHandle,
-        cls2: ClassHandle,
-    ) -> TypeCompareState {
+    fn compare_types_for_equality(&self, cls1: ClassHandle, cls2: ClassHandle) -> TypeCompareState {
         let raw = unsafe {
             rokajit_ee_compare_types_for_equality(self.comp_raw(), cls1.as_raw(), cls2.as_raw())
         };
@@ -880,9 +866,8 @@ impl ClassQueries for GasketEeInfo {
 
     fn get_child_type(&self, cls_hnd: ClassHandle) -> (CorInfoType, Option<ClassHandle>) {
         let mut cls_ret: ffi::CORINFO_CLASS_HANDLE = std::ptr::null_mut();
-        let raw = unsafe {
-            rokajit_ee_get_child_type(self.comp_raw(), cls_hnd.as_raw(), &mut cls_ret)
-        };
+        let raw =
+            unsafe { rokajit_ee_get_child_type(self.comp_raw(), cls_hnd.as_raw(), &mut cls_ret) };
         (
             CorInfoType::from_raw(raw).unwrap_or(CorInfoType::Undef),
             ClassHandle::from_raw(cls_ret),
@@ -902,11 +887,7 @@ impl ClassQueries for GasketEeInfo {
         CorInfoArrayIntrinsic::from_raw(raw).unwrap_or(CorInfoArrayIntrinsic::Illegal)
     }
 
-    fn get_array_initialization_data(
-        &self,
-        field: FieldHandle,
-        size: u32,
-    ) -> Option<NonNull<u8>> {
+    fn get_array_initialization_data(&self, field: FieldHandle, size: u32) -> Option<NonNull<u8>> {
         NonNull::new(unsafe {
             rokajit_ee_get_array_initialization_data(self.comp_raw(), field.as_raw(), size)
         } as *mut u8)
@@ -924,7 +905,8 @@ impl ClassQueries for GasketEeInfo {
                     self.comp_raw(),
                     // The C++ signature is non-const, but canAccessClass does not
                     // mutate the token.
-                    p_resolved_token as *const CORINFO_RESOLVED_TOKEN as *mut CORINFO_RESOLVED_TOKEN,
+                    p_resolved_token as *const CORINFO_RESOLVED_TOKEN
+                        as *mut CORINFO_RESOLVED_TOKEN,
                     caller_handle.as_raw(),
                     helper,
                 )
@@ -953,7 +935,11 @@ impl ClassQueries for GasketEeInfo {
                 )
             };
         });
-        if ok { Some(desc) } else { None }
+        if ok {
+            Some(desc)
+        } else {
+            None
+        }
     }
 
     fn get_swift_lowering(&self, struct_hnd: ClassHandle) -> ffi::CORINFO_SWIFT_LOWERING {
@@ -962,10 +948,7 @@ impl ClassQueries for GasketEeInfo {
         })
     }
 
-    fn get_fp_struct_lowering(
-        &self,
-        struct_hnd: ClassHandle,
-    ) -> ffi::CORINFO_FPSTRUCT_LOWERING {
+    fn get_fp_struct_lowering(&self, struct_hnd: ClassHandle) -> ffi::CORINFO_FPSTRUCT_LOWERING {
         zeroed_out(|lowering| unsafe {
             rokajit_ee_get_fp_struct_lowering(self.comp_raw(), struct_hnd.as_raw(), lowering)
         })
@@ -981,12 +964,7 @@ impl ClassQueries for GasketEeInfo {
         unsafe { rokajit_ee_get_address_alignment(self.comp_raw(), address) }
     }
 
-    fn get_object_content(
-        &self,
-        obj: ObjectHandle,
-        buffer: &mut [u8],
-        value_offset: i32,
-    ) -> bool {
+    fn get_object_content(&self, obj: ObjectHandle, buffer: &mut [u8], value_offset: i32) -> bool {
         unsafe {
             rokajit_ee_get_object_content(
                 self.comp_raw(),
@@ -998,10 +976,7 @@ impl ClassQueries for GasketEeInfo {
         }
     }
 
-    fn get_wasm_type_symbol(
-        &self,
-        types: &mut [CorInfoWasmType],
-    ) -> Option<WasmTypeSymbolHandle> {
+    fn get_wasm_type_symbol(&self, types: &mut [CorInfoWasmType]) -> Option<WasmTypeSymbolHandle> {
         // CorInfoWasmType is #[repr(u32)], layout-identical to the bindgen
         // c_uint alias the forwarder expects.
         let raw = unsafe {

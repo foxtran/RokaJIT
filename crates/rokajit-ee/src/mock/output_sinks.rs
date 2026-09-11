@@ -14,14 +14,19 @@ impl OutputSinks for MockEe {
     }
 
     fn alloc_mem(&self, request: &[ChunkRequest], xcptns_count: u32) -> Vec<AllocatedChunk> {
-        self.sink_log
-            .borrow_mut()
-            .push(format!("alloc_mem({}, xcptns={})", request.len(), xcptns_count));
+        self.sink_log.borrow_mut().push(format!(
+            "alloc_mem({}, xcptns={})",
+            request.len(),
+            xcptns_count
+        ));
         request
             .iter()
             .map(|r| {
                 let p = self.fake_alloc(r.size as usize);
-                AllocatedChunk { executable: p, writable: p }
+                AllocatedChunk {
+                    executable: p,
+                    writable: p,
+                }
             })
             .collect()
     }
@@ -41,9 +46,10 @@ impl OutputSinks for MockEe {
         unwind: &[u8],
         func_kind: CorJitFuncKind,
     ) {
-        self.sink_log
-            .borrow_mut()
-            .push(format!("alloc_unwind_info({}, {func_kind:?})", unwind.len()));
+        self.sink_log.borrow_mut().push(format!(
+            "alloc_unwind_info({}, {func_kind:?})",
+            unwind.len()
+        ));
     }
 
     fn alloc_gc_info(&self, size: usize) -> NonNull<u8> {
@@ -51,11 +57,15 @@ impl OutputSinks for MockEe {
     }
 
     fn set_eh_count(&self, count: u32) {
-        self.sink_log.borrow_mut().push(format!("set_eh_count({count})"));
+        self.sink_log
+            .borrow_mut()
+            .push(format!("set_eh_count({count})"));
     }
 
     fn set_eh_info(&self, index: u32, _clause: &ffi::CORINFO_EH_CLAUSE) {
-        self.sink_log.borrow_mut().push(format!("set_eh_info({index})"));
+        self.sink_log
+            .borrow_mut()
+            .push(format!("set_eh_info({index})"));
     }
 
     fn record_call_site(
