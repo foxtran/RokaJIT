@@ -21,6 +21,11 @@
 
 use rokajit_ffi as ffi;
 
+// Kept in scope so the intra-doc links on [`InstructionSet`] and
+// [`GetTailCallHelpersFlags`] resolve (same pattern as `ee_info/mod.rs`).
+#[allow(unused_imports)]
+use crate::ee_info::{Helpers, InliningAndTailCall};
+
 /// Defines a checked Rust enum over a bindgen C++ enum: `#[repr($raw)]`,
 /// `from_raw` (checked) and `to_raw`.
 macro_rules! ffi_enum {
@@ -139,6 +144,115 @@ ffi_enum!(
     CheckCanInlineVmFail => CorInfoInline_INLINE_CHECK_CAN_INLINE_VMFAIL,
     Fail => CorInfoInline_INLINE_FAIL,
     Never => CorInfoInline_INLINE_NEVER,
+);
+
+ffi_enum!(
+    TypeCompareState,
+    i32,
+    "Result of a type-comparison query (C++ `TypeCompareState`, corinfo.h:2117).",
+    MustNot => TypeCompareState_MustNot,
+    May => TypeCompareState_May,
+    Must => TypeCompareState_Must,
+);
+
+ffi_enum!(
+    CorInfoClassId,
+    u32,
+    "The EE's well-known class ids for `getBuiltinClass` (C++ `CorInfoClassId`, \
+     corinfo.h:929).",
+    SystemObject => CorInfoClassId_CLASSID_SYSTEM_OBJECT,
+    TypedByref => CorInfoClassId_CLASSID_TYPED_BYREF,
+    TypeHandle => CorInfoClassId_CLASSID_TYPE_HANDLE,
+    FieldHandle => CorInfoClassId_CLASSID_FIELD_HANDLE,
+    MethodHandle => CorInfoClassId_CLASSID_METHOD_HANDLE,
+    String => CorInfoClassId_CLASSID_STRING,
+    ArgumentHandle => CorInfoClassId_CLASSID_ARGUMENT_HANDLE,
+    RuntimeType => CorInfoClassId_CLASSID_RUNTIME_TYPE,
+    NumericsVectorT => CorInfoClassId_CLASSID_NUMERICS_VECTORT,
+);
+
+ffi_enum!(
+    CorInfoArrayIntrinsic,
+    i32,
+    "Which runtime-provided array method a handle denotes (C++ \
+     `CorInfoArrayIntrinsic`, corinfo.h:829).",
+    Get => CorInfoArrayIntrinsic_GET,
+    Set => CorInfoArrayIntrinsic_SET,
+    Address => CorInfoArrayIntrinsic_ADDRESS,
+    Illegal => CorInfoArrayIntrinsic_ILLEGAL,
+);
+
+ffi_enum!(
+    CorInfoIsAccessAllowedResult,
+    u32,
+    "Access-check verdict (C++ `CorInfoIsAccessAllowedResult`, corinfo.h:1437).",
+    Allowed => CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ALLOWED,
+    Illegal => CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ILLEGAL,
+);
+
+ffi_enum!(
+    CorInfoWasmType,
+    u32,
+    "Wasm primitive type for by-value struct passing (C++ `CorInfoWasmType`, \
+     corinfo.h:621). `Void` means \"pass/return by reference\".",
+    Void => CorInfoWasmType_CORINFO_WASM_TYPE_VOID,
+    V128 => CorInfoWasmType_CORINFO_WASM_TYPE_V128,
+    F64 => CorInfoWasmType_CORINFO_WASM_TYPE_F64,
+    F32 => CorInfoWasmType_CORINFO_WASM_TYPE_F32,
+    I64 => CorInfoWasmType_CORINFO_WASM_TYPE_I64,
+    I32 => CorInfoWasmType_CORINFO_WASM_TYPE_I32,
+);
+
+ffi_enum!(
+    GetTypeLayoutResult,
+    i32,
+    "Outcome of a `getTypeLayout` call (C++ `GetTypeLayoutResult`, \
+     corinfo.h:2032). `Partial` means the tree was truncated to fit the \
+     caller's buffer.",
+    Success => GetTypeLayoutResult_Success,
+    Partial => GetTypeLayoutResult_Partial,
+    Failure => GetTypeLayoutResult_Failure,
+);
+
+ffi_enum!(
+    CorInfoCallConvExtension,
+    i32,
+    "Unmanaged entry-point calling convention (C++ `CorInfoCallConvExtension`, \
+     corinfo.h:673). `enum class`, ABI type `c_int`; small closed set, so a \
+     checked Rust enum per the frozen enum policy.",
+    Managed => CorInfoCallConvExtension_Managed,
+    C => CorInfoCallConvExtension_C,
+    Stdcall => CorInfoCallConvExtension_Stdcall,
+    Thiscall => CorInfoCallConvExtension_Thiscall,
+    Fastcall => CorInfoCallConvExtension_Fastcall,
+    CMemberFunction => CorInfoCallConvExtension_CMemberFunction,
+    StdcallMemberFunction => CorInfoCallConvExtension_StdcallMemberFunction,
+    FastcallMemberFunction => CorInfoCallConvExtension_FastcallMemberFunction,
+    Swift => CorInfoCallConvExtension_Swift,
+);
+
+ffi_enum!(
+    CorInfoHFAElemType,
+    u32,
+    "HFA element kind of a valuetype (C++ `CorInfoHFAElemType`, corhdr.h:1762). \
+     `None` = not an HFA (a regular value, not a failure sentinel).",
+    None => CorInfoHFAElemType_CORINFO_HFA_ELEM_NONE,
+    Float => CorInfoHFAElemType_CORINFO_HFA_ELEM_FLOAT,
+    Double => CorInfoHFAElemType_CORINFO_HFA_ELEM_DOUBLE,
+    Vector64 => CorInfoHFAElemType_CORINFO_HFA_ELEM_VECTOR64,
+    Vector128 => CorInfoHFAElemType_CORINFO_HFA_ELEM_VECTOR128,
+);
+
+ffi_enum!(
+    InfoAccessType,
+    u32,
+    "How an embedded value is reached at runtime (C++ `InfoAccessType`, \
+     corinfo.h:839): directly, through one indirection, through two, or \
+     through a relative indirection.",
+    Value => InfoAccessType_IAT_VALUE,
+    PValue => InfoAccessType_IAT_PVALUE,
+    PPValue => InfoAccessType_IAT_PPVALUE,
+    RelPValue => InfoAccessType_IAT_RELPVALUE,
 );
 
 /// Which EE helper to call (C++ `CorInfoHelpFunc`, corinfo.h:305).
@@ -387,6 +501,79 @@ impl RelocType {
     }
 }
 
+/// Target instruction set for [`Helpers::notify_instruction_set_usage`] (C++
+/// `CORINFO_InstructionSet`).
+///
+/// A transparent newtype, not a checked enum: the set is large,
+/// architecture-specific, and grows with the hardware (49 values at runtime
+/// commit ac550b6); nothing matches on it exhaustively. Only the boundary
+/// sentinels are named; everything else is constructed with
+/// [`InstructionSet::from_raw`].
+#[repr(transparent)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct InstructionSet(pub u32);
+
+impl InstructionSet {
+    pub const ILLEGAL: Self = Self(ffi::CORINFO_InstructionSet_InstructionSet_ILLEGAL);
+    pub const NONE: Self = Self(ffi::CORINFO_InstructionSet_InstructionSet_NONE);
+
+    /// Wraps a raw ABI value (all `u32`s are representable).
+    #[inline]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+    /// The raw ABI value.
+    #[inline]
+    pub const fn to_raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Call-site modifiers for [`InliningAndTailCall::get_tail_call_helpers`]
+/// (C++ `CORINFO_GET_TAILCALL_HELPERS_FLAGS`, corinfo.h:1868).
+///
+/// Hand-rolled rather than `flag_set!` because the per-bit doc on
+/// [`GetTailCallHelpersFlags::IS_CALLVIRT`] does not fit the macro shape;
+/// the API is otherwise identical to the macro expansion.
+#[repr(transparent)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub struct GetTailCallHelpersFlags(pub u32);
+
+impl GetTailCallHelpersFlags {
+    /// The callsite is a callvirt instruction.
+    pub const IS_CALLVIRT: Self =
+        Self(ffi::CORINFO_GET_TAILCALL_HELPERS_FLAGS_CORINFO_TAILCALL_IS_CALLVIRT);
+    pub const THIS_ARG_IS_BYREF: Self =
+        Self(ffi::CORINFO_GET_TAILCALL_HELPERS_FLAGS_CORINFO_TAILCALL_THIS_ARG_IS_BYREF);
+
+    pub const EMPTY: Self = Self(0);
+
+    #[inline]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+    #[inline]
+    pub const fn to_raw(self) -> u32 {
+        self.0
+    }
+    #[inline]
+    pub const fn contains(self, bit: Self) -> bool {
+        self.0 & bit.0 == bit.0
+    }
+    #[inline]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOr for GetTailCallHelpersFlags {
+    type Output = Self;
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self {
+        self.union(rhs)
+    }
+}
+
 /// Defines a bitmask newtype over a bindgen flag field: `const` bits,
 /// `const` `|` composition, `contains`.
 macro_rules! flag_set {
@@ -483,6 +670,42 @@ flag_set!(
     FINALLY => CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FINALLY,
     FAULT => CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FAULT,
     SAMETRY => CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_SAMETRY,
+);
+
+flag_set!(
+    CorInfoInitClassResult,
+    u32,
+    "Class-initialization verdict returned by `initClass` (C++ \
+     `CorInfoInitClassResult`, corinfo.h:966). The EE may combine \
+     `USE_HELPER | DONT_INLINE`, so this is a flag set, not a plain enum.",
+    NOT_REQUIRED => CorInfoInitClassResult_CORINFO_INITCLASS_NOT_REQUIRED,
+    INITIALIZED => CorInfoInitClassResult_CORINFO_INITCLASS_INITIALIZED,
+    USE_HELPER => CorInfoInitClassResult_CORINFO_INITCLASS_USE_HELPER,
+    DONT_INLINE => CorInfoInitClassResult_CORINFO_INITCLASS_DONT_INLINE,
+);
+
+flag_set!(
+    AccessFlags,
+    u32,
+    "Access modifiers for `getFunctionEntryPoint` (C++ `CORINFO_ACCESS_FLAGS`, \
+     corinfo.h:795). `CORINFO_ACCESS_ANY` is zero, i.e. [`AccessFlags::EMPTY`]. \
+     Only the method-access bits are named; the field-access bits (GET/SET/\
+     ADDRESS/INIT_ARRAY/INLINECHECK) are reachable via [`AccessFlags::from_raw`].",
+    THIS => CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_THIS,
+    PREFER_SLOT_OVER_TEMPORARY_ENTRYPOINT => CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_PREFER_SLOT_OVER_TEMPORARY_ENTRYPOINT,
+    NONNULL => CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_NONNULL,
+    LDFTN => CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_LDFTN,
+    UNMANAGED_CALLER_MAYBE => CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_UNMANAGED_CALLER_MAYBE,
+);
+
+flag_set!(
+    MethodRuntimeFlags,
+    u32,
+    "Flags the JIT reports back about a compiled method (C++ \
+     `CorInfoMethodRuntimeFlags`, corinfo.h:785).",
+    BAD_INLINEE => CorInfoMethodRuntimeFlags_CORINFO_FLG_BAD_INLINEE,
+    SWITCHED_TO_MIN_OPT => CorInfoMethodRuntimeFlags_CORINFO_FLG_SWITCHED_TO_MIN_OPT,
+    SWITCHED_TO_OPTIMIZED => CorInfoMethodRuntimeFlags_CORINFO_FLG_SWITCHED_TO_OPTIMIZED,
 );
 
 #[cfg(test)]

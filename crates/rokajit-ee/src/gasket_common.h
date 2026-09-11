@@ -22,6 +22,58 @@
 #include "corjithost.h"
 #include "jiteeversionguid.h"
 
+#include <cstdio>
+#include <type_traits>
+
+// ---------------------------------------------------------------------------
+// Exception trap (frozen pattern, decisions/2026-09-11-gasket-exception-trap.md):
+// a C++ exception must never unwind into Rust, so every gasket forwarder
+// routes its single virtual call through one of these. reportFatalError is
+// the EE's own fatal channel; a conforming EE does not return from it, so
+// the zero fallback in the value case is unreachable. ICorJitHost has no
+// error channel, so the host variant logs to stderr and returns the zero
+// sentinel instead. Note catch (...) traps C++ exceptions only; a hardware
+// fault inside the EE unwinds as an unmanaged (SEH) exception, which no
+// C++ handler can catch (observed live in step_05).
+// ---------------------------------------------------------------------------
+
+template <typename F>
+inline auto rokajit_ee_trap(ICorJitInfo* info, F&& call) -> decltype(call())
+{
+    using R = decltype(call());
+    try
+    {
+        return call();
+    }
+    catch (...)
+    {
+        info->reportFatalError(CORJIT_INTERNALERROR);
+        if constexpr (!std::is_void_v<R>)
+            return R{};
+        else
+            return;
+    }
+}
+
+template <typename F>
+inline auto rokajit_host_trap(const char* cppName, F&& call) -> decltype(call())
+{
+    using R = decltype(call());
+    try
+    {
+        return call();
+    }
+    catch (...)
+    {
+        fprintf(stderr, "rokajit: C++ exception escaped ICorJitHost::%s\n", cppName);
+        if constexpr (!std::is_void_v<R>)
+            return R{};
+        else
+            return;
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 // Rust entry points (defined in the rokajit crate).
 // ---------------------------------------------------------------------------
@@ -36,6 +88,10 @@ extern "C" CorJitResult rokajit_compile_method(
 extern "C" void rokajit_set_target_os(CORINFO_OS os);
 
 extern "C" void rokajit_process_shutdown_work(ICorStaticInfo* info);
+
+// Defined in rokajit-ee (`ee_info/real.rs`): captures the process-lifetime
+// ICorJitHost for GasketEeInfo. Called once from jitStartup below.
+extern "C" void rokajit_ee_set_jit_host(ICorJitHost* jitHost);
 
 // ---------------------------------------------------------------------------
 // ICorJitCompiler implementation: pure forwarding into Rust.

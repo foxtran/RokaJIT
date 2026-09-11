@@ -27,7 +27,9 @@
 pub mod artifact;
 pub mod error;
 pub mod ir;
+mod spot_check;
 
+use rokajit_ee::ee_info::{EeInfo, GasketEeInfo};
 use rokajit_ffi::{
     CorJitResult, CorJitResult_CORJIT_INTERNALERROR, CORINFO_METHOD_INFO, CORINFO_OS, ICorJitInfo,
     ICorStaticInfo,
@@ -65,12 +67,13 @@ pub extern "C" fn rokajit_compile_method(
         // SAFETY: the EE passes a valid CORINFO_METHOD_INFO for the duration
         // of this call.
         let info = unsafe { &*info };
-        eprintln!(
-            "rokajit: compileMethod ftn={:p} ILCodeSize={} maxStack={} EHcount={} flags={:#x}",
-            info.ftn, info.ILCodeSize, info.maxStack, info.EHcount, flags
-        );
-        let _ = (comp, native_entry, native_size_of_code);
-        CorJitResult_CORJIT_INTERNALERROR
+        let Some(ee) = GasketEeInfo::new(comp) else {
+            eprintln!("rokajit: null ICorJitInfo in compileMethod");
+            return CorJitResult_CORJIT_INTERNALERROR;
+        };
+        let _ = (native_entry, native_size_of_code);
+        spot_check::run(info, &ee);
+        compile_method(info, flags, &ee)
     };
     match std::panic::catch_unwind(compile) {
         Ok(result) => result,
@@ -79,6 +82,18 @@ pub extern "C" fn rokajit_compile_method(
             CorJitResult_CORJIT_INTERNALERROR
         }
     }
+}
+
+/// The compiler spine: receives the safe EE surface and the method to
+/// compile. No compiler work yet (step 04) — log the request and report a
+/// graceful failure to the EE.
+fn compile_method(info: &CORINFO_METHOD_INFO, flags: std::ffi::c_uint, ee: &dyn EeInfo) -> CorJitResult {
+    eprintln!(
+        "rokajit: compileMethod ftn={:p} ILCodeSize={} maxStack={} EHcount={} flags={:#x}",
+        info.ftn, info.ILCodeSize, info.maxStack, info.EHcount, flags
+    );
+    let _ = ee;
+    CorJitResult_CORJIT_INTERNALERROR
 }
 
 #[no_mangle]

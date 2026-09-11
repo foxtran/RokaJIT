@@ -38,12 +38,13 @@
 //!
 //! No compiler logic, no allocation policy, no caching — all behavior lives
 //! in `rokajit`. The concrete `EeInfo` implementation that talks to a real
-//! EE through the gasket forwarders is Phase 1 work; step 02 freezes the
-//! trait and proves it implementable via `MockEe` (see the tests).
+//! EE through the gasket forwarders is [`ee_info::GasketEeInfo`] (step 04);
+//! `MockEe` (test-only) proves the trait implementable without a live EE.
 
-pub mod ee_info;
+#[macro_use]
 pub mod enums;
 pub mod handles;
+pub mod ee_info;
 pub mod host;
 
 #[cfg(test)]

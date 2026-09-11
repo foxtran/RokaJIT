@@ -115,6 +115,19 @@ handle_newtype!(
     rokajit_ffi::CORINFO_JUST_MY_CODE_HANDLE,
     "Just-my-code token (`CORINFO_JUST_MY_CODE_HANDLE`)."
 );
+handle_newtype!(
+    VarArgsHandle,
+    rokajit_ffi::CORINFO_VARARGS_HANDLE,
+    "VM cookie for a vararg signature (`CORINFO_VARARGS_HANDLE`), returned \
+     by `getVarArgsHandle`. Added at step_04 integration: the frozen list \
+     of ten kinds predated the tokens/sig group's surface."
+);
+handle_newtype!(
+    WasmTypeSymbolHandle,
+    rokajit_ffi::CORINFO_WASM_TYPE_SYMBOL_HANDLE,
+    "Opaque EE reference to a wasm type symbol \
+     (`CORINFO_WASM_TYPE_SYMBOL_HANDLE`, corinfo.h:1000)."
+);
 
 #[cfg(test)]
 mod tests {

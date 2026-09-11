@@ -1,3 +1,4 @@
+use std::ffi::c_char;
 use std::ptr::NonNull;
 
 use rokajit_ffi as ffi;
@@ -72,5 +73,24 @@ impl OutputSinks for MockEe {
         self.sink_log
             .borrow_mut()
             .push(format!("report_fatal_error({result:?})"));
+    }
+
+    unsafe fn log_msg(
+        &self,
+        level: u32,
+        _fmt: *const c_char,
+        _args: *mut ffi::__va_list_tag,
+    ) -> bool {
+        self.sink_log.borrow_mut().push(format!("log_msg({level})"));
+        // The mock's sink_log IS the log, so logging always "succeeded".
+        true
+    }
+
+    fn do_assert(&self, file: &str, line: i32, expr: &str) -> bool {
+        self.sink_log
+            .borrow_mut()
+            .push(format!("do_assert({file}:{line}: {expr})"));
+        // false = ignore the assert (never asks for a DebugBreak retry).
+        false
     }
 }

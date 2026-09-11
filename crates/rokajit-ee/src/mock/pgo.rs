@@ -1,5 +1,7 @@
 use std::ptr::NonNull;
 
+use rokajit_ffi as ffi;
+
 use super::MockEe;
 use crate::ee_info::{Pgo, PgoResults, PgoSchemaItem};
 use crate::handles::MethodHandle;
@@ -22,5 +24,11 @@ impl Pgo for MockEe {
             item.offset = i * 8;
         }
         Ok(self.fake_alloc(schema.len() * 8))
+    }
+
+    fn record_wasm_managed_call_sig(&self, _call_sig: &ffi::CORINFO_SIG_INFO) {
+        self.sink_log
+            .borrow_mut()
+            .push("record_wasm_managed_call_sig()".into());
     }
 }

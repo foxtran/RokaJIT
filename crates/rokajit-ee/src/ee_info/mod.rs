@@ -73,8 +73,10 @@ mod inlining_and_tail_call;
 mod method_queries;
 mod output_sinks;
 mod pgo;
+mod real;
 mod relocations;
 mod tokens_and_signatures;
+pub(crate) mod wrap;
 
 pub use class_queries::ClassQueries;
 pub use debug_info::{BoundaryMap, DebugInfo, NativeVarInfo};
@@ -84,6 +86,7 @@ pub use inlining_and_tail_call::InliningAndTailCall;
 pub use method_queries::MethodQueries;
 pub use output_sinks::{AllocatedChunk, ChunkRequest, OutputSinks};
 pub use pgo::{Pgo, PgoResults, PgoSchemaItem, PgoSource};
+pub use real::GasketEeInfo;
 pub use relocations::Relocations;
 pub use tokens_and_signatures::TokensAndSignatures;
 
@@ -96,9 +99,9 @@ use rokajit_ffi::{
 };
 
 /// The full EE surface the compiler core consumes: the composition of all
-/// functional groups above. Implemented by the FFI-edge wrapper (Phase 1)
-/// and by `MockEe` in tests. Blanket-implemented for any type implementing
-/// all groups.
+/// functional groups above. Implemented by [`GasketEeInfo`] (the
+/// gasket-backed wrapper, see `real.rs`) and by `MockEe` in tests.
+/// Blanket-implemented for any type implementing all groups.
 pub trait EeInfo:
     MethodQueries
     + ClassQueries

@@ -21,6 +21,10 @@ fn runtime_checkout() -> PathBuf {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=ROKAJIT_RUNTIME");
+    // Emitting any rerun-if-* line opts cargo into precise tracking, so the
+    // src dir must be named explicitly or newly added gasket_*.cpp files
+    // would leave the archive stale (found at step_04 integration).
+    println!("cargo:rerun-if-changed=src");
 
     let runtime = runtime_checkout();
     let coreclr = runtime.join("src/coreclr");
@@ -31,9 +35,9 @@ fn main() {
     );
 
     // Every gasket_*.cpp is a translation unit of the same archive; new
-    // per-group forwarder files are picked up automatically (no
-    // rerun-if-changed lines are emitted, so cargo watches the whole
-    // package and the glob is re-evaluated on every build-script run).
+    // per-group forwarder files need no build-system edits (the glob is
+    // re-evaluated on every build-script run; `rerun-if-changed=src` above
+    // keeps cargo watching the directory so new files trigger a re-run).
     let mut gasket_sources: Vec<PathBuf> = std::fs::read_dir("src")
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -75,4 +79,13 @@ fn main() {
 
     let out_dir = env::var("OUT_DIR").unwrap();
     println!("cargo:rustc-link-search=native={out_dir}");
+
+    // The exception trap (decisions/2026-09-11-gasket-exception-trap.md)
+    // uses try/catch, whose unwind machinery lives in the C++ runtime
+    // (__cxa_begin_catch, __gxx_personality_v0, std::terminate). The
+    // original no-C++-runtime goal of the gasket-link-strategy decision is
+    // superseded by that decision: libstdc++ becomes a dynamic dependency of
+    // librokajit.so (always present in a CoreCLR host process) and of test
+    // executables, which unlike the cdylib cannot leave symbols unresolved.
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 }

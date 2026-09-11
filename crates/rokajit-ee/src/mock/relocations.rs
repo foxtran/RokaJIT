@@ -2,7 +2,7 @@ use std::ptr::NonNull;
 
 use super::MockEe;
 use crate::ee_info::Relocations;
-use crate::enums::RelocType;
+use crate::enums::{CorInfoArch, RelocType};
 
 impl Relocations for MockEe {
     fn record_relocation(
@@ -17,5 +17,10 @@ impl Relocations for MockEe {
 
     fn get_reloc_type_hint(&self, _target: usize) -> RelocType {
         RelocType::NONE
+    }
+
+    fn get_expected_target_architecture(&self) -> CorInfoArch {
+        // The one target RokaJIT generates code for.
+        CorInfoArch::X64
     }
 }

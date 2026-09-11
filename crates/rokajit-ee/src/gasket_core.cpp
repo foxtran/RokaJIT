@@ -18,6 +18,7 @@ extern "C" ROKAJIT_EXPORT void jitStartup(ICorJitHost* jitHost)
 {
     g_jitHost = jitHost;
     g_jitInitialized = true;
+    rokajit_ee_set_jit_host(jitHost);
 }
 
 extern "C" ROKAJIT_EXPORT ICorJitCompiler* getJit()
