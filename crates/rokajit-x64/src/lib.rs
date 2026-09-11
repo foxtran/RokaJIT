@@ -13,6 +13,7 @@
 //! and [`rokajit::target`] vocabulary only, and names not a single IL
 //! opcode.
 
+pub mod encode;
 pub mod inst;
 pub mod lower;
 pub mod regs;
