@@ -184,10 +184,9 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
 /// Stage 2 (step_07.3): morph-lite — call-argument and return
 /// normalization. A pure `hir::Method → hir::Method` transform producing a
 /// new value (no in-place mutation); it needs no EE queries and no target
-/// knowledge.
+/// knowledge. Implemented in [`crate::morph`].
 pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
-    let _ = method;
-    Err(CompileError::Unsupported("morph: implemented in step_07.3"))
+    crate::morph::morph(method)
 }
 
 /// Stage 3 (step_07.4): HIR → LIR lowering. The generic driver lives here;
