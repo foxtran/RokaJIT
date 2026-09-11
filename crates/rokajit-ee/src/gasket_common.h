@@ -10,6 +10,8 @@
 // This file contains NO logic beyond forwarding. All behavior lives in Rust
 // (rokajit crate).
 
+#pragma once
+
 // <cstddef>/<cstdint> first: the CoreCLR headers use size_t & co. without
 // including the headers that define them (same reason the bindgen wrapper
 // header leads with these).
@@ -71,60 +73,6 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Exports, following runtime/src/coreclr/jit/ee_il_dll.cpp:41/195.
-// ---------------------------------------------------------------------------
-
-static ICorJitHost*    g_jitHost        = nullptr;
-static bool            g_jitInitialized = false;
-static RokaJitCompiler g_compiler;
-
-#if defined(__GNUC__)
-#define ROKAJIT_EXPORT __attribute__((visibility("default")))
-#else
-#define ROKAJIT_EXPORT __declspec(dllexport)
-#endif
-
-extern "C" ROKAJIT_EXPORT void jitStartup(ICorJitHost* jitHost)
-{
-    g_jitHost = jitHost;
-    g_jitInitialized = true;
-}
-
-extern "C" ROKAJIT_EXPORT ICorJitCompiler* getJit()
-{
-    if (!g_jitInitialized)
-    {
-        return nullptr;
-    }
-
-    return &g_compiler;
-}
-
-// ---------------------------------------------------------------------------
 // EE forwarders — sample pattern for Phase 1's per-functional-group wrappers.
 // One-liners only; Rust's EeInfo wrappers will call these through plain C.
 // ---------------------------------------------------------------------------
-
-extern "C" uint32_t rokajit_ee_get_jit_flags(
-    ICorJitInfo*    info,
-    CORJIT_FLAGS*   flags,
-    uint32_t        sizeInBytes)
-{
-    return info->getJitFlags(flags, sizeInBytes);
-}
-
-extern "C" uint32_t rokajit_ee_get_method_attribs(
-    ICorJitInfo*            info,
-    CORINFO_METHOD_HANDLE   ftn)
-{
-    return info->getMethodAttribs(ftn);
-}
-
-extern "C" void rokajit_ee_get_method_sig(
-    ICorJitInfo*            info,
-    CORINFO_METHOD_HANDLE   ftn,
-    CORINFO_SIG_INFO*       sig,
-    CORINFO_CLASS_HANDLE    memberParent)
-{
-    info->getMethodSig(ftn, sig, memberParent);
-}

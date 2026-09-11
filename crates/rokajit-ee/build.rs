@@ -1,4 +1,4 @@
-//! Builds the C++ ABI gasket (`src/gasket.cpp`) with the `cc` crate, per
+//! Builds the C++ ABI gasket (`src/gasket_*.cpp`) with the `cc` crate, per
 //! `decisions/2026-09-11-cpp-abi-gasket.md`.
 //!
 //! Uses the same defines and include paths as rokajit-ffi's bindgen build so
@@ -30,7 +30,23 @@ fn main() {
         runtime.display()
     );
 
-    cc::Build::new()
+    // Every gasket_*.cpp is a translation unit of the same archive; new
+    // per-group forwarder files are picked up automatically (no
+    // rerun-if-changed lines are emitted, so cargo watches the whole
+    // package and the glob is re-evaluated on every build-script run).
+    let mut gasket_sources: Vec<PathBuf> = std::fs::read_dir("src")
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("gasket_") && name.ends_with(".cpp"))
+        })
+        .collect();
+    gasket_sources.sort();
+
+    let mut build = cc::Build::new();
+    build
         .cpp(true)
         // The CoreCLR headers assume clang (g++ trips over them); clang++ is
         // already required for bindgen's libclang.
@@ -39,8 +55,11 @@ fn main() {
         // Match CoreCLR's own JIT build settings: no RTTI, so the gasket
         // references no libstdc++ typeinfo (keeps librokajit.so free of a
         // C++ runtime dependency and lets test executables link).
-        .flag("-fno-rtti")
-        .file("src/gasket.cpp")
+        .flag("-fno-rtti");
+    for source in &gasket_sources {
+        build.file(source);
+    }
+    build
         .define("TARGET_AMD64", None)
         .define("TARGET_XARCH", None)
         .define("TARGET_UNIX", None)

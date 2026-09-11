@@ -69,8 +69,9 @@ fn main() {
         // interfaces) come out as opaque blobs — the rokajit-ee gasket owns
         // everything vtable-shaped.
         .allowlist_item("CORINFO.*|CorJit.*|ICorJit.*|ICor.*Info|JITEE.*|GUID|AllocMem.*|CorInfo.*|CORJIT.*")
-        // Layout tests stay on: bindgen emits bindgen_test_layout_* unit
-        // tests into the generated file.
+        // Layout assertions stay on: bindgen 0.72 emits them as compile-time
+        // array-size tricks (const _ = [...]) in the generated file, so a
+        // layout drift fails the build rather than a unit test.
         .layout_tests(true)
         .generate()
         .expect("bindgen failed on the CoreCLR headers");

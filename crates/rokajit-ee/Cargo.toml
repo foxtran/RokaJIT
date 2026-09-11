@@ -5,5 +5,8 @@ edition = "2021"
 license = "MIT"
 description = "C++ ABI gasket between CoreCLR's EE and the RokaJIT Rust core"
 
+[dependencies]
+rokajit-ffi = { path = "../rokajit-ffi" }
+
 [build-dependencies]
 cc = "1"

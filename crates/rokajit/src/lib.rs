@@ -4,6 +4,29 @@
 //! `libclrjit.so`. The exports the EE looks up (`jitStartup`, `getJit`) are
 //! owned by the C++ gasket in `rokajit-ee`; this crate provides the
 //! `extern "C"` entry points the gasket forwards to.
+//!
+//! # Error model (frozen; `decisions/2026-09-11-error-model.md`)
+//!
+//! - The compiler core fails with [`error::CompileError`]; the FFI edge
+//!   maps it to the EE's `CorJitResult` via
+//!   [`error::CompileError::to_cor_jit_result`] — the single mapping table.
+//! - Panics are bugs, never control flow. `catch_unwind` appears only at
+//!   the `extern "C"` entry points below. A caught panic is reported to the
+//!   EE via `EeInfo::report_fatal_error(CorJitResult::InternalError)` when
+//!   the EE info object is available, then surfaces as
+//!   `CORJIT_INTERNALERROR`.
+//!
+//! # Contracts
+//!
+//! - [`ir`] — the HIR/LIR IR shapes (docs: `RokaJIT-internal/docs/ir-design.md`).
+//! - [`artifact`] — what a successful `compileMethod` produces and hands to
+//!   the EE's output sinks.
+//! - The safe EE surface (`EeInfo`, handles, enums) lives in `rokajit-ee`;
+//!   this crate depends on it, never the other way.
+
+pub mod artifact;
+pub mod error;
+pub mod ir;
 
 use rokajit_ffi::{
     CorJitResult, CorJitResult_CORJIT_INTERNALERROR, CORINFO_METHOD_INFO, CORINFO_OS, ICorJitInfo,
@@ -60,8 +83,11 @@ pub extern "C" fn rokajit_compile_method(
 
 #[no_mangle]
 pub extern "C" fn rokajit_set_target_os(os: CORINFO_OS) {
-    eprintln!("rokajit: setTargetOS os={os}");
+    // A panic crossing the FFI boundary is UB; swallow it like compileMethod.
+    let _ = std::panic::catch_unwind(|| eprintln!("rokajit: setTargetOS os={os}"));
 }
 
 #[no_mangle]
-pub extern "C" fn rokajit_process_shutdown_work(_info: *mut ICorStaticInfo) {}
+pub extern "C" fn rokajit_process_shutdown_work(_info: *mut ICorStaticInfo) {
+    let _ = std::panic::catch_unwind(|| {});
+}
