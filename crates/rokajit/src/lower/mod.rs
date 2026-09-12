@@ -23,10 +23,12 @@
 //! registers and addressing modes so invalid sequences are
 //! unrepresentable (the ISLE typed-terms lesson).
 //!
-//! Scope: the fib subset (step_07.md) plus the step_10.1 scalar-cheap
-//! pack: every [`BinaryOp`] (arithmetic, `div`/`rem` signed and unsigned,
-//! logic, shifts, and compare-as-value — a compare's temp is `Int32`),
-//! `neg`/`not` unary ops, and the integer `conv.*` nodes. Everything
+//! Scope: the fib subset (step_07.md), the step_10.1 scalar-cheap pack,
+//! and the step_10.2 float pack: every [`BinaryOp`] (arithmetic,
+//! `div`/`rem` signed and unsigned, logic, shifts, and compare-as-value —
+//! a compare's temp is `Int32`), on integer and float operands alike
+//! (float `rem` arrives as a helper call from the importer), `neg`/`not`
+//! unary ops, and the `conv.*` nodes (int↔float included). Everything
 //! else — loads and stores through byrefs, switches, and EH — fails with
 //! [`CompileError::Unsupported`].
 
@@ -1027,5 +1029,74 @@ mod tests {
             &MockTarget,
         );
         assert!(matches!(m, Err(CompileError::Unsupported(_))));
+    }
+
+    // --- step_10.2: float pack flattening ---
+    #[test]
+    fn float_ops_flatten_with_the_right_temp_types() {
+        // A float binary op's temp carries the operand type (Double);
+        // a float compare's temp is Int32 (ECMA-335 III.1.5).
+        let mut m = method_with(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Binary {
+                    op: BinaryOp::Lt,
+                    lhs: Box::new(hir::Expr::Binary {
+                        op: BinaryOp::Div,
+                        lhs: Box::new(hir::Expr::Local(LocalId(1))),
+                        rhs: Box::new(hir::Expr::Const(Const::Double(2.0))),
+                    }),
+                    rhs: Box::new(hir::Expr::Const(Const::Double(0.0))),
+                }),
+            },
+        ));
+        m.locals
+            .push(local(Type::Double, hir::LocalKind::IlLocal(0)));
+        m.num_il_locals = 1;
+        let m = lower_ok(m);
+        let stmts = &m.blocks[0].stmts;
+        // Div statement, then the compare, then the return.
+        match &stmts[0].kind {
+            lir::StmtKind::Binary { dst, op, .. } => {
+                assert_eq!(*op, BinaryOp::Div);
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Double);
+            }
+            _ => panic!("expected the Div"),
+        }
+        match &stmts[1].kind {
+            lir::StmtKind::Binary { dst, op, .. } => {
+                assert_eq!(*op, BinaryOp::Lt);
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Int32);
+            }
+            _ => panic!("expected the compare"),
+        }
+    }
+
+    #[test]
+    fn float_conv_and_unary_flatten_like_ints() {
+        let m = lower_ret(hir::Expr::Conv {
+            to: Type::Double,
+            overflow: false,
+            unsigned: false,
+            arg: Box::new(hir::Expr::Local(LocalId(0))),
+        });
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::Conv { dst, to, .. } => {
+                assert_eq!(*to, Type::Double);
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Double);
+            }
+            _ => panic!("expected Conv"),
+        }
+        let m = lower_ret(hir::Expr::Unary {
+            op: crate::ir::UnaryOp::Neg,
+            arg: Box::new(hir::Expr::Const(Const::Float(1.0))),
+        });
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::Unary { dst, .. } => {
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Float);
+            }
+            _ => panic!("expected Unary"),
+        }
     }
 }

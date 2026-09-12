@@ -24,9 +24,15 @@
 //! | `MovExt`              | [`Asm::movsxd`] / a 32-bit [`Asm::mov`]     |
 //! | `Cmp`                 | [`Asm::cmp`] (+ [`Asm::test`])              |
 //! | `Jcc` / `Jmp`         | [`Asm::jcc`] / [`Asm::jmp`]                 |
-//! | `CallDirect`          | [`Asm::call`]                               |
+//! | `CallDirect` / `CallHelper` | [`Asm::call`]                       |
 //! | `Push` / `AllocFrame` | [`Asm::push`] / [`Asm::sub`] on `rsp`       |
 //! | `Leave` / `Ret`       | [`Asm::leave`] / [`Asm::ret`]               |
+//! | `ConstF`              | [`Asm::mov`] (GPR) + [`Asm::mov_gpr_to_xmm`] |
+//! | `MovF`                | [`Asm::mov_f_load`] / [`Asm::mov_f_store`]  |
+//! | `ArithF` / `NegF`     | [`Asm::arith_f`] / [`Asm::xor_f`]           |
+//! | `CmpF`                | [`Asm::ucomis`]                             |
+//! | `SetccF` / `JccF`     | [`Asm::setcc`] / [`Asm::jcc`] sequences     |
+//! | `CvtIntToF` / `CvtFToInt` / `CvtFToF` | [`Asm::cvtsi2s`] / [`Asm::cvtts2si`] / [`Asm::cvts2s`] |
 //!
 //! REX/ModRM/SIB selection is table-driven: one generic ModRM/SIB/disp
 //! encoder ([`encode_modrm`]) plus per-group rows ([`AluRow`],
@@ -37,8 +43,8 @@
 //! [`CallReloc`]; 07.7 patches it once the EE supplies the target address
 //! (the call site is also a GC safepoint, drained from codegen's records).
 
-use crate::inst::{CondCode, Width};
-use crate::regs::Gpr;
+use crate::inst::{ArithFOp, CondCode, FWidth, Width};
+use crate::regs::{Gpr, Xmm};
 use rokajit::lower::Label;
 use rokajit_ee::handles::MethodHandle;
 use std::collections::HashMap;
@@ -160,6 +166,26 @@ impl From<i64> for Rmi {
     }
 }
 
+/// A register-or-memory operand on the XMM side: the `r/m` of a scalar
+/// SSE instruction ([`Rm`]'s floating-point twin).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum RmX {
+    Reg(Xmm),
+    Mem(Mem),
+}
+
+impl From<Xmm> for RmX {
+    fn from(reg: Xmm) -> Self {
+        RmX::Reg(reg)
+    }
+}
+
+impl From<Mem> for RmX {
+    fn from(mem: Mem) -> Self {
+        RmX::Mem(mem)
+    }
+}
+
 /// A call-site relocation recorded by [`Asm::call`]: the rel32 field at
 /// `offset` in the finalized buffer must be patched with the callee
 /// address the EE supplies at emit time (07.7 drains these).
@@ -241,6 +267,29 @@ struct ModRmEnc {
     modrm: u8,
     sib: Option<u8>,
     disp: Disp,
+}
+
+/// The XMM-side twin of [`encode_modrm`]: same ModRM/SIB/disp selection,
+/// with an XMM register on the `r/m` side (Intel SDM vol. 2A — the SSE
+/// scalar forms share the GPR ModRM encoding rules).
+fn encode_modrm_x(wide: bool, reg: u8, rm: RmX) -> ModRmEnc {
+    match rm {
+        RmX::Reg(x) => {
+            let mut rex = if wide { 0b1000 } else { 0 };
+            rex |= (reg >> 3) << 2; // REX.R
+            rex |= (x as u8) >> 3; // REX.B
+            ModRmEnc {
+                rex,
+                modrm: 0xC0 | ((reg & 7) << 3) | (x as u8 & 7),
+                sib: None,
+                disp: Disp::None,
+            }
+        }
+        RmX::Mem(mem) => {
+            let rex = (if wide { 0b1000 } else { 0 }) | ((reg >> 3) << 2);
+            encode_mem(rex, reg, mem)
+        }
+    }
 }
 
 /// The single ModRM/SIB/disp encoder every instruction form goes through
@@ -394,6 +443,17 @@ fn cc_tttn(cc: CondCode) -> u8 {
         CondCode::ULe => 0x6,
         CondCode::UGt => 0x7,
         CondCode::UGe => 0x3,
+        CondCode::Parity => 0xA,
+        CondCode::NotParity => 0xB,
+    }
+}
+
+/// The legacy opcode prefix for the scalar SSE forms that distinguish
+/// `ss` from `sd` by prefix: F3 = single, F2 = double (Intel SDM vol. 2A).
+fn sse_prefix(width: FWidth) -> u8 {
+    match width {
+        FWidth::S => 0xF3,
+        FWidth::D => 0xF2,
     }
 }
 
@@ -568,6 +628,90 @@ impl Asm {
         self.emit_modrm_insn(true, dst as u8, src, &[0x63]);
     }
 
+    // ---- scalar SSE (x64 floating point; step_10.2) ----
+
+    /// `movss`/`movsd dst, src` — the load/reg-reg form (`0F 10 /r`,
+    /// F3 for `ss`, F2 for `sd`).
+    pub fn mov_f_load(&mut self, width: FWidth, dst: Xmm, src: RmX) {
+        self.emit_sse(sse_prefix(width), false, dst as u8, src, 0x10);
+    }
+
+    /// `movss`/`movsd [mem], src` — the store form (`0F 11 /r`).
+    pub fn mov_f_store(&mut self, width: FWidth, dst: Mem, src: Xmm) {
+        self.emit_sse(sse_prefix(width), false, src as u8, RmX::Mem(dst), 0x11);
+    }
+
+    /// `add`/`sub`/`mul`/`div ss|sd dst, src` (`0F 58/5C/59/5E /r`).
+    /// Destructive two-operand: `dst` is both source and destination.
+    pub fn arith_f(&mut self, op: ArithFOp, width: FWidth, dst: Xmm, src: RmX) {
+        let opcode = match op {
+            ArithFOp::Add => 0x58,
+            ArithFOp::Sub => 0x5C,
+            ArithFOp::Mul => 0x59,
+            ArithFOp::Div => 0x5E,
+        };
+        self.emit_sse(sse_prefix(width), false, dst as u8, src, opcode);
+    }
+
+    /// `ucomiss`/`ucomisd lhs, rhs` (`0F 2E /r`; `ss` unprefixed, `sd`
+    /// 66-prefixed). Sets ZF/PF/CF: unordered (NaN) reports all three set,
+    /// which the parity-aware compare expansions in codegen key off.
+    /// `ucomis*`, not `comis*`: quiet NaNs must not trap (#IA is only
+    /// raised for SNaN, which IL never produces).
+    pub fn ucomis(&mut self, width: FWidth, lhs: Xmm, rhs: RmX) {
+        let prefix = match width {
+            FWidth::S => 0,
+            FWidth::D => 0x66,
+        };
+        self.emit_sse(prefix, false, lhs as u8, rhs, 0x2E);
+    }
+
+    /// `xorps`/`xorpd dst, src` (`0F 57 /r`; same prefix rule as
+    /// [`Asm::ucomis`]). The float-`neg` mechanism: XOR with the sign mask.
+    pub fn xor_f(&mut self, width: FWidth, dst: Xmm, src: RmX) {
+        let prefix = match width {
+            FWidth::S => 0,
+            FWidth::D => 0x66,
+        };
+        self.emit_sse(prefix, false, dst as u8, src, 0x57);
+    }
+
+    /// `cvtsi2ss`/`cvtsi2sd dst, src` (`0F 2A /r`, F3/F2): signed integer
+    /// to float. `src_w64` selects the 64-bit integer source (REX.W).
+    pub fn cvtsi2s(&mut self, width: FWidth, dst: Xmm, src: Rm, src_w64: bool) {
+        // The r/m side is a GPR or memory — the GPR-side encoder as-is.
+        let enc = encode_modrm(src_w64, dst as u8, src);
+        self.emit_sse_enc(sse_prefix(width), enc, 0x2A);
+    }
+
+    /// `cvttss2si`/`cvttsd2si dst, src` (`0F 2C /r`, F3/F2): float to
+    /// integer, truncation toward zero; out-of-range/NaN yields the
+    /// "integer indefinite" `0x8000…`. `dst_w64` selects the 64-bit
+    /// destination (REX.W).
+    pub fn cvtts2si(&mut self, width: FWidth, dst: Gpr, src: RmX, dst_w64: bool) {
+        self.emit_sse(sse_prefix(width), dst_w64, dst as u8, src, 0x2C);
+    }
+
+    /// `cvtss2sd` (to `FWidth::D`, F3) / `cvtsd2ss` (to `FWidth::S`, F2)
+    /// (`0F 5A /r`): the float↔double conversions.
+    pub fn cvts2s(&mut self, to: FWidth, dst: Xmm, src: RmX) {
+        // The prefix names the *source* width: F3 reads ss, F2 reads sd.
+        let prefix = match to {
+            FWidth::D => 0xF3,
+            FWidth::S => 0xF2,
+        };
+        self.emit_sse(prefix, false, dst as u8, src, 0x5A);
+    }
+
+    /// `movq xmm, r64` (`FWidth::D`) / `movd xmm, r32` (`FWidth::S`) —
+    /// `66 0F 6E /r`, REX.W for the 64-bit form. Bits cross from the GPR
+    /// world unchanged; this is how float constants reach an XMM register.
+    pub fn mov_gpr_to_xmm(&mut self, width: FWidth, dst: Xmm, src: Gpr) {
+        let w64 = matches!(width, FWidth::D);
+        let enc = encode_modrm(w64, dst as u8, Rm::Reg(src));
+        self.emit_sse_enc(0x66, enc, 0x6E);
+    }
+
     fn alu(&mut self, row: &AluRow, width: Width, dst: Rm, src: Rmi) {
         let wide = matches!(width, Width::W64);
         match (dst, src) {
@@ -652,6 +796,14 @@ impl Asm {
         self.emit_u8(0xE8);
         let offset = self.offset();
         self.call_relocs.push(CallReloc { method, offset });
+        self.emit_u32(0);
+    }
+
+    /// `call rel32` (E8) with a placeholder displacement and no
+    /// [`CallReloc`] record: codegen records the relocation through its
+    /// own drain, and helper calls have no method handle to key one on.
+    pub fn call_unlinked(&mut self) {
+        self.emit_u8(0xE8);
         self.emit_u32(0);
     }
 
@@ -743,6 +895,36 @@ impl Asm {
             Disp::D8(d) => self.emit_u8(d as u8),
             Disp::D32(d) => self.emit_u32(d as u32),
         }
+    }
+
+    /// Emit `[prefix?] [rex?] 0F opcode modrm [sib] [disp]` — every scalar
+    /// SSE form here is a two-byte `0F xx` opcode, optionally preceded by
+    /// a legacy prefix (F2/F3/66; 0 = none). Prefixes precede REX (Intel
+    /// SDM vol. 2A §2.2.1).
+    fn emit_sse_enc(&mut self, prefix: u8, enc: ModRmEnc, opcode: u8) {
+        if prefix != 0 {
+            self.emit_u8(prefix);
+        }
+        if enc.rex != 0 {
+            self.emit_u8(0x40 | enc.rex);
+        }
+        self.emit_u8(0x0F);
+        self.emit_u8(opcode);
+        self.emit_u8(enc.modrm);
+        if let Some(sib) = enc.sib {
+            self.emit_u8(sib);
+        }
+        match enc.disp {
+            Disp::None => {}
+            Disp::D8(d) => self.emit_u8(d as u8),
+            Disp::D32(d) => self.emit_u32(d as u32),
+        }
+    }
+
+    /// The XMM-operand half: encodes the `r/m` side from an [`RmX`].
+    fn emit_sse(&mut self, prefix: u8, wide: bool, reg: u8, rm: RmX, opcode: u8) {
+        let enc = encode_modrm_x(wide, reg, rm);
+        self.emit_sse_enc(prefix, enc, opcode);
     }
 
     fn emit_u8(&mut self, v: u8) {
@@ -1545,6 +1727,172 @@ mod tests {
             finish(|a| a.movsxd(R11, Rm::Mem(Mem::base_disp(Rbp, -8)))),
             [0x4C, 0x63, 0x5D, 0xF8]
         );
+    }
+
+    // ---- scalar SSE (step_10.2) ----
+
+    use crate::inst::{ArithFOp, FWidth};
+    use crate::regs::Xmm::*;
+    use FWidth::{D, S};
+
+    #[test]
+    fn movs_forms() {
+        // movsd %xmm1, %xmm0
+        assert_eq!(
+            finish(|a| a.mov_f_load(D, Xmm0, RmX::Reg(Xmm1))),
+            [0xF2, 0x0F, 0x10, 0xC1]
+        );
+        // movss -8(%rbp), %xmm3
+        assert_eq!(
+            finish(|a| a.mov_f_load(S, Xmm3, RmX::Mem(Mem::base_disp(Rbp, -8)))),
+            [0xF3, 0x0F, 0x10, 0x5D, 0xF8]
+        );
+        // movsd %xmm5, -16(%rbp) — the store form (0F 11).
+        assert_eq!(
+            finish(|a| a.mov_f_store(D, Mem::base_disp(Rbp, -16), Xmm5)),
+            [0xF2, 0x0F, 0x11, 0x6D, 0xF0]
+        );
+        // movsd %xmm14, %xmm15 — REX.R+REX.B, prefix before REX.
+        assert_eq!(
+            finish(|a| a.mov_f_load(D, Xmm15, RmX::Reg(Xmm14))),
+            [0xF2, 0x45, 0x0F, 0x10, 0xFE]
+        );
+    }
+
+    #[test]
+    fn arith_f_forms() {
+        // addsd %xmm1, %xmm0
+        assert_eq!(
+            finish(|a| a.arith_f(ArithFOp::Add, D, Xmm0, RmX::Reg(Xmm1))),
+            [0xF2, 0x0F, 0x58, 0xC1]
+        );
+        // addss -4(%rbp), %xmm2 — memory source.
+        assert_eq!(
+            finish(|a| a.arith_f(ArithFOp::Add, S, Xmm2, RmX::Mem(Mem::base_disp(Rbp, -4)))),
+            [0xF3, 0x0F, 0x58, 0x55, 0xFC]
+        );
+        // subsd %xmm2, %xmm3
+        assert_eq!(
+            finish(|a| a.arith_f(ArithFOp::Sub, D, Xmm3, RmX::Reg(Xmm2))),
+            [0xF2, 0x0F, 0x5C, 0xDA]
+        );
+        // mulsd -24(%rbp), %xmm4
+        assert_eq!(
+            finish(|a| a.arith_f(ArithFOp::Mul, D, Xmm4, RmX::Mem(Mem::base_disp(Rbp, -24)))),
+            [0xF2, 0x0F, 0x59, 0x65, 0xE8]
+        );
+        // divsd %xmm6, %xmm7
+        assert_eq!(
+            finish(|a| a.arith_f(ArithFOp::Div, D, Xmm7, RmX::Reg(Xmm6))),
+            [0xF2, 0x0F, 0x5E, 0xFE]
+        );
+    }
+
+    #[test]
+    fn ucomis_and_xor_forms() {
+        // ucomiss %xmm1, %xmm0 — no prefix for the ss form.
+        assert_eq!(
+            finish(|a| a.ucomis(S, Xmm0, RmX::Reg(Xmm1))),
+            [0x0F, 0x2E, 0xC1]
+        );
+        // ucomisd %xmm1, %xmm0 — 66 prefix.
+        assert_eq!(
+            finish(|a| a.ucomis(D, Xmm0, RmX::Reg(Xmm1))),
+            [0x66, 0x0F, 0x2E, 0xC1]
+        );
+        // ucomisd -8(%rbp), %xmm2 — memory rhs.
+        assert_eq!(
+            finish(|a| a.ucomis(D, Xmm2, RmX::Mem(Mem::base_disp(Rbp, -8)))),
+            [0x66, 0x0F, 0x2E, 0x55, 0xF8]
+        );
+        // xorps %xmm1, %xmm0
+        assert_eq!(
+            finish(|a| a.xor_f(S, Xmm0, RmX::Reg(Xmm1))),
+            [0x0F, 0x57, 0xC1]
+        );
+        // xorpd %xmm9, %xmm8 — 66 + REX.R+B.
+        assert_eq!(
+            finish(|a| a.xor_f(D, Xmm8, RmX::Reg(Xmm9))),
+            [0x66, 0x45, 0x0F, 0x57, 0xC1]
+        );
+    }
+
+    #[test]
+    fn cvt_forms() {
+        // cvtsi2sdl %eax, %xmm0
+        assert_eq!(
+            finish(|a| a.cvtsi2s(D, Xmm0, Rm::Reg(Rax), false)),
+            [0xF2, 0x0F, 0x2A, 0xC0]
+        );
+        // cvtsi2ssq %rax, %xmm1 — REX.W for the 64-bit integer source.
+        assert_eq!(
+            finish(|a| a.cvtsi2s(S, Xmm1, Rm::Reg(Rax), true)),
+            [0xF3, 0x48, 0x0F, 0x2A, 0xC8]
+        );
+        // cvtsi2sdl -8(%rbp), %xmm2 — memory source.
+        assert_eq!(
+            finish(|a| a.cvtsi2s(D, Xmm2, Rm::Mem(Mem::base_disp(Rbp, -8)), false)),
+            [0xF2, 0x0F, 0x2A, 0x55, 0xF8]
+        );
+        // cvttsd2si %xmm0, %eax
+        assert_eq!(
+            finish(|a| a.cvtts2si(D, Rax, RmX::Reg(Xmm0), false)),
+            [0xF2, 0x0F, 0x2C, 0xC0]
+        );
+        // cvttsd2si %xmm0, %rax — REX.W for the 64-bit destination.
+        assert_eq!(
+            finish(|a| a.cvtts2si(D, Rax, RmX::Reg(Xmm0), true)),
+            [0xF2, 0x48, 0x0F, 0x2C, 0xC0]
+        );
+        // cvttss2si %xmm2, %ecx
+        assert_eq!(
+            finish(|a| a.cvtts2si(S, Rcx, RmX::Reg(Xmm2), false)),
+            [0xF3, 0x0F, 0x2C, 0xCA]
+        );
+        // cvtss2sd %xmm1, %xmm0 — F3 (the prefix names the source width).
+        assert_eq!(
+            finish(|a| a.cvts2s(D, Xmm0, RmX::Reg(Xmm1))),
+            [0xF3, 0x0F, 0x5A, 0xC1]
+        );
+        // cvtsd2ss -8(%rbp), %xmm0 — F2, memory source.
+        assert_eq!(
+            finish(|a| a.cvts2s(S, Xmm0, RmX::Mem(Mem::base_disp(Rbp, -8)))),
+            [0xF2, 0x0F, 0x5A, 0x45, 0xF8]
+        );
+    }
+
+    #[test]
+    fn mov_gpr_to_xmm_forms() {
+        // movq %rax, %xmm0 — 66 REX.W 0F 6E.
+        assert_eq!(
+            finish(|a| a.mov_gpr_to_xmm(D, Xmm0, Rax)),
+            [0x66, 0x48, 0x0F, 0x6E, 0xC0]
+        );
+        // movd %eax, %xmm1
+        assert_eq!(
+            finish(|a| a.mov_gpr_to_xmm(S, Xmm1, Rax)),
+            [0x66, 0x0F, 0x6E, 0xC8]
+        );
+        // movq %r9, %xmm10 — REX.W+R+B.
+        assert_eq!(
+            finish(|a| a.mov_gpr_to_xmm(D, Xmm10, R9)),
+            [0x66, 0x4D, 0x0F, 0x6E, 0xD1]
+        );
+    }
+
+    #[test]
+    fn parity_condition_codes() {
+        // The float-compare expansions' jp/jnp: 0F 8A / 0F 8B rel32.
+        let bytes = finish(|a| {
+            a.bind(label(0));
+            a.jcc(CondCode::Parity, label(0));
+        });
+        assert_eq!(bytes, [0x0F, 0x8A, 0xFA, 0xFF, 0xFF, 0xFF]);
+        let bytes = finish(|a| {
+            a.bind(label(0));
+            a.jcc(CondCode::NotParity, label(0));
+        });
+        assert_eq!(bytes, [0x0F, 0x8B, 0xFA, 0xFF, 0xFF, 0xFF]);
     }
 
     // ---- the fib prolog/epilog shape, end to end ----

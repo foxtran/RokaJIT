@@ -403,7 +403,8 @@ PANIC_RE = re.compile(r"rokajit: panic in compileMethod")
 # Unsupported payload -> feature bucket, first match wins. Order matters:
 # specific payloads before the importer's catch-all opcode messages.
 # (step_10.1 landed compare-as-value, unary/conv and the div/shift/logic
-# ops, so their rules are gone; messages evolve with the importer.)
+# ops, so their rules are gone; step_10.2 landed floats, so the
+# float-argument rule is gone; messages evolve with the importer.)
 BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"EH regions|EH control flow|EH clauses|draining EH clauses"), "EH (try/catch/finally)"),
     (re.compile(r"generic methods"), "generics"),
@@ -412,7 +413,6 @@ BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"static fields"), "static fields"),
     (re.compile(r"byref / field access|byref \(stind/stfld\)"), "objects & fields (byref/field access)"),
     (re.compile(r"cast/box"), "boxing & casts"),
-    (re.compile(r"float argument"), "float arguments"),
     (re.compile(r"switch:"), "switch"),
     (re.compile(r"null checks"), "null checks"),
     (re.compile(r"GC-info slot tables"), "GC slot tables (tracked refs)"),

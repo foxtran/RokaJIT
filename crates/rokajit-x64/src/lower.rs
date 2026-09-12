@@ -17,17 +17,20 @@
 //!
 //! The rules produce pre-allocation descriptors: value operands stay
 //! [`Val`]s; physical registers appear only where the SysV ABI or the
-//! architecture pins them (arg moves per [`crate::regs::INT_ARG_REGS`],
-//! returns through `rax`, the `idiv` fixed-register sequence, the
-//! `rbp`-based frame contract from `regs.rs`).
+//! architecture pins them (arg moves per the [`crate::codegen::classify_call`]
+//! assignment, returns through `rax`/`xmm0`, the `idiv` fixed-register
+//! sequence, the `rbp`-based frame contract from `regs.rs`).
 
 use rokajit::error::{CompileError, CompileResult};
 use rokajit::ir::lir::{BranchCond, Operand, StmtKind::*};
-use rokajit::ir::{lir, BinaryOp, BlockId, Const, LocalId, Type};
+use rokajit::ir::{lir, BinaryOp, BlockId, CallSig, Const, LocalId, Type};
 use rokajit::lower::{Cx, Label, Val};
+use rokajit::target::ArgLocation;
 
-use crate::inst::{Amode, ArithOp, CondCode, Inst, Place, ShiftOp, Src, Width};
-use crate::regs::{self, Gpr};
+use crate::inst::{
+    Amode, ArithFOp, ArithOp, CondCode, FWidth, Inst, Place, ShiftOp, Src, Width, XmmPlace, XmmSrc,
+};
+use crate::regs::{self, Gpr, Xmm};
 
 /// The whole lowered method: the prolog sequence plus one descriptor
 /// sequence per block, in layout order. Epilogs are per-block, emitted
@@ -103,32 +106,123 @@ fn operand_width(cx: &Cx, op: Operand) -> Option<Width> {
     }
 }
 
-/// The per-ABI argument setup for a direct call: one `mov` per argument
-/// into its SysV register ([`regs::INT_ARG_REGS`] order; entry 0 is the
-/// implicit `this` when present — the importer/morph already place the
-/// receiver first). A `&local` argument materializes through `lea` (the
-/// `ldloca`/`ldarga` value form). `None` — no rule match — when an
-/// argument needs a stack slot (more than six integer arguments) or a
-/// float register.
-fn arg_moves(cx: &Cx, args: &[Operand]) -> Option<Vec<Inst>> {
-    if args.len() > regs::INT_ARG_REGS.len() {
-        return None;
+// --- float extractors (step_10.2) ---
+
+/// The SSE width of a local/arg/temp slot's float type.
+fn fwidth_of(cx: &Cx, id: LocalId) -> Option<FWidth> {
+    FWidth::of(cx.ty_of(id)?)
+}
+
+/// A float constant as its bit pattern plus its SSE width.
+fn const_float(k: Const) -> Option<(u64, FWidth)> {
+    match k {
+        Const::Float(v) => Some((u64::from(v.to_bits()), FWidth::S)),
+        Const::Double(v) => Some((v.to_bits(), FWidth::D)),
+        _ => None,
     }
-    let mut moves = Vec::with_capacity(args.len());
-    for (i, arg) in args.iter().enumerate() {
-        moves.push(match arg {
-            Operand::AddrOf(l) => Inst::Lea {
-                dst: Place::Reg(regs::INT_ARG_REGS[i]),
-                addr: Amode::FrameSlot(*l),
-            },
-            _ => Inst::Mov {
-                width: operand_width(cx, *arg)?,
-                dst: Place::Reg(regs::INT_ARG_REGS[i]),
-                src: operand_src(*arg)?,
-            },
-        });
+}
+
+/// Any LIR operand as an XMM-side source: slots stay [`XmmSrc::Val`]
+/// (float values are always frame-resident, so codegen reads a slot),
+/// constants carry their bit pattern.
+fn xmm_opnd(cx: &Cx, op: Operand) -> Option<XmmSrc> {
+    match op {
+        Operand::Temp(id) | Operand::Local(id) => {
+            fwidth_of(cx, id)?;
+            Some(XmmSrc::Val(Val(id)))
+        }
+        Operand::Const(k) => Some(XmmSrc::Bits(const_float(k)?.0)),
+        Operand::AddrOf(_) => None,
     }
-    Some(moves)
+}
+
+/// The SSE width a float operand carries (the operand must be
+/// float-typed; used as a rule guard).
+fn operand_fwidth(cx: &Cx, op: Operand) -> Option<FWidth> {
+    match op {
+        Operand::Temp(id) | Operand::Local(id) => fwidth_of(cx, id),
+        Operand::Const(k) => Some(const_float(k)?.1),
+        Operand::AddrOf(_) => None,
+    }
+}
+
+/// One argument setup move for a classified ABI location.
+fn arg_move(cx: &Cx, arg: &Operand, loc: &ArgLocation) -> Option<Inst> {
+    match *loc {
+        ArgLocation::Reg(phys) => {
+            if let Some(g) = Gpr::from_phys(phys) {
+                Some(match arg {
+                    Operand::AddrOf(l) => Inst::Lea {
+                        dst: Place::Reg(g),
+                        addr: Amode::FrameSlot(*l),
+                    },
+                    _ => Inst::Mov {
+                        width: operand_width(cx, *arg)?,
+                        dst: Place::Reg(g),
+                        src: operand_src(*arg)?,
+                    },
+                })
+            } else {
+                let x = Xmm::from_phys(phys)?;
+                Some(match arg {
+                    Operand::Const(k) => {
+                        let (bits, width) = const_float(*k)?;
+                        Inst::ConstF {
+                            width,
+                            dst: XmmPlace::Reg(x),
+                            bits,
+                        }
+                    }
+                    _ => Inst::MovF {
+                        width: operand_fwidth(cx, *arg)?,
+                        dst: XmmPlace::Reg(x),
+                        src: xmm_opnd(cx, *arg)?,
+                    },
+                })
+            }
+        }
+        // Outgoing stack arguments (7+ integer or 9+ float): outside the
+        // tier-0 subset for now.
+        ArgLocation::Stack { .. } => None,
+    }
+}
+
+/// The per-ABI argument setup for a call: one move per argument into its
+/// SysV location, per the [`crate::codegen::classify_call`] assignment
+/// (integer-class values take [`regs::INT_ARG_REGS`] in order, floats take
+/// [`regs::FLOAT_ARG_REGS`]; entry 0 is the implicit `this` when present).
+/// `None` — no rule match — when an argument needs a stack slot.
+fn arg_moves(cx: &Cx, sig: &CallSig, args: &[Operand]) -> Option<Vec<Inst>> {
+    let abi = crate::codegen::classify_call(sig).ok()?;
+    args.iter()
+        .zip(&abi.args)
+        .map(|(arg, loc)| arg_move(cx, arg, loc))
+        .collect()
+}
+
+/// The result move after a call, per the ABI return location (`rax` for
+/// integers, `xmm0` for floats).
+fn call_result_move(cx: &Cx, sig: &CallSig, dst: LocalId) -> Option<Inst> {
+    let abi = crate::codegen::classify_call(sig).ok()?;
+    match abi.ret {
+        Some(ArgLocation::Reg(phys)) => {
+            if let Some(g) = Gpr::from_phys(phys) {
+                Some(Inst::Mov {
+                    width: width_of(cx, dst)?,
+                    dst: Place::Val(Val(dst)),
+                    src: Src::Reg(g),
+                })
+            } else {
+                let x = Xmm::from_phys(phys)?;
+                Some(Inst::MovF {
+                    width: fwidth_of(cx, dst)?,
+                    dst: XmmPlace::Val(Val(dst)),
+                    src: XmmSrc::Reg(x),
+                })
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The per-block epilog, shared by both return rules. Matches the
@@ -156,6 +250,16 @@ rokajit::lower_rules! {
             src: Src::Imm(imm),
         }];
 
+    /// `t := f` — a float constant: the bit pattern materializes through
+    /// a GPR at codegen (SSE has no immediate forms).
+    rule copy_const_f: Copy { dst, src: Operand::Const(k) }
+        if let (Some(w), Some((bits, _))) = (fwidth_of(cx, *dst), const_float(*k))
+        => |_| vec![Inst::ConstF {
+            width: w,
+            dst: XmmPlace::Val(Val(*dst)),
+            bits,
+        }];
+
     /// `t := &local` — `lea` against the local's (symbolic) frame slot.
     rule copy_addr_of: Copy { dst, src: Operand::AddrOf(l) }
         => |_| vec![Inst::Lea {
@@ -173,6 +277,15 @@ rokajit::lower_rules! {
             src: s,
         }];
 
+    /// `t := v` for float values — `movss`/`movsd`.
+    rule copy_f: Copy { dst, src }
+        if let (Some(w), Some(s)) = (fwidth_of(cx, *dst), xmm_opnd(cx, *src))
+        => |_| vec![Inst::MovF {
+            width: w,
+            dst: XmmPlace::Val(Val(*dst)),
+            src: s,
+        }];
+
     /// `t := a + b`, `a - b`, `a * b` — one three-operand descriptor;
     /// codegen emits the destructive two-operand pair. Constants ride
     /// along as immediates (`Src::Imm`); the encoder picks the imm form.
@@ -187,6 +300,25 @@ rokajit::lower_rules! {
             op: aop,
             width: w,
             dst: Place::Val(Val(*dst)),
+            lhs: l,
+            rhs: r,
+        }];
+
+    /// `t := a + b` … `a / b` on floats — the scalar SSE forms
+    /// (`addss`/`addsd`/…). (`rem` on floats never reaches here: the
+    /// importer expands it to the `CORINFO_HELP_FLTREM`/`DBLREM` call,
+    /// RyuJIT's morph.cpp GT_MOD lowering.)
+    rule arith_f: Binary { dst, op, lhs, rhs }
+        if let (Some(aop), Some(w), Some(l), Some(r)) = (
+            ArithFOp::of(*op),
+            fwidth_of(cx, *dst),
+            xmm_opnd(cx, *lhs),
+            xmm_opnd(cx, *rhs),
+        )
+        => |_| vec![Inst::ArithF {
+            op: aop,
+            width: w,
+            dst: XmmPlace::Val(Val(*dst)),
             lhs: l,
             rhs: r,
         }];
@@ -280,6 +412,16 @@ rokajit::lower_rules! {
             src: s,
         }];
 
+    /// `t := -a` on floats — the sign-mask XOR (`not` has no float form;
+    /// the importer rejects it).
+    rule neg_f: Unary { dst, op: rokajit::ir::UnaryOp::Neg, src }
+        if let (Some(w), Some(s)) = (fwidth_of(cx, *dst), xmm_opnd(cx, *src))
+        => |_| vec![Inst::NegF {
+            width: w,
+            dst: XmmPlace::Val(Val(*dst)),
+            src: s,
+        }];
+
     /// `t := (a cmp b)` — compare-as-a-value (`ceq`/`cgt`/`clt`/…): the
     /// flags materialization of `branch_cmp`, with `setcc` consuming them
     /// into an Int32 0/1. Producer and consumer are adjacent by
@@ -294,6 +436,26 @@ rokajit::lower_rules! {
         => |_| vec![
             Inst::Cmp { width: w, lhs: l, rhs: r },
             Inst::Setcc { cc, dst: Place::Val(Val(*dst)) },
+        ];
+
+    /// `t := (a cmp b)` on floats — `ucomis*` plus the parity-aware
+    /// materialization: the ordered forms (`ceq`/`cgt`/`clt`) are false
+    /// when either operand is NaN, the `.un` forms true (ECMA-335 table
+    /// III.4). The descriptor pair carries the *IR operator*; codegen owns
+    /// the flag-sequence expansion.
+    rule cmp_value_f: Binary { dst, op, lhs, rhs }
+        if let (true, Some(w), Some(l), Some(r)) = (
+            CondCode::of(*op).is_some(),
+            operand_fwidth(cx, *lhs),
+            xmm_opnd(cx, *lhs),
+            xmm_opnd(cx, *rhs),
+        )
+        => |_| vec![
+            Inst::CmpF { width: w, lhs: l, rhs: r },
+            Inst::SetccF {
+                op: *op,
+                dst: Place::Val(Val(*dst)),
+            },
         ];
 
     /// `conv.i4`/`conv.u4` from a 64-bit operand: a 32-bit `mov` keeps the
@@ -318,6 +480,62 @@ rokajit::lower_rules! {
             signed: !unsigned,
         }];
 
+    /// `conv.r4`/`conv.r8` from an integer operand: `cvtsi2ss`/`cvtsi2sd`,
+    /// the 32- or 64-bit form from the source's width. (`conv.r.un` and
+    /// unsigned 64-bit sources are outside the pack — the importer rejects
+    /// them.)
+    rule conv_i_to_f: Conv { dst, to, src, .. }
+        if let (Some(w), Some(src_w), Some(s)) = (
+            FWidth::of(*to),
+            operand_width(cx, *src),
+            operand_src(*src),
+        )
+        => |_| vec![Inst::CvtIntToF {
+            width: w,
+            src_w64: matches!(src_w, Width::W64),
+            dst: XmmPlace::Val(Val(*dst)),
+            src: s,
+        }];
+
+    /// `conv.i4`/`i8`/`u4` from a float operand: `cvttss2si`/`cvttsd2si`,
+    /// truncating toward zero; out-of-range/NaN yields the hardware's
+    /// "integer indefinite" value, matching RyuJIT. A 32-bit *unsigned*
+    /// target still converts through the 64-bit form (values up to
+    /// 2³²−1 exact; beyond is ECMA-unspecified), keeping the low half.
+    rule conv_f_to_i: Conv { dst, to, unsigned, src, .. }
+        if let (Some(w64), Some(w), Some(s)) = (
+            match to {
+                Type::Int32 => Some(*unsigned),
+                Type::Int64 => Some(true),
+                _ => None,
+            },
+            operand_fwidth(cx, *src),
+            xmm_opnd(cx, *src),
+        )
+        => |_| vec![Inst::CvtFToInt {
+            src_width: w,
+            dst_w64: w64,
+            dst: Place::Val(Val(*dst)),
+            src: s,
+        }];
+
+    /// `conv.r4`/`conv.r8` from a float operand of the other width:
+    /// `cvtsd2ss`/`cvtss2sd`. (Same-width conversions are the identity;
+    /// the importer drops them.)
+    rule conv_f_to_f: Conv { dst, to, src, .. }
+        if let (Some(w), Some(_), Some(s), true) = (
+            FWidth::of(*to),
+            operand_fwidth(cx, *src),
+            xmm_opnd(cx, *src),
+            // The other float width only (same-width is the identity).
+            matches!((FWidth::of(*to), operand_fwidth(cx, *src)), (Some(a), Some(b)) if a != b),
+        )
+        => |_| vec![Inst::CvtFToF {
+            to: w,
+            dst: XmmPlace::Val(Val(*dst)),
+            src: s,
+        }];
+
     /// `if (a cmp b) goto L` — flag materialization: the compare and the
     /// conditional jump are one rule's output, so the flag producer and
     /// consumer are adjacent by construction.
@@ -333,9 +551,26 @@ rokajit::lower_rules! {
             Inst::Jcc { cc, target: Label(*target) },
         ];
 
+    /// `if (a cmp b) goto L` on floats — `ucomis*` + the parity-aware
+    /// branch expansion (`beq`..`blt.un` on float operands; ECMA-335 table
+    /// III.4 unordered semantics).
+    rule branch_cmp_f: Branch { cond: BranchCond::Cmp { op, lhs, rhs }, target }
+        if let (true, Some(w), Some(l), Some(r)) = (
+            CondCode::of(*op).is_some(),
+            operand_fwidth(cx, *lhs),
+            xmm_opnd(cx, *lhs),
+            xmm_opnd(cx, *rhs),
+        )
+        => |_| vec![
+            Inst::CmpF { width: w, lhs: l, rhs: r },
+            Inst::JccF {
+                op: *op,
+                target: Label(*target),
+            },
+        ];
+
     /// `if v goto L` — compare against zero.
-    rule branch_true: Branch { cond: BranchCond::True(v), target }
-        if let (Some(w), Some(s)) = (operand_width(cx, *v), operand_src(*v))
+    rule branch_true: Branch { cond: BranchCond::True(v), target }        if let (Some(w), Some(s)) = (operand_width(cx, *v), operand_src(*v))
         => |_| vec![
             Inst::Cmp { width: w, lhs: s, rhs: Src::Imm(0) },
             Inst::Jcc { cc: CondCode::Ne, target: Label(*target) },
@@ -353,21 +588,33 @@ rokajit::lower_rules! {
     rule jump: Jump { target }
         => |_| vec![Inst::Jmp { target: Label(*target) }];
 
-    /// `call m(args)` — direct: argument moves per the ABI constants,
-    /// then the call, then the result out of `rax`. `?` on the result
-    /// width aborts the match: a matched call whose destination temp has
-    /// no GPR width is an upstream bug, not a "try the next rule".
-    rule call_direct: Call { dst, target: rokajit::ir::CallTarget::Direct(method), args, .. }
-        if let Some(moves) = arg_moves(cx, args)
+    /// `call m(args)` — direct: argument moves per the ABI classification
+    /// (mixed int/float signatures interleave the GPR and XMM sequences),
+    /// then the call, then the result out of `rax`/`xmm0`. `?` on the
+    /// result move aborts the match: a matched call whose destination
+    /// can't receive the ABI return is an upstream bug, not a "try the
+    /// next rule".
+    rule call_direct: Call { dst, target: rokajit::ir::CallTarget::Direct(method), sig, args }
+        if let Some(moves) = arg_moves(cx, sig, args)
         => |cx| {
             let mut insts = moves;
             insts.push(Inst::CallDirect { method: *method });
             if let Some(d) = dst {
-                insts.push(Inst::Mov {
-                    width: width_of(cx, *d)?,
-                    dst: Place::Val(Val(*d)),
-                    src: Src::Reg(Gpr::Rax),
-                });
+                insts.push(call_result_move(cx, sig, *d)?);
+            }
+            insts
+        };
+
+    /// `call helper(args)` — an EE runtime helper (float `rem`); same ABI
+    /// treatment as a direct call, target resolved via `getHelperFtn` at
+    /// emit time.
+    rule call_helper: Call { dst, target: rokajit::ir::CallTarget::Helper(id), sig, args }
+        if let Some(moves) = arg_moves(cx, sig, args)
+        => |cx| {
+            let mut insts = moves;
+            insts.push(Inst::CallHelper { id: *id });
+            if let Some(d) = dst {
+                insts.push(call_result_move(cx, sig, *d)?);
             }
             insts
         };
@@ -379,6 +626,19 @@ rokajit::lower_rules! {
             let mut insts = vec![Inst::Mov {
                 width: w,
                 dst: Place::Reg(Gpr::Rax),
+                src: s,
+            }];
+            insts.extend(epilog());
+            insts
+        };
+
+    /// `return f` — float result to `xmm0` (SysV §3.2.3), then the epilog.
+    rule return_f: Return { value: Some(v) }
+        if let (Some(w), Some(s)) = (operand_fwidth(cx, *v), xmm_opnd(cx, *v))
+        => |_| {
+            let mut insts = vec![Inst::MovF {
+                width: w,
+                dst: XmmPlace::Reg(regs::FLOAT_RETURN_REG),
                 src: s,
             }];
             insts.extend(epilog());
@@ -522,12 +782,19 @@ mod tests {
                 src: Src::Imm(0),
             }])
         );
-        // A float constant matches no rule.
+        // A float constant materializes its bit pattern (ConstF).
         let s = stmt(StmtKind::Copy {
             dst: LocalId(3),
             src: Operand::Const(Const::Float(1.0)),
         });
-        assert_eq!(lower_one(&s), None);
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::ConstF {
+                width: crate::inst::FWidth::S,
+                dst: crate::inst::XmmPlace::Val(Val(LocalId(3))),
+                bits: u64::from(1.0f32.to_bits()),
+            }])
+        );
     }
 
     #[test]
@@ -613,14 +880,23 @@ mod tests {
                 rhs: vsrc(1),
             }])
         );
-        // Float arithmetic matches no rule.
+        // Float arithmetic takes the scalar SSE descriptor.
         let s = stmt(StmtKind::Binary {
             dst: LocalId(3),
             op: BinaryOp::Add,
             lhs: Operand::Local(LocalId(3)),
             rhs: Operand::Local(LocalId(3)),
         });
-        assert_eq!(lower_one(&s), None);
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::ArithF {
+                op: crate::inst::ArithFOp::Add,
+                width: crate::inst::FWidth::S,
+                dst: crate::inst::XmmPlace::Val(Val(LocalId(3))),
+                lhs: crate::inst::XmmSrc::Val(Val(LocalId(3))),
+                rhs: crate::inst::XmmSrc::Val(Val(LocalId(3))),
+            }])
+        );
     }
 
     #[test]
@@ -1102,7 +1378,7 @@ mod tests {
             args: vec![Operand::Local(LocalId(0)); 7],
         });
         assert_eq!(lower_one(&s), None);
-        // A float argument needs an XMM register move.
+        // A float argument moves into xmm0 (step_10.2: the FP ABI).
         let s = stmt(StmtKind::Call {
             dst: Some(LocalId(2)),
             target: CallTarget::Direct(handle(0x42)),
@@ -1113,7 +1389,24 @@ mod tests {
             },
             args: vec![Operand::Local(LocalId(3))],
         });
-        assert_eq!(lower_one(&s), None);
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![
+                Inst::MovF {
+                    width: crate::inst::FWidth::S,
+                    dst: crate::inst::XmmPlace::Reg(regs::Xmm::Xmm0),
+                    src: crate::inst::XmmSrc::Val(Val(LocalId(3))),
+                },
+                Inst::CallDirect {
+                    method: handle(0x42),
+                },
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: val(2),
+                    src: Src::Reg(Gpr::Rax),
+                },
+            ])
+        );
         // Virtual dispatch is not a direct call.
         let s = stmt(StmtKind::Call {
             dst: Some(LocalId(2)),
@@ -1334,6 +1627,439 @@ mod tests {
                 Inst::Leave,
                 Inst::Ret,
             ]
+        );
+    }
+
+    // --- step_10.2: the float pack rules ---
+
+    use crate::inst::{ArithFOp, FWidth, XmmPlace, XmmSrc};
+
+    /// Locals: Double 0/1, Int32 2 (compare dst), Float 3, Int64 4,
+    /// Double 5 (float dst).
+    fn locals_f() -> Vec<hir::Local> {
+        let l = |ty: Type, i: u32| hir::Local {
+            ty,
+            kind: hir::LocalKind::IlLocal(i),
+            pinned: false,
+        };
+        vec![
+            l(Type::Double, 0),
+            l(Type::Double, 1),
+            l(Type::Int32, 2),
+            l(Type::Float, 3),
+            l(Type::Int64, 4),
+            l(Type::Double, 5),
+        ]
+    }
+
+    fn lower_f(s: &lir::Stmt) -> Option<Vec<Inst>> {
+        lower_stmt(s, &Cx::new(&locals_f()))
+    }
+
+    fn xval(i: u32) -> XmmPlace {
+        XmmPlace::Val(Val(LocalId(i)))
+    }
+
+    fn xsrc(i: u32) -> XmmSrc {
+        XmmSrc::Val(Val(LocalId(i)))
+    }
+
+    #[test]
+    fn float_copy_and_const_lower_to_movsd_and_constf() {
+        let s = stmt(StmtKind::Copy {
+            dst: LocalId(5),
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::MovF {
+                width: FWidth::D,
+                dst: xval(5),
+                src: xsrc(0),
+            }])
+        );
+        // A float constant becomes its bit pattern.
+        let s = stmt(StmtKind::Copy {
+            dst: LocalId(3),
+            src: Operand::Const(Const::Float(-0.5)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::ConstF {
+                width: FWidth::S,
+                dst: xval(3),
+                bits: u64::from((-0.5f32).to_bits()),
+            }])
+        );
+    }
+
+    #[test]
+    fn float_arith_lowers_to_the_scalar_sse_descriptor() {
+        for (op, aop) in [
+            (BinaryOp::Add, ArithFOp::Add),
+            (BinaryOp::Sub, ArithFOp::Sub),
+            (BinaryOp::Mul, ArithFOp::Mul),
+            (BinaryOp::Div, ArithFOp::Div),
+        ] {
+            let s = stmt(StmtKind::Binary {
+                dst: LocalId(5),
+                op,
+                lhs: Operand::Local(LocalId(0)),
+                rhs: Operand::Local(LocalId(1)),
+            });
+            assert_eq!(
+                lower_f(&s),
+                Some(vec![Inst::ArithF {
+                    op: aop,
+                    width: FWidth::D,
+                    dst: xval(5),
+                    lhs: xsrc(0),
+                    rhs: xsrc(1),
+                }]),
+                "{op:?}"
+            );
+        }
+        // A float constant operand carries its bits inline.
+        let s = stmt(StmtKind::Binary {
+            dst: LocalId(5),
+            op: BinaryOp::Add,
+            lhs: Operand::Local(LocalId(0)),
+            rhs: Operand::Const(Const::Double(1.0)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::ArithF {
+                op: ArithFOp::Add,
+                width: FWidth::D,
+                dst: xval(5),
+                lhs: xsrc(0),
+                rhs: XmmSrc::Bits(1.0f64.to_bits()),
+            }])
+        );
+        // rem has no SSE form (the importer expands it to a helper call).
+        let s = stmt(StmtKind::Binary {
+            dst: LocalId(5),
+            op: BinaryOp::Rem,
+            lhs: Operand::Local(LocalId(0)),
+            rhs: Operand::Local(LocalId(1)),
+        });
+        assert_eq!(lower_f(&s), None);
+    }
+
+    #[test]
+    fn float_neg_and_not() {
+        let s = stmt(StmtKind::Unary {
+            dst: LocalId(5),
+            op: UnaryOp::Neg,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::NegF {
+                width: FWidth::D,
+                dst: xval(5),
+                src: xsrc(0),
+            }])
+        );
+        // `not` has no float form (the importer rejects it; the backend
+        // agrees).
+        let s = stmt(StmtKind::Unary {
+            dst: LocalId(5),
+            op: UnaryOp::Not,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(lower_f(&s), None);
+    }
+
+    #[test]
+    fn float_compare_value_lowers_to_ucomisd_setccf() {
+        for op in [
+            BinaryOp::Eq,
+            BinaryOp::Gt,
+            BinaryOp::UGt,
+            BinaryOp::Lt,
+            BinaryOp::ULt,
+        ] {
+            let s = stmt(StmtKind::Binary {
+                dst: LocalId(2),
+                op,
+                lhs: Operand::Local(LocalId(0)),
+                rhs: Operand::Local(LocalId(1)),
+            });
+            assert_eq!(
+                lower_f(&s),
+                Some(vec![
+                    Inst::CmpF {
+                        width: FWidth::D,
+                        lhs: xsrc(0),
+                        rhs: xsrc(1),
+                    },
+                    Inst::SetccF {
+                        op,
+                        dst: Place::Val(Val(LocalId(2))),
+                    },
+                ]),
+                "{op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn float_branch_lowers_to_ucomisd_jccf() {
+        let s = stmt(StmtKind::Branch {
+            cond: BranchCond::Cmp {
+                op: BinaryOp::UGt,
+                lhs: Operand::Local(LocalId(0)),
+                rhs: Operand::Local(LocalId(1)),
+            },
+            target: BlockId(2),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![
+                Inst::CmpF {
+                    width: FWidth::D,
+                    lhs: xsrc(0),
+                    rhs: xsrc(1),
+                },
+                Inst::JccF {
+                    op: BinaryOp::UGt,
+                    target: Label(BlockId(2)),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn float_convs_lower_to_the_cvt_descriptors() {
+        // conv.r8 of an i32: cvtsi2sd, 32-bit source.
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(5),
+            to: Type::Double,
+            overflow: false,
+            unsigned: false,
+            src: Operand::Local(LocalId(2)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::CvtIntToF {
+                width: FWidth::D,
+                src_w64: false,
+                dst: xval(5),
+                src: vsrc(2),
+            }])
+        );
+        // conv.r4 of an i64: cvtsi2ss, 64-bit source.
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(3),
+            to: Type::Float,
+            overflow: false,
+            unsigned: false,
+            src: Operand::Local(LocalId(4)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::CvtIntToF {
+                width: FWidth::S,
+                src_w64: true,
+                dst: xval(3),
+                src: vsrc(4),
+            }])
+        );
+        // conv.i4 of a double: cvttsd2si, 32-bit destination.
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(2),
+            to: Type::Int32,
+            overflow: false,
+            unsigned: false,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::CvtFToInt {
+                src_width: FWidth::D,
+                dst_w64: false,
+                dst: Place::Val(Val(LocalId(2))),
+                src: xsrc(0),
+            }])
+        );
+        // conv.u4 of a float: the 64-bit form (the low half is the result).
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(2),
+            to: Type::Int32,
+            overflow: false,
+            unsigned: true,
+            src: Operand::Local(LocalId(3)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::CvtFToInt {
+                src_width: FWidth::S,
+                dst_w64: true,
+                dst: Place::Val(Val(LocalId(2))),
+                src: xsrc(3),
+            }])
+        );
+        // conv.i8 of a double: 64-bit destination.
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(4),
+            to: Type::Int64,
+            overflow: false,
+            unsigned: false,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::CvtFToInt {
+                src_width: FWidth::D,
+                dst_w64: true,
+                dst: Place::Val(Val(LocalId(4))),
+                src: xsrc(0),
+            }])
+        );
+        // conv.r4 of a double / conv.r8 of a float: cvt between widths.
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(3),
+            to: Type::Float,
+            overflow: false,
+            unsigned: false,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::CvtFToF {
+                to: FWidth::S,
+                dst: xval(3),
+                src: xsrc(0),
+            }])
+        );
+    }
+
+    #[test]
+    fn helper_call_lowers_like_a_direct_call() {
+        // The float-rem helper: (double, double) -> double.
+        let sig = rokajit::ir::CallSig {
+            ret: Type::Double,
+            args: vec![Type::Double, Type::Double],
+            has_this: false,
+        };
+        let s = stmt(StmtKind::Call {
+            dst: Some(LocalId(5)),
+            target: CallTarget::Helper(rokajit_ee::enums::CorInfoHelpFunc::DBLREM),
+            sig,
+            args: vec![Operand::Local(LocalId(0)), Operand::Local(LocalId(1))],
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![
+                Inst::MovF {
+                    width: FWidth::D,
+                    dst: XmmPlace::Reg(regs::Xmm::Xmm0),
+                    src: xsrc(0),
+                },
+                Inst::MovF {
+                    width: FWidth::D,
+                    dst: XmmPlace::Reg(regs::Xmm::Xmm1),
+                    src: xsrc(1),
+                },
+                Inst::CallHelper {
+                    id: rokajit_ee::enums::CorInfoHelpFunc::DBLREM,
+                },
+                Inst::MovF {
+                    width: FWidth::D,
+                    dst: xval(5),
+                    src: XmmSrc::Reg(regs::Xmm::Xmm0),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn mixed_signature_call_interleaves_the_register_classes() {
+        // (int, double, float, long) -> int: rdi, xmm0, xmm1, rsi.
+        let sig = rokajit::ir::CallSig {
+            ret: Type::Int32,
+            args: vec![Type::Int32, Type::Double, Type::Float, Type::Int64],
+            has_this: false,
+        };
+        let s = stmt(StmtKind::Call {
+            dst: Some(LocalId(2)),
+            target: CallTarget::Direct(handle(0x42)),
+            sig,
+            args: vec![
+                Operand::Local(LocalId(2)),
+                Operand::Local(LocalId(0)),
+                Operand::Local(LocalId(3)),
+                Operand::Local(LocalId(4)),
+            ],
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Reg(Gpr::Rdi),
+                    src: vsrc(2),
+                },
+                Inst::MovF {
+                    width: FWidth::D,
+                    dst: XmmPlace::Reg(regs::Xmm::Xmm0),
+                    src: xsrc(0),
+                },
+                Inst::MovF {
+                    width: FWidth::S,
+                    dst: XmmPlace::Reg(regs::Xmm::Xmm1),
+                    src: xsrc(3),
+                },
+                Inst::Mov {
+                    width: Width::W64,
+                    dst: Place::Reg(Gpr::Rsi),
+                    src: vsrc(4),
+                },
+                Inst::CallDirect {
+                    method: handle(0x42),
+                },
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: val(2),
+                    src: Src::Reg(Gpr::Rax),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn float_return_moves_to_xmm0() {
+        let s = stmt(StmtKind::Return {
+            value: Some(Operand::Local(LocalId(0))),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![
+                Inst::MovF {
+                    width: FWidth::D,
+                    dst: XmmPlace::Reg(regs::Xmm::Xmm0),
+                    src: xsrc(0),
+                },
+                Inst::Leave,
+                Inst::Ret,
+            ])
+        );
+        // A float constant return carries its bits.
+        let s = stmt(StmtKind::Return {
+            value: Some(Operand::Const(Const::Double(1.0))),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![
+                Inst::MovF {
+                    width: FWidth::D,
+                    dst: XmmPlace::Reg(regs::Xmm::Xmm0),
+                    src: XmmSrc::Bits(1.0f64.to_bits()),
+                },
+                Inst::Leave,
+                Inst::Ret,
+            ])
         );
     }
 }

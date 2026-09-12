@@ -1,18 +1,24 @@
 //! Pipeline stage 1 (step_07.2): CIL bytes → [`hir::Method`].
 //!
-//! Scope is the fib subset (`RokaJIT-internal/docs/step_07.md`) plus the
-//! step_10.1 scalar-cheap pack (`RokaJIT-internal/docs/step_10.1.md`):
-//! `ldarg`/`ldloc`/`stloc` in all widths, the `ldc.i4` family,
-//! `add`/`sub`/`mul`/`div`/`rem` and the unsigned `div.un`/`rem.un`,
-//! the logic ops `and`/`or`/`xor`/`neg`/`not`, the shifts
-//! `shl`/`shr`/`shr.un`, compare-as-value `ceq`/`cgt`/`cgt.un`/`clt`/
-//! `clt.un`, the integer conversions `conv.i1`/`i2`/`i4`/`i8`/`u4`/`u8`,
+//! Scope is the fib subset (`RokaJIT-internal/docs/step_07.md`), the
+//! step_10.1 scalar-cheap pack (`RokaJIT-internal/docs/step_10.1.md`), and
+//! the step_10.2 float pack (`RokaJIT-internal/docs/step_10.2.md`):
+//! `ldarg`/`ldloc`/`stloc` in all widths, the `ldc.i4` family plus
+//! `ldc.r4`/`ldc.r8`, `add`/`sub`/`mul`/`div`/`rem` (integers and floats;
+//! float `rem` expands to the `CORINFO_HELP_FLTREM`/`DBLREM` helper call)
+//! and the unsigned `div.un`/`rem.un`, the logic ops `and`/`or`/`xor`/
+//! `neg`/`not` (`neg` accepts floats), the shifts `shl`/`shr`/`shr.un`,
+//! compare-as-value `ceq`/`cgt`/`cgt.un`/`clt`/`clt.un` (integers,
+//! floats, and the reference forms), the integer conversions
+//! `conv.i1`/`i2`/`i4`/`i8`/`u4`/`u8` (float sources truncate toward
+//! zero; `conv.u8` from a float is out) plus `conv.r4`/`conv.r8`,
 //! `dup`/`pop`, `ldloca`/`ldarga`/`starg` (short and wide forms),
 //! `ldnull`, the compare-branch family `beq`..`blt.un` plus `brfalse`/
 //! `brtrue`/`br` (short and long forms; the null-check forms now also
-//! accept references), `call`, and `ret`. Anything else is
-//! [`CompileError::Unsupported`]; malformed IL is [`CompileError::BadIl`].
-//! The importer never panics: every operand read is bounds-checked.
+//! accept references, and the compare forms floats), `call`, and `ret`.
+//! Anything else is [`CompileError::Unsupported`]; malformed IL is
+//! [`CompileError::BadIl`]. The importer never panics: every operand read
+//! is bounds-checked.
 //!
 //! Stack discipline (ECMA-335 §III): the evaluation stack is simulated
 //! statically, with types propagated. It must be **empty at every block
@@ -35,7 +41,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use rokajit_ee::ee_info::{zeroed_out, EeInfo};
-use rokajit_ee::enums::{CallInfoFlags, CorInfoType};
+use rokajit_ee::enums::{CallInfoFlags, CorInfoHelpFunc, CorInfoType};
 use rokajit_ee::handles::{ArgListHandle, MethodHandle};
 use rokajit_ffi as ffi;
 
@@ -216,11 +222,20 @@ enum Op {
     /// `ldloca` — address of a local, a `ByRef` value.
     LdLoca(u16),
     LdcI4(i32),
+    /// `ldc.i8` — a 64-bit integer constant.
+    LdcI8(i64),
+    /// `ldc.r4` — a single-precision constant (the f32 bit pattern
+    /// decodes straight from the operand).
+    LdcR4(f32),
+    /// `ldc.r8`.
+    LdcR8(f64),
     LdNull,
     Dup,
     Pop,
-    /// Same-type integer binary ops: arithmetic, `div`/`rem` and their
-    /// unsigned forms, and the bitwise logic ops.
+    /// Same-type numeric binary ops: arithmetic, `div`/`rem` and their
+    /// unsigned forms, and the bitwise logic ops. Float operands are
+    /// valid for `add`/`sub`/`mul`/`div`/`rem` only (ECMA-335 §III.1.5);
+    /// float `rem` expands to the EE helper call at import.
     Binary(BinaryOp),
     /// `shl`/`shr`/`shr.un`: the shift count's type is independent of the
     /// value's (ECMA-335 §III.1.5), so these are not [`Op::Binary`].
@@ -249,10 +264,11 @@ enum Op {
     Ret,
 }
 
-/// The `conv.*` opcodes of the scalar-cheap pack. `I1`/`I2` carry the
-/// truncation width the IR's type vocabulary cannot (eval-stack types
-/// normalize at Int32, ECMA-335 §III.1.1.1) — the importer expands them
-/// to shift pairs ([`BlockImport::conv_narrow`]).
+/// The `conv.*` opcodes of the scalar-cheap pack plus the float pack's
+/// `conv.r4`/`conv.r8`. `I1`/`I2` carry the truncation width the IR's
+/// type vocabulary cannot (eval-stack types normalize at Int32, ECMA-335
+/// §III.1.1.1) — the importer expands them to shift pairs
+/// ([`BlockImport::conv_narrow`]).
 #[derive(Copy, Clone)]
 enum ConvKind {
     I1,
@@ -261,6 +277,8 @@ enum ConvKind {
     I8,
     U4,
     U8,
+    R4,
+    R8,
 }
 
 /// The compare ops of `beq`..`blt.un` in opcode order (0x2E..=0x37 short,
@@ -315,6 +333,13 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    fn u64(&mut self) -> CompileResult<u64> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
     fn i32(&mut self) -> CompileResult<i32> {
         Ok(self.u32()? as i32)
     }
@@ -352,6 +377,9 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x15..=0x1E => Op::LdcI4(i32::from(opcode) - 0x16),
             0x1F => Op::LdcI4(i32::from(r.i8()?)),
             0x20 => Op::LdcI4(r.i32()?),
+            0x21 => Op::LdcI8(r.u64()? as i64),
+            0x22 => Op::LdcR4(f32::from_bits(r.u32()?)),
+            0x23 => Op::LdcR8(f64::from_bits(r.u64()?)),
             0x25 => Op::Dup,
             0x26 => Op::Pop,
             0x28 => Op::Call(r.u32()?),
@@ -424,6 +452,8 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x68 => Op::Conv(ConvKind::I2),
             0x69 => Op::Conv(ConvKind::I4),
             0x6A => Op::Conv(ConvKind::I8),
+            0x6B => Op::Conv(ConvKind::R4),
+            0x6C => Op::Conv(ConvKind::R8),
             0x6D => Op::Conv(ConvKind::U4),
             0x6E => Op::Conv(ConvKind::U8),
             0xFE => match r.u8()? {
@@ -619,10 +649,41 @@ impl BlockImport<'_> {
     }
 
     fn arith(&mut self, op: BinaryOp) -> CompileResult<()> {
-        let (rt, rhs) = self.pop_int()?;
-        let (lt, lhs) = self.pop_int()?;
-        if lt != rt {
+        // ECMA-335 §III.1.5: `add`/`sub`/`mul`/`div`/`rem` accept
+        // same-type float pairs; the unsigned and bitwise forms are
+        // integer-only.
+        let float_ok = matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
+        );
+        let (rt, rhs) = self.pop()?;
+        let (lt, lhs) = self.pop()?;
+        let int = matches!(lt, Type::Int32 | Type::Int64 | Type::NativeInt);
+        let fp = matches!(lt, Type::Float | Type::Double);
+        if lt != rt || !(int || (float_ok && fp)) {
             return Err(CompileError::BadIl("binary operand type mismatch"));
+        }
+        if fp && op == BinaryOp::Rem {
+            // Float `rem` has no SSE form: it is a call to the EE's
+            // fmod/fmodf helper (CORINFO_HELP_FLTREM/DBLREM) — RyuJIT's
+            // morph.cpp GT_MOD lowering does exactly this.
+            let helper = if lt == Type::Float {
+                CorInfoHelpFunc::FLTREM
+            } else {
+                CorInfoHelpFunc::DBLREM
+            };
+            return self.push(
+                lt,
+                hir::Expr::Call {
+                    target: CallTarget::Helper(helper),
+                    sig: CallSig {
+                        ret: lt,
+                        args: vec![lt, lt],
+                        has_this: false,
+                    },
+                    args: vec![lhs, rhs],
+                },
+            );
         }
         self.push(lt, binary(op, lhs, rhs))
     }
@@ -748,12 +809,17 @@ impl BlockImport<'_> {
     /// forms (`ceq` and `cgt.un` only, ECMA-335 §III.1.5) also accept
     /// `Ref`/`ByRef`/`NativeInt` operands in any combination (a `null`
     /// literal compares against both references and pointers).
+    /// Same-type float pairs take every form; on floats the plain forms
+    /// are the *ordered* predicates (false on NaN) and the `.un` forms
+    /// the unordered ones (true on NaN) — table III.4.
     fn compare(&mut self, op: BinaryOp) -> CompileResult<()> {
         let (rt, rhs) = self.pop()?;
         let (lt, lhs) = self.pop()?;
         let int = |t: Type| matches!(t, Type::Int32 | Type::Int64 | Type::NativeInt);
         let ptr = |t: Type| matches!(t, Type::Ref | Type::ByRef | Type::NativeInt);
-        let ok = if int(lt) && int(rt) {
+        let fp = |t: Type| matches!(t, Type::Float | Type::Double);
+        let ok = if (int(lt) && int(rt)) || (fp(lt) && fp(rt)) {
+            // Same-type numeric pairs (int or float).
             lt == rt
         } else {
             matches!(op, BinaryOp::Eq | BinaryOp::UGt) && ptr(lt) && ptr(rt)
@@ -780,17 +846,19 @@ impl BlockImport<'_> {
     }
 
     /// `conv.*` (unchecked): stack-type transitions of the scalar-cheap
-    /// pack. Same-width conversions are the identity; `conv.i1`/`conv.i2`
-    /// expand to shift pairs (`conv_narrow`); the rest become
-    /// `hir::Expr::Conv` nodes whose `unsigned` flag selects sign- vs
-    /// zero-extension at lowering.
+    /// and float packs. Same-width conversions are the identity;
+    /// `conv.i1`/`conv.i2` expand to shift pairs (`conv_narrow`); the rest
+    /// become `hir::Expr::Conv` nodes whose `unsigned` flag selects sign-
+    /// vs zero-extension at lowering. Float sources truncate toward zero
+    /// (`cvtt*`); `conv.r4`/`conv.r8` convert from any numeric operand.
     fn conv(&mut self, kind: ConvKind) -> CompileResult<()> {
         let (ty, value) = self.pop()?;
-        // Pointer/float conversions (`conv.i`/`conv.u`, float sources) are
-        // outside the scalar-cheap pack.
-        if !matches!(ty, Type::Int32 | Type::Int64 | Type::NativeInt) {
+        // Pointer conversions (`conv.i`/`conv.u` from a byref) stay out.
+        let int = matches!(ty, Type::Int32 | Type::Int64 | Type::NativeInt);
+        let fp = matches!(ty, Type::Float | Type::Double);
+        if !int && !fp {
             return Err(CompileError::Unsupported(
-                "conv from a non-integer operand (floats, pointers)",
+                "conv from a non-numeric operand (pointers)",
             ));
         }
         match kind {
@@ -813,8 +881,13 @@ impl BlockImport<'_> {
                     )
                 }
             }
-            // conv.i8/u8: extend to 64 bits (identity on a 64-bit operand).
+            // conv.i8/u8: extend to 64 bits (identity on a 64-bit
+            // operand). conv.u8 from a float needs the unsigned-overflow
+            // fixup sequence — outside the pack.
             ConvKind::I8 | ConvKind::U8 => {
+                if fp && matches!(kind, ConvKind::U8) {
+                    return Err(CompileError::Unsupported("conv.u8 from a float operand"));
+                }
                 if ty == Type::Int64 || ty == Type::NativeInt {
                     self.push(ty, value)
                 } else {
@@ -830,6 +903,28 @@ impl BlockImport<'_> {
                     )
                 }
             }
+            // conv.r4/r8: to float from any numeric operand (identity
+            // when already at the target width).
+            ConvKind::R4 | ConvKind::R8 => {
+                let to = if matches!(kind, ConvKind::R4) {
+                    Type::Float
+                } else {
+                    Type::Double
+                };
+                if ty == to {
+                    self.push(to, value)
+                } else {
+                    self.push(
+                        to,
+                        hir::Expr::Conv {
+                            to,
+                            overflow: false,
+                            unsigned: false,
+                            arg: Box::new(value),
+                        },
+                    )
+                }
+            }
         }
     }
 
@@ -837,12 +932,15 @@ impl BlockImport<'_> {
     /// shift pair `(v << (32 - bits)) >> (32 - bits)` at 32 bits. The IR's
     /// type vocabulary normalizes sub-Int32 types away (ECMA-335
     /// §III.1.1.1), so the narrowing cannot be a `Conv` node; the shift
-    /// expansion is exact (arithmetic `shr` replicates the sign bit).
+    /// expansion is exact (arithmetic `shr` replicates the sign bit). A
+    /// non-Int32 operand converts to Int32 first — for a float source
+    /// that is the truncating `cvtt*` conversion, after which the low
+    /// `bits` behave as for integers.
     fn conv_narrow(&mut self, bits: u32, ty: Type, value: hir::Expr) -> CompileResult<()> {
         let value = if ty == Type::Int32 {
             value
         } else {
-            // A 64-bit operand truncates to 32 bits first; the low `bits`
+            // A wider operand narrows to 32 bits first; the low `bits`
             // survive either way.
             hir::Expr::Conv {
                 to: Type::Int32,
@@ -1029,6 +1127,9 @@ impl BlockImport<'_> {
                     self.push(Type::ByRef, hir::Expr::LocalAddr(id))?;
                 }
                 Op::LdcI4(v) => self.push(Type::Int32, hir::Expr::Const(Const::Int32(v)))?,
+                Op::LdcI8(v) => self.push(Type::Int64, hir::Expr::Const(Const::Int64(v)))?,
+                Op::LdcR4(v) => self.push(Type::Float, hir::Expr::Const(Const::Float(v)))?,
+                Op::LdcR8(v) => self.push(Type::Double, hir::Expr::Const(Const::Double(v)))?,
                 Op::LdNull => self.push(Type::Ref, hir::Expr::Const(Const::NullRef))?,
                 Op::Dup => self.dup(&mut stmts, il_offset)?,
                 Op::Pop => self.pop_value(&mut stmts, il_offset)?,
@@ -1036,7 +1137,17 @@ impl BlockImport<'_> {
                 Op::Shift(op) => self.shift(op)?,
                 Op::Compare(op) => self.compare(op)?,
                 Op::Unary(op) => {
-                    let (ty, value) = self.pop_int()?;
+                    let (ty, value) = self.pop()?;
+                    // `neg` accepts integers and floats; `not` is
+                    // integer-only (ECMA-335 §III.1.5).
+                    let numeric = matches!(
+                        ty,
+                        Type::Int32 | Type::Int64 | Type::NativeInt | Type::Float | Type::Double
+                    );
+                    if !numeric || (op == UnaryOp::Not && matches!(ty, Type::Float | Type::Double))
+                    {
+                        return Err(CompileError::BadIl("unary operand type mismatch"));
+                    }
                     self.push(
                         ty,
                         hir::Expr::Unary {
@@ -1076,10 +1187,14 @@ impl BlockImport<'_> {
                     let (rt, rhs) = self.pop()?;
                     let (lt, lhs) = self.pop()?;
                     // Integer operands must agree in type; `beq`/`bne.un`
-                    // additionally accept reference pairs (ECMA-335 §III.1.5).
+                    // additionally accept reference pairs, and same-type
+                    // float pairs take every form (ECMA-335 §III.1.5; on
+                    // floats the plain forms are ordered, `.un` unordered).
                     let int = |t: Type| matches!(t, Type::Int32 | Type::Int64 | Type::NativeInt);
                     let ptr = |t: Type| matches!(t, Type::Ref | Type::ByRef);
-                    let ok = if int(lt) && int(rt) {
+                    let fp = |t: Type| matches!(t, Type::Float | Type::Double);
+                    let ok = if (int(lt) && int(rt)) || (fp(lt) && fp(rt)) {
+                        // Same-type numeric pairs (int or float).
                         lt == rt
                     } else {
                         matches!(op, BinaryOp::Eq | BinaryOp::Ne) && ptr(lt) && ptr(rt)
@@ -1497,6 +1612,19 @@ mod tests {
         let m = import(&info, &ee).expect("imports");
         assert_eq!(as_i32(store(&m.blocks[0].stmts[0]).1), -10);
         assert_eq!(as_i32(store(&m.blocks[0].stmts[1]).1), 0x1234_5678);
+    }
+
+    #[test]
+    fn ldc_i8_pushes_an_int64_constant() {
+        // ldc.i8 long.MinValue; stloc.0; ldc.i4.0; ret.
+        let mut il = vec![0x21];
+        il.extend_from_slice(&i64::MIN.to_le_bytes());
+        il.extend_from_slice(&[0x0A, 0x16, 0x2A]);
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::Long]);
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(0));
+        assert!(matches!(value, hir::Expr::Const(Const::Int64(i64::MIN))));
     }
 
     #[test]
@@ -2215,5 +2343,251 @@ mod tests {
             &[],
         );
         assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    // --- step_10.2: the float pack ---
+
+    fn as_const_float(e: &hir::Expr) -> Const {
+        match e {
+            hir::Expr::Const(k @ (Const::Float(_) | Const::Double(_))) => *k,
+            _ => panic!("expected a float Expr::Const"),
+        }
+    }
+
+    /// `double f(double, double)` shape.
+    fn import_dd(il: &[u8]) -> hir::Method {
+        let (ee, info) = fixture(
+            il,
+            &sig(
+                CorInfoType::Double,
+                &[CorInfoType::Double, CorInfoType::Double],
+            ),
+            &[],
+        );
+        import(&info, &ee).expect("imports")
+    }
+
+    #[test]
+    fn ldc_r4_r8_push_typed_constants() {
+        // ldc.r4 2.5; stloc.0 (float local); ldc.r8 -1.25; stloc.1; ...
+        let il = [
+            0x22, 0x00, 0x00, 0x20, 0x40, 0x0A, // ldc.r4 2.5; stloc.0
+            0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF4, 0xBF,
+            0x0B, // ldc.r8 -1.25; stloc.1
+            0x16, 0x2A, // ldc.i4.0; ret
+        ];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Int, &[]),
+            &[CorInfoType::Float, CorInfoType::Double],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(0));
+        assert_eq!(m.locals[0].ty, Type::Float);
+        assert_eq!(as_const_float(value), Const::Float(2.5));
+        let (dst, value) = store(&m.blocks[0].stmts[1]);
+        assert_eq!(dst, LocalId(1));
+        assert_eq!(m.locals[1].ty, Type::Double);
+        assert_eq!(as_const_float(value), Const::Double(-1.25));
+    }
+
+    #[test]
+    fn float_arith_and_neg_type_like_the_operands() {
+        // ldarg.0; ldarg.1; add; ret — Double + Double.
+        for (opcode, expected) in [
+            (0x58, BinaryOp::Add),
+            (0x59, BinaryOp::Sub),
+            (0x5A, BinaryOp::Mul),
+            (0x5B, BinaryOp::Div),
+        ] {
+            let il = [0x02, 0x03, opcode, 0x2A];
+            let m = import_dd(&il);
+            let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+            assert_eq!(op, expected);
+            assert_eq!(as_local(lhs), LocalId(0));
+            assert_eq!(as_local(rhs), LocalId(1));
+        }
+        // ldarg.0; neg; ret — float neg.
+        let m = import_dd(&[0x02, 0x65, 0x2A]);
+        let (op, arg) = as_unary(return_value(&m, 0));
+        assert_eq!(op, UnaryOp::Neg);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // and/div.un/not on floats are BadIl.
+        for il in [
+            &[0x02, 0x03, 0x5F, 0x2A][..], // and
+            &[0x02, 0x03, 0x5C, 0x2A][..], // div.un
+            &[0x02, 0x66, 0x2A][..],       // not
+        ] {
+            let (ee, info) = fixture(
+                il,
+                &sig(
+                    CorInfoType::Double,
+                    &[CorInfoType::Double, CorInfoType::Double],
+                ),
+                &[],
+            );
+            assert!(
+                matches!(import(&info, &ee), Err(CompileError::BadIl(_))),
+                "IL {il:?} must be rejected"
+            );
+        }
+        // Mixed float/double arithmetic is BadIl.
+        let (ee, info) = fixture(
+            &[0x02, 0x03, 0x58, 0x2A],
+            &sig(
+                CorInfoType::Double,
+                &[CorInfoType::Double, CorInfoType::Float],
+            ),
+            &[],
+        );
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn float_rem_is_the_ee_helper_call() {
+        // ldarg.0; ldarg.1; rem; ret — doubles: CORINFO_HELP_DBLREM.
+        let m = import_dd(&[0x02, 0x03, 0x5D, 0x2A]);
+        match return_value(&m, 0) {
+            hir::Expr::Call { target, sig, args } => {
+                assert!(matches!(
+                    target,
+                    CallTarget::Helper(h) if *h == CorInfoHelpFunc::DBLREM
+                ));
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::Double,
+                        args: vec![Type::Double, Type::Double],
+                        has_this: false
+                    }
+                );
+                assert_eq!(as_local(&args[0]), LocalId(0));
+                assert_eq!(as_local(&args[1]), LocalId(1));
+            }
+            _ => panic!("expected the rem helper call"),
+        }
+        // floats: CORINFO_HELP_FLTREM.
+        let (ee, info) = fixture(
+            &[0x02, 0x03, 0x5D, 0x2A],
+            &sig(
+                CorInfoType::Float,
+                &[CorInfoType::Float, CorInfoType::Float],
+            ),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::Call { target, sig, .. } => {
+                assert!(matches!(
+                    target,
+                    CallTarget::Helper(h) if *h == CorInfoHelpFunc::FLTREM
+                ));
+                assert_eq!(sig.ret, Type::Float);
+            }
+            _ => panic!("expected the rem helper call"),
+        }
+    }
+
+    #[test]
+    fn float_compares_and_branches() {
+        // ldarg.0; ldarg.1; cXX; ret — all five forms on doubles.
+        for (opcode2, expected) in [
+            (0x01, BinaryOp::Eq),
+            (0x02, BinaryOp::Gt),
+            (0x03, BinaryOp::UGt),
+            (0x04, BinaryOp::Lt),
+            (0x05, BinaryOp::ULt),
+        ] {
+            let il = [0x02, 0x03, 0xFE, opcode2, 0x2A];
+            let (ee, info) = fixture(
+                &il,
+                &sig(
+                    CorInfoType::Int,
+                    &[CorInfoType::Double, CorInfoType::Double],
+                ),
+                &[],
+            );
+            let m = import(&info, &ee).expect("imports");
+            let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+            assert_eq!(op, expected);
+            assert_eq!(as_local(lhs), LocalId(0));
+            assert_eq!(as_local(rhs), LocalId(1));
+        }
+        // ldarg.0; ldarg.1; bgt.s L; ... — float compare branches import.
+        let il = [0x02, 0x03, 0x30, 0x02, 0x16, 0x2A, 0x17, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(
+                CorInfoType::Int,
+                &[CorInfoType::Double, CorInfoType::Double],
+            ),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].terminator {
+            hir::Terminator::Branch { cond, .. } => {
+                assert_eq!(as_binary(cond).0, BinaryOp::Gt);
+            }
+            _ => panic!("expected Branch"),
+        }
+    }
+
+    #[test]
+    fn conv_to_and_from_floats() {
+        // ldarg.0; conv.r8; ret — int to double.
+        let (ee, info) = fixture(
+            &[0x02, 0x6C, 0x2A],
+            &sig(CorInfoType::Double, &[CorInfoType::Int]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Double);
+        assert!(!overflow && !unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // ldarg.0; conv.r4; ret — double to float.
+        let (ee, info) = fixture(
+            &[0x02, 0x6B, 0x2A],
+            &sig(CorInfoType::Float, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, _, _) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Float);
+
+        // ldarg.0; conv.i4; ret — double to int (truncation).
+        let (ee, info) = fixture(
+            &[0x02, 0x69, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, _, _) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int32);
+
+        // ldarg.0; conv.u4; ret — the unsigned flag rides along.
+        let (ee, info) = fixture(
+            &[0x02, 0x6D, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, unsigned, _) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int32);
+        assert!(unsigned);
+
+        // conv.u8 from a float is outside the pack.
+        let (ee, info) = fixture(
+            &[0x02, 0x6E, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Double]),
+            &[],
+        );
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(_))
+        ));
     }
 }

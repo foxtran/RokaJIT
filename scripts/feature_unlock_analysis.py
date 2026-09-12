@@ -62,6 +62,9 @@ SUPPORTED = {
     *range(0x15, 0x1F),      # ldc.i4.m1..ldc.i4.8
     0x1F,                    # ldc.i4.s
     0x20,                    # ldc.i4
+    0x21,                    # ldc.i8 (step_10.2)
+    0x22,                    # ldc.r4 (step_10.2)
+    0x23,                    # ldc.r8 (step_10.2)
     0x25,                    # dup
     0x26,                    # pop
     0x28,                    # call
@@ -75,6 +78,8 @@ SUPPORTED = {
     0x5D, 0x5E,              # rem / rem.un
     *range(0x5F, 0x67),      # and / or / xor / shl / shr / shr.un / neg / not
     *range(0x67, 0x6B),      # conv.i1 / conv.i2 / conv.i4 / conv.i8
+    0x6B,                    # conv.r4 (step_10.2)
+    0x6C,                    # conv.r8 (step_10.2)
     0x6D,                    # conv.u4
     0x6E,                    # conv.u8
 }

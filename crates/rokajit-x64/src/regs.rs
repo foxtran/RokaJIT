@@ -64,13 +64,71 @@ impl Gpr {
     pub const fn phys(self) -> PhysReg {
         PhysReg(self as u8)
     }
+
+    /// The GPR behind a [`PhysReg`] in the 0–15 range.
+    pub const fn from_phys(reg: PhysReg) -> Option<Gpr> {
+        if reg.0 < 16 {
+            // The discriminants are the hardware encodings, so the index
+            // is the transmute-free table lookup below.
+            Some(GPR_BY_INDEX[reg.0 as usize])
+        } else {
+            None
+        }
+    }
 }
+
+const GPR_BY_INDEX: [Gpr; 16] = [
+    Gpr::Rax,
+    Gpr::Rcx,
+    Gpr::Rdx,
+    Gpr::Rbx,
+    Gpr::Rsp,
+    Gpr::Rbp,
+    Gpr::Rsi,
+    Gpr::Rdi,
+    Gpr::R8,
+    Gpr::R9,
+    Gpr::R10,
+    Gpr::R11,
+    Gpr::R12,
+    Gpr::R13,
+    Gpr::R14,
+    Gpr::R15,
+];
+
+const XMM_BY_INDEX: [Xmm; 16] = [
+    Xmm::Xmm0,
+    Xmm::Xmm1,
+    Xmm::Xmm2,
+    Xmm::Xmm3,
+    Xmm::Xmm4,
+    Xmm::Xmm5,
+    Xmm::Xmm6,
+    Xmm::Xmm7,
+    Xmm::Xmm8,
+    Xmm::Xmm9,
+    Xmm::Xmm10,
+    Xmm::Xmm11,
+    Xmm::Xmm12,
+    Xmm::Xmm13,
+    Xmm::Xmm14,
+    Xmm::Xmm15,
+];
 
 impl Xmm {
     /// The core-facing register handle. XMM registers occupy [`PhysReg`]
     /// 16–31 so indices are unique across classes (the `PhysReg` contract).
     pub const fn phys(self) -> PhysReg {
         PhysReg(16 + self as u8)
+    }
+
+    /// The XMM register behind a [`PhysReg`] in the 16–31 range.
+    pub const fn from_phys(reg: PhysReg) -> Option<Xmm> {
+        if reg.0 >= 16 && reg.0 < 32 {
+            Some(XMM_BY_INDEX[(reg.0 - 16) as usize])
+        } else {
+            None
+        }
     }
 }
 

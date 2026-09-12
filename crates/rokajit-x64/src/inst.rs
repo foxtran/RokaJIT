@@ -27,9 +27,10 @@
 
 use rokajit::ir::LocalId;
 use rokajit::lower::{Label, Val};
+use rokajit_ee::enums::CorInfoHelpFunc;
 use rokajit_ee::handles::MethodHandle;
 
-use crate::regs::Gpr;
+use crate::regs::{Gpr, Xmm};
 
 /// Operand width of an instruction: the 32- or 64-bit form.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -63,6 +64,74 @@ pub enum Src {
 pub enum Amode {
     /// The frame slot of a local/arg/temp.
     FrameSlot(LocalId),
+}
+
+/// Scalar floating-point width: the `ss` (f32) or `sd` (f64) SSE form.
+/// x64 floating point *is* SSE — there is no x87 anywhere in the backend.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum FWidth {
+    /// 32-bit (`movss`/`addss`/…).
+    S,
+    /// 64-bit (`movsd`/`addsd`/…).
+    D,
+}
+
+impl FWidth {
+    /// The width matching an IR float type, or `None` for non-floats.
+    pub fn of(ty: rokajit::ir::Type) -> Option<Self> {
+        match ty {
+            rokajit::ir::Type::Float => Some(FWidth::S),
+            rokajit::ir::Type::Double => Some(FWidth::D),
+            _ => None,
+        }
+    }
+}
+
+/// A writable XMM-side destination. Same separation as [`Place`]:
+/// immediates and addressing modes are not destinations.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum XmmPlace {
+    Val(Val),
+    Reg(Xmm),
+}
+
+/// A readable XMM-side source. [`XmmSrc::Bits`] is a float constant as a
+/// raw bit pattern (`f32::to_bits` zero-extended for `FWidth::S`) — SSE
+/// has no immediate operand forms, so codegen materializes the bits
+/// through a GPR scratch (`movabs` + `movq`/`movd`). [`Inst::ConstF`]
+/// denotes the same materialization when the constant is the statement's
+/// *result* (a `Copy`).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum XmmSrc {
+    Val(Val),
+    Reg(Xmm),
+    Bits(u64),
+}
+
+/// The scalar SSE arithmetic instructions lowering emits (`add`/`sub`/
+/// `mul`/`div`; `rem` on floats is an EE helper call, not an instruction
+/// — see `decisions/` for step_10.2).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ArithFOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl ArithFOp {
+    /// The IR operator this instruction lowers, or `None` when the
+    /// operator has no scalar SSE form (`rem`, and every integer-only op).
+    pub fn of(op: rokajit::ir::BinaryOp) -> Option<Self> {
+        use rokajit::ir::BinaryOp as B;
+        match op {
+            B::Add => Some(ArithFOp::Add),
+            B::Sub => Some(ArithFOp::Sub),
+            B::Mul => Some(ArithFOp::Mul),
+            B::Div => Some(ArithFOp::Div),
+            _ => None,
+        }
+    }
 }
 
 /// The arithmetic instructions lowering emits (`imul` is the signed
@@ -146,6 +215,11 @@ pub enum CondCode {
     UGt,
     /// `jae` (unsigned).
     UGe,
+    /// `jp` — parity set. Only float-compare expansions emit this:
+    /// `ucomis*` reports an unordered (NaN) operand pair as PF=1.
+    Parity,
+    /// `jnp` — parity clear (the ordered case of `ucomis*`).
+    NotParity,
 }
 
 impl CondCode {
@@ -178,6 +252,92 @@ pub enum Inst {
     /// `mov dst, src` — reg/reg, reg/imm, or (after codegen binds
     /// values) frame-slot forms.
     Mov { width: Width, dst: Place, src: Src },
+    /// A float constant: `dst` receives the value whose bit pattern is
+    /// `bits` (`f32::to_bits` zero-extended for `FWidth::S`). SSE has no
+    /// immediate forms; codegen materializes the bits through a GPR
+    /// (`movabs` + `movq`/`movd`) — no rodata pool (step_10.2 decision).
+    ConstF {
+        width: FWidth,
+        dst: XmmPlace,
+        bits: u64,
+    },
+    /// `movss`/`movsd dst, src` — xmm/xmm or, after binding, frame-slot
+    /// forms in either direction.
+    MovF {
+        width: FWidth,
+        dst: XmmPlace,
+        src: XmmSrc,
+    },
+    /// Scalar SSE arithmetic: `dst := lhs op rhs`. Destructive two-operand
+    /// like [`Inst::Arith`]; codegen emits the `movs*` + op.
+    ArithF {
+        op: ArithFOp,
+        width: FWidth,
+        dst: XmmPlace,
+        lhs: XmmSrc,
+        rhs: XmmSrc,
+    },
+    /// Float `neg`: `dst := -src`, implemented as an XOR with the sign
+    /// mask (flips the sign bit exactly — `0.0 − x` would get `-0.0` and
+    /// NaN signs wrong). The mask is a [`FWidth`]-sized constant.
+    NegF {
+        width: FWidth,
+        dst: XmmPlace,
+        src: XmmSrc,
+    },
+    /// `ucomiss`/`ucomisd lhs, rhs` — the unordered-aware compare; sets
+    /// ZF/PF/CF for the [`Inst::SetccF`]/[`Inst::JccF`] that immediately
+    /// follows (same adjacency contract as [`Inst::Cmp`]). `ucomis*` (not
+    /// `comis*`) so quiet NaNs don't trap.
+    CmpF {
+        width: FWidth,
+        lhs: XmmSrc,
+        rhs: XmmSrc,
+    },
+    /// Materialize a float compare's flags into an Int32 0/1. `op` is the
+    /// IR comparison operator — ordered forms (`Eq`/`Gt`/`Lt`) are false
+    /// on NaN, `.un` forms true on NaN (ECMA-335 table III.4); codegen
+    /// owns the parity-aware expansion. Same adjacency contract as
+    /// [`Inst::Setcc`].
+    SetccF {
+        op: rokajit::ir::BinaryOp,
+        dst: Place,
+    },
+    /// Conditional branch on a float compare's flags (the branch-folded
+    /// `SetccF`). Codegen expands the unordered forms to a `jp` + `jcc`
+    /// pair, and the ordered equality/less forms to `jp`-guarded jumps.
+    JccF {
+        op: rokajit::ir::BinaryOp,
+        target: Label,
+    },
+    /// `cvtsi2ss`/`cvtsi2sd dst, src` — signed integer to float
+    /// (`conv.r4`/`conv.r8` from an integer operand). `src_w64` selects
+    /// the 32- vs 64-bit integer source form.
+    CvtIntToF {
+        width: FWidth,
+        src_w64: bool,
+        dst: XmmPlace,
+        src: Src,
+    },
+    /// `cvttss2si`/`cvttsd2si dst, src` — float to integer with truncation
+    /// (`conv.i4`/`i8`/`u4` from a float operand). Out-of-range input
+    /// yields the "integer indefinite" value (`0x8000…`), matching RyuJIT.
+    /// `dst_w64` selects the 64-bit destination form; a 32-bit unsigned
+    /// conversion also uses it (the low half is the result — values up to
+    /// 2³²−1 convert exactly, everything beyond is unspecified by ECMA).
+    CvtFToInt {
+        src_width: FWidth,
+        dst_w64: bool,
+        dst: Place,
+        src: XmmSrc,
+    },
+    /// `cvtss2sd`/`cvtsd2ss` — float↔double (`conv.r4`/`conv.r8` with a
+    /// float operand). `to` is the destination width.
+    CvtFToF {
+        to: FWidth,
+        dst: XmmPlace,
+        src: XmmSrc,
+    },
     /// `lea dst, [addr]` — address of a frame slot (always 64-bit).
     Lea { dst: Place, addr: Amode },
     /// Three-operand arithmetic: `dst := lhs op rhs`. x64 arithmetic is
@@ -239,6 +399,11 @@ pub enum Inst {
     /// address at emit time; the call site is a relocation and a GC
     /// safepoint (07.7 drains it from codegen's records).
     CallDirect { method: MethodHandle },
+    /// `call rel32` to an EE runtime helper (float `rem` lowers to
+    /// `CORINFO_HELP_FLTREM`/`DBLREM`, RyuJIT's morph.cpp GT_MOD path).
+    /// The EE supplies the entry point via `getHelperFtn`; the call site
+    /// records carry no method handle (artifact.rs's CallSite contract).
+    CallHelper { id: CorInfoHelpFunc },
     /// `push reg` (prolog: the frame pointer).
     Push { reg: Gpr },
     /// `sub rsp, <frame size>` — the size is codegen's frame-layout
@@ -264,8 +429,9 @@ pub struct FixedRegs {
 
 /// The GPRs a `call` destroys: the caller-saved set (SysV §3.2.1 — the
 /// allocatable class minus the callee-saved subset). All XMM registers
-/// are additionally caller-saved; tier 0 keeps no live float values, so
-/// that half is documentary.
+/// are additionally caller-saved; float values are always frame-resident
+/// in tier 0 (the step_10.2 codegen policy), so no XMM value can be
+/// live across a call and that half stays documentary.
 pub const CALL_DEFS: &[Gpr] = &[
     Gpr::Rax,
     Gpr::Rcx,
@@ -304,7 +470,7 @@ impl Inst {
                 uses: &[],
                 defs: &[Gpr::Rcx],
             },
-            Inst::CallDirect { .. } => FixedRegs {
+            Inst::CallDirect { .. } | Inst::CallHelper { .. } => FixedRegs {
                 uses: &[],
                 defs: CALL_DEFS,
             },
