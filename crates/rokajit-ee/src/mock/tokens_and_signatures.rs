@@ -174,9 +174,13 @@ impl TokensAndSignatures for MockEe {
     fn construct_string_literal(
         &self,
         _module: ModuleHandle,
-        _meta_tok: ffi::mdToken,
+        meta_tok: ffi::mdToken,
     ) -> (InfoAccessType, Option<NonNull<c_void>>) {
-        (InfoAccessType::Value, None)
+        // A canned frozen object: deterministic per token (identical
+        // literals get identical references, like the real EE's interning),
+        // never dereferenced by tests.
+        let ptr = (0x5AFE_0000usize + meta_tok as usize) as *mut c_void;
+        (InfoAccessType::Value, NonNull::new(ptr))
     }
 
     fn empty_string_literal(&self) -> (InfoAccessType, Option<NonNull<c_void>>) {

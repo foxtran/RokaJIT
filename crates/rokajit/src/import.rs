@@ -13,7 +13,9 @@
 //! `conv.i1`/`i2`/`i4`/`i8`/`u4`/`u8` (float sources truncate toward
 //! zero; `conv.u8` from a float is out) plus `conv.r4`/`conv.r8`,
 //! `dup`/`pop`, `ldloca`/`ldarga`/`starg` (short and wide forms),
-//! `ldnull`, the compare-branch family `beq`..`blt.un` plus `brfalse`/
+//! `ldnull`, `ldstr` (resolved through the EE's `constructStringLiteral`
+//! to a frozen-ref constant; the IAT_PVALUE/PPVALUE indirection forms are
+//! out), the compare-branch family `beq`..`blt.un` plus `brfalse`/
 //! `brtrue`/`br` (short and long forms; the null-check forms now also
 //! accept references, and the compare forms floats), `call`, and `ret`.
 //! Anything else is [`CompileError::Unsupported`]; malformed IL is
@@ -31,7 +33,8 @@
 //! spills every such tree to a temp first (RyuJIT's `impSpillLclRefs`).
 //!
 //! EE queries consumed (via `&dyn EeInfo`): `resolve_token`,
-//! `get_call_info`, and signature walking (`get_arg_type`/`get_arg_next`,
+//! `get_call_info`, `construct_string_literal` (for `ldstr`), and
+//! signature walking (`get_arg_type`/`get_arg_next`,
 //! bounded by `numArgs` — the real EE's `getArgNext` never returns null, so
 //! stepping past `numArgs` walks off the signature blob). The entry
 //! method's argument and local signatures come from
@@ -41,8 +44,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use rokajit_ee::ee_info::{zeroed_out, EeInfo};
-use rokajit_ee::enums::{CallInfoFlags, CorInfoHelpFunc, CorInfoType};
-use rokajit_ee::handles::{ArgListHandle, MethodHandle};
+use rokajit_ee::enums::{CallInfoFlags, CorInfoHelpFunc, CorInfoType, InfoAccessType};
+use rokajit_ee::handles::{ArgListHandle, MethodHandle, ModuleHandle};
 use rokajit_ffi as ffi;
 
 use crate::error::{CompileError, CompileResult};
@@ -229,6 +232,8 @@ enum Op {
     LdcR4(f32),
     /// `ldc.r8`.
     LdcR8(f64),
+    /// `ldstr` — a metadata string token (0x70xxxxxx, the #US heap).
+    LdStr(u32),
     LdNull,
     Dup,
     Pop,
@@ -456,6 +461,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x6C => Op::Conv(ConvKind::R8),
             0x6D => Op::Conv(ConvKind::U4),
             0x6E => Op::Conv(ConvKind::U8),
+            0x72 => Op::LdStr(r.u32()?),
             0xFE => match r.u8()? {
                 0x01 => Op::Compare(BinaryOp::Eq),
                 0x02 => Op::Compare(BinaryOp::Gt),
@@ -995,6 +1001,36 @@ impl BlockImport<'_> {
         Ok(hir::Terminator::Return { value: Some(value) })
     }
 
+    /// `ldstr` (0x72): the EE constructs and interns the literal — RyuJIT's
+    /// `GT_CNS_STR` morph path goes through `constructStringLiteral`
+    /// (morph.cpp:6775), and so do we, resolved against the compilation
+    /// scope (decisions/2026-09-12-ldstr-and-gc-roots.md). `IAT_VALUE`
+    /// hands back the frozen object reference directly: an IR ref
+    /// constant. The handle-cell indirection forms (R2R-style) need load
+    /// and relocation plumbing tier 0 doesn't have — a later step.
+    fn ldstr(&mut self, token: u32) -> CompileResult<()> {
+        let Some(module) = ModuleHandle::from_raw(self.info.args.scope) else {
+            return Err(CompileError::BadIl("ldstr with a null module scope"));
+        };
+        let (access, value) = self.ee.construct_string_literal(module, token);
+        match access {
+            InfoAccessType::Value => {
+                let Some(ptr) = value else {
+                    return Err(CompileError::Internal(
+                        "construct_string_literal: IAT_VALUE with a null pointer",
+                    ));
+                };
+                self.push(
+                    Type::Ref,
+                    hir::Expr::Const(Const::FrozenRef(ptr.as_ptr() as u64)),
+                )
+            }
+            _ => Err(CompileError::Unsupported(
+                "ldstr through a handle-cell indirection (IAT_PVALUE/PPVALUE)",
+            )),
+        }
+    }
+
     /// `call` (0x28): resolve the token, take the EE's verdict on how the
     /// call is performed, and pop the call-site signature's arguments.
     fn call(
@@ -1130,6 +1166,7 @@ impl BlockImport<'_> {
                 Op::LdcI8(v) => self.push(Type::Int64, hir::Expr::Const(Const::Int64(v)))?,
                 Op::LdcR4(v) => self.push(Type::Float, hir::Expr::Const(Const::Float(v)))?,
                 Op::LdcR8(v) => self.push(Type::Double, hir::Expr::Const(Const::Double(v)))?,
+                Op::LdStr(token) => self.ldstr(token)?,
                 Op::LdNull => self.push(Type::Ref, hir::Expr::Const(Const::NullRef))?,
                 Op::Dup => self.dup(&mut stmts, il_offset)?,
                 Op::Pop => self.pop_value(&mut stmts, il_offset)?,
@@ -2343,6 +2380,43 @@ mod tests {
             &[],
         );
         assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    // --- step_10.3: ldstr ---
+
+    #[test]
+    fn ldstr_pushes_a_frozen_ref_constant() {
+        // ldstr 0x70000001; stloc.0; ldloc.0; ldnull; ceq; ret — a Ref
+        // local holding the literal, compared against null.
+        let il = [
+            0x72, 0x01, 0x00, 0x00, 0x70, 0x0A, 0x06, 0x14, 0xFE, 0x01, 0x2A,
+        ];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::Class]);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.locals[0].ty, Type::Ref, "the IL local is a reference");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(0));
+        match value {
+            hir::Expr::Const(Const::FrozenRef(addr)) => {
+                // The mock cans 0x5AFE_0000 + token, deterministic per
+                // token (the interning shape: identical literals,
+                // identical references).
+                assert_eq!(*addr, 0x5AFE_0000 + 0x7000_0001);
+            }
+            _ => panic!("expected Const::FrozenRef"),
+        }
+        // The literal flows into a ceq against null like any Ref value.
+        let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Eq);
+        assert_eq!(as_local(lhs), LocalId(0));
+        assert!(matches!(rhs, hir::Expr::Const(Const::NullRef)));
+
+        // The same token in a second method yields the same address.
+        let m2 = import(&info, &ee).expect("imports");
+        let (_, value2) = store(&m2.blocks[0].stmts[0]);
+        assert!(
+            matches!(value2, hir::Expr::Const(Const::FrozenRef(a)) if *a == 0x5AFE_0000 + 0x7000_0001)
+        );
     }
 
     // --- step_10.2: the float pack ---

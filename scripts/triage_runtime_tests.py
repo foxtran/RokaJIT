@@ -404,7 +404,9 @@ PANIC_RE = re.compile(r"rokajit: panic in compileMethod")
 # specific payloads before the importer's catch-all opcode messages.
 # (step_10.1 landed compare-as-value, unary/conv and the div/shift/logic
 # ops, so their rules are gone; step_10.2 landed floats, so the
-# float-argument rule is gone; messages evolve with the importer.)
+# float-argument rule is gone; step_10.3 landed ldstr and the GC slot
+# table, so the slot-table rule is gone; messages evolve with the
+# importer.)
 BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"EH regions|EH control flow|EH clauses|draining EH clauses"), "EH (try/catch/finally)"),
     (re.compile(r"generic methods"), "generics"),
@@ -415,7 +417,7 @@ BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"cast/box"), "boxing & casts"),
     (re.compile(r"switch:"), "switch"),
     (re.compile(r"null checks"), "null checks"),
-    (re.compile(r"GC-info slot tables"), "GC slot tables (tracked refs)"),
+    (re.compile(r"ldstr through a handle-cell"), "ldstr indirection (IAT_PVALUE/PPVALUE)"),
     (re.compile(r"non-direct call kind"), "non-direct calls (callvirt/calli)"),
     (re.compile(r"non-default calling convention"), "non-default calling conventions"),
     (re.compile(r"evaluation-stack values crossing"), "eval-stack values across block boundaries"),

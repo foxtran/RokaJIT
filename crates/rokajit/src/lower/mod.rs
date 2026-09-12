@@ -150,7 +150,7 @@ impl Flatten {
                 Const::NativeInt(_) => Type::NativeInt,
                 Const::Float(_) => Type::Float,
                 Const::Double(_) => Type::Double,
-                Const::NullRef => Type::Ref,
+                Const::NullRef | Const::FrozenRef(_) => Type::Ref,
             }),
         }
     }

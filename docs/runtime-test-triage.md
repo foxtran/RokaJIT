@@ -31,12 +31,12 @@ under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 59 |
-| CRASH | 486 |
+| MATCH | 66 |
+| CRASH | 479 |
 | TIMEOUT | 2 |
 | COMPILE_FAIL | 2734 |
 
-Of the MATCHes, 58 exit 100 (the CoreCLR pass
+Of the MATCHes, 65 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -51,11 +51,11 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| unsupported IL opcode (importer) | 274 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/Array1.cs`<br>`JIT/CodeGenBringUpTests/Array2.cs`<br>`JIT/CodeGenBringUpTests/Array3.cs`<br>`JIT/CodeGenBringUpTests/Array4.cs`<br>… and 269 more |
+| unsupported IL opcode (importer) | 260 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/Array1.cs`<br>`JIT/CodeGenBringUpTests/Array2.cs`<br>`JIT/CodeGenBringUpTests/Array3.cs`<br>`JIT/CodeGenBringUpTests/Array4.cs`<br>… and 255 more |
 | structs & value types | 124 | `JIT/CodeGenBringUpTests/InitObj.cs`<br>`JIT/CodeGenBringUpTests/OpMembersOfStructLocal.cs`<br>`JIT/CodeGenBringUpTests/StructFldAddr.cs`<br>`JIT/CodeGenBringUpTests/StructInstMethod.cs`<br>`JIT/CodeGenBringUpTests/StructReturn.cs`<br>… and 119 more |
-| EH (try/catch/finally) | 81 | `JIT/CodeGenBringUpTests/ArrayExc.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>`JIT/CodeGenBringUpTests/DivConst.cs`<br>`JIT/CodeGenBringUpTests/Localloc.cs`<br>`JIT/CodeGenBringUpTests/ModConst.cs`<br>… and 76 more |
-| GC slot tables (tracked refs) | 3 | `JIT/CodeGenBringUpTests/ObjAlloc.cs`<br>`JIT/Regression_2/Runtime_63942/Runtime_63942.cs`<br>`JIT/Regression_2/Runtime_64208/Runtime_64208.cs` |
-| generics | 3 | `JIT/opt/AssertionPropagation/DynBlkNullAssertions.cs`<br>`JIT/opt/Devirtualization/GitHub_59668.cs`<br>`JIT/opt/OSR/invalidpromotion.cs` |
+| EH (try/catch/finally) | 86 | `JIT/CodeGenBringUpTests/ArrayExc.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>`JIT/CodeGenBringUpTests/DivConst.cs`<br>`JIT/CodeGenBringUpTests/Localloc.cs`<br>`JIT/CodeGenBringUpTests/LocallocB_N_PSP.cs`<br>… and 81 more |
+| generics | 4 | `JIT/opt/AssertionPropagation/DynBlkNullAssertions.cs`<br>`JIT/opt/Devirtualization/EqualityComparer_GitHub_10050.cs`<br>`JIT/opt/Devirtualization/GitHub_59668.cs`<br>`JIT/opt/OSR/invalidpromotion.cs` |
+| unsupported (unmapped): no x64 lowering rule matched an LIR statement | 4 | `JIT/jit64/gc/misc/9_and_alloca2.cs`<br>`JIT/jit64/gc/misc/9param.cs`<br>`JIT/jit64/gc/misc/test_noalloca.cs`<br>`JIT/jit64/gc/regress/vswhidbey/339415.cs` |
 | bad IL rejected by importer | 1 | `JIT/CodeGenBringUpTests/StaticCalls.cs` |
 
 ## COMPILE_FAIL by csc error class

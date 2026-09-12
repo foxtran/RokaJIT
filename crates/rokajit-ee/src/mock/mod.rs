@@ -104,6 +104,10 @@ impl MockEe {
     ) -> ffi::CORINFO_SIG_INFO {
         let mut sig: ffi::CORINFO_SIG_INFO = unsafe { std::mem::zeroed() };
         sig.callConv = call_conv;
+        // A real EE always names the signature's module; consumers
+        // (resolve_token's tokenScope, ldstr's constructStringLiteral)
+        // pass it back to the EE.
+        sig.scope = 0xC0DEusize as ffi::CORINFO_MODULE_HANDLE;
         sig.set_retType(ret.to_raw());
         sig.set_numArgs(self.arg_lists[arg_list].len() as u32);
         sig.args = Self::cursor_raw(arg_list, 0);

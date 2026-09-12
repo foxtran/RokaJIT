@@ -71,6 +71,10 @@ pub enum Const {
     Double(f64),
     /// `ldnull`.
     NullRef,
+    /// A reference to an EE-frozen (immovable, process-lifetime) object,
+    /// embedded as a 64-bit immediate — what `ldstr` resolves to
+    /// (`decisions/2026-09-12-ldstr-and-gc-roots.md`).
+    FrozenRef(u64),
 }
 
 /// A call's signature in IR terms (not the EE's `CORINFO_SIG_INFO`): the

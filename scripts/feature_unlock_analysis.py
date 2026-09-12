@@ -82,6 +82,7 @@ SUPPORTED = {
     0x6C,                    # conv.r8 (step_10.2)
     0x6D,                    # conv.u4
     0x6E,                    # conv.u8
+    0x72,                    # ldstr (step_10.3)
 }
 # Supported 0xFE-prefixed opcodes, by second byte (opcode.def):
 #   FE 01..05 = ceq, cgt, cgt.un, clt, clt.un

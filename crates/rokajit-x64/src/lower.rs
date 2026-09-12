@@ -72,6 +72,7 @@ fn const_imm(k: Const) -> Option<(i64, Width)> {
         Const::Int64(v) => Some((v, Width::W64)),
         Const::NativeInt(v) => Some((v as i64, Width::W64)),
         Const::NullRef => Some((0, Width::W64)),
+        Const::FrozenRef(v) => Some((v as i64, Width::W64)),
         Const::Float(_) | Const::Double(_) => None,
     }
 }
@@ -780,6 +781,20 @@ mod tests {
                 width: Width::W64,
                 dst: val(0),
                 src: Src::Imm(0),
+            }])
+        );
+        // A frozen ref (ldstr) is a 64-bit immediate holding the object
+        // address; codegen's wide-imm machinery covers >imm32 payloads.
+        let s = stmt(StmtKind::Copy {
+            dst: LocalId(0),
+            src: Operand::Const(Const::FrozenRef(0x1_2345_6789)),
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::Mov {
+                width: Width::W64,
+                dst: val(0),
+                src: Src::Imm(0x1_2345_6789),
             }])
         );
         // A float constant materializes its bit pattern (ConstF).
