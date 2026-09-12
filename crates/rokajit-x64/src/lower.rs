@@ -26,7 +26,7 @@ use rokajit::ir::lir::{BranchCond, Operand, StmtKind::*};
 use rokajit::ir::{lir, BinaryOp, BlockId, Const, LocalId, Type};
 use rokajit::lower::{Cx, Label, Val};
 
-use crate::inst::{Amode, ArithOp, CondCode, Inst, Place, Src, Width};
+use crate::inst::{Amode, ArithOp, CondCode, Inst, Place, ShiftOp, Src, Width};
 use crate::regs::{self, Gpr};
 
 /// The whole lowered method: the prolog sequence plus one descriptor
@@ -106,18 +106,26 @@ fn operand_width(cx: &Cx, op: Operand) -> Option<Width> {
 /// The per-ABI argument setup for a direct call: one `mov` per argument
 /// into its SysV register ([`regs::INT_ARG_REGS`] order; entry 0 is the
 /// implicit `this` when present — the importer/morph already place the
-/// receiver first). `None` — no rule match — when an argument needs a
-/// stack slot (more than six integer arguments) or a float register.
+/// receiver first). A `&local` argument materializes through `lea` (the
+/// `ldloca`/`ldarga` value form). `None` — no rule match — when an
+/// argument needs a stack slot (more than six integer arguments) or a
+/// float register.
 fn arg_moves(cx: &Cx, args: &[Operand]) -> Option<Vec<Inst>> {
     if args.len() > regs::INT_ARG_REGS.len() {
         return None;
     }
     let mut moves = Vec::with_capacity(args.len());
     for (i, arg) in args.iter().enumerate() {
-        moves.push(Inst::Mov {
-            width: operand_width(cx, *arg)?,
-            dst: Place::Reg(regs::INT_ARG_REGS[i]),
-            src: operand_src(*arg)?,
+        moves.push(match arg {
+            Operand::AddrOf(l) => Inst::Lea {
+                dst: Place::Reg(regs::INT_ARG_REGS[i]),
+                addr: Amode::FrameSlot(*l),
+            },
+            _ => Inst::Mov {
+                width: operand_width(cx, *arg)?,
+                dst: Place::Reg(regs::INT_ARG_REGS[i]),
+                src: operand_src(*arg)?,
+            },
         });
     }
     Some(moves)
@@ -131,9 +139,10 @@ fn epilog() -> Vec<Inst> {
 }
 
 rokajit::lower_rules! {
-    /// LIR statement → x64 instruction descriptors, for the fib subset.
-    /// Rules are tried in declaration order; the more specific operand
-    /// shapes (constants, addresses) precede the general value rules.
+    /// LIR statement → x64 instruction descriptors, for the fib subset
+    /// plus the step_10.1 scalar-cheap pack. Rules are tried in
+    /// declaration order; the more specific operand shapes (constants,
+    /// addresses) precede the general value rules.
     pub fn lower_stmt(stmt: &lir::Stmt, cx: &Cx<'_>) -> Option<Vec<Inst>>
     matching &stmt.kind;
 
@@ -198,6 +207,116 @@ rokajit::lower_rules! {
             Inst::Idiv { width: w, divisor: r },
             Inst::Mov { width: w, dst: Place::Val(Val(*dst)), src: Src::Reg(Gpr::Rdx) },
         ];
+
+    /// `t := a / b` (signed `div`) — the same fixed-register sequence,
+    /// quotient out of `rax`. `DivideByZeroException` and the
+    /// `int.MinValue / -1` overflow come from the `idiv` hardware trap
+    /// (#DE → the EE's signal translation via our unwind info); there is
+    /// deliberately no explicit divisor check.
+    rule div_s: Binary { dst, op: BinaryOp::Div, lhs, rhs }
+        if let (Some(w), Some(l), Some(r)) = (
+            width_of(cx, *dst),
+            operand_src(*lhs),
+            operand_src(*rhs),
+        )
+        => |_| vec![
+            Inst::Mov { width: w, dst: Place::Reg(Gpr::Rax), src: l },
+            Inst::Cdq { width: w },
+            Inst::Idiv { width: w, divisor: r },
+            Inst::Mov { width: w, dst: Place::Val(Val(*dst)), src: Src::Reg(Gpr::Rax) },
+        ];
+
+    /// `t := a / b`, `a % b` (unsigned `div.un`/`rem.un`) — `edx` is
+    /// zeroed rather than sign-extended (a 32-bit `mov` clears all of
+    /// `rdx`), then the unsigned `div` form. The quotient is `rax`, the
+    /// remainder `rdx`.
+    rule div_un: Binary { dst, op, lhs, rhs }
+        if let (Some(w), Some(l), Some(r), true) = (
+            width_of(cx, *dst),
+            operand_src(*lhs),
+            operand_src(*rhs),
+            matches!(op, BinaryOp::UDiv | BinaryOp::URem),
+        )
+        => |_| {
+            let result = if matches!(op, BinaryOp::UDiv) {
+                Gpr::Rax
+            } else {
+                Gpr::Rdx
+            };
+            vec![
+                Inst::Mov { width: w, dst: Place::Reg(Gpr::Rax), src: l },
+                Inst::Mov { width: Width::W32, dst: Place::Reg(Gpr::Rdx), src: Src::Imm(0) },
+                Inst::Div { width: w, divisor: r },
+                Inst::Mov { width: w, dst: Place::Val(Val(*dst)), src: Src::Reg(result) },
+            ]
+        };
+
+    /// `t := a << b`, `a >> b` — one descriptor; codegen emits the
+    /// destructive pair, with the count in `cl` when it isn't constant.
+    /// The signedness flip (`shr` → `sar`, `shr.un` → `shr`) happens in
+    /// `ShiftOp::of`.
+    rule shift: Binary { dst, op, lhs, rhs }
+        if let (Some(sop), Some(w), Some(l), Some(r)) = (
+            ShiftOp::of(*op),
+            width_of(cx, *dst),
+            operand_src(*lhs),
+            operand_src(*rhs),
+        )
+        => |_| vec![Inst::Shift {
+            op: sop,
+            width: w,
+            dst: Place::Val(Val(*dst)),
+            lhs: l,
+            rhs: r,
+        }];
+
+    /// `t := -a`, `~a` — the one-operand complement forms.
+    rule unary: Unary { dst, op, src }
+        if let (Some(w), Some(s)) = (width_of(cx, *dst), operand_src(*src))
+        => |_| vec![Inst::Unary {
+            op: *op,
+            width: w,
+            dst: Place::Val(Val(*dst)),
+            src: s,
+        }];
+
+    /// `t := (a cmp b)` — compare-as-a-value (`ceq`/`cgt`/`clt`/…): the
+    /// flags materialization of `branch_cmp`, with `setcc` consuming them
+    /// into an Int32 0/1. Producer and consumer are adjacent by
+    /// construction.
+    rule cmp_value: Binary { dst, op, lhs, rhs }
+        if let (Some(cc), Some(w), Some(l), Some(r)) = (
+            CondCode::of(*op),
+            operand_width(cx, *lhs),
+            operand_src(*lhs),
+            operand_src(*rhs),
+        )
+        => |_| vec![
+            Inst::Cmp { width: w, lhs: l, rhs: r },
+            Inst::Setcc { cc, dst: Place::Val(Val(*dst)) },
+        ];
+
+    /// `conv.i4`/`conv.u4` from a 64-bit operand: a 32-bit `mov` keeps the
+    /// low half. (Signedness is unobservable in a truncation, and on the
+    /// evaluation stack both forms normalize to Int32.)
+    rule conv_trunc: Conv { dst, to: Type::Int32, src, .. }
+        if let (Some(Width::W64), Some(s)) = (operand_width(cx, *src), operand_src(*src))
+        => |_| vec![Inst::Mov {
+            width: Width::W32,
+            dst: Place::Val(Val(*dst)),
+            src: s,
+        }];
+
+    /// `conv.i8`/`conv.u8` from a 32-bit operand: sign- (`movsxd`) vs
+    /// zero-extension (a 32-bit `mov`, which clears the upper half) —
+    /// another spot where the `unsigned` flag is the whole semantics.
+    rule conv_ext: Conv { dst, to: Type::Int64, unsigned, src, .. }
+        if let (Some(Width::W32), Some(s)) = (operand_width(cx, *src), operand_src(*src))
+        => |_| vec![Inst::MovExt {
+            dst: Place::Val(Val(*dst)),
+            src: s,
+            signed: !unsigned,
+        }];
 
     /// `if (a cmp b) goto L` — flag materialization: the compare and the
     /// conditional jump are one rule's output, so the flag producer and
@@ -334,7 +453,7 @@ pub fn lower_method(method: &lir::Method) -> CompileResult<LoweredMethod> {
 mod tests {
     use super::*;
     use rokajit::ir::lir::StmtKind;
-    use rokajit::ir::{hir, CallTarget, IlOffset};
+    use rokajit::ir::{hir, CallTarget, IlOffset, UnaryOp};
     use rokajit_ee::handles::MethodHandle;
 
     /// Locals: three Int32 slots (0, 1, 2) and one Float slot (3), so
@@ -529,6 +648,277 @@ mod tests {
                     width: Width::W32,
                     dst: val(2),
                     src: Src::Reg(Gpr::Rdx),
+                },
+            ])
+        );
+    }
+
+    // --- step_10.1: the scalar-cheap pack rules ---
+
+    /// Locals: Int64 slots 0 and 1, an Int32 slot 2 (dst for 32-bit
+    /// results), an Int32 slot 3 (a 32-bit source), an Int64 slot 4
+    /// (dst for 64-bit results).
+    fn locals_mixed() -> Vec<hir::Local> {
+        let l = |ty: Type, i: u32| hir::Local {
+            ty,
+            kind: hir::LocalKind::IlLocal(i),
+            pinned: false,
+        };
+        vec![
+            l(Type::Int64, 0),
+            l(Type::Int64, 1),
+            l(Type::Int32, 2),
+            l(Type::Int32, 3),
+            l(Type::Int64, 4),
+        ]
+    }
+
+    fn lower_with(locals: &[hir::Local], s: &lir::Stmt) -> Option<Vec<Inst>> {
+        lower_stmt(s, &Cx::new(locals))
+    }
+
+    #[test]
+    fn div_lowers_like_rem_with_quotient_from_rax() {
+        let s = stmt(StmtKind::Binary {
+            dst: LocalId(2),
+            op: BinaryOp::Div,
+            lhs: Operand::Local(LocalId(0)),
+            rhs: Operand::Local(LocalId(1)),
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Reg(Gpr::Rax),
+                    src: vsrc(0),
+                },
+                Inst::Cdq { width: Width::W32 },
+                Inst::Idiv {
+                    width: Width::W32,
+                    divisor: vsrc(1),
+                },
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: val(2),
+                    src: Src::Reg(Gpr::Rax),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn unsigned_div_rem_zero_rdx_and_use_div() {
+        // `div.un`: quotient from rax, `edx` zeroed (never `cdq`).
+        let s = stmt(StmtKind::Binary {
+            dst: LocalId(2),
+            op: BinaryOp::UDiv,
+            lhs: Operand::Local(LocalId(0)),
+            rhs: Operand::Local(LocalId(1)),
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Reg(Gpr::Rax),
+                    src: vsrc(0),
+                },
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Reg(Gpr::Rdx),
+                    src: Src::Imm(0),
+                },
+                Inst::Div {
+                    width: Width::W32,
+                    divisor: vsrc(1),
+                },
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: val(2),
+                    src: Src::Reg(Gpr::Rax),
+                },
+            ])
+        );
+        // `rem.un`: same sequence, remainder from rdx.
+        let s = stmt(StmtKind::Binary {
+            dst: LocalId(2),
+            op: BinaryOp::URem,
+            lhs: Operand::Local(LocalId(0)),
+            rhs: Operand::Local(LocalId(1)),
+        });
+        let lowered = lower_one(&s).expect("matches");
+        assert!(matches!(lowered[2], Inst::Div { .. }));
+        assert_eq!(
+            lowered[3],
+            Inst::Mov {
+                width: Width::W32,
+                dst: val(2),
+                src: Src::Reg(Gpr::Rdx),
+            }
+        );
+    }
+
+    #[test]
+    fn shifts_lower_to_the_shift_descriptor() {
+        // `shr` (signed) is arithmetic (`sar`); `shr.un` is logical
+        // (`shr`). 64-bit value, 32-bit count.
+        for (op, expected) in [
+            (BinaryOp::Shl, ShiftOp::Shl),
+            (BinaryOp::Shr, ShiftOp::Sar),
+            (BinaryOp::UShr, ShiftOp::Shr),
+        ] {
+            let s = stmt(StmtKind::Binary {
+                dst: LocalId(4),
+                op,
+                lhs: Operand::Local(LocalId(0)),
+                rhs: Operand::Local(LocalId(3)),
+            });
+            assert_eq!(
+                lower_with(&locals_mixed(), &s),
+                Some(vec![Inst::Shift {
+                    op: expected,
+                    width: Width::W64,
+                    dst: val(4),
+                    lhs: vsrc(0),
+                    rhs: vsrc(3),
+                }])
+            );
+        }
+        // A constant count rides along as an immediate.
+        let s = stmt(StmtKind::Binary {
+            dst: LocalId(2),
+            op: BinaryOp::Shl,
+            lhs: Operand::Local(LocalId(3)),
+            rhs: Operand::Const(Const::Int32(3)),
+        });
+        assert_eq!(
+            lower_with(&locals_mixed(), &s),
+            Some(vec![Inst::Shift {
+                op: ShiftOp::Shl,
+                width: Width::W32,
+                dst: val(2),
+                lhs: vsrc(3),
+                rhs: Src::Imm(3),
+            }])
+        );
+    }
+
+    #[test]
+    fn neg_not_lower_to_the_unary_descriptor() {
+        for (op, name) in [(UnaryOp::Neg, "neg"), (UnaryOp::Not, "not")] {
+            let s = stmt(StmtKind::Unary {
+                dst: LocalId(2),
+                op,
+                src: Operand::Local(LocalId(0)),
+            });
+            assert_eq!(
+                lower_one(&s),
+                Some(vec![Inst::Unary {
+                    op,
+                    width: Width::W32,
+                    dst: val(2),
+                    src: vsrc(0),
+                }]),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn compare_as_value_lowers_to_cmp_setcc() {
+        // `ceq`: cmp + sete. The unsigned `cgt.un` maps to `seta`.
+        for (op, cc) in [(BinaryOp::Eq, CondCode::Eq), (BinaryOp::UGt, CondCode::UGt)] {
+            let s = stmt(StmtKind::Binary {
+                dst: LocalId(2),
+                op,
+                lhs: Operand::Local(LocalId(0)),
+                rhs: Operand::Local(LocalId(1)),
+            });
+            assert_eq!(
+                lower_one(&s),
+                Some(vec![
+                    Inst::Cmp {
+                        width: Width::W32,
+                        lhs: vsrc(0),
+                        rhs: vsrc(1),
+                    },
+                    Inst::Setcc { cc, dst: val(2) },
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn conv_rules_truncate_and_extend() {
+        // conv.i4 from a 64-bit source: a truncating 32-bit mov.
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(2),
+            to: Type::Int32,
+            overflow: false,
+            unsigned: false,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_with(&locals_mixed(), &s),
+            Some(vec![Inst::Mov {
+                width: Width::W32,
+                dst: val(2),
+                src: vsrc(0),
+            }])
+        );
+        // conv.u8 / conv.i8 from a 32-bit source: MovExt, the `unsigned`
+        // flag selecting zero- vs sign-extension.
+        for (unsigned, signed) in [(true, false), (false, true)] {
+            let s = stmt(StmtKind::Conv {
+                dst: LocalId(4),
+                to: Type::Int64,
+                overflow: false,
+                unsigned,
+                src: Operand::Local(LocalId(3)),
+            });
+            assert_eq!(
+                lower_with(&locals_mixed(), &s),
+                Some(vec![Inst::MovExt {
+                    dst: val(4),
+                    src: vsrc(3),
+                    signed,
+                }])
+            );
+        }
+        // Same-width conversions match no rule (the importer drops them).
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(4),
+            to: Type::Int64,
+            overflow: false,
+            unsigned: false,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(lower_with(&locals_mixed(), &s), None);
+    }
+
+    #[test]
+    fn byref_call_arg_materializes_with_lea() {
+        let sig = rokajit::ir::CallSig {
+            ret: Type::Void,
+            args: vec![Type::ByRef],
+            has_this: false,
+        };
+        let s = stmt(StmtKind::Call {
+            dst: None,
+            target: CallTarget::Direct(handle(0x42)),
+            sig,
+            args: vec![Operand::AddrOf(LocalId(0))],
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![
+                Inst::Lea {
+                    dst: Place::Reg(Gpr::Rdi),
+                    addr: Amode::FrameSlot(LocalId(0)),
+                },
+                Inst::CallDirect {
+                    method: handle(0x42),
                 },
             ])
         );

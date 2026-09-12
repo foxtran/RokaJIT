@@ -15,6 +15,13 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
+// bindgen's enum-field glue transmutes same-typed values; the lint fires
+// on generated code only (clippy 1.98).
+#![allow(clippy::useless_transmute)]
+// Same story for the generated raw accessors: pointer arithmetic by byte
+// offset and undocumented unsafe fns are bindgen's house style.
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::ptr_offset_with_cast)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 

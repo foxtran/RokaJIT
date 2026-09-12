@@ -66,12 +66,16 @@ pub enum Amode {
 }
 
 /// The arithmetic instructions lowering emits (`imul` is the signed
-/// multiply; tier 0 does not distinguish for `add`/`sub`).
+/// multiply; tier 0 does not distinguish for `add`/`sub`/the bitwise
+/// logic ops).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ArithOp {
     Add,
     Sub,
     Imul,
+    And,
+    Or,
+    Xor,
 }
 
 impl ArithOp {
@@ -83,6 +87,35 @@ impl ArithOp {
             B::Add => Some(ArithOp::Add),
             B::Sub => Some(ArithOp::Sub),
             B::Mul => Some(ArithOp::Imul),
+            B::And => Some(ArithOp::And),
+            B::Or => Some(ArithOp::Or),
+            B::Xor => Some(ArithOp::Xor),
+            _ => None,
+        }
+    }
+}
+
+/// The shift instructions lowering emits. `BinaryOp::Shr` (IL `shr`) is
+/// the *arithmetic* shift right (`sar`); `BinaryOp::UShr` (IL `shr.un`)
+/// is the logical one (`shr`) — the signedness flip is exactly here.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ShiftOp {
+    Shl,
+    /// Logical shift right (IL `shr.un`).
+    Shr,
+    /// Arithmetic shift right (IL `shr`).
+    Sar,
+}
+
+impl ShiftOp {
+    /// The IR shift operator this instruction lowers, or `None` for
+    /// non-shift operators.
+    pub fn of(op: rokajit::ir::BinaryOp) -> Option<Self> {
+        use rokajit::ir::BinaryOp as B;
+        match op {
+            B::Shl => Some(ShiftOp::Shl),
+            B::Shr => Some(ShiftOp::Sar),
+            B::UShr => Some(ShiftOp::Shr),
             _ => None,
         }
     }
@@ -137,8 +170,9 @@ impl CondCode {
 }
 
 /// One x64 machine instruction, as a typed descriptor. The variants are
-/// exactly the fib-subset instruction set (step_07.6's list); each
-/// variant's fields admit only the operand shapes the instruction takes.
+/// the instruction set the lowering rules emit (the fib subset plus the
+/// step_10.1 scalar-cheap pack); each variant's fields admit only the
+/// operand shapes the instruction takes.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Inst {
     /// `mov dst, src` — reg/reg, reg/imm, or (after codegen binds
@@ -157,9 +191,41 @@ pub enum Inst {
     },
     /// `cdq`/`cqo`: sign-extend `rax` into `rdx:rax` before `idiv`.
     Cdq { width: Width },
-    /// `idiv divisor`: `rdx:rax / divisor`; quotient → `rax`, remainder
-    /// → `rdx`. No immediate form exists.
+    /// `idiv divisor`: signed `rdx:rax / divisor`; quotient → `rax`,
+    /// remainder → `rdx`. No immediate form exists.
     Idiv { width: Width, divisor: Src },
+    /// `div divisor`: unsigned `rdx:rax / divisor` (IL `div.un`/`rem.un`;
+    /// lowering zeroes `edx` instead of emitting `cdq`). No immediate
+    /// form exists.
+    Div { width: Width, divisor: Src },
+    /// `shl`/`shr`/`sar dst, count`: the count is an immediate (the `C1`
+    /// imm8 form) or a value that codegen places in `cl` (the `D3` form).
+    /// Hardware masks the count to 5/6 bits by operand width — ECMA-335's
+    /// masking rule exactly, so no mask instruction is emitted.
+    Shift {
+        op: ShiftOp,
+        width: Width,
+        dst: Place,
+        lhs: Src,
+        rhs: Src,
+    },
+    /// `neg`/`not dst` — one-operand complement forms.
+    Unary {
+        op: rokajit::ir::UnaryOp,
+        width: Width,
+        dst: Place,
+        src: Src,
+    },
+    /// `setcc dst_low_byte` — the compare-as-value (`ceq`/`clt`/…)
+    /// materialization. Reads the flags a preceding `Cmp` left; codegen
+    /// zeroes the destination register first, so the result is a clean
+    /// 0/1. Same adjacency contract as `Jcc`.
+    Setcc { cc: CondCode, dst: Place },
+    /// 32→64 extension (IL `conv.i8`/`conv.u8` from a 32-bit operand):
+    /// `movsxd` for the signed form, a 32-bit `mov` (which zero-extends)
+    /// for the unsigned form. Codegen always materializes into a scratch
+    /// register — a widening copy may never alias the source's slot.
+    MovExt { dst: Place, src: Src, signed: bool },
     /// `cmp lhs, rhs` — sets the flags a following `Jcc` consumes.
     Cmp { width: Width, lhs: Src, rhs: Src },
     /// `jcc target` — reads the flags `Cmp` (or a future flag-setting
@@ -229,9 +295,14 @@ impl Inst {
                 uses: &[Gpr::Rax],
                 defs: &[Gpr::Rdx],
             },
-            Inst::Idiv { .. } => FixedRegs {
+            Inst::Idiv { .. } | Inst::Div { .. } => FixedRegs {
                 uses: &[Gpr::Rax, Gpr::Rdx],
                 defs: &[Gpr::Rax, Gpr::Rdx],
+            },
+            // A variable-count shift moves the count into `cl`.
+            Inst::Shift { rhs, .. } if !matches!(rhs, Src::Imm(_)) => FixedRegs {
+                uses: &[],
+                defs: &[Gpr::Rcx],
             },
             Inst::CallDirect { .. } => FixedRegs {
                 uses: &[],
@@ -252,8 +323,21 @@ mod tests {
         assert_eq!(ArithOp::of(B::Add), Some(ArithOp::Add));
         assert_eq!(ArithOp::of(B::Sub), Some(ArithOp::Sub));
         assert_eq!(ArithOp::of(B::Mul), Some(ArithOp::Imul));
+        assert_eq!(ArithOp::of(B::And), Some(ArithOp::And));
+        assert_eq!(ArithOp::of(B::Or), Some(ArithOp::Or));
+        assert_eq!(ArithOp::of(B::Xor), Some(ArithOp::Xor));
         assert_eq!(ArithOp::of(B::Rem), None);
         assert_eq!(ArithOp::of(B::Lt), None);
+    }
+
+    #[test]
+    fn shift_op_maps_the_shift_subset() {
+        // The signedness flip: IL `shr` is arithmetic (sar), IL `shr.un`
+        // is logical (shr). This is where a wrong choice is a silent bug.
+        assert_eq!(ShiftOp::of(B::Shl), Some(ShiftOp::Shl));
+        assert_eq!(ShiftOp::of(B::Shr), Some(ShiftOp::Sar));
+        assert_eq!(ShiftOp::of(B::UShr), Some(ShiftOp::Shr));
+        assert_eq!(ShiftOp::of(B::Add), None);
     }
 
     #[test]

@@ -402,6 +402,8 @@ PANIC_RE = re.compile(r"rokajit: panic in compileMethod")
 
 # Unsupported payload -> feature bucket, first match wins. Order matters:
 # specific payloads before the importer's catch-all opcode messages.
+# (step_10.1 landed compare-as-value, unary/conv and the div/shift/logic
+# ops, so their rules are gone; messages evolve with the importer.)
 BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"EH regions|EH control flow|EH clauses|draining EH clauses"), "EH (try/catch/finally)"),
     (re.compile(r"generic methods"), "generics"),
@@ -411,16 +413,14 @@ BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"byref / field access|byref \(stind/stfld\)"), "objects & fields (byref/field access)"),
     (re.compile(r"cast/box"), "boxing & casts"),
     (re.compile(r"float argument"), "float arguments"),
-    (re.compile(r"compare producing a value"), "compare-as-value (ceq/clt)"),
-    (re.compile(r"unary/conv"), "unary ops & conversions"),
     (re.compile(r"switch:"), "switch"),
     (re.compile(r"null checks"), "null checks"),
+    (re.compile(r"GC-info slot tables"), "GC slot tables (tracked refs)"),
     (re.compile(r"non-direct call kind"), "non-direct calls (callvirt/calli)"),
     (re.compile(r"non-default calling convention"), "non-default calling conventions"),
     (re.compile(r"evaluation-stack values crossing"), "eval-stack values across block boundaries"),
-    (re.compile(r"binary operator outside"), "extended binary ops (div/shift/logic)"),
     (re.compile(r"local's type has no register class"), "locals without a register class"),
-    (re.compile(r"opcode outside the fib subset|0xFE-prefixed opcode"), "unsupported IL opcode (importer)"),
+    (re.compile(r"opcode outside the supported set|0xFE-prefixed opcode"), "unsupported IL opcode (importer)"),
 ]
 
 

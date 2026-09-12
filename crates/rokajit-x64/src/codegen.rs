@@ -29,7 +29,7 @@ use rokajit::artifact::{CallSite, ChunkRef, CodeChunk, CodeChunks, Relocation};
 use rokajit::codegen::{Loc, Move, ReadSrc, ValueState};
 use rokajit::error::{CompileError, CompileResult};
 use rokajit::ir::lir::StmtKind;
-use rokajit::ir::{hir, lir, CallSig, LocalId, Type};
+use rokajit::ir::{hir, lir, CallSig, LocalId, Type, UnaryOp};
 use rokajit::lower::{Cx, Label};
 use rokajit::pipeline::{CodegenOutput, FrameInfo};
 use rokajit::target::{ArgLocation, CallAbi, PhysReg};
@@ -38,7 +38,7 @@ use rokajit_ee::enums::RelocType;
 use rokajit_ee::handles::MethodHandle;
 
 use crate::encode::{Asm, Mem, Rm, Rmi};
-use crate::inst::{ArithOp, Inst, Place, Src, Width};
+use crate::inst::{ArithOp, Inst, Place, ShiftOp, Src, Width};
 use crate::lower::{lower_frame, lower_stmt, width_of_ty, FrameReq};
 use crate::regs::{self, Gpr};
 
@@ -496,6 +496,31 @@ impl<'a> Emitter<'a> {
                 self.asm.idiv(width, rm);
                 Ok(())
             }
+            Inst::Div { width, divisor } => {
+                // Same fixed-register discipline as `idiv` (unsigned form).
+                let moves = self.vs.clobber(Gpr::Rax.phys());
+                self.apply(moves)?;
+                let moves = self.vs.clobber(Gpr::Rdx.phys());
+                self.apply(moves)?;
+                let rm = self.rm_of(divisor, width, &[Gpr::Rax.phys(), Gpr::Rdx.phys()])?;
+                self.asm.div(width, rm);
+                Ok(())
+            }
+            Inst::Shift {
+                op,
+                width,
+                dst,
+                lhs,
+                rhs,
+            } => self.emit_shift(op, width, dst, lhs, rhs),
+            Inst::Unary {
+                op,
+                width,
+                dst,
+                src,
+            } => self.emit_unary(op, width, dst, src),
+            Inst::Setcc { cc, dst } => self.emit_setcc(cc, dst),
+            Inst::MovExt { dst, src, signed } => self.emit_movext(dst, src, signed),
             Inst::Cmp { width, lhs, rhs } => self.emit_cmp(width, lhs, rhs),
             Inst::Jcc { cc, target } => {
                 self.asm.jcc(cc, target);
@@ -627,6 +652,15 @@ impl<'a> Emitter<'a> {
         let crate::inst::Amode::FrameSlot(l) = addr;
         let mem = self.slot_mem(self.layout.slots[l.0 as usize]);
         match dst {
+            // A `lea` into an IL local/arg slot follows the store
+            // discipline: aliases of the slot materialize first.
+            Place::Val(t) if (t.0 .0 as usize) < self.num_frame_fixed => {
+                let (p, moves) = self.vs.take_scratch(&[]);
+                self.apply(moves)?;
+                let g = gpr_of(p)?;
+                self.asm.lea(g, mem);
+                self.emit_store_to_local(t.0, Width::W64, Src::Reg(g))
+            }
             Place::Val(t) => {
                 let (p, moves) = self.vs.take_scratch(&[]);
                 self.apply(moves)?;
@@ -641,6 +675,126 @@ impl<'a> Emitter<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// A shift: the value moves into a scratch register and the shift
+    /// applies in place. A constant count uses the imm8 form; a variable
+    /// count must be in `cl` — `rcx` is clobbered (its temp spills), the
+    /// count moves in with a 32-bit `mov` (only `cl` is ever read), and
+    /// the `D3` form applies. The destination scratch excludes `rcx` so
+    /// the count move can't evict the value. Hardware masks the count to
+    /// 5/6 bits by operand width — ECMA-335's masking rule exactly.
+    fn emit_shift(
+        &mut self,
+        op: ShiftOp,
+        width: Width,
+        dst: Place,
+        lhs: Src,
+        rhs: Src,
+    ) -> CompileResult<()> {
+        let Place::Val(t) = dst else {
+            return Err(CompileError::Internal(
+                "shift destination is always a value",
+            ));
+        };
+        let (d, moves) = self.vs.take_scratch(&[Gpr::Rcx.phys()]);
+        self.apply(moves)?;
+        let dg = gpr_of(d)?;
+        match self.rmi_of(lhs)? {
+            Rmi::Reg(g) => self.asm.mov(width, Rm::Reg(dg), Rmi::Reg(g)),
+            Rmi::Mem(m) => self.asm.mov(width, Rm::Reg(dg), Rmi::Mem(m)),
+            Rmi::Imm(i) => self.asm.mov(width, Rm::Reg(dg), Rmi::Imm(i)),
+        }
+        match rhs {
+            Src::Imm(count) => self.asm.shift_imm(op, width, Rm::Reg(dg), count),
+            rhs => {
+                let moves = self.vs.clobber(Gpr::Rcx.phys());
+                self.apply(moves)?;
+                let count = self.rmi_of(rhs)?;
+                self.asm.mov(Width::W32, Rm::Reg(Gpr::Rcx), count);
+                self.asm.shift_cl(op, width, Rm::Reg(dg));
+            }
+        }
+        self.define_temp_reg(t.0, dg)
+    }
+
+    /// `neg`/`not`: the source moves into a scratch register and the
+    /// operation applies in place.
+    fn emit_unary(&mut self, op: UnaryOp, width: Width, dst: Place, src: Src) -> CompileResult<()> {
+        let Place::Val(t) = dst else {
+            return Err(CompileError::Internal(
+                "unary destination is always a value",
+            ));
+        };
+        let (d, moves) = self.vs.take_scratch(&[]);
+        self.apply(moves)?;
+        let dg = gpr_of(d)?;
+        let rmi = self.rmi_of(src)?;
+        self.asm.mov(width, Rm::Reg(dg), rmi);
+        match op {
+            UnaryOp::Neg => self.asm.neg(width, Rm::Reg(dg)),
+            UnaryOp::Not => self.asm.not(width, Rm::Reg(dg)),
+        }
+        self.define_temp_reg(t.0, dg)
+    }
+
+    /// `setcc` materializes a compare's flags into an Int32 0/1. The flags
+    /// come from the immediately preceding `Cmp` (the lowering rules emit
+    /// the pair adjacently); every move emitted here — scratch spills, the
+    /// zeroing — is flag-preserving.
+    fn emit_setcc(&mut self, cc: crate::inst::CondCode, dst: Place) -> CompileResult<()> {
+        match dst {
+            Place::Val(t) => {
+                let (p, moves) = self.vs.take_scratch(&[]);
+                self.apply(moves)?;
+                let g = gpr_of(p)?;
+                // `mov` doesn't touch the flags: zero, then set the low byte.
+                self.asm.mov(Width::W32, Rm::Reg(g), Rmi::Imm(0));
+                self.asm.setcc(cc, g);
+                self.define_temp_reg(t.0, g)
+            }
+            Place::Reg(g) => {
+                let moves = self.vs.clobber(g.phys());
+                self.apply(moves)?;
+                self.asm.mov(Width::W32, Rm::Reg(g), Rmi::Imm(0));
+                self.asm.setcc(cc, g);
+                Ok(())
+            }
+        }
+    }
+
+    /// A 32→64 extension (`conv.i8`/`conv.u8`): `movsxd` when signed, a
+    /// 32-bit `mov` (which zeroes the upper half) when unsigned. Always
+    /// materializes into a register — a widening copy must never alias
+    /// the source's slot (a 64-bit read of a 32-bit slot would pick up
+    /// the neighboring 4 bytes).
+    fn emit_movext(&mut self, dst: Place, src: Src, signed: bool) -> CompileResult<()> {
+        match dst {
+            Place::Val(t) => {
+                let (p, moves) = self.vs.take_scratch(&[]);
+                self.apply(moves)?;
+                let g = gpr_of(p)?;
+                self.ext_into(g, src, signed)?;
+                self.define_temp_reg(t.0, g)
+            }
+            Place::Reg(g) => {
+                let moves = self.vs.clobber(g.phys());
+                self.apply(moves)?;
+                self.ext_into(g, src, signed)
+            }
+        }
+    }
+
+    /// The extension proper: `movsxd g, src32` or `mov g32, src32`.
+    fn ext_into(&mut self, g: Gpr, src: Src, signed: bool) -> CompileResult<()> {
+        if signed {
+            let rm = self.rm_of(src, Width::W32, &[g.phys()])?;
+            self.asm.movsxd(g, rm);
+        } else {
+            let rmi = self.rmi_of(src)?;
+            self.asm.mov(Width::W32, Rm::Reg(g), rmi);
+        }
+        Ok(())
     }
 
     fn emit_arith(
@@ -681,6 +835,18 @@ impl<'a> Emitter<'a> {
             ArithOp::Sub => {
                 let rhs = self.rmi_of(rhs)?;
                 self.asm.sub(width, Rm::Reg(dg), rhs);
+            }
+            ArithOp::And => {
+                let rhs = self.rmi_of(rhs)?;
+                self.asm.and(width, Rm::Reg(dg), rhs);
+            }
+            ArithOp::Or => {
+                let rhs = self.rmi_of(rhs)?;
+                self.asm.or(width, Rm::Reg(dg), rhs);
+            }
+            ArithOp::Xor => {
+                let rhs = self.rmi_of(rhs)?;
+                self.asm.xor(width, Rm::Reg(dg), rhs);
             }
             ArithOp::Imul => {
                 let rhs = self.rm_of(rhs, width, &[d])?;
@@ -1175,6 +1341,207 @@ mod tests {
         assert_eq!(out.code.hot.bytes, expected);
         assert_eq!(out.code.hot.bytes.len(), 45);
         assert_eq!(out.code.hot.bytes[35..40], out.code.hot.bytes[40..45]);
+    }
+
+    /// `int m(int a, int b) => a < b` — compare-as-a-value: the `cmp` /
+    /// `setcc` pair, with the zeroing `mov` in between (flag-preserving).
+    #[test]
+    fn compare_value_method_bytes() {
+        let m = method(
+            vec![int_arg(0), int_arg(1), int_temp()],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Binary {
+                        dst: LocalId(2),
+                        op: BinaryOp::Lt,
+                        lhs: Operand::Local(LocalId(0)),
+                        rhs: Operand::Local(LocalId(1)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(2))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)  — arg a
+            0x89, 0x75, 0xF8, // movl %esi, -8(%rbp)  — arg b
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax  (mem,mem cmp avoided)
+            0x3B, 0x45, 0xF8, // cmpl -8(%rbp), %eax
+            0xB9, 0, 0, 0, 0, // movl $0, %ecx       — flag-preserving zeroing
+            0x0F, 0x9C, 0xC1, // setl %cl
+            0x89, 0xC8, // movl %ecx, %eax           — return value
+            0xC9, 0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `uint m(uint a) => a / 3` — the unsigned-divide sequence: `edx`
+    /// zeroed (never `cdq`), the `div` form, quotient out of `rax`.
+    #[test]
+    fn udiv_method_bytes() {
+        let m = method(
+            vec![int_arg(0), int_temp()],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Binary {
+                        dst: LocalId(1),
+                        op: BinaryOp::UDiv,
+                        lhs: Operand::Local(LocalId(0)),
+                        rhs: Operand::Const(Const::Int32(3)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax  — dividend to rax
+            0xBA, 0, 0, 0, 0, // movl $0, %edx       — zero, not sign-extend
+            0xB9, 0x03, 0, 0, 0, // movl $3, %ecx    — imm divisor materialized
+            0xF7, 0xF1, // divl %ecx                  — the unsigned form
+            0x89, 0x45, 0xF8, // movl %eax, -8(%rbp) — rax clobber spill at ret
+            0x8B, 0x45, 0xF8, // movl -8(%rbp), %eax
+            0xC9, 0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `int m(int a, int b) => a << b` — the variable-count shift: the
+    /// count moves into `cl` with a 32-bit `mov`, the `D3` form applies.
+    #[test]
+    fn shift_by_cl_method_bytes() {
+        let m = method(
+            vec![int_arg(0), int_arg(1), int_temp()],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Binary {
+                        dst: LocalId(2),
+                        op: BinaryOp::Shl,
+                        lhs: Operand::Local(LocalId(0)),
+                        rhs: Operand::Local(LocalId(1)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(2))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)  — arg a
+            0x89, 0x75, 0xF8, // movl %esi, -8(%rbp)  — arg b
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax
+            0x8B, 0x4D, 0xF8, // movl -8(%rbp), %ecx — count into cl
+            0xD3, 0xE0, // shll %cl, %eax
+            0x89, 0x45, 0xF4, // movl %eax, -12(%rbp) — rax clobber spill at ret
+            0x8B, 0x45, 0xF4, // movl -12(%rbp), %eax
+            0xC9, 0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `ulong m(uint a) => a` — `conv.u8`: a 32-bit `mov` materializes the
+    /// zero-extension (never an alias of the 32-bit slot, which a 64-bit
+    /// read would overrun into the neighboring bytes).
+    #[test]
+    fn conv_u8_method_bytes() {
+        let m = method(
+            vec![int_arg(0), local(Type::Int64, LocalKind::Temp)],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Conv {
+                        dst: LocalId(1),
+                        to: Type::Int64,
+                        overflow: false,
+                        unsigned: true,
+                        src: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax  — zero-extends into rax
+            0x48, 0x89, 0x45, 0xF0, // movq %rax, -16(%rbp) — rax clobber spill
+            0x48, 0x8B, 0x45, 0xF0, // movq -16(%rbp), %rax
+            0xC9, 0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `long m(int a) => a` — `conv.i8`: `movsxd` sign-extends.
+    #[test]
+    fn conv_i8_method_bytes() {
+        let m = method(
+            vec![int_arg(0), local(Type::Int64, LocalKind::Temp)],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Conv {
+                        dst: LocalId(1),
+                        to: Type::Int64,
+                        overflow: false,
+                        unsigned: false,
+                        src: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)
+            0x48, 0x63, 0x45, 0xFC, // movslq -4(%rbp), %rax
+            0x48, 0x89, 0x45, 0xF0, // movq %rax, -16(%rbp) — rax clobber spill
+            0x48, 0x8B, 0x45, 0xF0, // movq -16(%rbp), %rax
+            0xC9, 0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
     }
 
     /// `int m(int n) { return n % 3; }` — the idiv fixed-register

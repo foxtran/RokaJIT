@@ -1,11 +1,16 @@
 //! Pipeline stage 1 (step_07.2): CIL bytes → [`hir::Method`].
 //!
-//! Scope is the fib subset (`RokaJIT-internal/docs/step_07.md`, verified
-//! against `tests/bin/fib.dll`): `ldarg`/`ldloc`/`stloc` in all widths,
-//! the `ldc.i4` family, `add`/`sub`/`mul`/`rem` (fib's `Main` uses `rem`),
-//! the integer compare-branch family `beq`..`blt.un` plus `brfalse`/
-//! `brtrue`/`br` (short and long forms — fib itself uses `blt.s`, there is
-//! no `clt`), `call`, and `ret`. Anything else is
+//! Scope is the fib subset (`RokaJIT-internal/docs/step_07.md`) plus the
+//! step_10.1 scalar-cheap pack (`RokaJIT-internal/docs/step_10.1.md`):
+//! `ldarg`/`ldloc`/`stloc` in all widths, the `ldc.i4` family,
+//! `add`/`sub`/`mul`/`div`/`rem` and the unsigned `div.un`/`rem.un`,
+//! the logic ops `and`/`or`/`xor`/`neg`/`not`, the shifts
+//! `shl`/`shr`/`shr.un`, compare-as-value `ceq`/`cgt`/`cgt.un`/`clt`/
+//! `clt.un`, the integer conversions `conv.i1`/`i2`/`i4`/`i8`/`u4`/`u8`,
+//! `dup`/`pop`, `ldloca`/`ldarga`/`starg` (short and wide forms),
+//! `ldnull`, the compare-branch family `beq`..`blt.un` plus `brfalse`/
+//! `brtrue`/`br` (short and long forms; the null-check forms now also
+//! accept references), `call`, and `ret`. Anything else is
 //! [`CompileError::Unsupported`]; malformed IL is [`CompileError::BadIl`].
 //! The importer never panics: every operand read is bounds-checked.
 //!
@@ -35,7 +40,9 @@ use rokajit_ee::handles::{ArgListHandle, MethodHandle};
 use rokajit_ffi as ffi;
 
 use crate::error::{CompileError, CompileResult};
-use crate::ir::{hir, BinaryOp, BlockId, CallSig, CallTarget, Const, IlOffset, LocalId, Type};
+use crate::ir::{
+    hir, BinaryOp, BlockId, CallSig, CallTarget, Const, IlOffset, LocalId, Type, UnaryOp,
+};
 use crate::pipeline::MethodInfo;
 
 /// Stage entry point (the body of [`crate::pipeline::import`]).
@@ -194,7 +201,7 @@ struct Insn {
     size: u32,
 }
 
-/// The fib-subset opcode set, operands already decoded. Branch targets are
+/// The supported opcode set, operands already decoded. Branch targets are
 /// absolute IL offsets, range-checked at decode time.
 #[derive(Copy, Clone)]
 enum Op {
@@ -202,15 +209,33 @@ enum Op {
     LdArg(u16),
     LdLoc(u16),
     StLoc(u16),
+    /// `ldarga` — address of an argument, a `ByRef` value.
+    LdArgA(u16),
+    /// `starg` — store into an argument slot.
+    StArg(u16),
+    /// `ldloca` — address of a local, a `ByRef` value.
+    LdLoca(u16),
     LdcI4(i32),
-    Add,
-    Sub,
-    Mul,
-    Rem,
+    LdNull,
+    Dup,
+    Pop,
+    /// Same-type integer binary ops: arithmetic, `div`/`rem` and their
+    /// unsigned forms, and the bitwise logic ops.
+    Binary(BinaryOp),
+    /// `shl`/`shr`/`shr.un`: the shift count's type is independent of the
+    /// value's (ECMA-335 §III.1.5), so these are not [`Op::Binary`].
+    Shift(BinaryOp),
+    /// `neg`/`not`.
+    Unary(UnaryOp),
+    /// `ceq`/`cgt`/`cgt.un`/`clt`/`clt.un` — compare producing an Int32
+    /// value (as opposed to the branch-folded compares).
+    Compare(BinaryOp),
+    /// `conv.i1`/`i2`/`i4`/`i8`/`u4`/`u8` (unchecked forms only).
+    Conv(ConvKind),
     Br {
         target: u32,
     },
-    /// `brfalse`/`brtrue`: one operand, compared against zero.
+    /// `brfalse`/`brtrue`: one operand, compared against zero/null.
     BrZero {
         op: BinaryOp,
         target: u32,
@@ -222,6 +247,20 @@ enum Op {
     },
     Call(u32),
     Ret,
+}
+
+/// The `conv.*` opcodes of the scalar-cheap pack. `I1`/`I2` carry the
+/// truncation width the IR's type vocabulary cannot (eval-stack types
+/// normalize at Int32, ECMA-335 §III.1.1.1) — the importer expands them
+/// to shift pairs ([`BlockImport::conv_narrow`]).
+#[derive(Copy, Clone)]
+enum ConvKind {
+    I1,
+    I2,
+    I4,
+    I8,
+    U4,
+    U8,
 }
 
 /// The compare ops of `beq`..`blt.un` in opcode order (0x2E..=0x37 short,
@@ -289,7 +328,7 @@ fn branch_target(il_len: usize, next_ip: usize, delta: i32) -> CompileResult<u32
     Ok(target as u32)
 }
 
-/// Pass 1: linear decode. Any opcode outside the fib subset is
+/// Pass 1: linear decode. Any opcode outside the supported set is
 /// `Unsupported` — including inside what would prove to be unreachable
 /// code, since pass 1 cannot know that yet.
 fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
@@ -304,11 +343,17 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x06..=0x09 => Op::LdLoc(u16::from(opcode - 0x06)),
             0x0A..=0x0D => Op::StLoc(u16::from(opcode - 0x0A)),
             0x0E => Op::LdArg(u16::from(r.u8()?)),
+            0x0F => Op::LdArgA(u16::from(r.u8()?)),
+            0x10 => Op::StArg(u16::from(r.u8()?)),
             0x11 => Op::LdLoc(u16::from(r.u8()?)),
+            0x12 => Op::LdLoca(u16::from(r.u8()?)),
             0x13 => Op::StLoc(u16::from(r.u8()?)),
+            0x14 => Op::LdNull,
             0x15..=0x1E => Op::LdcI4(i32::from(opcode) - 0x16),
             0x1F => Op::LdcI4(i32::from(r.i8()?)),
             0x20 => Op::LdcI4(r.i32()?),
+            0x25 => Op::Dup,
+            0x26 => Op::Pop,
             0x28 => Op::Call(r.u32()?),
             0x2A => Op::Ret,
             0x2B => {
@@ -360,21 +405,50 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                     target: branch_target(il.len(), r.ip, d)?,
                 }
             }
-            0x58 => Op::Add,
-            0x59 => Op::Sub,
-            0x5A => Op::Mul,
-            0x5D => Op::Rem,
+            0x58 => Op::Binary(BinaryOp::Add),
+            0x59 => Op::Binary(BinaryOp::Sub),
+            0x5A => Op::Binary(BinaryOp::Mul),
+            0x5B => Op::Binary(BinaryOp::Div),
+            0x5C => Op::Binary(BinaryOp::UDiv),
+            0x5D => Op::Binary(BinaryOp::Rem),
+            0x5E => Op::Binary(BinaryOp::URem),
+            0x5F => Op::Binary(BinaryOp::And),
+            0x60 => Op::Binary(BinaryOp::Or),
+            0x61 => Op::Binary(BinaryOp::Xor),
+            0x62 => Op::Shift(BinaryOp::Shl),
+            0x63 => Op::Shift(BinaryOp::Shr),
+            0x64 => Op::Shift(BinaryOp::UShr),
+            0x65 => Op::Unary(UnaryOp::Neg),
+            0x66 => Op::Unary(UnaryOp::Not),
+            0x67 => Op::Conv(ConvKind::I1),
+            0x68 => Op::Conv(ConvKind::I2),
+            0x69 => Op::Conv(ConvKind::I4),
+            0x6A => Op::Conv(ConvKind::I8),
+            0x6D => Op::Conv(ConvKind::U4),
+            0x6E => Op::Conv(ConvKind::U8),
             0xFE => match r.u8()? {
+                0x01 => Op::Compare(BinaryOp::Eq),
+                0x02 => Op::Compare(BinaryOp::Gt),
+                0x03 => Op::Compare(BinaryOp::UGt),
+                0x04 => Op::Compare(BinaryOp::Lt),
+                0x05 => Op::Compare(BinaryOp::ULt),
                 0x09 => Op::LdArg(r.u16()?),
+                0x0A => Op::LdArgA(r.u16()?),
+                0x0B => Op::StArg(r.u16()?),
                 0x0C => Op::LdLoc(r.u16()?),
+                0x0D => Op::LdLoca(r.u16()?),
                 0x0E => Op::StLoc(r.u16()?),
                 _ => {
                     return Err(CompileError::Unsupported(
-                        "0xFE-prefixed opcode outside the fib subset",
+                        "0xFE-prefixed opcode outside the supported set",
                     ));
                 }
             },
-            _ => return Err(CompileError::Unsupported("opcode outside the fib subset")),
+            _ => {
+                return Err(CompileError::Unsupported(
+                    "opcode outside the supported set",
+                ))
+            }
         };
         insns.push(Insn {
             op,
@@ -489,6 +563,37 @@ fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
     }
 }
 
+/// Does evaluating the tree have an observable effect beyond producing a
+/// value — a call, or a trapping `div`/`rem` (divide-by-zero and the
+/// `int.MinValue / -1` overflow are exceptions, so a discarded `x / y`
+/// must still execute)? Drives `pop`: a tree with an effect becomes an
+/// `Eval` statement; anything else is dropped.
+fn must_eval(expr: &hir::Expr) -> bool {
+    match expr {
+        hir::Expr::Const(_) | hir::Expr::Local(_) | hir::Expr::LocalAddr(_) => false,
+        hir::Expr::StaticFieldAddr { .. } => false,
+        hir::Expr::Load { .. } => true, // can fault (null byref) — not built yet
+        hir::Expr::FieldAddr { obj, .. } => must_eval(obj),
+        hir::Expr::Unary { arg, .. } => must_eval(arg),
+        hir::Expr::Binary { op, lhs, rhs } => {
+            matches!(
+                op,
+                BinaryOp::Div | BinaryOp::UDiv | BinaryOp::Rem | BinaryOp::URem
+            ) || must_eval(lhs)
+                || must_eval(rhs)
+        }
+        hir::Expr::Conv { arg, .. } => must_eval(arg),
+        hir::Expr::Call { .. } => true,
+        hir::Expr::NullCheck { .. } => true, // the check itself can fault
+        hir::Expr::ArrLen { .. } => true,    // faults on a null array
+        hir::Expr::ArrElemAddr { array, index, .. } => must_eval(array) || must_eval(index),
+        // Not built by the importer yet, but a cast can throw and a box
+        // allocates — both observable.
+        hir::Expr::Cast { .. } | hir::Expr::Box { .. } => true,
+        hir::Expr::StructVal { addr, .. } => must_eval(addr),
+    }
+}
+
 impl BlockImport<'_> {
     fn push(&mut self, ty: Type, expr: hir::Expr) -> CompileResult<()> {
         if self.stack.len() >= self.info.max_stack as usize {
@@ -559,21 +664,20 @@ impl BlockImport<'_> {
         id
     }
 
-    /// `stloc`: the value pops normally, but any tree still on the stack
-    /// that references the destination loaded the local *before* this
+    /// `stloc`/`starg`: the value pops normally, but any tree still on the
+    /// stack that references the destination loaded the local *before* this
     /// store — ECMA-335 gives it the old value. Materialize every such
     /// tree into a temp ahead of the store (RyuJIT's `impSpillLclRefs`,
     /// importer.cpp:413), so the tree reads can't observe the new value.
-    fn stloc(
+    fn store_local(
         &mut self,
-        index: u32,
+        id: LocalId,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let id = self.il_local_id(index)?;
         let (ty, value) = self.pop()?;
         if ty != self.local_types[id.0 as usize] {
-            return Err(CompileError::BadIl("stloc type mismatch"));
+            return Err(CompileError::BadIl("store type mismatch"));
         }
         for i in 0..self.stack.len() {
             let (entry_ty, _) = &self.stack[i];
@@ -592,6 +696,169 @@ impl BlockImport<'_> {
             kind: hir::StmtKind::Store { dst: id, value },
         });
         Ok(())
+    }
+
+    /// `dup`: copy the top of the evaluation stack. A trivial tree copies
+    /// outright; anything else is spilled to a temp first so its effects
+    /// (calls, trapping divides) still happen exactly once.
+    fn dup(&mut self, stmts: &mut Vec<hir::Stmt>, il_offset: IlOffset) -> CompileResult<()> {
+        let (ty, value) = self.pop()?;
+        match value {
+            hir::Expr::Const(k) => {
+                self.push(ty, hir::Expr::Const(k))?;
+                self.push(ty, hir::Expr::Const(k))?;
+            }
+            hir::Expr::Local(id) => {
+                self.push(ty, hir::Expr::Local(id))?;
+                self.push(ty, hir::Expr::Local(id))?;
+            }
+            hir::Expr::LocalAddr(id) => {
+                self.push(ty, hir::Expr::LocalAddr(id))?;
+                self.push(ty, hir::Expr::LocalAddr(id))?;
+            }
+            value => {
+                let tmp = self.temp(ty);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store { dst: tmp, value },
+                });
+                self.push(ty, hir::Expr::Local(tmp))?;
+                self.push(ty, hir::Expr::Local(tmp))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `pop`: discard the top of the stack. A tree whose evaluation has an
+    /// observable effect (a call, or a `div`/`rem` that can trap) is still
+    /// evaluated — it becomes an `Eval` statement.
+    fn pop_value(&mut self, stmts: &mut Vec<hir::Stmt>, il_offset: IlOffset) -> CompileResult<()> {
+        let (_ty, value) = self.pop()?;
+        if must_eval(&value) {
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Eval(value),
+            });
+        }
+        Ok(())
+    }
+
+    /// `ceq`/`cgt`/`cgt.un`/`clt`/`clt.un`: pop two operands, push the
+    /// Int32 result. Integer operands must agree in type; the reference
+    /// forms (`ceq` and `cgt.un` only, ECMA-335 §III.1.5) also accept
+    /// `Ref`/`ByRef`/`NativeInt` operands in any combination (a `null`
+    /// literal compares against both references and pointers).
+    fn compare(&mut self, op: BinaryOp) -> CompileResult<()> {
+        let (rt, rhs) = self.pop()?;
+        let (lt, lhs) = self.pop()?;
+        let int = |t: Type| matches!(t, Type::Int32 | Type::Int64 | Type::NativeInt);
+        let ptr = |t: Type| matches!(t, Type::Ref | Type::ByRef | Type::NativeInt);
+        let ok = if int(lt) && int(rt) {
+            lt == rt
+        } else {
+            matches!(op, BinaryOp::Eq | BinaryOp::UGt) && ptr(lt) && ptr(rt)
+        };
+        if !ok {
+            return Err(CompileError::BadIl("compare operand type mismatch"));
+        }
+        self.push(Type::Int32, binary(op, lhs, rhs))
+    }
+
+    /// `shl`/`shr`/`shr.un`: the count is `Int32`/`NativeInt` regardless of
+    /// the value's type; the result has the value's type. The hardware
+    /// masks the count (31/63 by operand width), matching ECMA-335's
+    /// masking rule, so no mask tree is built.
+    fn shift(&mut self, op: BinaryOp) -> CompileResult<()> {
+        let (ct, count) = self.pop_int()?;
+        if !matches!(ct, Type::Int32 | Type::NativeInt) {
+            return Err(CompileError::BadIl(
+                "shift count must be int32 or native int",
+            ));
+        }
+        let (vt, value) = self.pop_int()?;
+        self.push(vt, binary(op, value, count))
+    }
+
+    /// `conv.*` (unchecked): stack-type transitions of the scalar-cheap
+    /// pack. Same-width conversions are the identity; `conv.i1`/`conv.i2`
+    /// expand to shift pairs (`conv_narrow`); the rest become
+    /// `hir::Expr::Conv` nodes whose `unsigned` flag selects sign- vs
+    /// zero-extension at lowering.
+    fn conv(&mut self, kind: ConvKind) -> CompileResult<()> {
+        let (ty, value) = self.pop()?;
+        // Pointer/float conversions (`conv.i`/`conv.u`, float sources) are
+        // outside the scalar-cheap pack.
+        if !matches!(ty, Type::Int32 | Type::Int64 | Type::NativeInt) {
+            return Err(CompileError::Unsupported(
+                "conv from a non-integer operand (floats, pointers)",
+            ));
+        }
+        match kind {
+            ConvKind::I1 => self.conv_narrow(8, ty, value),
+            ConvKind::I2 => self.conv_narrow(16, ty, value),
+            // conv.i4/u4: truncate to 32 bits (identity on an Int32).
+            ConvKind::I4 | ConvKind::U4 => {
+                if ty == Type::Int32 {
+                    self.push(Type::Int32, value)
+                } else {
+                    let unsigned = matches!(kind, ConvKind::U4);
+                    self.push(
+                        Type::Int32,
+                        hir::Expr::Conv {
+                            to: Type::Int32,
+                            overflow: false,
+                            unsigned,
+                            arg: Box::new(value),
+                        },
+                    )
+                }
+            }
+            // conv.i8/u8: extend to 64 bits (identity on a 64-bit operand).
+            ConvKind::I8 | ConvKind::U8 => {
+                if ty == Type::Int64 || ty == Type::NativeInt {
+                    self.push(ty, value)
+                } else {
+                    let unsigned = matches!(kind, ConvKind::U8);
+                    self.push(
+                        Type::Int64,
+                        hir::Expr::Conv {
+                            to: Type::Int64,
+                            overflow: false,
+                            unsigned,
+                            arg: Box::new(value),
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    /// `conv.i1`/`conv.i2`: truncate to `bits` then sign-extend, as the
+    /// shift pair `(v << (32 - bits)) >> (32 - bits)` at 32 bits. The IR's
+    /// type vocabulary normalizes sub-Int32 types away (ECMA-335
+    /// §III.1.1.1), so the narrowing cannot be a `Conv` node; the shift
+    /// expansion is exact (arithmetic `shr` replicates the sign bit).
+    fn conv_narrow(&mut self, bits: u32, ty: Type, value: hir::Expr) -> CompileResult<()> {
+        let value = if ty == Type::Int32 {
+            value
+        } else {
+            // A 64-bit operand truncates to 32 bits first; the low `bits`
+            // survive either way.
+            hir::Expr::Conv {
+                to: Type::Int32,
+                overflow: false,
+                unsigned: false,
+                arg: Box::new(value),
+            }
+        };
+        let sh = hir::Expr::Const(Const::Int32((32 - bits) as i32));
+        let shifted = binary(BinaryOp::Shl, value, sh);
+        let back = binary(
+            BinaryOp::Shr,
+            shifted,
+            hir::Expr::Const(Const::Int32((32 - bits) as i32)),
+        );
+        self.push(Type::Int32, back)
     }
 
     fn branch(
@@ -739,12 +1006,46 @@ impl BlockImport<'_> {
                     let id = self.il_local_id(u32::from(index))?;
                     self.push(self.local_types[id.0 as usize], hir::Expr::Local(id))?;
                 }
-                Op::StLoc(index) => self.stloc(u32::from(index), &mut stmts, il_offset)?,
+                Op::StLoc(index) => {
+                    let id = self.il_local_id(u32::from(index))?;
+                    self.store_local(id, &mut stmts, il_offset)?;
+                }
+                Op::LdArgA(index) => {
+                    let index = u32::from(index);
+                    if index >= self.num_args {
+                        return Err(CompileError::BadIl("argument index out of range"));
+                    }
+                    self.push(Type::ByRef, hir::Expr::LocalAddr(LocalId(index)))?;
+                }
+                Op::StArg(index) => {
+                    let index = u32::from(index);
+                    if index >= self.num_args {
+                        return Err(CompileError::BadIl("argument index out of range"));
+                    }
+                    self.store_local(LocalId(index), &mut stmts, il_offset)?;
+                }
+                Op::LdLoca(index) => {
+                    let id = self.il_local_id(u32::from(index))?;
+                    self.push(Type::ByRef, hir::Expr::LocalAddr(id))?;
+                }
                 Op::LdcI4(v) => self.push(Type::Int32, hir::Expr::Const(Const::Int32(v)))?,
-                Op::Add => self.arith(BinaryOp::Add)?,
-                Op::Sub => self.arith(BinaryOp::Sub)?,
-                Op::Mul => self.arith(BinaryOp::Mul)?,
-                Op::Rem => self.arith(BinaryOp::Rem)?,
+                Op::LdNull => self.push(Type::Ref, hir::Expr::Const(Const::NullRef))?,
+                Op::Dup => self.dup(&mut stmts, il_offset)?,
+                Op::Pop => self.pop_value(&mut stmts, il_offset)?,
+                Op::Binary(op) => self.arith(op)?,
+                Op::Shift(op) => self.shift(op)?,
+                Op::Compare(op) => self.compare(op)?,
+                Op::Unary(op) => {
+                    let (ty, value) = self.pop_int()?;
+                    self.push(
+                        ty,
+                        hir::Expr::Unary {
+                            op,
+                            arg: Box::new(value),
+                        },
+                    )?;
+                }
+                Op::Conv(kind) => self.conv(kind)?,
                 Op::Call(token) => self.call(token, &mut stmts, il_offset)?,
                 Op::Br { target } => {
                     self.note_depth(target, self.stack.len())?;
@@ -753,20 +1054,37 @@ impl BlockImport<'_> {
                     });
                 }
                 Op::BrZero { op, target } => {
-                    let (ty, value) = self.pop_int()?;
+                    // brfalse/brtrue: integers compare against zero,
+                    // references against null (`ldnull; brfalse` is the
+                    // canonical null check).
+                    let (ty, value) = self.pop()?;
                     let zero = match ty {
                         Type::Int32 => Const::Int32(0),
                         Type::Int64 => Const::Int64(0),
                         Type::NativeInt => Const::NativeInt(0),
-                        _ => return Err(CompileError::Internal("pop_int returned non-integer")),
+                        Type::Ref | Type::ByRef => Const::NullRef,
+                        _ => {
+                            return Err(CompileError::BadIl(
+                                "brfalse/brtrue operand must be an integer or reference",
+                            ));
+                        }
                     };
                     let cond = binary(op, value, hir::Expr::Const(zero));
                     terminator = Some(self.branch(cond, target, insn.offset + insn.size)?);
                 }
                 Op::BrCmp { op, target } => {
-                    let (rt, rhs) = self.pop_int()?;
-                    let (lt, lhs) = self.pop_int()?;
-                    if lt != rt {
+                    let (rt, rhs) = self.pop()?;
+                    let (lt, lhs) = self.pop()?;
+                    // Integer operands must agree in type; `beq`/`bne.un`
+                    // additionally accept reference pairs (ECMA-335 §III.1.5).
+                    let int = |t: Type| matches!(t, Type::Int32 | Type::Int64 | Type::NativeInt);
+                    let ptr = |t: Type| matches!(t, Type::Ref | Type::ByRef);
+                    let ok = if int(lt) && int(rt) {
+                        lt == rt
+                    } else {
+                        matches!(op, BinaryOp::Eq | BinaryOp::Ne) && ptr(lt) && ptr(rt)
+                    };
+                    if !ok {
                         return Err(CompileError::BadIl("compare operand type mismatch"));
                     }
                     terminator =
@@ -1519,5 +1837,383 @@ mod tests {
             import(&info, &ee),
             Err(CompileError::Unsupported(_))
         ));
+    }
+
+    // --- step_10.1: the scalar-cheap pack ---
+
+    fn as_unary(e: &hir::Expr) -> (UnaryOp, &hir::Expr) {
+        match e {
+            hir::Expr::Unary { op, arg } => (*op, arg),
+            _ => panic!("expected Expr::Unary"),
+        }
+    }
+
+    fn as_conv(e: &hir::Expr) -> (Type, bool, bool, &hir::Expr) {
+        match e {
+            hir::Expr::Conv {
+                to,
+                overflow,
+                unsigned,
+                arg,
+            } => (*to, *overflow, *unsigned, arg),
+            _ => panic!("expected Expr::Conv"),
+        }
+    }
+
+    fn as_local_addr(e: &hir::Expr) -> LocalId {
+        match e {
+            hir::Expr::LocalAddr(id) => *id,
+            _ => panic!("expected Expr::LocalAddr"),
+        }
+    }
+
+    #[test]
+    fn dup_copies_trivial_trees() {
+        // ldc.i4.3; dup; add; ret — both copies are the same constant.
+        let m = import_ii(&[0x19, 0x25, 0x58, 0x2A]).expect("imports");
+        assert!(m.blocks[0].stmts.is_empty(), "no spill for a constant");
+        let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_i32(lhs), 3);
+        assert_eq!(as_i32(rhs), 3);
+
+        // ldarg.0; dup; add; ret — a local reference copies too.
+        let m = import_ii(&[0x02, 0x25, 0x58, 0x2A]).expect("imports");
+        assert!(m.blocks[0].stmts.is_empty());
+        let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_local(lhs), LocalId(0));
+        assert_eq!(as_local(rhs), LocalId(0));
+    }
+
+    #[test]
+    fn dup_of_a_call_spills_to_a_temp() {
+        // call fib; dup; add; ret — the call must evaluate exactly once:
+        // a store to a fresh temp, then two reads of it.
+        let il = [0x02, 0x28, 0x01, 0x00, 0x00, 0x06, 0x25, 0x58, 0x2A];
+        let m = import_ii(&il).expect("imports");
+        assert_eq!(m.locals.len(), 2, "arg + the dup spill temp");
+        assert_eq!(m.locals[1].kind, hir::LocalKind::Temp);
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1);
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(1));
+        assert!(matches!(value, hir::Expr::Call { .. }));
+        let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_local(lhs), LocalId(1));
+        assert_eq!(as_local(rhs), LocalId(1));
+    }
+
+    #[test]
+    fn pop_drops_pure_trees_but_evaluates_effects() {
+        // ldc.i4.1; pop; ldarg.0; ret — a pure tree is dropped outright.
+        let m = import_ii(&[0x17, 0x26, 0x02, 0x2A]).expect("imports");
+        assert!(m.blocks[0].stmts.is_empty());
+
+        // call fib; pop; ldarg.0; ret — the call survives as an Eval.
+        let il = [0x02, 0x28, 0x01, 0x00, 0x00, 0x06, 0x26, 0x02, 0x2A];
+        let m = import_ii(&il).expect("imports");
+        assert_eq!(m.blocks[0].stmts.len(), 1);
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(e) => assert!(matches!(e, hir::Expr::Call { .. })),
+            _ => panic!("expected StmtKind::Eval"),
+        }
+
+        // ldarg.0; ldarg.0; div; pop; ldc.i4.0; ret — a trapping divide
+        // must still execute: it becomes an Eval of the div tree.
+        let il = [0x02, 0x02, 0x5B, 0x26, 0x16, 0x2A];
+        let m = import_ii(&il).expect("imports");
+        assert_eq!(m.blocks[0].stmts.len(), 1);
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(e) => assert_eq!(as_binary(e).0, BinaryOp::Div),
+            _ => panic!("expected StmtKind::Eval of the divide"),
+        }
+    }
+
+    #[test]
+    fn ldloca_ldarga_starg_forms() {
+        // ldloca.s 0; pop; ldc.i4.0; ret — address of local 0 is a ByRef.
+        let il = [0x12, 0x00, 0x26, 0x16, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::Int]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(m.blocks[0].stmts.is_empty(), "pop of an address is pure");
+
+        // The wide ldloca (0xFE 0D) decodes identically.
+        let il = [0xFE, 0x0D, 0x00, 0x00, 0x26, 0x16, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::Int]);
+        import(&info, &ee).expect("wide ldloca imports");
+
+        // ldarga.s 0 (and wide 0xFE 0A); starg.s 0 (and wide 0xFE 0B):
+        // starg.s of an int into arg 0 stores through the locals table.
+        for il in [
+            &[0x0F, 0x00, 0x26, 0x16, 0x2A][..], // ldarga.s 0; pop
+            &[0xFE, 0x0A, 0x00, 0x00, 0x26, 0x16, 0x2A][..], // ldarga 0; pop
+        ] {
+            let m = import_ii(il).expect("ldarga imports");
+            assert!(m.blocks[0].stmts.is_empty());
+        }
+        for il in [
+            &[0x17, 0x10, 0x00, 0x02, 0x2A][..], // ldc.i4.1; starg.s 0; ldarg.0; ret
+            &[0x17, 0xFE, 0x0B, 0x00, 0x00, 0x02, 0x2A][..], // wide starg
+        ] {
+            let m = import_ii(il).expect("starg imports");
+            let stmts = &m.blocks[0].stmts;
+            assert_eq!(stmts.len(), 1);
+            let (dst, value) = store(&stmts[0]);
+            assert_eq!(dst, LocalId(0), "starg writes the argument slot");
+            assert_eq!(as_i32(value), 1);
+            assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+        }
+    }
+
+    #[test]
+    fn starg_spills_stack_trees_referencing_the_argument() {
+        // ldarg.0; ldc.i4.1; starg.s 0; ret — the ldarg.0 under the store
+        // read arg 0 *before* the store: it is snapshotted to a temp (the
+        // same spill discipline as stloc) and is what `ret` returns.
+        let il = [0x02, 0x17, 0x10, 0x00, 0x2A];
+        let m = import_ii(&il).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "spill store, then the starg itself");
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(1), "the spill temp follows the one arg");
+        assert_eq!(as_local(value), LocalId(0));
+        let (dst, value) = store(&stmts[1]);
+        assert_eq!(dst, LocalId(0));
+        assert_eq!(as_i32(value), 1);
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(1));
+    }
+
+    #[test]
+    fn ldarga_of_a_ref_arg_is_typed_byref() {
+        // ldarga.s 0; starg.s 1 — byref copy between two byref args.
+        let il = [0x0F, 0x00, 0x10, 0x01, 0x16, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Int, &[CorInfoType::ByRef, CorInfoType::ByRef]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(1));
+        assert_eq!(as_local_addr(value), LocalId(0));
+    }
+
+    #[test]
+    fn compare_ops_produce_int32_values() {
+        // ldarg.0; ldarg.1; cXX; ret — ceq/cgt/cgt.un/clt/clt.un.
+        for (opcode2, expected) in [
+            (0x01, BinaryOp::Eq),
+            (0x02, BinaryOp::Gt),
+            (0x03, BinaryOp::UGt),
+            (0x04, BinaryOp::Lt),
+            (0x05, BinaryOp::ULt),
+        ] {
+            let il = [0x02, 0x03, 0xFE, opcode2, 0x2A];
+            let m = import_ii2(&il);
+            let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+            assert_eq!(op, expected);
+            assert_eq!(as_local(lhs), LocalId(0));
+            assert_eq!(as_local(rhs), LocalId(1));
+        }
+    }
+
+    #[test]
+    fn ceq_accepts_references_and_null() {
+        // ldarg.0; ldnull; ceq; ret — a Ref-vs-null compare, Int32 result.
+        let il = [0x02, 0x14, 0xFE, 0x01, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Eq);
+        assert_eq!(as_local(lhs), LocalId(0));
+        assert!(matches!(rhs, hir::Expr::Const(Const::NullRef)));
+
+        // clt on references is BadIl (ECMA-335 §III.1.5: only ceq/cgt.un).
+        let il = [0x02, 0x02, 0xFE, 0x04, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn logic_and_unary_ops() {
+        // ldarg.0; ldarg.1; op; ret for and/or/xor; ldarg.0; neg/not; ret.
+        for (opcode, expected) in [
+            (0x5F, BinaryOp::And),
+            (0x60, BinaryOp::Or),
+            (0x61, BinaryOp::Xor),
+        ] {
+            let il = [0x02, 0x03, opcode, 0x2A];
+            let m = import_ii2(&il);
+            assert_eq!(as_binary(return_value(&m, 0)).0, expected);
+        }
+        for (opcode, expected) in [(0x65, UnaryOp::Neg), (0x66, UnaryOp::Not)] {
+            let il = [0x02, opcode, 0x2A];
+            let m = import_ii(&il).expect("imports");
+            let (op, arg) = as_unary(return_value(&m, 0));
+            assert_eq!(op, expected);
+            assert_eq!(as_local(arg), LocalId(0));
+        }
+    }
+
+    #[test]
+    fn shifts_take_an_independent_count_type() {
+        // The legal mixed case: value i64, count i32 (ECMA-335 §III.1.5).
+        for (opcode, expected) in [
+            (0x62, BinaryOp::Shl),
+            (0x63, BinaryOp::Shr),
+            (0x64, BinaryOp::UShr),
+        ] {
+            let il = [0x02, 0x03, opcode, 0x2A];
+            let (ee, info) = fixture(
+                &il,
+                &sig(CorInfoType::Long, &[CorInfoType::Long, CorInfoType::Int]),
+                &[],
+            );
+            let m = import(&info, &ee).expect("imports");
+            let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+            assert_eq!(op, expected);
+            assert_eq!(as_local(lhs), LocalId(0));
+            assert_eq!(as_local(rhs), LocalId(1));
+        }
+        // i64 count is rejected.
+        let il = [0x02, 0x03, 0x62, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Long, &[CorInfoType::Long, CorInfoType::Long]),
+            &[],
+        );
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn div_family_ops() {
+        for (opcode, expected) in [
+            (0x5B, BinaryOp::Div),
+            (0x5C, BinaryOp::UDiv),
+            (0x5D, BinaryOp::Rem),
+            (0x5E, BinaryOp::URem),
+        ] {
+            let il = [0x02, 0x03, opcode, 0x2A];
+            let m = import_ii2(&il);
+            assert_eq!(as_binary(return_value(&m, 0)).0, expected);
+        }
+    }
+
+    #[test]
+    fn conv_widening_and_truncation_nodes() {
+        // conv.i4 of an i64 arg: Conv node to Int32 (truncation).
+        let il = [0x02, 0x69, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Long]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int32);
+        assert!(!overflow && !unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // conv.u4 of an i64 arg: same truncation, unsigned flag set.
+        let il = [0x02, 0x6D, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Long]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let (_, _, unsigned, _) = as_conv(return_value(&m, 0));
+        assert!(unsigned);
+
+        // conv.i8 of an i32 arg: Conv node to Int64, signed.
+        let il = [0x02, 0x6A, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Long, &[CorInfoType::Int]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int64);
+        assert!(!unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // conv.u8: unsigned extension.
+        let il = [0x02, 0x6E, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Long, &[CorInfoType::Int]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, unsigned, _) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int64);
+        assert!(unsigned);
+
+        // Same-width conversions are the identity: no node at all.
+        let m = import_ii(&[0x02, 0x69, 0x2A]).expect("conv.i4 of i32");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+        let (ee, info) = fixture(
+            &[0x02, 0x6A, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("conv.i8 of i64");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+    }
+
+    #[test]
+    fn conv_i1_i2_expand_to_shift_pairs() {
+        // ldarg.0; conv.i1; ret — ((v << 24) >> 24) at 32 bits.
+        let m = import_ii(&[0x02, 0x67, 0x2A]).expect("imports");
+        let (op, shl, count) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Shr, "arithmetic shift right re-sign-extends");
+        assert_eq!(as_i32(count), 24);
+        let (op, value, count) = as_binary(shl);
+        assert_eq!(op, BinaryOp::Shl);
+        assert_eq!(as_local(value), LocalId(0));
+        assert_eq!(as_i32(count), 24);
+
+        // conv.i2: shift by 16.
+        let m = import_ii(&[0x02, 0x68, 0x2A]).expect("imports");
+        let (_, _, count) = as_binary(return_value(&m, 0));
+        assert_eq!(as_i32(count), 16);
+
+        // A 64-bit operand truncates to 32 bits first: the shl's value is
+        // a Conv-to-Int32 node.
+        let (ee, info) = fixture(
+            &[0x02, 0x67, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (_, shl, _) = as_binary(return_value(&m, 0));
+        let (_, value, _) = as_binary(shl);
+        let (to, _, _, arg) = as_conv(value);
+        assert_eq!(to, Type::Int32);
+        assert_eq!(as_local(arg), LocalId(0));
+    }
+
+    #[test]
+    fn ldnull_pushes_a_null_ref_and_branches_on_it() {
+        // ldnull; stloc.0; ldloc.0; brfalse.s L; ldc.i4.1; ret; L: ldc.i4.2; ret
+        // — a Ref local holding null, branched on directly.
+        let il = [0x14, 0x0A, 0x06, 0x2C, 0x02, 0x17, 0x2A, 0x18, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::Class]);
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(0));
+        assert!(matches!(value, hir::Expr::Const(Const::NullRef)));
+        match &m.blocks[0].terminator {
+            hir::Terminator::Branch { cond, .. } => {
+                let (op, lhs, rhs) = as_binary(cond);
+                assert_eq!(op, BinaryOp::Eq);
+                assert_eq!(as_local(lhs), LocalId(0));
+                assert!(matches!(rhs, hir::Expr::Const(Const::NullRef)));
+            }
+            _ => panic!("expected Branch"),
+        }
+
+        // beq on two refs is legal; blt on refs is not.
+        let il = [0x02, 0x03, 0x2E, 0x02, 0x16, 0x2A, 0x17, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Int, &[CorInfoType::Class, CorInfoType::Class]),
+            &[],
+        );
+        import(&info, &ee).expect("beq on refs imports");
+        let il = [0x02, 0x03, 0x32, 0x02, 0x16, 0x2A, 0x17, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Int, &[CorInfoType::Class, CorInfoType::Class]),
+            &[],
+        );
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
     }
 }

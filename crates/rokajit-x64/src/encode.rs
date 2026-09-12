@@ -15,9 +15,13 @@
 //! |-----------------------|---------------------------------------------|
 //! | `Mov`                 | [`Asm::mov`]                                |
 //! | `Lea`                 | [`Asm::lea`]                                |
-//! | `Arith`               | [`Asm::add`] / [`Asm::sub`] / [`Asm::imul`] (+ [`Asm::imul_imm`]) |
+//! | `Arith`               | [`Asm::add`] / [`Asm::sub`] / [`Asm::and`] / [`Asm::or`] / [`Asm::xor`] / [`Asm::imul`] (+ [`Asm::imul_imm`]) |
 //! | `Cdq`                 | [`Asm::cdq`]                                |
-//! | `Idiv`                | [`Asm::idiv`]                               |
+//! | `Idiv` / `Div`        | [`Asm::idiv`] / [`Asm::div`]                |
+//! | `Shift`               | [`Asm::shift_cl`] / [`Asm::shift_imm`]      |
+//! | `Unary`               | [`Asm::neg`] / [`Asm::not`]                 |
+//! | `Setcc`               | [`Asm::setcc`]                              |
+//! | `MovExt`              | [`Asm::movsxd`] / a 32-bit [`Asm::mov`]     |
 //! | `Cmp`                 | [`Asm::cmp`] (+ [`Asm::test`])              |
 //! | `Jcc` / `Jmp`         | [`Asm::jcc`] / [`Asm::jmp`]                 |
 //! | `CallDirect`          | [`Asm::call`]                               |
@@ -346,10 +350,39 @@ const TEST_ROW: AluRow = AluRow {
     imm_op: 0xF7,
     imm_ext: 0,
 };
+const AND_ROW: AluRow = AluRow {
+    rm_r: 0x21,
+    r_rm: 0x23,
+    imm_op: 0x81,
+    imm_ext: 4,
+};
+const OR_ROW: AluRow = AluRow {
+    rm_r: 0x09,
+    r_rm: 0x0B,
+    imm_op: 0x81,
+    imm_ext: 1,
+};
+const XOR_ROW: AluRow = AluRow {
+    rm_r: 0x31,
+    r_rm: 0x33,
+    imm_op: 0x81,
+    imm_ext: 6,
+};
 
-/// The `tttn` low nibble of the `0F 8x` jcc opcode for a [`CondCode`]
-/// (the descriptor contract's condition vocabulary → hardware codes).
-fn jcc_tttn(cc: CondCode) -> u8 {
+/// The `/ext` reg field of the shift group (`D1`/`C1`/`D3`) for a
+/// [`ShiftOp`](crate::inst::ShiftOp) (Intel SDM vol. 2A).
+fn shift_ext(op: crate::inst::ShiftOp) -> u8 {
+    match op {
+        crate::inst::ShiftOp::Shl => 4,
+        crate::inst::ShiftOp::Shr => 5,
+        crate::inst::ShiftOp::Sar => 7,
+    }
+}
+
+/// The `tttn` low nibble of the `0F 8x`/`0F 9x` jcc/setcc opcode for a
+/// [`CondCode`] (the descriptor contract's condition vocabulary →
+/// hardware codes).
+fn cc_tttn(cc: CondCode) -> u8 {
     match cc {
         CondCode::Eq => 0x4,
         CondCode::Ne => 0x5,
@@ -458,6 +491,83 @@ impl Asm {
         self.alu(&TEST_ROW, width, lhs, rhs);
     }
 
+    /// `and dst, src`.
+    pub fn and(&mut self, width: Width, dst: Rm, src: Rmi) {
+        self.alu(&AND_ROW, width, dst, src);
+    }
+
+    /// `or dst, src`.
+    pub fn or(&mut self, width: Width, dst: Rm, src: Rmi) {
+        self.alu(&OR_ROW, width, dst, src);
+    }
+
+    /// `xor dst, src`.
+    pub fn xor(&mut self, width: Width, dst: Rm, src: Rmi) {
+        self.alu(&XOR_ROW, width, dst, src);
+    }
+
+    /// `neg dst` (`F7 /3`).
+    pub fn neg(&mut self, width: Width, dst: Rm) {
+        let wide = matches!(width, Width::W64);
+        self.emit_modrm_insn(wide, 3, dst, &[0xF7]);
+    }
+
+    /// `not dst` (`F7 /2`).
+    pub fn not(&mut self, width: Width, dst: Rm) {
+        let wide = matches!(width, Width::W64);
+        self.emit_modrm_insn(wide, 2, dst, &[0xF7]);
+    }
+
+    /// `div divisor` — unsigned `rdx:rax / divisor` (`F7 /6`); no
+    /// immediate form exists (the `inst.rs` contract makes that shape
+    /// unreachable).
+    pub fn div(&mut self, width: Width, divisor: Rm) {
+        let wide = matches!(width, Width::W64);
+        self.emit_modrm_insn(wide, 6, divisor, &[0xF7]);
+    }
+
+    /// `shl`/`shr`/`sar dst, cl` (`D3 /ext`) — the variable-count form;
+    /// the count register is implicit (`cl`), as the descriptor's
+    /// fixed-duty declaration records.
+    pub fn shift_cl(&mut self, op: crate::inst::ShiftOp, width: Width, dst: Rm) {
+        let wide = matches!(width, Width::W64);
+        self.emit_modrm_insn(wide, shift_ext(op), dst, &[0xD3]);
+    }
+
+    /// `shl`/`shr`/`sar dst, imm8` — the constant-count form. A count of
+    /// 1 uses the shorter `D1 /ext` encoding, as every assembler picks;
+    /// other counts use `C1 /ext ib`. The hardware masks the count
+    /// (5/6 bits by operand width) — ECMA-335's masking rule.
+    pub fn shift_imm(&mut self, op: crate::inst::ShiftOp, width: Width, dst: Rm, count: i64) {
+        let wide = matches!(width, Width::W64);
+        if count == 1 {
+            self.emit_modrm_insn(wide, shift_ext(op), dst, &[0xD1]);
+        } else {
+            self.emit_modrm_insn(wide, shift_ext(op), dst, &[0xC1]);
+            self.emit_u8(count as u8);
+        }
+    }
+
+    /// `setcc dst_low_byte` (`0F 9x /r`, 8-bit operand). A REX prefix is
+    /// emitted when the register's low byte needs one (`sil`/`dil`/
+    /// `r8b`+ — without REX, encodings 4–7 mean the legacy high bytes
+    /// `ah`/`ch`/`dh`/`bh`).
+    pub fn setcc(&mut self, cc: CondCode, dst: Gpr) {
+        let d = dst as u8;
+        if d >= 4 {
+            self.emit_u8(0x40 | (d >> 3)); // REX (+ REX.B for r8b+)
+        }
+        self.emit_u8(0x0F);
+        self.emit_u8(0x90 | cc_tttn(cc));
+        self.emit_u8(0xC0 | (d & 7));
+    }
+
+    /// `movsxd dst, src` (`63 /r`, REX.W): sign-extend the 32-bit source
+    /// into the 64-bit destination.
+    pub fn movsxd(&mut self, dst: Gpr, src: Rm) {
+        self.emit_modrm_insn(true, dst as u8, src, &[0x63]);
+    }
+
     fn alu(&mut self, row: &AluRow, width: Width, dst: Rm, src: Rmi) {
         let wide = matches!(width, Width::W64);
         match (dst, src) {
@@ -522,7 +632,7 @@ impl Asm {
     /// `jcc target` — `0F 8x rel32`, fixup resolved at finalize.
     pub fn jcc(&mut self, cc: CondCode, target: Label) {
         self.emit_u8(0x0F);
-        self.emit_u8(0x80 | jcc_tttn(cc));
+        self.emit_u8(0x80 | cc_tttn(cc));
         self.emit_rel32_fixup(target);
     }
 
@@ -1276,6 +1386,165 @@ mod tests {
             .patch(&mut code.bytes, 0x2000, 0x1000)
             .unwrap();
         assert_eq!(code.bytes, [0xE8, 0xFB, 0xEF, 0xFF, 0xFF, 0xC3]);
+    }
+
+    // ---- and / or / xor (the shared ALU machinery, step_10.1) ----
+
+    #[test]
+    fn and_or_xor_forms() {
+        // andl %ecx, %eax
+        assert_eq!(
+            finish(|a| a.and(W32, Rm::Reg(Rax), Rmi::Reg(Rcx))),
+            [0x21, 0xC8]
+        );
+        // orq %rcx, %rax
+        assert_eq!(
+            finish(|a| a.or(W64, Rm::Reg(Rax), Rmi::Reg(Rcx))),
+            [0x48, 0x09, 0xC8]
+        );
+        // xorl %ecx, %eax
+        assert_eq!(
+            finish(|a| a.xor(W32, Rm::Reg(Rax), Rmi::Reg(Rcx))),
+            [0x31, 0xC8]
+        );
+        // xorl $5, %eax — group-1 imm8 (83 /6).
+        assert_eq!(
+            finish(|a| a.xor(W32, Rm::Reg(Rax), Rmi::Imm(5))),
+            [0x83, 0xF0, 0x05]
+        );
+        // andq $0x1234, %rcx — imm32 form (81 /4). (Not rax: llvm-mc
+        // picks the accumulator-special form there.)
+        assert_eq!(
+            finish(|a| a.and(W64, Rm::Reg(Rcx), Rmi::Imm(0x1234))),
+            [0x48, 0x81, 0xE1, 0x34, 0x12, 0x00, 0x00]
+        );
+        // orl $-1, %r9d (REX.B, 83 /1).
+        assert_eq!(
+            finish(|a| a.or(W32, Rm::Reg(R9), Rmi::Imm(-1))),
+            [0x41, 0x83, 0xC9, 0xFF]
+        );
+        // andl -8(%rbp), %eax — the load form (23 /r).
+        assert_eq!(
+            finish(|a| a.and(W32, Rm::Reg(Rax), Rmi::Mem(Mem::base_disp(Rbp, -8)))),
+            [0x23, 0x45, 0xF8]
+        );
+        // xorq %rax, -8(%rbp) — memory destination.
+        assert_eq!(
+            finish(|a| a.xor(W64, Rm::Mem(Mem::base_disp(Rbp, -8)), Rmi::Reg(Rax))),
+            [0x48, 0x31, 0x45, 0xF8]
+        );
+    }
+
+    // ---- neg / not / div (F7 group) ----
+
+    #[test]
+    fn neg_not_div_forms() {
+        // negl %eax
+        assert_eq!(finish(|a| a.neg(W32, Rm::Reg(Rax))), [0xF7, 0xD8]);
+        // negq %r8 (REX.W+B)
+        assert_eq!(finish(|a| a.neg(W64, Rm::Reg(R8))), [0x49, 0xF7, 0xD8]);
+        // notq %rax
+        assert_eq!(finish(|a| a.not(W64, Rm::Reg(Rax))), [0x48, 0xF7, 0xD0]);
+        // notl %r15d (REX.B)
+        assert_eq!(finish(|a| a.not(W32, Rm::Reg(R15))), [0x41, 0xF7, 0xD7]);
+        // divl %ecx
+        assert_eq!(finish(|a| a.div(W32, Rm::Reg(Rcx))), [0xF7, 0xF1]);
+        // divq %r8 (REX.W+B)
+        assert_eq!(finish(|a| a.div(W64, Rm::Reg(R8))), [0x49, 0xF7, 0xF0]);
+        // divl -4(%rbp) — memory divisor.
+        assert_eq!(
+            finish(|a| a.div(W32, Rm::Mem(Mem::base_disp(Rbp, -4)))),
+            [0xF7, 0x75, 0xFC]
+        );
+    }
+
+    // ---- shifts (D1 / C1 / D3 forms) ----
+
+    #[test]
+    fn shift_forms() {
+        use crate::inst::ShiftOp;
+        // shll %cl, %eax
+        assert_eq!(
+            finish(|a| a.shift_cl(ShiftOp::Shl, W32, Rm::Reg(Rax))),
+            [0xD3, 0xE0]
+        );
+        // sarq %cl, %rax
+        assert_eq!(
+            finish(|a| a.shift_cl(ShiftOp::Sar, W64, Rm::Reg(Rax))),
+            [0x48, 0xD3, 0xF8]
+        );
+        // shrl %cl, %r10d (REX.B)
+        assert_eq!(
+            finish(|a| a.shift_cl(ShiftOp::Shr, W32, Rm::Reg(R10))),
+            [0x41, 0xD3, 0xEA]
+        );
+        // sarl %cl, %ecx
+        assert_eq!(
+            finish(|a| a.shift_cl(ShiftOp::Sar, W32, Rm::Reg(Rcx))),
+            [0xD3, 0xF9]
+        );
+        // shrl $7, %eax (C1 /5 ib)
+        assert_eq!(
+            finish(|a| a.shift_imm(ShiftOp::Shr, W32, Rm::Reg(Rax), 7)),
+            [0xC1, 0xE8, 0x07]
+        );
+        // shll $24, %eax — the conv.i1 expansion shape.
+        assert_eq!(
+            finish(|a| a.shift_imm(ShiftOp::Shl, W32, Rm::Reg(Rax), 24)),
+            [0xC1, 0xE0, 0x18]
+        );
+        // sarl $24, %eax
+        assert_eq!(
+            finish(|a| a.shift_imm(ShiftOp::Sar, W32, Rm::Reg(Rax), 24)),
+            [0xC1, 0xF8, 0x18]
+        );
+        // shll $1, %eax — the one-bit short form (D1 /4), as assemblers pick.
+        assert_eq!(
+            finish(|a| a.shift_imm(ShiftOp::Shl, W32, Rm::Reg(Rax), 1)),
+            [0xD1, 0xE0]
+        );
+        // shrq $63, %r9 (REX.W+B, C1 /5 ib)
+        assert_eq!(
+            finish(|a| a.shift_imm(ShiftOp::Shr, W64, Rm::Reg(R9), 63)),
+            [0x49, 0xC1, 0xE9, 0x3F]
+        );
+    }
+
+    // ---- setcc (0F 9x, 8-bit destination) ----
+
+    #[test]
+    fn setcc_forms() {
+        // setae %al
+        assert_eq!(finish(|a| a.setcc(CondCode::UGe, Rax)), [0x0F, 0x93, 0xC0]);
+        // sete %cl
+        assert_eq!(finish(|a| a.setcc(CondCode::Eq, Rcx)), [0x0F, 0x94, 0xC1]);
+        // setle %bl
+        assert_eq!(finish(|a| a.setcc(CondCode::Le, Rbx)), [0x0F, 0x9E, 0xC3]);
+        // setb %sil — REX required: without it rm=6 encodes %dh.
+        assert_eq!(
+            finish(|a| a.setcc(CondCode::ULt, Rsi)),
+            [0x40, 0x0F, 0x92, 0xC6]
+        );
+        // setg %r8b (REX.B)
+        assert_eq!(
+            finish(|a| a.setcc(CondCode::Gt, R8)),
+            [0x41, 0x0F, 0x9F, 0xC0]
+        );
+    }
+
+    // ---- movsxd (63 /r) ----
+
+    #[test]
+    fn movsxd_forms() {
+        // movslq %ecx, %rax
+        assert_eq!(finish(|a| a.movsxd(Rax, Rm::Reg(Rcx))), [0x48, 0x63, 0xC1]);
+        // movslq %r8d, %r9 (REX.W+R+B)
+        assert_eq!(finish(|a| a.movsxd(R9, Rm::Reg(R8))), [0x4D, 0x63, 0xC8]);
+        // movslq -8(%rbp), %r11 — memory source.
+        assert_eq!(
+            finish(|a| a.movsxd(R11, Rm::Mem(Mem::base_disp(Rbp, -8)))),
+            [0x4C, 0x63, 0x5D, 0xF8]
+        );
     }
 
     // ---- the fib prolog/epilog shape, end to end ----

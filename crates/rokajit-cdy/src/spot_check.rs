@@ -65,7 +65,7 @@ pub fn run(info: &CORINFO_METHOD_INFO, ee: &GasketEeInfo) {
         {
             break; // claimed: run the sample below
         }
-        if slot as *const _ == &SEEN[SPOT_CHECK_METHODS - 1] as *const _ {
+        if std::ptr::eq(slot, &SEEN[SPOT_CHECK_METHODS - 1]) {
             return; // all slots taken by other methods
         }
     }

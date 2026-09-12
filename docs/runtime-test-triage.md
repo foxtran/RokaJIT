@@ -31,12 +31,12 @@ under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 26 |
-| CRASH | 519 |
+| MATCH | 47 |
+| CRASH | 498 |
 | TIMEOUT | 2 |
 | COMPILE_FAIL | 2734 |
 
-Of the MATCHes, 25 exit 100 (the CoreCLR pass
+Of the MATCHes, 46 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -51,11 +51,11 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| unsupported IL opcode (importer) | 312 | `JIT/CodeGenBringUpTests/And1.cs`<br>`JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/Array1.cs`<br>`JIT/CodeGenBringUpTests/Array2.cs`<br>`JIT/CodeGenBringUpTests/Array3.cs`<br>… and 307 more |
-| structs & value types | 122 | `JIT/CodeGenBringUpTests/InitObj.cs`<br>`JIT/CodeGenBringUpTests/OpMembersOfStructLocal.cs`<br>`JIT/CodeGenBringUpTests/StructFldAddr.cs`<br>`JIT/CodeGenBringUpTests/StructInstMethod.cs`<br>`JIT/CodeGenBringUpTests/StructReturn.cs`<br>… and 117 more |
-| EH (try/catch/finally) | 80 | `JIT/CodeGenBringUpTests/ArrayExc.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>`JIT/CodeGenBringUpTests/DivConst.cs`<br>`JIT/CodeGenBringUpTests/Localloc.cs`<br>`JIT/CodeGenBringUpTests/ModConst.cs`<br>… and 75 more |
+| unsupported IL opcode (importer) | 288 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/Array1.cs`<br>`JIT/CodeGenBringUpTests/Array2.cs`<br>`JIT/CodeGenBringUpTests/Array3.cs`<br>`JIT/CodeGenBringUpTests/Array4.cs`<br>… and 283 more |
+| structs & value types | 124 | `JIT/CodeGenBringUpTests/InitObj.cs`<br>`JIT/CodeGenBringUpTests/OpMembersOfStructLocal.cs`<br>`JIT/CodeGenBringUpTests/StructFldAddr.cs`<br>`JIT/CodeGenBringUpTests/StructInstMethod.cs`<br>`JIT/CodeGenBringUpTests/StructReturn.cs`<br>… and 119 more |
+| EH (try/catch/finally) | 81 | `JIT/CodeGenBringUpTests/ArrayExc.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>`JIT/CodeGenBringUpTests/DivConst.cs`<br>`JIT/CodeGenBringUpTests/Localloc.cs`<br>`JIT/CodeGenBringUpTests/ModConst.cs`<br>… and 76 more |
 | generics | 3 | `JIT/opt/AssertionPropagation/DynBlkNullAssertions.cs`<br>`JIT/opt/Devirtualization/GitHub_59668.cs`<br>`JIT/opt/OSR/invalidpromotion.cs` |
-| branches on references (brtrue/brfalse null checks) | 2 | `JIT/CodeGenBringUpTests/ObjAlloc.cs`<br>`JIT/Regression_2/Runtime_64208/Runtime_64208.cs` |
+| GC slot tables (tracked refs) | 2 | `JIT/CodeGenBringUpTests/ObjAlloc.cs`<br>`JIT/Regression_2/Runtime_64208/Runtime_64208.cs` |
 
 ## COMPILE_FAIL by csc error class
 
@@ -67,8 +67,8 @@ entry shapes). Out of scope for triage; listed for the record.
 | --- | ---: |
 | CS0246 | 1590 |
 | CS0103 | 851 |
-| CS0234 | 278 |
-| SYSLIB5003 | 8 |
+| CS0234 | 277 |
+| SYSLIB5003 | 9 |
 | CS0017 | 1 |
 | CS0104 | 1 |
 | CS0122 | 1 |

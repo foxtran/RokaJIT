@@ -23,10 +23,11 @@
 //! registers and addressing modes so invalid sequences are
 //! unrepresentable (the ISLE typed-terms lesson).
 //!
-//! Scope: the fib subset (step_07.md). `add`/`sub`/`mul`/`rem`,
-//! compare-and-branch, direct calls, `ret`, local/arg/const operands.
-//! Everything else — including compare-as-a-value (`clt`/`ceq`), loads
-//! and stores through byrefs, switches, and EH — fails with
+//! Scope: the fib subset (step_07.md) plus the step_10.1 scalar-cheap
+//! pack: every [`BinaryOp`] (arithmetic, `div`/`rem` signed and unsigned,
+//! logic, shifts, and compare-as-value — a compare's temp is `Int32`),
+//! `neg`/`not` unary ops, and the integer `conv.*` nodes. Everything
+//! else — loads and stores through byrefs, switches, and EH — fails with
 //! [`CompileError::Unsupported`].
 
 mod dsl;
@@ -84,9 +85,7 @@ impl<'a> Cx<'a> {
 /// folded to `BranchCond`, temps defined exactly once before use.
 pub fn lower(method: hir::Method, target: &dyn Target) -> CompileResult<lir::Method> {
     if !method.eh_regions.is_empty() {
-        return Err(CompileError::Unsupported(
-            "EH regions: outside the step_07 fib subset",
-        ));
+        return Err(CompileError::Unsupported("EH regions: not yet supported"));
     }
     for local in &method.locals {
         if target.class_of(local.ty).is_none() {
@@ -176,7 +175,7 @@ impl Flatten {
                 }
                 hir::StmtKind::StoreInd { .. } => {
                     return Err(CompileError::Unsupported(
-                        "store through a byref (stind/stfld): outside the fib subset",
+                        "store through a byref (stind/stfld): not yet supported",
                     ));
                 }
                 hir::StmtKind::Eval(expr) => {
@@ -222,24 +221,16 @@ impl Flatten {
             hir::Expr::Local(id) => Ok(lir::Operand::Local(*id)),
             hir::Expr::LocalAddr(id) => Ok(lir::Operand::AddrOf(*id)),
             hir::Expr::Binary { op, lhs, rhs } => {
-                match op {
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Rem => {}
-                    // Compare-as-a-value (ceq/clt/...) arrives with its
-                    // importer support; fib branches on compares instead.
-                    _ if is_compare(*op) => {
-                        return Err(CompileError::Unsupported(
-                            "compare producing a value (ceq/clt): outside the fib subset",
-                        ));
-                    }
-                    _ => {
-                        return Err(CompileError::Unsupported(
-                            "binary operator outside the fib subset (add/sub/mul/rem)",
-                        ));
-                    }
-                }
                 let lhs = self.flatten_expr(lhs, out, il)?;
                 let rhs = self.flatten_expr(rhs, out, il)?;
-                let ty = self.operand_ty(&lhs)?;
+                // A compare's result is Int32 (ECMA-335 III.1.5); every
+                // other binary op has its (integer) operands' type — for
+                // shifts that is the value operand's, per the importer.
+                let ty = if is_compare(*op) {
+                    Type::Int32
+                } else {
+                    self.operand_ty(&lhs)?
+                };
                 let dst = self.temp(ty);
                 Self::push(
                     out,
@@ -262,25 +253,55 @@ impl Flatten {
                 }
             }
             hir::Expr::Load { .. } | hir::Expr::FieldAddr { .. } => Err(CompileError::Unsupported(
-                "load through a byref / field access: outside the fib subset",
+                "load through a byref / field access: not yet supported",
             )),
             hir::Expr::StaticFieldAddr { .. } => Err(CompileError::Unsupported(
-                "static fields: outside the fib subset",
+                "static fields: not yet supported",
             )),
-            hir::Expr::Unary { .. } | hir::Expr::Conv { .. } => Err(CompileError::Unsupported(
-                "unary/conv: outside the fib subset",
-            )),
-            hir::Expr::NullCheck { .. } => Err(CompileError::Unsupported(
-                "null checks: outside the fib subset",
-            )),
-            hir::Expr::ArrLen { .. } | hir::Expr::ArrElemAddr { .. } => {
-                Err(CompileError::Unsupported("arrays: outside the fib subset"))
+            hir::Expr::Unary { op, arg } => {
+                let src = self.flatten_expr(arg, out, il)?;
+                let ty = self.operand_ty(&src)?;
+                let dst = self.temp(ty);
+                Self::push(out, il, lir::StmtKind::Unary { dst, op: *op, src });
+                Ok(lir::Operand::Temp(dst))
             }
-            hir::Expr::Cast { .. } | hir::Expr::Box { .. } => Err(CompileError::Unsupported(
-                "cast/box: outside the fib subset",
-            )),
+            hir::Expr::Conv {
+                to,
+                overflow,
+                unsigned,
+                arg,
+            } => {
+                // Checked (`.ovf`) conversions need OverflowException
+                // sites; the importer only builds unchecked ones.
+                if *overflow {
+                    return Err(CompileError::Unsupported("checked (ovf) conversion"));
+                }
+                let src = self.flatten_expr(arg, out, il)?;
+                let dst = self.temp(*to);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::Conv {
+                        dst,
+                        to: *to,
+                        overflow: *overflow,
+                        unsigned: *unsigned,
+                        src,
+                    },
+                );
+                Ok(lir::Operand::Temp(dst))
+            }
+            hir::Expr::NullCheck { .. } => {
+                Err(CompileError::Unsupported("null checks: not yet supported"))
+            }
+            hir::Expr::ArrLen { .. } | hir::Expr::ArrElemAddr { .. } => {
+                Err(CompileError::Unsupported("arrays: not yet supported"))
+            }
+            hir::Expr::Cast { .. } | hir::Expr::Box { .. } => {
+                Err(CompileError::Unsupported("cast/box: not yet supported"))
+            }
             hir::Expr::StructVal { .. } => {
-                Err(CompileError::Unsupported("structs: outside the fib subset"))
+                Err(CompileError::Unsupported("structs: not yet supported"))
             }
         }
     }
@@ -382,13 +403,13 @@ impl Flatten {
                 Self::push(out, IL_OFFSET_NONE, lir::StmtKind::Return { value });
             }
             hir::Terminator::Switch { .. } => {
-                return Err(CompileError::Unsupported("switch: outside the fib subset"));
+                return Err(CompileError::Unsupported("switch: not yet supported"));
             }
             hir::Terminator::Throw { .. }
             | hir::Terminator::Leave { .. }
             | hir::Terminator::EndFinally => {
                 return Err(CompileError::Unsupported(
-                    "EH control flow: outside the fib subset",
+                    "EH control flow: not yet supported",
                 ));
             }
         }
@@ -858,5 +879,153 @@ mod tests {
             &MockTarget,
         );
         assert!(m.is_ok());
+    }
+
+    // --- step_10.1: scalar-cheap pack flattening ---
+
+    /// `return <expr>` with one arg, no IL locals.
+    fn lower_ret(expr: hir::Expr) -> lir::Method {
+        lower_ok(method_with(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return { value: Some(expr) },
+        )))
+    }
+
+    #[test]
+    fn compare_as_value_produces_an_int32_temp() {
+        // return (arg0 < arg0): the Binary statement's temp is Int32 even
+        // though the operands are — the compare-result typing rule.
+        let m = lower_ret(hir::Expr::Binary {
+            op: BinaryOp::Lt,
+            lhs: Box::new(hir::Expr::Local(LocalId(0))),
+            rhs: Box::new(hir::Expr::Local(LocalId(0))),
+        });
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2);
+        match &stmts[0].kind {
+            lir::StmtKind::Binary { dst, op, .. } => {
+                assert_eq!(*op, BinaryOp::Lt);
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Int32);
+            }
+            _ => panic!("expected Binary"),
+        }
+        assert!(matches!(
+            stmts[1].kind,
+            lir::StmtKind::Return {
+                value: Some(lir::Operand::Temp(_))
+            }
+        ));
+    }
+
+    #[test]
+    fn logic_and_shift_ops_flatten_with_the_value_type() {
+        // and/or/xor/shl/shr/shr.un/div family all become Binary statements.
+        for op in [
+            BinaryOp::And,
+            BinaryOp::Or,
+            BinaryOp::Xor,
+            BinaryOp::Shl,
+            BinaryOp::Shr,
+            BinaryOp::UShr,
+            BinaryOp::Div,
+            BinaryOp::UDiv,
+            BinaryOp::URem,
+        ] {
+            let m = lower_ret(hir::Expr::Binary {
+                op,
+                lhs: Box::new(hir::Expr::Local(LocalId(0))),
+                rhs: Box::new(hir::Expr::Const(Const::Int32(1))),
+            });
+            match &m.blocks[0].stmts[0].kind {
+                lir::StmtKind::Binary { op: got, .. } => assert_eq!(*got, op),
+                _ => panic!("expected Binary for {op:?}"),
+            }
+        }
+        // A shift's result temp carries the *value* operand's type. With a
+        // 64-bit local the temp is Int64 even though the count is Int32.
+        let mut m = method_with(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Binary {
+                    op: BinaryOp::Shl,
+                    lhs: Box::new(hir::Expr::Local(LocalId(1))),
+                    rhs: Box::new(hir::Expr::Local(LocalId(0))),
+                }),
+            },
+        ));
+        m.locals
+            .push(local(Type::Int64, hir::LocalKind::IlLocal(0)));
+        m.num_il_locals = 1;
+        let m = lower_ok(m);
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::Binary { dst, .. } => {
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Int64)
+            }
+            _ => panic!("expected Binary"),
+        }
+    }
+
+    #[test]
+    fn unary_and_conv_flatten_to_their_statements() {
+        let m = lower_ret(hir::Expr::Unary {
+            op: crate::ir::UnaryOp::Neg,
+            arg: Box::new(hir::Expr::Local(LocalId(0))),
+        });
+        assert!(matches!(
+            m.blocks[0].stmts[0].kind,
+            lir::StmtKind::Unary {
+                op: crate::ir::UnaryOp::Neg,
+                ..
+            }
+        ));
+        // The neg temp takes the operand's type.
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::Unary { dst, .. } => {
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Int32)
+            }
+            _ => unreachable!(),
+        }
+
+        let m = lower_ret(hir::Expr::Conv {
+            to: Type::Int64,
+            overflow: false,
+            unsigned: true,
+            arg: Box::new(hir::Expr::Local(LocalId(0))),
+        });
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::Conv {
+                dst,
+                to,
+                overflow,
+                unsigned,
+                src,
+            } => {
+                assert_eq!(*to, Type::Int64);
+                assert!(!overflow && *unsigned);
+                assert_eq!(*src, lir::Operand::Local(LocalId(0)));
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Int64);
+            }
+            _ => panic!("expected Conv"),
+        }
+
+        // A checked conversion is rejected.
+        let m = lower(
+            method_with(block(
+                0,
+                Vec::new(),
+                hir::Terminator::Return {
+                    value: Some(hir::Expr::Conv {
+                        to: Type::Int32,
+                        overflow: true,
+                        unsigned: false,
+                        arg: Box::new(hir::Expr::Local(LocalId(0))),
+                    }),
+                },
+            )),
+            &MockTarget,
+        );
+        assert!(matches!(m, Err(CompileError::Unsupported(_))));
     }
 }
