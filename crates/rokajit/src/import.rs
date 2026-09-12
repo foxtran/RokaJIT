@@ -14,7 +14,10 @@
 //! boundary** — values crossing a boundary are legal IL but need temp
 //! materialization, which is a later step; they are rejected as
 //! `Unsupported` (so the ir-design stack-height invariant holds vacuously
-//! for everything the importer accepts).
+//! for everything the importer accepts). A value may, however, stay on
+//! the stack across a `stloc` *within* a block: a tree that references
+//! the store's destination observed the pre-store value, so `stloc`
+//! spills every such tree to a temp first (RyuJIT's `impSpillLclRefs`).
 //!
 //! EE queries consumed (via `&dyn EeInfo`): `resolve_token`,
 //! `get_call_info`, and signature walking (`get_arg_type`/`get_arg_next`,
@@ -46,7 +49,9 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
     check_call_conv(info.args.callConv)?;
 
     // The locals table: IL args (with `this` first when present), then the
-    // IL locals from the locals signature. Temps don't exist yet at import.
+    // IL locals from the locals signature. The importer appends its own
+    // temps (the stloc interference spill — see `BlockImport::stloc`) after
+    // the IL locals.
     let mut local_types = Vec::new();
     if info.args.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0 {
         // Class instance method: `this` is an object reference. (Value-type
@@ -69,7 +74,7 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
     let mut importer = BlockImport {
         ee,
         info,
-        local_types: &local_types,
+        local_types,
         num_args,
         num_il_locals,
         ret_ty,
@@ -91,14 +96,17 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         }
     }
 
-    let locals = local_types
+    let locals = importer
+        .local_types
         .iter()
         .enumerate()
         .map(|(i, &ty)| {
             let kind = if (i as u32) < num_args {
                 hir::LocalKind::IlArg(i as u32)
-            } else {
+            } else if (i as u32) < num_args + num_il_locals {
                 hir::LocalKind::IlLocal(i as u32 - num_args)
+            } else {
+                hir::LocalKind::Temp
             };
             hir::Local {
                 ty,
@@ -429,7 +437,9 @@ fn find_leaders(il: &[u8], insns: &[Insn]) -> CompileResult<Vec<u32>> {
 struct BlockImport<'a> {
     ee: &'a dyn EeInfo,
     info: &'a MethodInfo,
-    local_types: &'a [Type],
+    /// Types of the flat locals namespace (args, IL locals, then importer
+    /// temps — grown by [`BlockImport::temp`]).
+    local_types: Vec<Type>,
     num_args: u32,
     num_il_locals: u32,
     ret_ty: Type,
@@ -445,6 +455,37 @@ fn binary(op: BinaryOp, lhs: hir::Expr, rhs: hir::Expr) -> hir::Expr {
         op,
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
+    }
+}
+
+/// Does the tree read local `id` anywhere? Drives the stloc interference
+/// spill (`BlockImport::stloc`): a tree on the evaluation stack that
+/// references the store's destination must keep the pre-store value.
+fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
+    match expr {
+        hir::Expr::Const(_) | hir::Expr::StaticFieldAddr { .. } => false,
+        hir::Expr::Local(l) | hir::Expr::LocalAddr(l) => *l == id,
+        hir::Expr::Load { addr, .. } => references_local(addr, id),
+        hir::Expr::FieldAddr { obj, .. } => references_local(obj, id),
+        hir::Expr::Unary { arg, .. } => references_local(arg, id),
+        hir::Expr::Binary { lhs, rhs, .. } => {
+            references_local(lhs, id) || references_local(rhs, id)
+        }
+        hir::Expr::Conv { arg, .. } => references_local(arg, id),
+        hir::Expr::Call { target, args, .. } => {
+            let target_ref = match target {
+                CallTarget::Indirect(addr) => references_local(addr, id),
+                _ => false,
+            };
+            target_ref || args.iter().any(|a| references_local(a, id))
+        }
+        hir::Expr::NullCheck { arg } => references_local(arg, id),
+        hir::Expr::ArrLen { array } => references_local(array, id),
+        hir::Expr::ArrElemAddr { array, index, .. } => {
+            references_local(array, id) || references_local(index, id)
+        }
+        hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => references_local(arg, id),
+        hir::Expr::StructVal { addr, .. } => references_local(addr, id),
     }
 }
 
@@ -509,6 +550,48 @@ impl BlockImport<'_> {
             return Err(CompileError::BadIl("local index out of range"));
         }
         Ok(LocalId(self.num_args + index))
+    }
+
+    /// A fresh importer temp, after the IL locals in the flat namespace.
+    fn temp(&mut self, ty: Type) -> LocalId {
+        let id = LocalId(self.local_types.len() as u32);
+        self.local_types.push(ty);
+        id
+    }
+
+    /// `stloc`: the value pops normally, but any tree still on the stack
+    /// that references the destination loaded the local *before* this
+    /// store — ECMA-335 gives it the old value. Materialize every such
+    /// tree into a temp ahead of the store (RyuJIT's `impSpillLclRefs`,
+    /// importer.cpp:413), so the tree reads can't observe the new value.
+    fn stloc(
+        &mut self,
+        index: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let id = self.il_local_id(index)?;
+        let (ty, value) = self.pop()?;
+        if ty != self.local_types[id.0 as usize] {
+            return Err(CompileError::BadIl("stloc type mismatch"));
+        }
+        for i in 0..self.stack.len() {
+            let (entry_ty, _) = &self.stack[i];
+            let entry_ty = *entry_ty;
+            if references_local(&self.stack[i].1, id) {
+                let tmp = self.temp(entry_ty);
+                let value = std::mem::replace(&mut self.stack[i].1, hir::Expr::Local(tmp));
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store { dst: tmp, value },
+                });
+            }
+        }
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Store { dst: id, value },
+        });
+        Ok(())
     }
 
     fn branch(
@@ -656,17 +739,7 @@ impl BlockImport<'_> {
                     let id = self.il_local_id(u32::from(index))?;
                     self.push(self.local_types[id.0 as usize], hir::Expr::Local(id))?;
                 }
-                Op::StLoc(index) => {
-                    let id = self.il_local_id(u32::from(index))?;
-                    let (ty, value) = self.pop()?;
-                    if ty != self.local_types[id.0 as usize] {
-                        return Err(CompileError::BadIl("stloc type mismatch"));
-                    }
-                    stmts.push(hir::Stmt {
-                        il_offset,
-                        kind: hir::StmtKind::Store { dst: id, value },
-                    });
-                }
+                Op::StLoc(index) => self.stloc(u32::from(index), &mut stmts, il_offset)?,
                 Op::LdcI4(v) => self.push(Type::Int32, hir::Expr::Const(Const::Int32(v)))?,
                 Op::Add => self.arith(BinaryOp::Add)?,
                 Op::Sub => self.arith(BinaryOp::Sub)?,
@@ -893,6 +966,120 @@ mod tests {
 
         // Block 2: return n.
         assert_eq!(as_local(return_value(&m, 2)), LocalId(0));
+    }
+
+    // --- stloc interference spill (RyuJIT's impSpillLclRefs) ---
+
+    #[test]
+    fn stloc_spills_stack_trees_referencing_the_destination() {
+        // ldloc.0; ldloc.0; ldc.i4.1; add; stloc.0; ret — the first ldloc.0
+        // stays on the stack across the store to local 0. IL semantics give
+        // it the *pre-store* value, so the importer must snapshot it into a
+        // temp ahead of the store; the ret then returns the temp.
+        let il = [0x06, 0x06, 0x17, 0x58, 0x0A, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::Int]);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.blocks.len(), 1);
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "spill store, then the stloc itself");
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(1), "the spill temp follows the one IL local");
+        assert_eq!(as_local(value), LocalId(0));
+        let (dst, value) = store(&stmts[1]);
+        assert_eq!(dst, LocalId(0));
+        let (op, lhs, rhs) = as_binary(value);
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_local(lhs), LocalId(0));
+        assert_eq!(as_i32(rhs), 1);
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(1));
+        // The temp is in the locals table, typed and tagged like one.
+        assert_eq!(m.locals.len(), 2);
+        assert_eq!(m.locals[1].ty, Type::Int32);
+        assert_eq!(m.locals[1].kind, hir::LocalKind::Temp);
+    }
+
+    #[test]
+    fn stloc_without_interference_does_not_spill() {
+        // ldloc.1; ldloc.0; ldc.i4.1; add; stloc.0; ret — the value under
+        // the stloc references local 1, not the destination: no temp, no
+        // spill store.
+        let il = [0x07, 0x06, 0x17, 0x58, 0x0A, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Int, &[]),
+            &[CorInfoType::Int, CorInfoType::Int],
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.locals.len(), 2, "no temp created");
+        assert_eq!(m.blocks[0].stmts.len(), 1);
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(1));
+    }
+
+    /// The acceptance test for the step_08 FibLoop fix: the exact FibLoop
+    /// bytes (see tests/bin, `runtime/src/tests/JIT/CodeGenBringUpTests/
+    /// FibLoop.cs`) — an iterative loop whose body Roslyn compiles to an
+    /// eval-stack value (`curr + next`) live across `stloc.0`.
+    #[test]
+    fn fibloop_end_to_end() {
+        // 16 0A | 17 0B | 16 0C | 2B 0A | 06 07 58 07 0A 0B 08 17 58 0C |
+        // 08 02 32 F2 | 06 2A
+        // curr=0; next=1; i=0; br CHECK;
+        // LOOP: curr+next (stack); curr=next; next=<stack>; i++;
+        // CHECK: if (i < x) goto LOOP; return curr
+        let il = [
+            0x16, 0x0A, 0x17, 0x0B, 0x16, 0x0C, 0x2B, 0x0A, 0x06, 0x07, 0x58, 0x07, 0x0A, 0x0B,
+            0x08, 0x17, 0x58, 0x0C, 0x08, 0x02, 0x32, 0xF2, 0x06, 0x2A,
+        ];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Int, &[CorInfoType::Int]),
+            &[CorInfoType::Int, CorInfoType::Int, CorInfoType::Int],
+        );
+        let m = import(&info, &ee).expect("FibLoop imports");
+
+        // Locals: arg x, IL locals curr/next/i, then the spill temp.
+        assert_eq!(m.num_args, 1);
+        assert_eq!(m.num_il_locals, 3);
+        assert_eq!(m.locals.len(), 5);
+        assert_eq!(m.locals[4].kind, hir::LocalKind::Temp);
+        assert_eq!(m.blocks.len(), 4);
+
+        // Block 1 (the loop body): the add result must be snapshotted into
+        // the temp BEFORE curr is overwritten, then next takes the temp.
+        let stmts = &m.blocks[1].stmts;
+        assert_eq!(stmts.len(), 4);
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(4), "interference spill of curr+next");
+        let (op, lhs, rhs) = as_binary(value);
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_local(lhs), LocalId(1));
+        assert_eq!(as_local(rhs), LocalId(2));
+        assert_eq!(stmts[0].il_offset, IlOffset(0x0C), "the stloc.0 offset");
+        let (dst, value) = store(&stmts[1]);
+        assert_eq!(dst, LocalId(1), "curr = next");
+        assert_eq!(as_local(value), LocalId(2));
+        let (dst, value) = store(&stmts[2]);
+        assert_eq!(dst, LocalId(2), "next = the snapshotted sum");
+        assert_eq!(as_local(value), LocalId(4));
+        let (dst, value) = store(&stmts[3]);
+        assert_eq!(dst, LocalId(3), "i++");
+        let (op, _, _) = as_binary(value);
+        assert_eq!(op, BinaryOp::Add);
+
+        // Block 2: the backward conditional branch (blt.s -14) to block 1.
+        match &m.blocks[2].terminator {
+            hir::Terminator::Branch { cond, then, else_ } => {
+                let (op, lhs, rhs) = as_binary(cond);
+                assert_eq!(op, BinaryOp::Lt);
+                assert_eq!(as_local(lhs), LocalId(3));
+                assert_eq!(as_local(rhs), LocalId(0));
+                assert_eq!(*then, BlockId(1));
+                assert_eq!(*else_, BlockId(3));
+            }
+            _ => panic!("block 2: expected Branch"),
+        }
+        // Block 3: return curr.
+        assert_eq!(as_local(return_value(&m, 3)), LocalId(1));
     }
 
     #[test]

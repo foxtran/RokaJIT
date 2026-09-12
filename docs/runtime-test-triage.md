@@ -31,13 +31,12 @@ under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 25 |
-| MISMATCH | 1 |
+| MATCH | 26 |
 | CRASH | 519 |
 | TIMEOUT | 2 |
 | COMPILE_FAIL | 2734 |
 
-Of the MATCHes, 24 exit 100 (the CoreCLR pass
+Of the MATCHes, 25 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -90,6 +89,4 @@ RokaJIT failures with no `CompileError` marker in stderr — either
 silent-wrong-result bugs (MISMATCH with a clean run) or crashes the
 error model didn't classify. Each carries its stderr signature.
 
-| Test | Category | Detail | Stderr signature |
-| --- | --- | --- | --- |
-| `JIT/CodeGenBringUpTests/FibLoop.cs` | MISMATCH | ref=100 ours=255 | (no stderr output) |
+None.
