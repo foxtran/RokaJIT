@@ -31,12 +31,12 @@ under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 79 |
-| CRASH | 466 |
+| MATCH | 83 |
+| CRASH | 462 |
 | TIMEOUT | 2 |
 | COMPILE_FAIL | 2734 |
 
-Of the MATCHes, 78 exit 100 (the CoreCLR pass
+Of the MATCHes, 82 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -51,13 +51,13 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| unsupported IL opcode (importer) | 205 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/Array1.cs`<br>`JIT/CodeGenBringUpTests/Array2.cs`<br>`JIT/CodeGenBringUpTests/Array3.cs`<br>`JIT/CodeGenBringUpTests/Array4.cs`<br>… and 200 more |
-| non-direct calls (callvirt/calli) | 100 | `JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>`JIT/CodeGenBringUpTests/DblArea.cs`<br>`JIT/CodeGenBringUpTests/DblAvg2.cs`<br>… and 95 more |
+| unsupported IL opcode (importer) | 175 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/Array1.cs`<br>`JIT/CodeGenBringUpTests/Array2.cs`<br>`JIT/CodeGenBringUpTests/Array3.cs`<br>`JIT/CodeGenBringUpTests/Array4.cs`<br>… and 170 more |
+| non-direct calls (callvirt/calli) | 104 | `JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>`JIT/CodeGenBringUpTests/DblArea.cs`<br>`JIT/CodeGenBringUpTests/DblAvg2.cs`<br>… and 99 more |
 | EH (try/catch/finally) | 92 | `JIT/CodeGenBringUpTests/ArrayExc.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>`JIT/CodeGenBringUpTests/DivConst.cs`<br>`JIT/CodeGenBringUpTests/Localloc.cs`<br>`JIT/CodeGenBringUpTests/LocallocB_N_PSP.cs`<br>… and 87 more |
-| bad IL rejected by importer | 27 | `JIT/CodeGenBringUpTests/StaticCalls.cs`<br>`JIT/Regression_2/Runtime_53549/Runtime_53549.cs`<br>`JIT/Regression_2/Runtime_71118/Runtime_71118.cs`<br>`JIT/Regression_3/GitHub_65988/GitHub_65988.cs`<br>`JIT/jit64/gc/misc/struct1_4.cs`<br>… and 22 more |
-| field types outside the object pack | 23 | `JIT/Directed/LoopAlignment/LoopsToProcess.cs`<br>`JIT/Methodical/structs/StructStackParams.cs`<br>`JIT/Regression_2/Runtime_109269/Runtime_109269.cs`<br>`JIT/Regression_2/Runtime_110958/Runtime_110985.cs`<br>`JIT/Regression_2/Runtime_81725/Runtime_81725.cs`<br>… and 18 more |
-| generics | 17 | `JIT/Regression_2/Runtime_131285/Runtime_131285.cs`<br>`JIT/Regression_2/Runtime_133120/Runtime_133120.cs`<br>`JIT/Regression_2/Runtime_72926/Runtime_72926.cs`<br>`JIT/jit64/ebvts/cs/generics/generics/repro52.cs`<br>`JIT/opt/AssertionPropagation/DynBlkNullAssertions.cs`<br>… and 12 more |
-| newobj of a value class | 1 | `JIT/CodeGenBringUpTests/RecursiveTailCall.cs` |
+| newobj of a value class | 42 | `JIT/CodeGenBringUpTests/RecursiveTailCall.cs`<br>`JIT/Regression_2/Runtime_53549/Runtime_53549.cs`<br>`JIT/Regression_2/Runtime_71118/Runtime_71118.cs`<br>`JIT/Regression_3/GitHub_65988/GitHub_65988.cs`<br>`JIT/jit64/gc/misc/struct1_4.cs`<br>… and 37 more |
+| field types outside the object pack | 24 | `JIT/CodeGenBringUpTests/StructReturn.cs`<br>`JIT/Directed/LoopAlignment/LoopsToProcess.cs`<br>`JIT/Methodical/structs/StructStackParams.cs`<br>`JIT/Regression_2/Runtime_109269/Runtime_109269.cs`<br>`JIT/Regression_2/Runtime_110958/Runtime_110985.cs`<br>… and 19 more |
+| generics | 18 | `JIT/Regression_2/Runtime_131285/Runtime_131285.cs`<br>`JIT/Regression_2/Runtime_133120/Runtime_133120.cs`<br>`JIT/Regression_2/Runtime_72926/Runtime_72926.cs`<br>`JIT/jit64/ebvts/cs/generics/generics/repro52.cs`<br>`JIT/opt/AssertionPropagation/DynBlkNullAssertions.cs`<br>… and 13 more |
+| bad IL rejected by importer | 6 | `JIT/CodeGenBringUpTests/StaticCalls.cs`<br>`JIT/opt/Devirtualization/GitHub_10858.cs`<br>`JIT/opt/Inline/regression/bug595776/bug595776.cs`<br>`JIT/opt/Inline/tests/fact.cs`<br>`JIT/opt/OSR/tailrecurse.cs`<br>… and 1 more |
 | structs & value types | 1 | `JIT/Regression_2/Runtime_72506/Runtime_72506.cs` |
 
 ## COMPILE_FAIL by csc error class
@@ -84,7 +84,8 @@ entry shapes). Out of scope for triage; listed for the record.
 
 | Which JIT timed out | Tests |
 | --- | ---: |
-| ryujit | 2 |
+| ryujit | 1 |
+| ryujit,rokajit | 1 |
 
 ## Needs investigation
 

@@ -87,10 +87,15 @@ SUPPORTED = {
     0x71,                    # ldobj (step_10.9)
     0x72,                    # ldstr (step_10.3)
     0x73,                    # newobj (step_10.4)
+    0x74,                    # castclass (step_10.5)
+    0x75,                    # isinst (step_10.5)
+    0x79,                    # unbox (step_10.5)
     0x7B,                    # ldfld (step_10.4)
     0x7C,                    # ldflda (step_10.4)
     0x7D,                    # stfld (step_10.4)
     0x81,                    # stobj (step_10.9)
+    0x8C,                    # box (step_10.5)
+    0xA5,                    # unbox.any (step_10.5)
 }
 # Supported 0xFE-prefixed opcodes, by second byte (opcode.def):
 #   FE 01..05 = ceq, cgt, cgt.un, clt, clt.un

@@ -17,6 +17,9 @@ use crate::handles::{
 
 impl ClassQueries for MockEe {
     fn as_cor_info_type(&self, cls: ClassHandle) -> CorInfoType {
+        if let Some(&ty) = self.class_cor_info_types.get(&(cls.as_raw() as usize)) {
+            return ty;
+        }
         if self.classes.contains_key(&(cls.as_raw() as usize)) {
             CorInfoType::ValueClass
         } else {

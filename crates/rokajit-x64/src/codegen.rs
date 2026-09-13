@@ -1802,6 +1802,12 @@ impl<'a> Emitter<'a> {
 
     fn emit_lea(&mut self, dst: Place, addr: crate::inst::Amode) -> CompileResult<()> {
         let crate::inst::Amode::FrameSlot(l) = addr;
+        // The slot's address escapes through the `lea`: the addressed
+        // value must be in its slot NOW (a deferred const/register/alias
+        // tag would otherwise leak the slot's stale contents to the
+        // reader — the box-of-a-scalar bug, step_10.5).
+        let moves = self.vs.materialize(l);
+        self.apply(moves)?;
         let mem = self.slot_mem(self.layout.slots[l.0 as usize]);
         match dst {
             // A `lea` into an IL local/arg slot follows the store
@@ -4753,5 +4759,109 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Regression for the step_10.5 box-of-a-scalar bug: `t := 7` defers
+    /// to a `Loc::Const` tag, and the box helper call takes the temp's
+    /// ADDRESS (`AddrOf`) — the `lea` must first materialize the 7 into
+    /// the slot, or the helper copies stale slot bytes.
+    #[test]
+    fn lea_of_a_deferred_const_temp_materializes_the_value_first() {
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let m = method(
+            vec![
+                local(Type::Ref, LocalKind::IlLocal(0)),
+                local(Type::Int32, LocalKind::IlLocal(1)),
+                local(Type::Int32, LocalKind::Temp),
+                local(Type::Ref, LocalKind::Temp),
+                local(Type::ByRef, LocalKind::Temp),
+                local(Type::Int32, LocalKind::Temp),
+            ],
+            0,
+            2,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Copy {
+                        dst: LocalId(2),
+                        src: Operand::Const(Const::Int32(7)),
+                    }),
+                    stmt(StmtKind::Call {
+                        dst: Some(LocalId(3)),
+                        target: rokajit::ir::CallTarget::Helper(CorInfoHelpFunc::BOX),
+                        sig: CallSig {
+                            ret: Type::Ref,
+                            args: vec![Type::NativeInt, Type::ByRef],
+                            has_this: false,
+                        },
+                        args: vec![
+                            Operand::Const(Const::NativeInt(0x5000)),
+                            Operand::AddrOf(LocalId(2)),
+                        ],
+                    }),
+                    stmt(StmtKind::Copy {
+                        dst: LocalId(0),
+                        src: Operand::Temp(LocalId(3)),
+                    }),
+                    stmt(StmtKind::Call {
+                        dst: Some(LocalId(4)),
+                        target: rokajit::ir::CallTarget::Helper(CorInfoHelpFunc::UNBOX),
+                        sig: CallSig {
+                            ret: Type::ByRef,
+                            args: vec![Type::NativeInt, Type::Ref],
+                            has_this: false,
+                        },
+                        args: vec![
+                            Operand::Const(Const::NativeInt(0x5000)),
+                            Operand::Local(LocalId(0)),
+                        ],
+                    }),
+                    stmt(StmtKind::Load {
+                        dst: LocalId(5),
+                        addr: Operand::Temp(LocalId(4)),
+                        offset: 0,
+                        ty: Type::Int32,
+                    }),
+                    stmt(StmtKind::Copy {
+                        dst: LocalId(1),
+                        src: Operand::Temp(LocalId(5)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &ee);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x30, // subq $48, %rsp
+            0x48, 0xC7, 0x45, 0xF8, 0x00, 0x00, 0x00, 0x00, // movq $0, -8(%rbp)   — loc0 (Ref)
+            0xC7, 0x45, 0xF4, 0x00, 0x00, 0x00, 0x00, // movl $0, -12(%rbp)       — loc1
+            0x48, 0xC7, 0x45, 0xE8, 0x00, 0x00, 0x00, 0x00, // movq $0, -24(%rbp)  — Ref temp
+            0x48, 0xC7, 0x45, 0xE0, 0x00, 0x00, 0x00, 0x00, // movq $0, -32(%rbp)  — ByRef temp
+            0x48, 0xC7, 0xC7, 0x00, 0x50, 0x00, 0x00, // movq $0x5000, %rdi      — mt
+            0xB8, 0x07, 0x00, 0x00, 0x00, // movl $7, %eax        — the materialization
+            0x89, 0x45, 0xF0, // movl %eax, -16(%rbp)           — ...into the slot
+            0x48, 0x8D, 0x75, 0xF0, // leaq -16(%rbp), %rsi     — &temp
+            0xE8, 0, 0, 0, 0, // call rel32                    — BOX
+            0x48, 0x89, 0x45, 0xE8, // movq %rax, -24(%rbp)
+            0x48, 0x8B, 0x4D, 0xE8, // movq -24(%rbp), %rcx
+            0x48, 0x89, 0x4D, 0xF8, // movq %rcx, -8(%rbp)      — loc0 = box
+            0x48, 0xC7, 0xC7, 0x00, 0x50, 0x00, 0x00, // movq $0x5000, %rdi
+            0x48, 0x8B, 0x75, 0xF8, // movq -8(%rbp), %rsi      — the box
+            0xE8, 0, 0, 0, 0, // call rel32                    — UNBOX
+            0x48, 0x89, 0x45, 0xE0, // movq %rax, -32(%rbp)     — payload byref
+            0x48, 0x8B, 0x55, 0xE0, // movq -32(%rbp), %rdx
+            0x8B, 0x32, // movl (%rdx), %esi                   — the payload
+            0x89, 0x75, 0xF4, // movl %esi, -12(%rbp)
+            0x8B, 0x45, 0xF4, // movl -12(%rbp), %eax
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
     }
 }

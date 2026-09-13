@@ -31,6 +31,9 @@ impl Helpers for MockEe {
         _token: &ffi::CORINFO_RESOLVED_TOKEN,
         throwing: bool,
     ) -> CorInfoHelpFunc {
+        if let Some(h) = self.casting_helper {
+            return h;
+        }
         if throwing {
             CorInfoHelpFunc::CHKCASTANY
         } else {
@@ -39,7 +42,7 @@ impl Helpers for MockEe {
     }
 
     fn get_box_helper(&self, _cls: ClassHandle) -> CorInfoHelpFunc {
-        CorInfoHelpFunc::BOX
+        self.box_helper.unwrap_or(CorInfoHelpFunc::BOX)
     }
 
     fn get_function_entry_point(&self, ftn: MethodHandle) -> ffi::CORINFO_CONST_LOOKUP {
@@ -69,7 +72,7 @@ impl Helpers for MockEe {
     }
 
     fn get_un_box_helper(&self, _cls: ClassHandle) -> CorInfoHelpFunc {
-        CorInfoHelpFunc::UNBOX
+        self.unbox_helper.unwrap_or(CorInfoHelpFunc::UNBOX)
     }
 
     fn get_ready_to_run_helper(

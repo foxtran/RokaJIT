@@ -240,6 +240,76 @@ impl ValueState {
         moves
     }
 
+    /// Address exposure: `id`'s slot address is about to escape (a `lea`
+    /// names it, e.g. `box`'s data pointer or a `ldloca` use), so the
+    /// value must actually BE in its own slot — a deferred constant,
+    /// register value, or alias tag materializes now. (The box-of-a-
+    /// scalar path found this gap: `box 7` took the address of a temp
+    /// whose `7` was still a `Loc::Const` tag, and the helper copied
+    /// whatever the slot happened to hold.)
+    pub fn materialize(&mut self, id: LocalId) -> Vec<Move> {
+        let own = self.slot_of(id);
+        let mut moves = Vec::new();
+        match self.locs[id.0 as usize] {
+            Some(Loc::Reg(reg)) => {
+                self.occupants.remove(&reg);
+                moves.push(Move::Spill {
+                    reg,
+                    slot: own,
+                    ty: self.ty_of(id),
+                });
+            }
+            Some(Loc::Const(imm)) => {
+                let (reg, mut alloc) = self.take_scratch(&[]);
+                moves.append(&mut alloc);
+                moves.push(Move::Remat {
+                    imm,
+                    reg,
+                    ty: self.ty_of(id),
+                });
+                moves.push(Move::Spill {
+                    reg,
+                    slot: own,
+                    ty: self.ty_of(id),
+                });
+            }
+            Some(Loc::Local(l)) => {
+                let src = self.slot_of(l);
+                let (reg, mut alloc) = self.take_scratch(&[]);
+                moves.append(&mut alloc);
+                moves.push(Move::Reload {
+                    slot: src,
+                    ty: self.ty_of(id),
+                    reg,
+                });
+                moves.push(Move::Spill {
+                    reg,
+                    slot: own,
+                    ty: self.ty_of(id),
+                });
+            }
+            // A copy of a spilled temp aliases the source's slot; the
+            // escape needs the value in id's OWN slot.
+            Some(Loc::Mem(off)) if off != own => {
+                let (reg, mut alloc) = self.take_scratch(&[]);
+                moves.append(&mut alloc);
+                moves.push(Move::Reload {
+                    slot: off,
+                    ty: self.ty_of(id),
+                    reg,
+                });
+                moves.push(Move::Spill {
+                    reg,
+                    slot: own,
+                    ty: self.ty_of(id),
+                });
+            }
+            None | Some(Loc::Mem(_)) => return moves,
+        }
+        self.locs[id.0 as usize] = Some(Loc::Mem(own));
+        moves
+    }
+
     /// A fixed (ABI/architecture-pinned) register is about to be written:
     /// spill the temp it holds, if any.
     pub fn clobber(&mut self, reg: PhysReg) -> Vec<Move> {
@@ -505,6 +575,81 @@ mod tests {
         assert_eq!(vs.clobber(R1), vec![spill(R1, 4)]);
         assert_eq!(vs.read(LocalId(0)), ReadSrc::Slot(4));
         assert_eq!(vs.read(LocalId(1)), ReadSrc::Reg(R2));
+    }
+
+    /// step_10.5: address exposure (`lea` of a slot) must materialize a
+    /// deferred value into its own slot first — the box-of-a-scalar bug.
+    #[test]
+    fn materialize_flushes_a_deferred_constant_to_its_own_slot() {
+        let mut vs = state();
+        vs.define(LocalId(1), Loc::Const(7));
+        let moves = vs.materialize(LocalId(1));
+        assert_eq!(
+            moves,
+            vec![
+                Move::Remat {
+                    imm: 7,
+                    reg: R0,
+                    ty: Type::Int32
+                },
+                spill(R0, 8),
+            ]
+        );
+        assert_eq!(vs.read(LocalId(1)), ReadSrc::Slot(8));
+    }
+
+    #[test]
+    fn materialize_spills_a_register_value_to_its_own_slot() {
+        let mut vs = state();
+        vs.define(LocalId(2), Loc::Reg(R2));
+        let moves = vs.materialize(LocalId(2));
+        assert_eq!(moves, vec![spill(R2, 12)]);
+        assert_eq!(vs.read(LocalId(2)), ReadSrc::Slot(12));
+        // The freed register takes the next temp without a re-spill.
+        let moves = vs.define(LocalId(3), Loc::Reg(R2));
+        assert_eq!(moves, vec![]);
+    }
+
+    #[test]
+    fn materialize_copies_an_alias_into_its_own_slot() {
+        let mut vs = state();
+        vs.define(LocalId(2), Loc::Local(LocalId(0)));
+        let moves = vs.materialize(LocalId(2));
+        assert_eq!(
+            moves,
+            vec![
+                Move::Reload {
+                    slot: 4,
+                    ty: Type::Int32,
+                    reg: R0
+                },
+                spill(R0, 12),
+            ]
+        );
+        assert_eq!(vs.read(LocalId(2)), ReadSrc::Slot(12));
+    }
+
+    #[test]
+    fn materialize_an_already_frame_resident_value_is_a_noop() {
+        let mut vs = state();
+        assert_eq!(vs.materialize(LocalId(0)), vec![]);
+        // A copy of a spilled temp aliases the source's slot (Loc::Mem
+        // naming a slot that is NOT the value's own): the escape still
+        // copies it home.
+        vs.define(LocalId(3), Loc::Mem(4));
+        let moves = vs.materialize(LocalId(3));
+        assert_eq!(
+            moves,
+            vec![
+                Move::Reload {
+                    slot: 4,
+                    ty: Type::Int32,
+                    reg: R0
+                },
+                spill(R0, 16),
+            ]
+        );
+        assert_eq!(vs.read(LocalId(3)), ReadSrc::Slot(16));
     }
 
     #[test]

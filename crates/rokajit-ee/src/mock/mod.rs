@@ -129,6 +129,19 @@ pub struct MockEe {
     /// The canned `init_class` verdict (step_10.4). `EMPTY` is
     /// `CORINFO_INITCLASS_NOT_REQUIRED` (bit value 0) — the default.
     pub init_class_result: CorInfoInitClassResult,
+    /// Canned `get_box_helper`/`get_un_box_helper` verdicts (step_10.5);
+    /// `None` cans `CORINFO_HELP_BOX`/`CORINFO_HELP_UNBOX`.
+    pub box_helper: Option<CorInfoHelpFunc>,
+    pub unbox_helper: Option<CorInfoHelpFunc>,
+    /// Canned `get_casting_helper` override (step_10.5); `None` cans
+    /// CHKCASTANY (throwing) / ISINSTANCEOFANY.
+    pub casting_helper: Option<CorInfoHelpFunc>,
+    /// `as_cor_info_type` overrides keyed by the class handle's raw value
+    /// (step_10.5: canning a *primitive* class like System.Int32, which is
+    /// a value class whose CorInfoType is not VALUECLASS). Absent handles
+    /// keep the default (ValueClass if registered in `classes`, Class
+    /// otherwise).
+    pub class_cor_info_types: HashMap<usize, CorInfoType>,
     /// Canned directly-callable entry points for `get_function_entry_point`
     /// (step_07.5 codegen tests), keyed by the method handle's raw value.
     /// Absent handles get a zeroed lookup (`IAT_VALUE`, null address).

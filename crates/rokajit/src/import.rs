@@ -354,6 +354,20 @@ enum Op {
     StObj(u32),
     /// `initobj` — zero-init a value-type slot (type token).
     InitObj(u32),
+    /// `castclass` — throwing cast through the EE's casting helper (the
+    /// helper raises `InvalidCastException`; type token).
+    CastClass(u32),
+    /// `isinst` — null-producing cast through the EE's casting helper.
+    IsInst(u32),
+    /// `unbox` — boxed value to a byref to its payload (EE `UNBOX`
+    /// helper; type token).
+    Unbox(u32),
+    /// `box` — value to heap object through the EE's `BOX` helper (type
+    /// token); a no-op on a non-value class.
+    Box(u32),
+    /// `unbox.any` — boxed value to the value itself: `unbox` + `ldobj`
+    /// for a value class, `castclass` for anything else (type token).
+    UnboxAny(u32),
     Ret,
 }
 
@@ -554,10 +568,15 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x71 => Op::LdObj(r.u32()?),
             0x72 => Op::LdStr(r.u32()?),
             0x73 => Op::NewObj(r.u32()?),
+            0x74 => Op::CastClass(r.u32()?),
+            0x75 => Op::IsInst(r.u32()?),
+            0x79 => Op::Unbox(r.u32()?),
             0x7B => Op::LdFld(r.u32()?),
             0x7C => Op::LdFldA(r.u32()?),
             0x7D => Op::StFld(r.u32()?),
             0x81 => Op::StObj(r.u32()?),
+            0x8C => Op::Box(r.u32()?),
+            0xA5 => Op::UnboxAny(r.u32()?),
             0xFE => match r.u8()? {
                 0x01 => Op::Compare(BinaryOp::Eq),
                 0x02 => Op::Compare(BinaryOp::Gt),
@@ -1930,6 +1949,273 @@ impl BlockImport<'_> {
         self.push(Type::Ref, hir::Expr::Local(t_obj))
     }
 
+    /// Resolves a class metadata token for the box/cast opcodes. `kind`
+    /// is the token-kind hint `impResolveToken` sets (importer.cpp:
+    /// `CORINFO_TOKENKIND_Box` for `box`, `CORINFO_TOKENKIND_Casting` for
+    /// `castclass`/`isinst`, `CORINFO_TOKENKIND_Class` for the unbox
+    /// forms).
+    fn resolve_box_cast_class(
+        &mut self,
+        token: u32,
+        kind: ffi::CorInfoTokenKind,
+    ) -> CompileResult<(ffi::CORINFO_RESOLVED_TOKEN, ClassHandle)> {
+        let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+            t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+            t.tokenScope = self.info.args.scope;
+            t.token = token;
+            t.tokenType = kind;
+        });
+        self.ee.resolve_token(&mut resolved);
+        let Some(class) = ClassHandle::from_raw(resolved.hClass) else {
+            return Err(CompileError::BadIl("type token did not resolve to a class"));
+        };
+        Ok((resolved, class))
+    }
+
+    /// Embeds a class handle as a raw `NativeInt` constant (a MethodTable*
+    /// is not an object reference and is never GC-rooted as one — the
+    /// newobj rule); an indirection cell needs load/reloc plumbing tier 0
+    /// doesn't have.
+    fn embed_class_const(&mut self, class: ClassHandle) -> CompileResult<hir::Expr> {
+        let (embedded, indirection) = self.ee.embed_class_handle(class);
+        let (Some(class), None) = (embedded, indirection) else {
+            return Err(CompileError::Unsupported(
+                "class handle through an indirection cell",
+            ));
+        };
+        Ok(hir::Expr::Const(Const::NativeInt(class.as_raw() as isize)))
+    }
+
+    /// Pops the object operand of a cast/unbox: a reference (`null`
+    /// included).
+    fn pop_object(&mut self) -> CompileResult<hir::Expr> {
+        let (ty, obj) = self.pop()?;
+        if ty != Type::Ref {
+            return Err(CompileError::BadIl(
+                "cast/unbox operand must be a reference",
+            ));
+        }
+        Ok(obj)
+    }
+
+    /// `isinst` (0x75) / `castclass` (0x74): the EE picks the casting
+    /// helper (`getCastingHelper` — the ISINSTANCEOF*/CHKCAST* families,
+    /// all `(MethodTable*, Object*) -> Object*`), and the helper answers
+    /// the type test. `castclass` failure raises `InvalidCastException`
+    /// from the helper's own throwing path; nothing is open-coded.
+    fn cast(&mut self, token: u32, throwing: bool) -> CompileResult<()> {
+        let (resolved, class) =
+            self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Casting)?;
+        self.cast_from_resolved(&resolved, class, throwing)
+    }
+
+    /// The cast helper call on an already-resolved token; also the
+    /// non-value-class tail of `unbox.any` (the throwing form).
+    fn cast_from_resolved(
+        &mut self,
+        resolved: &ffi::CORINFO_RESOLVED_TOKEN,
+        class: ClassHandle,
+        throwing: bool,
+    ) -> CompileResult<()> {
+        let helper = self.ee.get_casting_helper(resolved, throwing);
+        if !matches!(
+            helper,
+            CorInfoHelpFunc::ISINSTANCEOFANY
+                | CorInfoHelpFunc::ISINSTANCEOFCLASS
+                | CorInfoHelpFunc::ISINSTANCEOFINTERFACE
+                | CorInfoHelpFunc::ISINSTANCEOFARRAY
+                | CorInfoHelpFunc::CHKCASTANY
+                | CorInfoHelpFunc::CHKCASTCLASS
+                | CorInfoHelpFunc::CHKCASTINTERFACE
+                | CorInfoHelpFunc::CHKCASTARRAY
+        ) {
+            return Err(CompileError::Unsupported(
+                "casting helper outside the isinst/castclass set",
+            ));
+        }
+        let mt = self.embed_class_const(class)?;
+        let obj = self.pop_object()?;
+        self.push(
+            Type::Ref,
+            hir::Expr::Call {
+                target: CallTarget::Helper(helper),
+                sig: CallSig {
+                    ret: Type::Ref,
+                    args: vec![Type::NativeInt, Type::Ref],
+                    has_this: false,
+                },
+                args: vec![mt, obj],
+            },
+        )
+    }
+
+    /// `box` (0x8C): allocate the box and copy the value through the EE's
+    /// `BOX` helper — `CastHelpers.Box(MethodTable*, ref byte)` —
+    /// never an inline allocate/copy sequence (tier 0: correct helper
+    /// selection, not reimplemented boxing). Boxing a non-value class is
+    /// the ECMA-335 no-op form (the reference passes through). The class
+    /// passed to the helper is `getTypeForBox`'s answer (boxing
+    /// `Nullable<T>` produces a boxed `T`).
+    fn box_(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let (_resolved, class) =
+            self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Box)?;
+        if !self.ee.is_value_class(class) {
+            // `box` of a reference type is a NOP (importer.cpp CEE_BOX).
+            let (ty, value) = self.pop()?;
+            if ty != Type::Ref {
+                return Err(CompileError::BadIl("box operand type mismatch"));
+            }
+            return self.push(Type::Ref, value);
+        }
+        let helper = self.ee.get_box_helper(class);
+        match helper {
+            CorInfoHelpFunc::BOX => {}
+            CorInfoHelpFunc::BOX_NULLABLE => {
+                return Err(CompileError::Unsupported("box of Nullable<T>"));
+            }
+            _ => {
+                return Err(CompileError::Unsupported("box helper outside the box set"));
+            }
+        }
+        let boxed = self.ee.get_type_for_box(class);
+        let mt = self.embed_class_const(boxed)?;
+
+        // The box operand pops first; the remaining pending stack trees
+        // then spill (IL order: they were produced before the operand),
+        // and only then does the operand's own temp store evaluate it —
+        // the stobj ordering pattern.
+        let (ty, value) = self.pop()?;
+        let expected = sig_elem_type(
+            Some(self.ee.as_cor_info_type(class)),
+            Some(class),
+            self.ee,
+            &mut self.struct_layouts,
+        )?;
+        if ty != expected {
+            return Err(CompileError::BadIl("box operand type mismatch"));
+        }
+        self.spill_stack(stmts, il_offset)?;
+        // The helper's second argument is the address of the value's
+        // bytes: a struct value IS its address (step_10.9), a scalar
+        // spills to a temp whose address is taken.
+        let addr = if let Type::Struct(class) = ty {
+            self.struct_addr_of(value, class, stmts, il_offset)
+        } else {
+            match value {
+                hir::Expr::Local(id) => hir::Expr::LocalAddr(id),
+                value => {
+                    let t = self.temp(ty);
+                    stmts.push(hir::Stmt {
+                        il_offset,
+                        kind: hir::StmtKind::Store { dst: t, value },
+                    });
+                    hir::Expr::LocalAddr(t)
+                }
+            }
+        };
+        self.push(
+            Type::Ref,
+            hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::BOX),
+                sig: CallSig {
+                    ret: Type::Ref,
+                    args: vec![Type::NativeInt, Type::ByRef],
+                    has_this: false,
+                },
+                args: vec![mt, addr],
+            },
+        )
+    }
+
+    /// The `CORINFO_HELP_UNBOX` call shared by `unbox` and `unbox.any`:
+    /// `CastHelpers.Unbox(MethodTable*, object) -> ref byte` — the EE
+    /// helper both checks the type (NullReferenceException /
+    /// InvalidCastException from its own throwing paths) and computes the
+    /// payload address, so the boxed-value layout offset is never
+    /// materialized JIT-side.
+    fn unbox_payload_call(&mut self, class: ClassHandle) -> CompileResult<hir::Expr> {
+        let helper = self.ee.get_un_box_helper(class);
+        match helper {
+            CorInfoHelpFunc::UNBOX => {}
+            CorInfoHelpFunc::UNBOX_NULLABLE => {
+                return Err(CompileError::Unsupported("unbox of Nullable<T>"));
+            }
+            _ => {
+                return Err(CompileError::Unsupported(
+                    "unbox helper outside the unbox set",
+                ));
+            }
+        }
+        let mt = self.embed_class_const(class)?;
+        let obj = self.pop_object()?;
+        Ok(hir::Expr::Call {
+            target: CallTarget::Helper(CorInfoHelpFunc::UNBOX),
+            sig: CallSig {
+                ret: Type::ByRef,
+                args: vec![Type::NativeInt, Type::Ref],
+                has_this: false,
+            },
+            args: vec![mt, obj],
+        })
+    }
+
+    /// `unbox` (0x79): the boxed value's payload address, an interior
+    /// `ByRef`. The temp the result lands in is a frame-resident byref
+    /// slot — reported in the GC slot table with the interior flag
+    /// (step_10.3/10.4's untracked-root mechanism), which both keeps the
+    /// box alive and re-bases the pointer if the GC moves it.
+    fn unbox(&mut self, token: u32) -> CompileResult<()> {
+        let (_resolved, class) =
+            self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
+        if !self.ee.is_value_class(class) {
+            return Err(CompileError::BadIl("unbox of a non-value class"));
+        }
+        let payload = self.unbox_payload_call(class)?;
+        self.push(Type::ByRef, payload)
+    }
+
+    /// `unbox.any` (0xA5): for a value class, `unbox` followed by the
+    /// `ldobj` read of the payload (the struct copy semantics of
+    /// step_10.9 apply through `StructVal`); for anything else it is
+    /// exactly `castclass` (importer.cpp CEE_UNBOX_ANY).
+    fn unbox_any(&mut self, token: u32) -> CompileResult<()> {
+        let (resolved, class) =
+            self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
+        if !self.ee.is_value_class(class) {
+            return self.cast_from_resolved(&resolved, class, true);
+        }
+        let ty = sig_elem_type(
+            Some(self.ee.as_cor_info_type(class)),
+            Some(class),
+            self.ee,
+            &mut self.struct_layouts,
+        )?;
+        let payload = self.unbox_payload_call(class)?;
+        if let Type::Struct(class) = ty {
+            self.push(
+                ty,
+                hir::Expr::StructVal {
+                    addr: Box::new(payload),
+                    class,
+                },
+            )
+        } else {
+            self.push(
+                ty,
+                hir::Expr::Load {
+                    addr: Box::new(payload),
+                    offset: 0,
+                    ty,
+                },
+            )
+        }
+    }
+
     /// Imports the instructions of block `b` (leader `leaders[b]`). The
     /// stack starts empty — a later pass over `expected_depth` proves that
     /// assumption against every predecessor, so any leftover from the
@@ -2027,6 +2313,11 @@ impl BlockImport<'_> {
                 Op::LdObj(token) => self.ldobj(token)?,
                 Op::StObj(token) => self.stobj(token, &mut stmts, il_offset)?,
                 Op::InitObj(token) => self.initobj(token, &mut stmts, il_offset)?,
+                Op::CastClass(token) => self.cast(token, true)?,
+                Op::IsInst(token) => self.cast(token, false)?,
+                Op::Unbox(token) => self.unbox(token)?,
+                Op::Box(token) => self.box_(token, &mut stmts, il_offset)?,
+                Op::UnboxAny(token) => self.unbox_any(token)?,
                 Op::Br { target } => {
                     self.note_depth(target, self.stack.len())?;
                     terminator = Some(hir::Terminator::Jump {
@@ -2702,9 +2993,10 @@ mod tests {
 
     #[test]
     fn unknown_opcodes_are_unsupported() {
-        // castclass, an undefined single byte, an unsupported 0xFE form.
+        // cpobj's byte neighbor, an undefined single byte, an unsupported
+        // 0xFE form.
         for il in [
-            &[0x74, 0x01, 0x00, 0x00, 0x06, 0x2A][..],
+            &[0x77, 0x2A][..],
             &[0xFF, 0x2A][..],
             &[0xFE, 0x17, 0x2A][..],
         ] {
@@ -4401,5 +4693,312 @@ mod tests {
         assert_eq!(dst, LocalId(1));
         let (addr, _) = as_struct_val(value);
         assert_eq!(as_local_addr(addr), LocalId(0));
+    }
+
+    // --- step_10.5: box / unbox / unbox.any / isinst / castclass ---
+
+    const BOX_CLASS_TOKEN: u32 = 0x0200_0007;
+
+    /// A MockEe with one registered class under BOX_CLASS_TOKEN.
+    /// `value_class`: registered in `classes` (a value class) or not (a
+    /// plain reference type stand-in). `cor_info_type` overrides
+    /// `as_cor_info_type` (a *primitive* value class like System.Int32).
+    fn box_ee(value_class: bool, cor_info_type: Option<CorInfoType>) -> (MockEe, ClassHandle) {
+        let mut ee = MockEe::default();
+        let class = if value_class {
+            ee.add_class(8, 8, &[], None)
+        } else {
+            // A reference-type stand-in: a non-null handle the `classes`
+            // map doesn't know.
+            ClassHandle::from_raw(0x7000usize as ffi::CORINFO_CLASS_HANDLE).unwrap()
+        };
+        if let Some(ty) = cor_info_type {
+            ee.class_cor_info_types.insert(class.as_raw() as usize, ty);
+        }
+        ee.class_tokens.insert(BOX_CLASS_TOKEN, class);
+        (ee, class)
+    }
+
+    fn tok(token: u32) -> [u8; 4] {
+        token.to_le_bytes()
+    }
+
+    /// Extracts (helper, sig, args) from a call expression.
+    fn as_helper_call(e: &hir::Expr) -> (CorInfoHelpFunc, &CallSig, &[hir::Expr]) {
+        match e {
+            hir::Expr::Call {
+                target: CallTarget::Helper(h),
+                sig,
+                args,
+            } => (*h, sig, args),
+            _ => panic!("expected a helper call"),
+        }
+    }
+
+    fn assert_mt_first(args: &[hir::Expr]) {
+        assert_eq!(args.len(), 2);
+        assert!(
+            matches!(args[0], hir::Expr::Const(Const::NativeInt(_))),
+            "the class handle is a raw pointer constant, never a Ref"
+        );
+    }
+
+    #[test]
+    fn box_of_a_primitive_class_calls_the_box_helper() {
+        // ldc.i4.7; box C(int-like); pop; ldc.i4.0; ret — the value spills
+        // to a temp and the helper gets its address.
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [0x1D, 0x8C, t[0], t[1], t[2], t[3], 0x26, 0x16, 0x2A];
+        let (mut ee, _c) = box_ee(true, Some(CorInfoType::Int));
+        let entry = sig(CorInfoType::Int, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        // The value store, then the Eval of the box call (pop must_eval).
+        assert_eq!(stmts.len(), 2);
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(m.locals[dst.0 as usize].ty, Type::Int32);
+        assert_eq!(as_i32(value), 7);
+        match &stmts[1].kind {
+            hir::StmtKind::Eval(call) => {
+                let (helper, sig, args) = as_helper_call(call);
+                assert_eq!(helper, CorInfoHelpFunc::BOX);
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::Ref,
+                        args: vec![Type::NativeInt, Type::ByRef],
+                        has_this: false,
+                    }
+                );
+                assert_mt_first(args);
+                assert!(
+                    matches!(args[1], hir::Expr::LocalAddr(id) if id == dst),
+                    "the helper gets the address of the spilled value"
+                );
+            }
+            _ => panic!("expected the box helper Eval"),
+        }
+    }
+
+    #[test]
+    fn box_of_a_struct_passes_the_value_address() {
+        // ldloca.0; ldobj C; box C; pop; ret — no extra copy: the struct
+        // value's own address goes to the helper.
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [
+            0x12, 0x00, 0x71, t[0], t[1], t[2], t[3], 0x8C, t[0], t[1], t[2], t[3], 0x26, 0x2A,
+        ];
+        let (mut ee, c) = box_ee(true, None);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[CorInfoType::ValueClass], &[Some(c)]);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "only the box Eval");
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(call) => {
+                let (helper, _, args) = as_helper_call(call);
+                assert_eq!(helper, CorInfoHelpFunc::BOX);
+                assert!(
+                    matches!(args[1], hir::Expr::LocalAddr(id) if id == LocalId(0)),
+                    "the struct local's address"
+                );
+            }
+            _ => panic!("expected the box helper Eval"),
+        }
+    }
+
+    #[test]
+    fn box_of_a_reference_class_is_a_nop() {
+        // ldnull; box C(ref); ret-int path: the reference passes through.
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [0x14, 0x8C, t[0], t[1], t[2], t[3], 0x26, 0x16, 0x2A];
+        let (mut ee, _c) = box_ee(false, None);
+        let entry = sig(CorInfoType::Int, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(
+            m.blocks[0].stmts.is_empty(),
+            "box of a ref class emits nothing (pop of null is pure)"
+        );
+    }
+
+    #[test]
+    fn box_of_nullable_is_unsupported() {
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [
+            0x12, 0x00, 0x71, t[0], t[1], t[2], t[3], 0x8C, t[0], t[1], t[2], t[3], 0x26, 0x2A,
+        ];
+        let (mut ee, c) = box_ee(true, None);
+        ee.box_helper = Some(CorInfoHelpFunc::BOX_NULLABLE);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[CorInfoType::ValueClass], &[Some(c)]);
+        let err = import(&info, &ee).err().expect("box of Nullable<T>");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("Nullable")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn unbox_pushes_the_payload_byref_call() {
+        // ldnull; unbox C; pop; ret.
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [0x14, 0x79, t[0], t[1], t[2], t[3], 0x26, 0x2A];
+        let (mut ee, _c) = box_ee(true, None);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(call) => {
+                let (helper, sig, args) = as_helper_call(call);
+                assert_eq!(helper, CorInfoHelpFunc::UNBOX);
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::ByRef,
+                        args: vec![Type::NativeInt, Type::Ref],
+                        has_this: false,
+                    }
+                );
+                assert_mt_first(args);
+                assert!(matches!(args[1], hir::Expr::Const(Const::NullRef)));
+            }
+            _ => panic!("expected the unbox helper Eval"),
+        }
+    }
+
+    #[test]
+    fn unbox_any_of_a_primitive_loads_through_the_payload_byref() {
+        // ldnull; unbox.any C(int-like); pop; ret.
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [0x14, 0xA5, t[0], t[1], t[2], t[3], 0x26, 0x2A];
+        let (mut ee, _c) = box_ee(true, Some(CorInfoType::Int));
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        // pop of a Load must_eval: one Eval of a Load through the unbox
+        // call's byref.
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Load { addr, offset, ty }) => {
+                assert_eq!(*offset, 0);
+                assert_eq!(*ty, Type::Int32);
+                let (helper, _, _) = as_helper_call(addr);
+                assert_eq!(helper, CorInfoHelpFunc::UNBOX);
+            }
+            _ => panic!("expected Eval(Load through the unbox byref)"),
+        }
+    }
+
+    #[test]
+    fn unbox_any_of_a_struct_is_a_struct_val_of_the_payload() {
+        // ldnull; unbox.any C; stloc.0; ret — the store block-copies out
+        // of the box payload.
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [0x14, 0xA5, t[0], t[1], t[2], t[3], 0x0A, 0x2A];
+        let (mut ee, c) = box_ee(true, None);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[CorInfoType::ValueClass], &[Some(c)]);
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(m.locals[dst.0 as usize].ty, Type::Struct(c));
+        let (addr, class) = as_struct_val(value);
+        assert_eq!(class, c);
+        let (helper, _, _) = as_helper_call(addr);
+        assert_eq!(helper, CorInfoHelpFunc::UNBOX);
+    }
+
+    #[test]
+    fn unbox_any_of_a_reference_class_is_castclass() {
+        // ldnull; unbox.any C(ref); pop; ret.
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [0x14, 0xA5, t[0], t[1], t[2], t[3], 0x26, 0x2A];
+        let (mut ee, _c) = box_ee(false, None);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(call) => {
+                let (helper, sig, _) = as_helper_call(call);
+                assert_eq!(helper, CorInfoHelpFunc::CHKCASTANY);
+                assert_eq!(sig.ret, Type::Ref);
+            }
+            _ => panic!("expected the cast helper Eval"),
+        }
+    }
+
+    #[test]
+    fn unbox_of_nullable_is_unsupported() {
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [0x14, 0x79, t[0], t[1], t[2], t[3], 0x26, 0x2A];
+        let (mut ee, _c) = box_ee(true, None);
+        ee.unbox_helper = Some(CorInfoHelpFunc::UNBOX_NULLABLE);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let err = import(&info, &ee).err().expect("unbox of Nullable<T>");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("Nullable")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn isinst_uses_the_null_producing_helper() {
+        // ldnull; isinst C; pop; ret.
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [0x14, 0x75, t[0], t[1], t[2], t[3], 0x26, 0x2A];
+        let (mut ee, _c) = box_ee(false, None);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(call) => {
+                let (helper, sig, args) = as_helper_call(call);
+                assert_eq!(helper, CorInfoHelpFunc::ISINSTANCEOFANY);
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::Ref,
+                        args: vec![Type::NativeInt, Type::Ref],
+                        has_this: false,
+                    }
+                );
+                assert_mt_first(args);
+            }
+            _ => panic!("expected the isinst helper Eval"),
+        }
+    }
+
+    #[test]
+    fn castclass_uses_the_throwing_helper() {
+        // ldnull; castclass C; pop; ret.
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [0x14, 0x74, t[0], t[1], t[2], t[3], 0x26, 0x2A];
+        let (mut ee, _c) = box_ee(false, None);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(call) => {
+                let (helper, _, _) = as_helper_call(call);
+                assert_eq!(helper, CorInfoHelpFunc::CHKCASTANY);
+            }
+            _ => panic!("expected the castclass helper Eval"),
+        }
+    }
+
+    #[test]
+    fn an_out_of_set_casting_helper_is_unsupported() {
+        let t = tok(BOX_CLASS_TOKEN);
+        let il = [0x14, 0x74, t[0], t[1], t[2], t[3], 0x26, 0x2A];
+        let (mut ee, _c) = box_ee(false, None);
+        ee.casting_helper = Some(CorInfoHelpFunc::CHKCASTCLASS_SPECIAL);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let err = import(&info, &ee).err().expect("helper outside the set");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("casting helper")),
+            "{err:?}"
+        );
     }
 }
