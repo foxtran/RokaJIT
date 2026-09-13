@@ -166,6 +166,15 @@ pub struct MockEe {
     /// Canned EH clauses returned by `get_eh_info` by index (10.6). Empty
     /// keeps the old behavior (a zeroed clause).
     pub eh_clauses: Vec<ffi::CORINFO_EH_CLAUSE>,
+    /// The canned `get_token_type_as_handle` answer (step_10.10 `ldtoken`):
+    /// the RuntimeTypeHandle/RuntimeMethodHandle/RuntimeFieldHandle
+    /// stand-in class.
+    pub token_type_class: Option<ClassHandle>,
+    /// `embed_generic_handle` rejection forms (step_10.10): can a
+    /// generic-context runtime lookup or an indirection-cell answer. The
+    /// default is a direct, token-deterministic IAT_VALUE handle.
+    pub embed_runtime_lookup: bool,
+    pub embed_indirection: bool,
     /// Sink calls observed, newest last, as "(kind, detail)" strings.
     pub sink_log: RefCell<Vec<String>>,
     /// Buffers handed out by the fake `alloc_mem`/`alloc_gc_info`, kept

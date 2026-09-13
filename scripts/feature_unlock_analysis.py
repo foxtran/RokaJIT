@@ -97,6 +97,7 @@ SUPPORTED = {
     0x81,                    # stobj (step_10.9)
     0x8C,                    # box (step_10.5)
     0xA5,                    # unbox.any (step_10.5)
+    0xD0,                    # ldtoken (step_10.10)
     0xDC,                    # endfinally (step_10.6)
     0xDD,                    # leave (step_10.6)
     0xDE,                    # leave.s (step_10.6)
@@ -106,7 +107,8 @@ SUPPORTED = {
 #   FE 09 = ldarg, FE 0A = ldarga, FE 0B = starg
 #   FE 0C = ldloc, FE 0D = ldloca, FE 0E = stloc
 #   FE 15 = initobj (step_10.9)
-SUPPORTED_FE = {0x01, 0x02, 0x03, 0x04, 0x05, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x15}
+#   FE 1C = sizeof (step_10.10)
+SUPPORTED_FE = {0x01, 0x02, 0x03, 0x04, 0x05, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x15, 0x1C}
 
 # --- IL linear-scan operand-size tables -------------------------------------
 # Operand sizes for opcodes the scanner may encounter; anything not listed

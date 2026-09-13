@@ -2692,6 +2692,77 @@ mod tests {
     }
 
     #[test]
+    fn helper_call_with_a_struct_return_stores_the_eightbyte() {
+        // step_10.10: the ldtoken conversion helper — (native int) -> a
+        // one-eightbyte struct (RuntimeTypeHandle). The raw handle
+        // constant goes to rdi; the rax result stores into the struct
+        // slot, like any register-passed struct return.
+        let c = rokajit_ee::handles::ClassHandle::from_raw(0x9008 as *mut u8 as _).unwrap();
+        let mut layouts = StructLayouts::new();
+        layouts.insert(
+            c,
+            rokajit::structs::StructLayout {
+                size: 8,
+                align: 8,
+                gc_cells: vec![],
+                sysv: rokajit::structs::SysVPass {
+                    passed_in_registers: true,
+                    count: 1,
+                    classes: [
+                        rokajit::structs::SysVClass::IntegerRef,
+                        rokajit::structs::SysVClass::Integer,
+                    ],
+                    sizes: [8, 0],
+                    offsets: [0, 0],
+                },
+            },
+        );
+        let locals = vec![
+            hir::Local {
+                ty: Type::NativeInt,
+                kind: hir::LocalKind::Temp,
+                pinned: false,
+            },
+            hir::Local {
+                ty: Type::Struct(c),
+                kind: hir::LocalKind::Temp,
+                pinned: false,
+            },
+        ];
+        let s = stmt(StmtKind::Call {
+            dst: Some(LocalId(1)),
+            target: CallTarget::Helper(
+                rokajit_ee::enums::CorInfoHelpFunc::TYPEHANDLE_TO_RUNTIMETYPEHANDLE,
+            ),
+            sig: rokajit::ir::CallSig {
+                ret: Type::Struct(c),
+                args: vec![Type::NativeInt],
+                has_this: false,
+            },
+            args: vec![Operand::Local(LocalId(0))],
+        });
+        assert_eq!(
+            lower_stmt(&s, &Cx::new(&locals, &layouts)),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W64,
+                    dst: Place::Reg(Gpr::Rdi),
+                    src: vsrc(0),
+                },
+                Inst::CallHelper {
+                    id: rokajit_ee::enums::CorInfoHelpFunc::TYPEHANDLE_TO_RUNTIMETYPEHANDLE,
+                },
+                Inst::StoreEightbyte {
+                    local: LocalId(1),
+                    offset: 0,
+                    size: 8,
+                    src: crate::inst::EbReg::Gpr(Gpr::Rax),
+                },
+            ])
+        );
+    }
+
+    #[test]
     fn mixed_signature_call_interleaves_the_register_classes() {
         // (int, double, float, long) -> int: rdi, xmm0, xmm1, rsi.
         let sig = rokajit::ir::CallSig {

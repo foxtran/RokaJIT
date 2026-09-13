@@ -55,7 +55,7 @@ impl TokensAndSignatures for MockEe {
         &self,
         _token: &ffi::CORINFO_RESOLVED_TOKEN,
     ) -> Option<ClassHandle> {
-        None
+        self.token_type_class
     }
 
     fn get_string_literal(
@@ -142,11 +142,35 @@ impl TokensAndSignatures for MockEe {
 
     fn embed_generic_handle(
         &self,
-        _token: &mut ffi::CORINFO_RESOLVED_TOKEN,
+        token: &mut ffi::CORINFO_RESOLVED_TOKEN,
         _embed_parent: bool,
         _caller: MethodHandle,
     ) -> ffi::CORINFO_GENERICHANDLE_RESULT {
-        unsafe { std::mem::zeroed() }
+        // A canned direct embedding (step_10.10): token-deterministic
+        // handle constant, no runtime lookup, handle kind from the
+        // resolved token's handles. The `embed_*` flags switch to the
+        // rejection forms (runtime lookup / indirection cell).
+        let mut result: ffi::CORINFO_GENERICHANDLE_RESULT = unsafe { std::mem::zeroed() };
+        result.handleType = if !token.hMethod.is_null() {
+            ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_METHOD
+        } else if !token.hField.is_null() {
+            ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_FIELD
+        } else {
+            ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_CLASS
+        };
+        let handle = (0x7A7A_0000usize + token.token as usize) as ffi::CORINFO_GENERIC_HANDLE;
+        result.compileTimeHandle = handle;
+        result.lookup.lookupKind.needsRuntimeLookup = self.embed_runtime_lookup;
+        let mut const_lookup: ffi::CORINFO_CONST_LOOKUP = unsafe { std::mem::zeroed() };
+        if self.embed_indirection {
+            const_lookup.accessType = ffi::InfoAccessType_IAT_PVALUE;
+            const_lookup.__bindgen_anon_1.addr = handle as *mut c_void;
+        } else {
+            const_lookup.accessType = ffi::InfoAccessType_IAT_VALUE;
+            const_lookup.__bindgen_anon_1.handle = handle;
+        }
+        result.lookup.__bindgen_anon_1.constLookup = const_lookup;
+        result
     }
 
     fn get_location_of_this_type(&self, _context: MethodHandle) -> ffi::CORINFO_LOOKUP_KIND {

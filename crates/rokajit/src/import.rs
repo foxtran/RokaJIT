@@ -38,7 +38,13 @@
 //! exception object ([`hir::Expr::CatchArg`]), and a `leave` that crosses
 //! finally handlers becomes a chain of step blocks ending in
 //! [`hir::Terminator::CallFinally`] hops. Filter and fault clauses and
-//! `rethrow`/`endfilter` are Unsupported. Anything else is
+//! `rethrow`/`endfilter` are Unsupported. The step_10.10 pack adds
+//! `ldtoken` (the token's raw handle embedded via `embed_generic_handle`
+//! — IAT_VALUE only — and converted to the RuntimeTypeHandle/
+//! RuntimeMethodHandle/RuntimeFieldHandle struct through the
+//! TYPEHANDLE_TO_*/METHODDESC_TO_*/FIELDDESC_TO_* helper family) and
+//! `sizeof` (a JIT-time constant fold of `get_class_size`). Anything else
+//! is
 //! [`CompileError::Unsupported`]; malformed IL is
 //! [`CompileError::BadIl`]. The importer never panics: every operand read
 //! is bounds-checked.
@@ -60,7 +66,8 @@
 //! `get_call_info`, `construct_string_literal` (for `ldstr`), the field
 //! queries (`get_field_offset`/`get_field_type`/`is_field_static`),
 //! `embed_class_handle`, `init_class`, and `get_new_helper` (the object
-//! pack), and
+//! pack), `embed_generic_handle`/`get_token_type_as_handle` (ldtoken) and
+//! `get_class_size` (sizeof), and
 //! signature walking (`get_arg_type`/`get_arg_next`,
 //! bounded by `numArgs` — the real EE's `getArgNext` never returns null, so
 //! stepping past `numArgs` walks off the signature blob). The entry
@@ -394,6 +401,10 @@ enum Op {
     LdcR8(f64),
     /// `ldstr` — a metadata string token (0x70xxxxxx, the #US heap).
     LdStr(u32),
+    /// `ldtoken` — push the RuntimeHandle struct for a metadata token
+    /// (type, method, or field); the raw EE handle converts through the
+    /// TYPEHANDLE_TO_* helper family (step_10.10).
+    LdToken(u32),
     LdNull,
     Dup,
     Pop,
@@ -448,6 +459,9 @@ enum Op {
     StObj(u32),
     /// `initobj` — zero-init a value-type slot (type token).
     InitObj(u32),
+    /// `sizeof` — the type's unmanaged size, a JIT-time constant fold of
+    /// the EE's `getClassSize` (step_10.10).
+    SizeOf(u32),
     /// `castclass` — throwing cast through the EE's casting helper (the
     /// helper raises `InvalidCastException`; type token).
     CastClass(u32),
@@ -681,6 +695,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x81 => Op::StObj(r.u32()?),
             0x8C => Op::Box(r.u32()?),
             0xA5 => Op::UnboxAny(r.u32()?),
+            0xD0 => Op::LdToken(r.u32()?),
             0xDC => Op::EndFinally,
             0xDD => {
                 let d = r.i32()?;
@@ -711,6 +726,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                 }
                 0x15 => Op::InitObj(r.u32()?),
                 0x1A => return Err(CompileError::Unsupported("rethrow")),
+                0x1C => Op::SizeOf(r.u32()?),
                 _ => {
                     return Err(CompileError::Unsupported(
                         "0xFE-prefixed opcode outside the supported set",
@@ -1881,6 +1897,112 @@ impl BlockImport<'_> {
         }
     }
 
+    /// `ldtoken` (0xD0, step_10.10): push the RuntimeTypeHandle /
+    /// RuntimeMethodHandle / RuntimeFieldHandle struct for a metadata
+    /// token. RyuJIT's CEE_LDTOKEN shape (importer.cpp:10616): resolve
+    /// with the Ldtoken kind hint, embed the raw EE handle through
+    /// `embedGenericHandle`, and convert it to the managed handle struct
+    /// through the TYPEHANDLE_TO_*/METHODDESC_TO_*/FIELDDESC_TO_* helper
+    /// (jithelpers.h:238-240 — CoreCLR's handle structs wrap a managed
+    /// object, so the helper call is where the RuntimeType comes from),
+    /// returned in `rax` like any one-eightbyte struct. A generic-context
+    /// runtime lookup is the shared-generics step; an indirection cell
+    /// needs load/reloc plumbing tier 0 doesn't have (the ldstr/newobj
+    /// policy — the EE decides, we follow).
+    fn ldtoken(&mut self, token: u32) -> CompileResult<()> {
+        let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+            t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+            t.tokenScope = self.info.args.scope;
+            t.token = token;
+            t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Ldtoken;
+        });
+        self.ee.resolve_token(&mut resolved);
+        // The handle struct's class — RyuJIT's `gtRetClsHnd`
+        // (getTokenTypeAsHandle answers RuntimeTypeHandle /
+        // RuntimeMethodHandle / RuntimeFieldHandle according to which of
+        // the resolved handles is set, jitinterface.cpp:556).
+        let Some(handle_class) = self.ee.get_token_type_as_handle(&resolved) else {
+            return Err(CompileError::BadIl("ldtoken token did not resolve"));
+        };
+        let result = self
+            .ee
+            .embed_generic_handle(&mut resolved, false, self.info.ftn);
+        if result.lookup.lookupKind.needsRuntimeLookup {
+            return Err(CompileError::Unsupported(
+                "ldtoken with a generic-context runtime lookup",
+            ));
+        }
+        // !needsRuntimeLookup ⇒ the constLookup union member is live
+        // (corinfo.h's CORINFO_LOOKUP contract).
+        let const_lookup = unsafe { result.lookup.__bindgen_anon_1.constLookup };
+        if const_lookup.accessType != ffi::InfoAccessType_IAT_VALUE {
+            return Err(CompileError::Unsupported(
+                "ldtoken handle through an indirection cell (IAT_PVALUE/PPVALUE)",
+            ));
+        }
+        let handle = unsafe { const_lookup.__bindgen_anon_1.handle };
+
+        // RyuJIT's impTokenToHandle mustRestoreHandle bookkeeping: record
+        // the load dependency with the EE (for a field, its owning
+        // class's). Notifications only — no codegen effect in-process.
+        match result.handleType {
+            ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_CLASS => {
+                if let Some(c) = ClassHandle::from_raw(handle as ffi::CORINFO_CLASS_HANDLE) {
+                    self.ee.class_must_be_loaded_before_code_is_run(c);
+                }
+            }
+            ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_METHOD => {
+                if let Some(m) = MethodHandle::from_raw(handle as ffi::CORINFO_METHOD_HANDLE) {
+                    self.ee.method_must_be_loaded_before_code_is_run(m);
+                }
+            }
+            ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_FIELD => {
+                if let Some(f) = FieldHandle::from_raw(handle as ffi::CORINFO_FIELD_HANDLE) {
+                    self.ee
+                        .class_must_be_loaded_before_code_is_run(self.ee.get_field_class(f));
+                }
+            }
+            _ => {}
+        }
+
+        // The raw-handle → handle-struct conversion helper, by the
+        // resolved handle kind (importer.cpp:10634-10641).
+        let helper = if !resolved.hMethod.is_null() {
+            CorInfoHelpFunc::METHODDESC_TO_STUBRUNTIMEMETHOD
+        } else if !resolved.hField.is_null() {
+            CorInfoHelpFunc::FIELDDESC_TO_STUBRUNTIMEFIELD
+        } else if !resolved.hClass.is_null() {
+            CorInfoHelpFunc::TYPEHANDLE_TO_RUNTIMETYPEHANDLE
+        } else {
+            return Err(CompileError::BadIl("ldtoken token did not resolve"));
+        };
+        layout_of(&mut self.struct_layouts, self.ee, handle_class)?;
+        self.push(
+            Type::Struct(handle_class),
+            hir::Expr::Call {
+                target: CallTarget::Helper(helper),
+                sig: CallSig {
+                    ret: Type::Struct(handle_class),
+                    args: vec![Type::NativeInt],
+                    has_this: false,
+                },
+                args: vec![hir::Expr::Const(Const::NativeInt(handle as isize))],
+            },
+        )
+    }
+
+    /// `sizeof` (0xFE 1C, step_10.10): the type's unmanaged size, folded
+    /// to a constant at JIT time — the EE's `getClassSize` is the query
+    /// (RyuJIT's CEE_SIZEOF, importer.cpp:10953: no value-type gate;
+    /// CoreCLR answers for any type, and C# emits the opcode for unmanaged
+    /// types only). The IL stack type is unsigned int32.
+    fn sizeof_(&mut self, token: u32) -> CompileResult<()> {
+        let (_resolved, class) =
+            self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
+        let size = self.ee.get_class_size(class);
+        self.push(Type::Int32, hir::Expr::Const(Const::Int32(size as i32)))
+    }
+
     /// `call` (0x28) / `callvirt` (0x6F): resolve the token, take the EE's
     /// verdict on how the call is performed, and pop the call-site
     /// signature's arguments. `flags` carries the callvirt distinction to
@@ -2957,6 +3079,8 @@ impl BlockImport<'_> {
                 Op::LdcR4(v) => self.push(Type::Float, hir::Expr::Const(Const::Float(v)))?,
                 Op::LdcR8(v) => self.push(Type::Double, hir::Expr::Const(Const::Double(v)))?,
                 Op::LdStr(token) => self.ldstr(token)?,
+                Op::LdToken(token) => self.ldtoken(token)?,
+                Op::SizeOf(token) => self.sizeof_(token)?,
                 Op::LdNull => self.push(Type::Ref, hir::Expr::Const(Const::NullRef))?,
                 Op::Dup => self.dup(&mut stmts, il_offset)?,
                 Op::Pop => self.pop_value(&mut stmts, il_offset)?,
@@ -4747,6 +4871,135 @@ mod tests {
         assert!(
             matches!(value2, hir::Expr::Const(Const::FrozenRef(a)) if *a == 0x5AFE_0000 + 0x7000_0001)
         );
+    }
+
+    // --- step_10.10: ldtoken / sizeof ---
+
+    const LDTYPE_TOKEN: u32 = 0x0200_0007;
+    const LDMETHOD_TOKEN: u32 = 0x0600_0009;
+    const LDFIELD_TOKEN: u32 = 0x0400_0003;
+
+    /// A MockEe with the canned handle-struct class (the
+    /// RuntimeTypeHandle/RuntimeMethodHandle/RuntimeFieldHandle stand-in:
+    /// 8 bytes, one reference cell, one integer eightbyte) registered as
+    /// `get_token_type_as_handle`'s answer.
+    fn ldtoken_fixture(il: &[u8]) -> (MockEe, MethodInfo) {
+        let (mut ee, info) = fixture(il, &sig(CorInfoType::Int, &[]), &[]);
+        let handle_class = ee.add_class(
+            8,
+            8,
+            &[(0, false)],
+            Some(rokajit_ee::mock::sysv_descriptor(&[(
+                ffi::SystemVClassificationType_SystemVClassificationTypeInteger,
+                8,
+            )])),
+        );
+        ee.token_type_class = Some(handle_class);
+        (ee, info)
+    }
+
+    /// `ldtoken <tok>; pop; ldc.i4.0; ret` — the pushed handle struct is
+    /// discarded; the conversion helper call stays as an Eval (a call is
+    /// observable).
+    fn ldtoken_eval(m: &hir::Method) -> (&CallTarget<hir::Expr>, &CallSig, &[hir::Expr]) {
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => (target, sig, args),
+            _ => panic!("expected an Eval of the conversion helper call"),
+        }
+    }
+
+    #[test]
+    fn ldtoken_of_a_type_embeds_the_handle_and_calls_the_type_helper() {
+        let il = [0xD0, 0x07, 0x00, 0x00, 0x02, 0x26, 0x16, 0x2A];
+        let (mut ee, info) = ldtoken_fixture(&il);
+        let cls = ee.add_class(16, 8, &[], None);
+        ee.class_tokens.insert(LDTYPE_TOKEN, cls);
+        let m = import(&info, &ee).expect("imports");
+        let handle_class = ee.token_type_class.unwrap();
+
+        let (target, sig, args) = ldtoken_eval(&m);
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::TYPEHANDLE_TO_RUNTIMETYPEHANDLE)
+        );
+        assert_eq!(sig.ret, Type::Struct(handle_class));
+        assert_eq!(sig.args, vec![Type::NativeInt]);
+        // The embedded handle constant: the mock cans 0x7A7A_0000 + token.
+        assert!(
+            matches!(&args[0], hir::Expr::Const(Const::NativeInt(v)) if *v == (0x7A7A_0000usize + LDTYPE_TOKEN as usize) as isize)
+        );
+        // The handle struct's layout was queried into the side table.
+        assert!(m.struct_layouts.contains_key(&handle_class));
+    }
+
+    #[test]
+    fn ldtoken_of_a_method_uses_the_methoddesc_helper() {
+        let il = [0xD0, 0x09, 0x00, 0x00, 0x06, 0x26, 0x16, 0x2A];
+        let (mut ee, info) = ldtoken_fixture(&il);
+        ee.add_method(LDMETHOD_TOKEN, sig(CorInfoType::Void, &[]));
+        let m = import(&info, &ee).expect("imports");
+        let (target, _, _) = ldtoken_eval(&m);
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::METHODDESC_TO_STUBRUNTIMEMETHOD)
+        );
+    }
+
+    #[test]
+    fn ldtoken_of_a_field_uses_the_fielddesc_helper() {
+        let il = [0xD0, 0x03, 0x00, 0x00, 0x04, 0x26, 0x16, 0x2A];
+        let (mut ee, info) = ldtoken_fixture(&il);
+        ee.add_field(LDFIELD_TOKEN, CorInfoType::Int, 8);
+        let m = import(&info, &ee).expect("imports");
+        let (target, _, _) = ldtoken_eval(&m);
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::FIELDDESC_TO_STUBRUNTIMEFIELD)
+        );
+    }
+
+    #[test]
+    fn ldtoken_rejection_forms_are_named_unsupported() {
+        let il = [0xD0, 0x07, 0x00, 0x00, 0x02, 0x26, 0x16, 0x2A];
+        // A generic-context runtime lookup is the shared-generics step.
+        let (mut ee, info) = ldtoken_fixture(&il);
+        let cls = ee.add_class(16, 8, &[], None);
+        ee.class_tokens.insert(LDTYPE_TOKEN, cls);
+        ee.embed_runtime_lookup = true;
+        let err = import(&info, &ee).err().expect("rejected");
+        assert!(
+            matches!(err, CompileError::Unsupported(m) if m.contains("generic-context runtime lookup"))
+        );
+
+        // An indirection cell needs load/reloc plumbing tier 0 lacks.
+        let (mut ee, info) = ldtoken_fixture(&il);
+        let cls = ee.add_class(16, 8, &[], None);
+        ee.class_tokens.insert(LDTYPE_TOKEN, cls);
+        ee.embed_indirection = true;
+        let err = import(&info, &ee).err().expect("rejected");
+        assert!(matches!(err, CompileError::Unsupported(m) if m.contains("indirection cell")));
+
+        // No resolved handles at all is bad IL.
+        let (mut ee, info) = ldtoken_fixture(&il);
+        ee.token_type_class = None;
+        let err = import(&info, &ee).err().expect("rejected");
+        assert!(matches!(err, CompileError::BadIl(m) if m.contains("did not resolve")));
+    }
+
+    #[test]
+    fn sizeof_folds_to_the_ee_class_size() {
+        // sizeof <tok>; ret — an Int32 constant straight from getClassSize.
+        let il = [0xFE, 0x1C, 0x07, 0x00, 0x00, 0x02, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let cls = ee.add_class(40, 8, &[], None);
+        ee.class_tokens.insert(LDTYPE_TOKEN, cls);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 40);
+    }
+
+    #[test]
+    fn sizeof_of_an_unresolvable_token_is_bad_il() {
+        let il = [0xFE, 0x1C, 0x07, 0x00, 0x00, 0x02, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let err = import(&info, &ee).err().expect("rejected");
+        assert!(matches!(err, CompileError::BadIl(m) if m.contains("did not resolve")));
     }
 
     // --- step_10.2: the float pack ---

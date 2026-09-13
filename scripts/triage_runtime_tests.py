@@ -424,6 +424,7 @@ BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"field type outside the 10\.4 object pack"), "field types outside the object pack"),
     (re.compile(r"allocation helper outside the newobj set"), "allocation helpers outside the newobj set"),
     (re.compile(r"class handle through an indirection cell"), "class handle indirection (IAT_PVALUE/PPVALUE)"),
+    (re.compile(r"ldtoken.*(indirection cell|runtime lookup)"), "ldtoken handle embedding (10.10 gates)"),
     (re.compile(r"cast/box|box of Nullable|unbox of Nullable|helper outside the (box|unbox|isinst/castclass) set"), "boxing & casts"),
     (re.compile(r"switch:"), "switch"),
     (re.compile(r"ldstr through a handle-cell"), "ldstr indirection (IAT_PVALUE/PPVALUE)"),
