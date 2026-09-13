@@ -102,6 +102,14 @@ pub struct MockField {
     pub is_static: bool,
     /// The value-class handle for a struct-typed field (step_10.9).
     pub value_class: Option<ClassHandle>,
+    /// Statics-pack knobs (step_10.7): whether `get_field_info` sets
+    /// `CORINFO_FLG_FIELD_INITCLASS`, whether it sets
+    /// `CORINFO_FLG_FIELD_STATIC_IN_HEAP` (the boxed-static indirection),
+    /// and a forced `fieldAccessor` override (to can an unsupported
+    /// accessor family).
+    pub init_class: bool,
+    pub in_heap: bool,
+    pub accessor: Option<ffi::CORINFO_FIELD_ACCESSOR>,
 }
 
 /// Canned EE. Every query returns the stored/default value; output sinks
@@ -312,8 +320,21 @@ impl MockEe {
                 ty,
                 is_static: false,
                 value_class: None,
+                init_class: false,
+                in_heap: false,
+                accessor: None,
             },
         );
+        handle
+    }
+
+    /// Registers a canned static field under `token` (step_10.7):
+    /// `get_field_info` answers `STATIC_ADDRESS`/`IAT_VALUE` with a
+    /// distinct canned address per field; the returned field's
+    /// `init_class`/`in_heap`/`accessor` knobs tune the answer.
+    pub fn add_static_field(&mut self, token: u32, ty: CorInfoType) -> FieldHandle {
+        let handle = self.add_field(token, ty, 0);
+        self.fields.get_mut(&token).unwrap().is_static = true;
         handle
     }
 

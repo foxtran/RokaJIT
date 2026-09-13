@@ -36,11 +36,50 @@ impl FieldQueries for MockEe {
 
     fn get_field_info(
         &self,
-        _token: &mut ffi::CORINFO_RESOLVED_TOKEN,
+        token: &mut ffi::CORINFO_RESOLVED_TOKEN,
         _caller: MethodHandle,
         _flags: u32,
     ) -> ffi::CORINFO_FIELD_INFO {
-        unsafe { std::mem::zeroed() }
+        let mut info: ffi::CORINFO_FIELD_INFO = unsafe { std::mem::zeroed() };
+        let Some(field) = self
+            .fields
+            .values()
+            .find(|f| f.handle.as_raw() == token.hField)
+        else {
+            return info;
+        };
+        if !field.is_static {
+            // The instance answer: fieldAccessor CORINFO_FIELD_INSTANCE
+            // (the zeroed default); nobody consults the rest.
+            return info;
+        }
+        // The statics pack (step_10.7): a plain static answers
+        // STATIC_ADDRESS with IAT_VALUE — `fieldLookup.addr` is the
+        // field's final address. A canned distinct constant per field
+        // stands in for it; the mock never dereferences addresses.
+        info.fieldAccessor = field
+            .accessor
+            .unwrap_or(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_ADDRESS);
+        info.fieldFlags = ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_STATIC
+            | if field.init_class {
+                ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_INITCLASS
+            } else {
+                0
+            }
+            | if field.in_heap {
+                ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_STATIC_IN_HEAP
+            } else {
+                0
+            };
+        info.fieldType = field.ty.to_raw();
+        info.structType = field
+            .value_class
+            .map_or(std::ptr::null_mut(), |c| c.as_raw());
+        info.accessAllowed = ffi::CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ALLOWED;
+        info.fieldLookup.accessType = ffi::InfoAccessType_IAT_VALUE;
+        info.fieldLookup.__bindgen_anon_1.addr =
+            (0x57A7_0000usize + field.handle.as_raw() as usize * 8) as *mut std::ffi::c_void;
+        info
     }
 
     fn print_field_name(&self, _field: FieldHandle) -> String {

@@ -94,13 +94,19 @@ SUPPORTED = {
     0x7B,                    # ldfld (step_10.4)
     0x7C,                    # ldflda (step_10.4)
     0x7D,                    # stfld (step_10.4)
+    0x7E,                    # ldsfld (step_10.7)
+    0x7F,                    # ldsflda (step_10.7)
+    0x80,                    # stsfld (step_10.7)
     0x81,                    # stobj (step_10.9)
     0x8C,                    # box (step_10.5)
     0xA5,                    # unbox.any (step_10.5)
     0xD0,                    # ldtoken (step_10.10)
+    0xD1,                    # conv.u2 (step_10.7)
+    0xD2,                    # conv.u1 (step_10.7)
     0xDC,                    # endfinally (step_10.6)
     0xDD,                    # leave (step_10.6)
     0xDE,                    # leave.s (step_10.6)
+    0xE0,                    # conv.u (step_10.7)
 }
 # Supported 0xFE-prefixed opcodes, by second byte (opcode.def):
 #   FE 01..05 = ceq, cgt, cgt.un, clt, clt.un

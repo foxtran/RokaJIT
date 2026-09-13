@@ -701,11 +701,17 @@ rokajit::lower_rules! {
             src: s,
         }];
 
-    /// `conv.i8`/`conv.u8` from a 32-bit operand: sign- (`movsxd`) vs
-    /// zero-extension (a 32-bit `mov`, which clears the upper half) —
-    /// another spot where the `unsigned` flag is the whole semantics.
-    rule conv_ext: Conv { dst, to: Type::Int64, unsigned, src, .. }
-        if let (Some(Width::W32), Some(s)) = (operand_width(cx, *src), operand_src(*src))
+    /// `conv.i8`/`conv.u8`/`conv.u` from a 32-bit operand: sign-
+    /// (`movsxd`) vs zero-extension (a 32-bit `mov`, which clears the
+    /// upper half) — another spot where the `unsigned` flag is the whole
+    /// semantics. `conv.u` targets `NativeInt` (step_10.7's rider), a
+    /// W64 slot exactly like Int64.
+    rule conv_ext: Conv { dst, to, unsigned, src, .. }
+        if let (true, Some(Width::W32), Some(s)) = (
+            matches!(*to, Type::Int64 | Type::NativeInt),
+            operand_width(cx, *src),
+            operand_src(*src),
+        )
         => |_| vec![Inst::MovExt {
             dst: Place::Val(Val(*dst)),
             src: s,

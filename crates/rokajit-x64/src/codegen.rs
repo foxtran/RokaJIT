@@ -2128,7 +2128,11 @@ impl<'a> Emitter<'a> {
     /// materialize into their own slot at once (the root invariant).
     fn emit_define_temp(&mut self, id: LocalId, width: Width, src: Src) -> CompileResult<()> {
         if matches!(self.ty_of(id), Type::Ref | Type::ByRef) {
-            match self.rmi_of(src)? {
+            // wide_imm: a W64 constant beyond the sign-extended imm32
+            // field (a frozen/static address) materializes via movabs
+            // into a scratch first — the same rule emit_store_to_local
+            // applies (found by step_10.7's struct-static block copies).
+            match self.wide_imm(width, src, &[])? {
                 Rmi::Reg(g) => self.asm.mov(width, Rm::Mem(self.own_slot(id)), Rmi::Reg(g)),
                 Rmi::Imm(i) => self.asm.mov(width, Rm::Mem(self.own_slot(id)), Rmi::Imm(i)),
                 Rmi::Mem(m) => {
@@ -4900,6 +4904,44 @@ mod tests {
             0x48, 0xB8, 0xE0, 0xE6, 0x4A, 0x6A, 0x74, 0, 0, 0, // movabsq $BIG, %rax
             0x48, 0x89, 0x45, 0xF8, // movq %rax, -8(%rbp)
             0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// The GC-typed-temp form of the wide-imm rule (step_10.7): a ByRef
+    /// temp defined from a wide constant (a static field's address
+    /// materialized for a block op) must go through a register — the
+    /// Ref/ByRef branch of `emit_define_temp` stores at once (the root
+    /// invariant), and the naive `mov qword [mem], imm32` would
+    /// sign-extend (the structstatic AV).
+    #[test]
+    fn wide_imm_define_gc_temp_materializes_the_constant() {
+        const BIG: i64 = 0x1234_5678_9ABC; // past i32
+        let m = method(
+            vec![local(Type::ByRef, LocalKind::Temp)],
+            0,
+            1,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Copy {
+                        dst: LocalId(0),
+                        src: Operand::Const(Const::NativeInt(BIG as isize)),
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0xC7, 0x45, 0xF8, 0, 0, 0, 0, // movq $0, -8(%rbp) — zero-init
+            0x48, 0xB8, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12, 0, 0, // movabsq $BIG, %rax
+            0x48, 0x89, 0x45, 0xF8, // movq %rax, -8(%rbp)
             0xC9, 0xC3, // leave; ret
         ];
         assert_eq!(out.code.hot.bytes, expected);

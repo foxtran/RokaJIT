@@ -245,10 +245,11 @@ impl Flatten<'_> {
                     // importer encoded (`stfld`: obj pushed before value).
                     let addr = self.flatten_expr(addr, &mut stmts, stmt.il_offset)?;
                     let src = self.flatten_expr(value, &mut stmts, stmt.il_offset)?;
-                    let addr = self.addr_value(addr, &mut stmts, stmt.il_offset);
                     if let Some(class) = struct_class_of(value) {
                         // A struct store through a computed address
-                        // (`stobj`/`cpobj`/struct `stfld`): a block copy.
+                        // (`stobj`/`cpobj`/struct `stfld`/`stsfld`): a
+                        // block copy.
+                        let addr = self.block_addr_value(addr, &mut stmts, stmt.il_offset);
                         Self::push(
                             &mut stmts,
                             stmt.il_offset,
@@ -260,6 +261,7 @@ impl Flatten<'_> {
                             },
                         );
                     } else {
+                        let addr = self.addr_value(addr, &mut stmts, stmt.il_offset);
                         Self::push(
                             &mut stmts,
                             stmt.il_offset,
@@ -274,6 +276,7 @@ impl Flatten<'_> {
                 }
                 hir::StmtKind::BlockZero { addr, class } => {
                     let addr = self.flatten_expr(addr, &mut stmts, stmt.il_offset)?;
+                    let addr = self.block_addr_value(addr, &mut stmts, stmt.il_offset);
                     Self::push(
                         &mut stmts,
                         stmt.il_offset,
@@ -334,6 +337,27 @@ impl Flatten<'_> {
                         src: lir::Operand::AddrOf(l),
                     },
                 );
+                lir::Operand::Temp(dst)
+            }
+            _ => addr,
+        }
+    }
+
+    /// A block-op address (`BlockCopy`/`BlockZero`, struct values): the
+    /// x64 block rules take a frame slot or a pointer-typed slot, so a
+    /// *constant* address (a static field's frozen address, step_10.7)
+    /// materializes into a fresh ByRef temp first. `AddrOf` and slot
+    /// operands pass straight through.
+    fn block_addr_value(
+        &mut self,
+        addr: lir::Operand,
+        out: &mut Vec<lir::Stmt>,
+        il: IlOffset,
+    ) -> lir::Operand {
+        match addr {
+            lir::Operand::Const(_) => {
+                let dst = self.temp(Type::ByRef);
+                Self::push(out, il, lir::StmtKind::Copy { dst, src: addr });
                 lir::Operand::Temp(dst)
             }
             _ => addr,
@@ -493,8 +517,10 @@ impl Flatten<'_> {
             hir::Expr::StructVal { addr, .. } => {
                 // A struct value IS its address (step_10.9): in LIR every
                 // struct-typed value is a ByRef operand naming the memory
-                // the value occupies.
-                self.flatten_expr(addr, out, il)
+                // the value occupies. A constant address (a struct-typed
+                // static's frozen address, step_10.7) materializes first.
+                let addr = self.flatten_expr(addr, out, il)?;
+                Ok(self.block_addr_value(addr, out, il))
             }
         }
     }

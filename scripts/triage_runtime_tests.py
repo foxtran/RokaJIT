@@ -420,6 +420,7 @@ BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"non-class receiver \(value types\)|initobj/ldobj/stobj/cpobj of a non-value class|struct alignment above 16|SysV descriptor"), "structs & value types"),
     (re.compile(r"newobj of a value class"), "newobj of a value class"),
     (re.compile(r"arrays:"), "arrays"),
+    (re.compile(r"thread-local statics|static field of a shared-generic|static field through an address helper|static field accessor outside|static field needing an access callout|static field address through an indirection cell"), "statics pack gates (10.7: TLS/generic/R2R/accessors)"),
     (re.compile(r"static fields"), "static fields"),
     (re.compile(r"field type outside the 10\.4 object pack"), "field types outside the object pack"),
     (re.compile(r"allocation helper outside the newobj set"), "allocation helpers outside the newobj set"),

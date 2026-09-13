@@ -106,6 +106,16 @@ impl ContextHandle {
                 as rokajit_ffi::CORINFO_CONTEXT_HANDLE,
         )
     }
+
+    /// Builds a method context (`MAKE_METHODCONTEXT`, corinfo.h:1029): the
+    /// method handle tagged with `CORINFO_CONTEXTFLAGS_METHOD` = 0x00 —
+    /// i.e. the bare handle. Named explicitly because the context's tag is
+    /// how the EE reads it (`GetTypeFromContext`, jitinterface.cpp:269): a
+    /// *class*-tagged handle where a method context is expected crashes the
+    /// EE, exactly like the reverse (see [`ContextHandle::from_class`]).
+    pub fn from_method(method: MethodHandle) -> Self {
+        Self(method.as_raw() as rokajit_ffi::CORINFO_CONTEXT_HANDLE)
+    }
 }
 handle_newtype!(
     ObjectHandle,

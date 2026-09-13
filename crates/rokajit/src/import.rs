@@ -10,8 +10,9 @@
 //! `neg`/`not` (`neg` accepts floats), the shifts `shl`/`shr`/`shr.un`,
 //! compare-as-value `ceq`/`cgt`/`cgt.un`/`clt`/`clt.un` (integers,
 //! floats, and the reference forms), the integer conversions
-//! `conv.i1`/`i2`/`i4`/`i8`/`u4`/`u8` (float sources truncate toward
-//! zero; `conv.u8` from a float is out) plus `conv.r4`/`conv.r8`,
+//! `conv.i1`/`i2`/`i4`/`i8`/`u1`/`u2`/`u4`/`u8`/`u` (float sources
+//! truncate toward zero; `conv.u8`/`conv.u` from a float is out) plus
+//! `conv.r4`/`conv.r8`,
 //! `dup`/`pop`, `ldloca`/`ldarga`/`starg` (short and wide forms),
 //! `ldnull`, `ldstr` (resolved through the EE's `constructStringLiteral`
 //! to a frozen-ref constant; the IAT_PVALUE/PPVALUE indirection forms are
@@ -20,10 +21,18 @@
 //! accept references, and the compare forms floats), `call`, and `ret`.
 //! The step_10.4 object pack adds `callvirt` (scoped: the EE must
 //! devirtualize to a direct call — a real vtable dispatch is
-//! `Unsupported`), instance field access `ldfld`/`stfld`/`ldflda` (static
-//! fields are out), and `newobj` (EE allocation helper + a direct
-//! constructor call; the reference-field store goes through the EE's
-//! checked-write-barrier helper). The step_10.9 value-type pack adds
+//! `Unsupported`), instance field access `ldfld`/`stfld`/`ldflda`
+//! (statics have their own pack), and `newobj` (EE allocation helper + a
+//! direct constructor call; the reference-field store goes through the
+//! EE's checked-write-barrier helper). The step_10.7 statics pack adds
+//! `ldsfld`/`ldsflda`/`stsfld`: the field's address comes from the EE's
+//! `getFieldInfo` (a plain static answers `STATIC_ADDRESS` with the
+//! final address as an `IAT_VALUE` constant — no layout math JIT-side;
+//! a boxed value-class static is one indirection away), the
+//! `CORINFO_FLG_FIELD_INITCLASS` flag plus `init_class` drive the static
+//! constructor trigger (a `CORINFO_HELP_INITCLASS` call ahead of the
+//! access), and a reference-typed `stsfld` reuses the checked write
+//! barrier. The step_10.9 value-type pack adds
 //! `initobj`/`ldobj`/`stobj`/`cpobj`, structs in signatures (args,
 //! returns — including the hidden return buffer — and locals, with SysV
 //! AMD64 eightbyte classification), struct instance methods (`this` as a
@@ -64,7 +73,8 @@
 //!
 //! EE queries consumed (via `&dyn EeInfo`): `resolve_token`,
 //! `get_call_info`, `construct_string_literal` (for `ldstr`), the field
-//! queries (`get_field_offset`/`get_field_type`/`is_field_static`),
+//! queries (`get_field_offset`/`get_field_type`/`is_field_static`, plus
+//! `get_field_info` for the statics),
 //! `embed_class_handle`, `init_class`, and `get_new_helper` (the object
 //! pack), `embed_generic_handle`/`get_token_type_as_handle` (ldtoken) and
 //! `get_class_size` (sizeof), and
@@ -451,6 +461,14 @@ enum Op {
     /// `stfld` — instance field store; a reference-typed field stores
     /// through the EE's checked-write-barrier helper (the GC must be told).
     StFld(u32),
+    /// `ldsfld` — static field load; the EE's `getFieldInfo` answers the
+    /// field's final address directly (step_10.7).
+    LdSFld(u32),
+    /// `ldsflda` — static field address, a `ByRef` value.
+    LdSFldA(u32),
+    /// `stsfld` — static field store; a reference-typed field stores
+    /// through the checked-write-barrier helper, like `stfld`.
+    StSFld(u32),
     /// `cpobj` — struct copy between two addresses (type token).
     CpObj(u32),
     /// `ldobj` — struct load through an address (type token).
@@ -489,18 +507,24 @@ enum Op {
 }
 
 /// The `conv.*` opcodes of the scalar-cheap pack plus the float pack's
-/// `conv.r4`/`conv.r8`. `I1`/`I2` carry the truncation width the IR's
-/// type vocabulary cannot (eval-stack types normalize at Int32, ECMA-335
-/// §III.1.1.1) — the importer expands them to shift pairs
-/// ([`BlockImport::conv_narrow`]).
+/// `conv.r4`/`conv.r8`. `I1`/`I2`/`U1`/`U2` carry the truncation width the
+/// IR's type vocabulary cannot (eval-stack types normalize at Int32,
+/// ECMA-335 §III.1.1.1) — the importer expands them to shift pairs
+/// ([`BlockImport::conv_narrow`]); `U1`/`U2` are the zero-extending forms
+/// (step_10.7's rider).
 #[derive(Copy, Clone)]
 enum ConvKind {
     I1,
     I2,
     I4,
     I8,
+    U1,
+    U2,
     U4,
     U8,
+    /// `conv.u` — to native uint: zero-extension from Int32, the identity
+    /// on a 64-bit operand.
+    U,
     R4,
     R8,
 }
@@ -692,10 +716,15 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x7B => Op::LdFld(r.u32()?),
             0x7C => Op::LdFldA(r.u32()?),
             0x7D => Op::StFld(r.u32()?),
+            0x7E => Op::LdSFld(r.u32()?),
+            0x7F => Op::LdSFldA(r.u32()?),
+            0x80 => Op::StSFld(r.u32()?),
             0x81 => Op::StObj(r.u32()?),
             0x8C => Op::Box(r.u32()?),
             0xA5 => Op::UnboxAny(r.u32()?),
             0xD0 => Op::LdToken(r.u32()?),
+            0xD1 => Op::Conv(ConvKind::U2),
+            0xD2 => Op::Conv(ConvKind::U1),
             0xDC => Op::EndFinally,
             0xDD => {
                 let d = r.i32()?;
@@ -709,6 +738,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                     target: branch_target(il.len(), r.ip, i32::from(d))?,
                 }
             }
+            0xE0 => Op::Conv(ConvKind::U),
             0xFE => match r.u8()? {
                 0x01 => Op::Compare(BinaryOp::Eq),
                 0x02 => Op::Compare(BinaryOp::Gt),
@@ -1628,7 +1658,8 @@ impl BlockImport<'_> {
 
     /// `conv.*` (unchecked): stack-type transitions of the scalar-cheap
     /// and float packs. Same-width conversions are the identity;
-    /// `conv.i1`/`conv.i2` expand to shift pairs (`conv_narrow`); the rest
+    /// `conv.i1`/`conv.i2`/`conv.u1`/`conv.u2` expand to shift pairs
+    /// (`conv_narrow`); the rest
     /// become `hir::Expr::Conv` nodes whose `unsigned` flag selects sign-
     /// vs zero-extension at lowering. Float sources truncate toward zero
     /// (`cvtt*`); `conv.r4`/`conv.r8` convert from any numeric operand.
@@ -1643,8 +1674,10 @@ impl BlockImport<'_> {
             ));
         }
         match kind {
-            ConvKind::I1 => self.conv_narrow(8, ty, value),
-            ConvKind::I2 => self.conv_narrow(16, ty, value),
+            ConvKind::I1 => self.conv_narrow(8, false, ty, value),
+            ConvKind::I2 => self.conv_narrow(16, false, ty, value),
+            ConvKind::U1 => self.conv_narrow(8, true, ty, value),
+            ConvKind::U2 => self.conv_narrow(16, true, ty, value),
             // conv.i4/u4: truncate to 32 bits (identity on an Int32).
             ConvKind::I4 | ConvKind::U4 => {
                 if ty == Type::Int32 {
@@ -1670,7 +1703,9 @@ impl BlockImport<'_> {
                     return Err(CompileError::Unsupported("conv.u8 from a float operand"));
                 }
                 if ty == Type::Int64 || ty == Type::NativeInt {
-                    self.push(ty, value)
+                    // A 64-bit operand is the identity; the IL stack type
+                    // still becomes int64 (a NativeInt source re-types).
+                    self.push(Type::Int64, value)
                 } else {
                     let unsigned = matches!(kind, ConvKind::U8);
                     self.push(
@@ -1679,6 +1714,28 @@ impl BlockImport<'_> {
                             to: Type::Int64,
                             overflow: false,
                             unsigned,
+                            arg: Box::new(value),
+                        },
+                    )
+                }
+            }
+            // conv.u: to native uint (step_10.7's rider) — zero-extend
+            // from Int32, the identity on a 64-bit operand. From a float
+            // it is the same unsigned 64-bit truncation as conv.u8 —
+            // outside the pack for the same reason.
+            ConvKind::U => {
+                if fp {
+                    return Err(CompileError::Unsupported("conv.u from a float operand"));
+                }
+                if ty == Type::Int64 || ty == Type::NativeInt {
+                    self.push(Type::NativeInt, value)
+                } else {
+                    self.push(
+                        Type::NativeInt,
+                        hir::Expr::Conv {
+                            to: Type::NativeInt,
+                            overflow: false,
+                            unsigned: true,
                             arg: Box::new(value),
                         },
                     )
@@ -1709,15 +1766,22 @@ impl BlockImport<'_> {
         }
     }
 
-    /// `conv.i1`/`conv.i2`: truncate to `bits` then sign-extend, as the
-    /// shift pair `(v << (32 - bits)) >> (32 - bits)` at 32 bits. The IR's
+    /// `conv.i1`/`conv.i2`/`conv.u1`/`conv.u2`: truncate to `bits` then
+    /// extend, as the shift pair `(v << (32 - bits)) >> (32 - bits)` at 32
+    /// bits — an arithmetic `shr` replicates the sign bit (`conv.i*`),
+    /// a logical `shr.un` zero-fills (`conv.u*`). The IR's
     /// type vocabulary normalizes sub-Int32 types away (ECMA-335
     /// §III.1.1.1), so the narrowing cannot be a `Conv` node; the shift
-    /// expansion is exact (arithmetic `shr` replicates the sign bit). A
-    /// non-Int32 operand converts to Int32 first — for a float source
-    /// that is the truncating `cvtt*` conversion, after which the low
-    /// `bits` behave as for integers.
-    fn conv_narrow(&mut self, bits: u32, ty: Type, value: hir::Expr) -> CompileResult<()> {
+    /// expansion is exact. A non-Int32 operand converts to Int32 first —
+    /// for a float source that is the truncating `cvtt*` conversion,
+    /// after which the low `bits` behave as for integers.
+    fn conv_narrow(
+        &mut self,
+        bits: u32,
+        unsigned: bool,
+        ty: Type,
+        value: hir::Expr,
+    ) -> CompileResult<()> {
         let value = if ty == Type::Int32 {
             value
         } else {
@@ -1732,8 +1796,13 @@ impl BlockImport<'_> {
         };
         let sh = hir::Expr::Const(Const::Int32((32 - bits) as i32));
         let shifted = binary(BinaryOp::Shl, value, sh);
+        let back_shift = if unsigned {
+            BinaryOp::UShr
+        } else {
+            BinaryOp::Shr
+        };
         let back = binary(
-            BinaryOp::Shr,
+            back_shift,
             shifted,
             hir::Expr::Const(Const::Int32((32 - bits) as i32)),
         );
@@ -2136,7 +2205,9 @@ impl BlockImport<'_> {
     /// Field-token resolution shared by `ldfld`/`stfld`/`ldflda`
     /// (step_10.4): the token-kind hint is `CORINFO_TOKENKIND_Field`
     /// (importer.cpp `impResolveToken` for the field opcodes), an
-    /// unresolved token is BadIl, and static fields are out of the pack.
+    /// unresolved token is BadIl, and static fields stay out of the
+    /// instance path (`ldsfld`/`ldsflda`/`stsfld` have their own,
+    /// step_10.7).
     /// Returns the field handle, the EE-supplied instance offset, and
     /// whether the field's declaring class is a value class (step_10.9:
     /// such fields accept a ByRef receiver).
@@ -2341,6 +2412,265 @@ impl BlockImport<'_> {
             hir::StmtKind::StoreInd {
                 addr: obj,
                 offset,
+                value,
+                access,
+            }
+        };
+        stmts.push(hir::Stmt { il_offset, kind });
+        Ok(())
+    }
+
+    /// Static-field resolution shared by `ldsfld`/`ldsflda`/`stsfld`
+    /// (step_10.7): one `getFieldInfo` query per opcode (the
+    /// `CORINFO_ACCESS_GET`/`SET`/`ADDRESS` flag is the only difference —
+    /// `flags`, corinfo.h:622). For a plain static the EE answers
+    /// `CORINFO_FIELD_STATIC_ADDRESS` (RVA statics:
+    /// `..._STATIC_RVA_ADDRESS`, the same shape) with `IAT_VALUE`, and
+    /// `fieldLookup.addr` IS the field's final address — the offset into
+    /// the statics block is already baked in (jitinterface.cpp:1492
+    /// `GetStaticAddressHandle`), embedded here as a raw `NativeInt`
+    /// constant with no layout math (the newobj MethodTable* policy).
+    /// A value-class static the EE boxes (`STATIC_IN_HEAP`) instead
+    /// answers the address of the cell holding the frozen box object —
+    /// the field data is one indirection plus the object header away
+    /// (importer.cpp:4417). Thread statics, shared-generic/collectible
+    /// helper accessors, indirection cells, and access callouts are all
+    /// named `Unsupported` (the gates RyuJIT's `CORINFO_FLG_FIELD_STATIC`
+    /// check and R2R paths also take).
+    ///
+    /// Returns the field, the field's address expression, and whether the
+    /// class-init trigger fired (see [`BlockImport::maybe_init_class`]).
+    fn resolve_static_field(
+        &mut self,
+        token: u32,
+        flags: u32,
+    ) -> CompileResult<(FieldHandle, hir::Expr, bool)> {
+        let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+            t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+            t.tokenScope = self.info.args.scope;
+            t.token = token;
+            t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Field;
+        });
+        self.ee.resolve_token(&mut resolved);
+        let Some(field) = FieldHandle::from_raw(resolved.hField) else {
+            return Err(CompileError::BadIl("field token did not resolve"));
+        };
+        let info = self.ee.get_field_info(&mut resolved, self.info.ftn, flags);
+        if info.fieldFlags & ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_STATIC == 0 {
+            // ldsfld/stsfld/ldsflda on an instance field — RyuJIT
+            // BADCODEs this too (importer.cpp CEE_LDSFLD).
+            return Err(CompileError::BadIl("static access on an instance field"));
+        }
+        match info.fieldAccessor {
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_ADDRESS
+            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_RVA_ADDRESS => {}
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS
+            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS_MANAGED => {
+                return Err(CompileError::Unsupported(
+                    "thread-local statics ([ThreadStatic])",
+                ));
+            }
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_SHARED_STATIC_HELPER
+            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER => {
+                return Err(CompileError::Unsupported(
+                    "static field of a shared-generic or collectible class (helper accessor)",
+                ));
+            }
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_ADDR_HELPER
+            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_READYTORUN_HELPER => {
+                return Err(CompileError::Unsupported(
+                    "static field through an address helper (R2R)",
+                ));
+            }
+            _ => {
+                return Err(CompileError::Unsupported(
+                    "static field accessor outside the statics pack",
+                ));
+            }
+        }
+        if info.accessAllowed != ffi::CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ALLOWED {
+            return Err(CompileError::Unsupported(
+                "static field needing an access callout",
+            ));
+        }
+        if info.fieldLookup.accessType != ffi::InfoAccessType_IAT_VALUE {
+            // The indirection-cell answer is the R2R shape — the
+            // ldstr/newobj policy: load+relocation plumbing tier 0
+            // doesn't have.
+            return Err(CompileError::Unsupported(
+                "static field address through an indirection cell (IAT_PVALUE/PPVALUE)",
+            ));
+        }
+        // SAFETY: IAT_VALUE's live union member is `addr`
+        // (corinfo.h's CORINFO_CONST_LOOKUP contract).
+        let addr = unsafe { info.fieldLookup.__bindgen_anon_1.addr };
+        let mut addr_expr = hir::Expr::Const(Const::NativeInt(addr as isize));
+        if info.fieldFlags & ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_STATIC_IN_HEAP != 0 {
+            // A boxed value-class static: the cell holds the frozen box
+            // object; the field data sits past the object header.
+            addr_expr = hir::Expr::FieldAddr {
+                obj: Box::new(hir::Expr::Load {
+                    addr: Box::new(addr_expr),
+                    offset: 0,
+                    ty: Type::Ref,
+                    access: MemAccess::Natural,
+                }),
+                field,
+                offset: 8, // TARGET_POINTER_SIZE
+            };
+        }
+        // The class-init trigger (the semantic core of the pack):
+        // getFieldInfo's INITCLASS flag says the class is not yet inited;
+        // initClass then decides — queried exactly as RyuJIT's
+        // impInitClass does (importer.cpp:3897): the field, the method
+        // being compiled, and the *method* context (an untagged or
+        // class-tagged context here would crash the EE).
+        let mut needs_init = false;
+        if info.fieldFlags & ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_INITCLASS != 0 {
+            let init = self.ee.init_class(
+                Some(field),
+                Some(self.info.ftn),
+                ContextHandle::from_method(self.info.ftn),
+            );
+            // DONT_INLINE is an inlining hint; we never inline.
+            needs_init = init.contains(CorInfoInitClassResult::USE_HELPER);
+        }
+        Ok((field, addr_expr, needs_init))
+    }
+
+    /// Emits the static-constructor trigger (`CORINFO_HELP_INITCLASS` of
+    /// the field's owning class, embedded as a raw `NativeInt` constant —
+    /// the newobj emission's exact shape) when the `init_class` verdict
+    /// asked for a helper.
+    fn maybe_init_class(
+        &mut self,
+        field: FieldHandle,
+        needs_init: bool,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        if !needs_init {
+            return Ok(());
+        }
+        let owner = self.ee.get_field_class(field);
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::INITCLASS),
+                sig: CallSig {
+                    ret: Type::Void,
+                    args: vec![Type::NativeInt],
+                    has_this: false,
+                },
+                args: vec![self.embed_class_const(owner)?],
+            }),
+        });
+        Ok(())
+    }
+
+    /// `ldsfld` (0x7E): a load through the field's static address. Pending
+    /// stack trees evaluate first (the spill), then the `.cctor` trigger
+    /// (a beforefieldinit class has no explicit cctor to observe, so the
+    /// uniform order is spec-conforming for both init modes), then the
+    /// load itself — a tree, like `ldfld`'s. A struct-typed static loads
+    /// as its address (the `StructVal` discipline, step_10.9).
+    fn ldsfld(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let (field, addr, needs_init) =
+            self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_GET)?;
+        let (ty, access) = self.field_mem_type(field)?;
+        self.spill_stack(stmts, il_offset)?;
+        self.maybe_init_class(field, needs_init, stmts, il_offset)?;
+        if let Type::Struct(class) = ty {
+            return self.push(
+                ty,
+                hir::Expr::StructVal {
+                    addr: Box::new(addr),
+                    class,
+                },
+            );
+        }
+        self.push(
+            ty,
+            hir::Expr::Load {
+                addr: Box::new(addr),
+                offset: 0,
+                ty,
+                access,
+            },
+        )
+    }
+
+    /// `ldsflda` (0x7F): the static field's address — type-agnostic, like
+    /// `ldflda`.
+    fn ldsflda(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let (field, addr, needs_init) =
+            self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_ADDRESS)?;
+        self.spill_stack(stmts, il_offset)?;
+        self.maybe_init_class(field, needs_init, stmts, il_offset)?;
+        self.push(Type::ByRef, addr)
+    }
+
+    /// `stsfld` (0x80): a store through the field's static address. The
+    /// uniform order is value → `.cctor` → store (RyuJIT's precise-init
+    /// order, importer.cpp:9849; ECMA-335's relaxed init makes it
+    /// conforming for beforefieldinit classes too): the value materializes
+    /// into a temp before the INITCLASS helper runs, so a value with side
+    /// effects evaluates ahead of the cctor. A reference-typed field
+    /// stores through the checked write barrier (statics blocks are
+    /// EE-managed GC roots), a struct-typed one through the block-copy
+    /// path (step_10.9), anything else as a plain indirect store.
+    fn stsfld(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let (field, addr, needs_init) =
+            self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_SET)?;
+        let (ty, access) = self.field_mem_type(field)?;
+        let (vt, value) = self.pop()?;
+        if vt != ty {
+            return Err(CompileError::BadIl("stsfld value type mismatch"));
+        }
+        self.spill_stack(stmts, il_offset)?;
+        let value = if needs_init {
+            let t = self.temp(ty);
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Store { dst: t, value },
+            });
+            self.local_value_expr(t).1
+        } else {
+            value
+        };
+        self.maybe_init_class(field, needs_init, stmts, il_offset)?;
+        if let Type::Struct(class) = ty {
+            return self.store_struct_through(addr, class, value, stmts, il_offset);
+        }
+        let kind = if ty == Type::Ref {
+            hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::CHECKED_ASSIGN_REF),
+                sig: CallSig {
+                    ret: Type::Void,
+                    args: vec![Type::ByRef, Type::Ref],
+                    has_this: false,
+                },
+                args: vec![addr, value],
+            })
+        } else {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset: 0,
                 value,
                 access,
             }
@@ -3118,6 +3448,9 @@ impl BlockImport<'_> {
                 Op::LdFld(token) => self.ldfld(token, &mut stmts, il_offset)?,
                 Op::LdFldA(token) => self.ldflda(token, &mut stmts, il_offset)?,
                 Op::StFld(token) => self.stfld(token, &mut stmts, il_offset)?,
+                Op::LdSFld(token) => self.ldsfld(token, &mut stmts, il_offset)?,
+                Op::LdSFldA(token) => self.ldsflda(token, &mut stmts, il_offset)?,
+                Op::StSFld(token) => self.stsfld(token, &mut stmts, il_offset)?,
                 Op::CpObj(token) => self.cpobj(token, &mut stmts, il_offset)?,
                 Op::LdObj(token) => self.ldobj(token)?,
                 Op::StObj(token) => self.stobj(token, &mut stmts, il_offset)?,
@@ -4800,6 +5133,74 @@ mod tests {
     }
 
     #[test]
+    fn conv_u1_u2_expand_to_zero_extending_shift_pairs() {
+        // ldarg.0; conv.u1; ret — ((v << 24) >>> 24): the logical
+        // back-shift zero-fills (conv.i1's arithmetic twin re-signs).
+        let m = import_ii(&[0x02, 0xD2, 0x2A]).expect("imports");
+        let (op, shl, count) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::UShr, "logical shift right zero-extends");
+        assert_eq!(as_i32(count), 24);
+        let (op, value, _) = as_binary(shl);
+        assert_eq!(op, BinaryOp::Shl);
+        assert_eq!(as_local(value), LocalId(0));
+
+        // conv.u2: the same pair with shifts of 16.
+        let m = import_ii(&[0x02, 0xD1, 0x2A]).expect("imports");
+        let (op, shl, count) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::UShr);
+        assert_eq!(as_i32(count), 16);
+        let (op, _, count) = as_binary(shl);
+        assert_eq!(op, BinaryOp::Shl);
+        assert_eq!(as_i32(count), 16);
+    }
+
+    #[test]
+    fn conv_u_zero_extends_to_native_int() {
+        // conv.u of an i32 arg: an unsigned Conv node to NativeInt.
+        let (ee, info) = fixture(
+            &[0x02, 0xE0, 0x2A],
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Int]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::NativeInt);
+        assert!(!overflow && unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // A 64-bit operand is already there: no node, re-typed NativeInt.
+        let (ee, info) = fixture(
+            &[0x02, 0xE0, 0x2A],
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+
+        // From a float it is the conv.u8-shaped gap (the 2^63 fixup).
+        let (ee, info) = fixture(
+            &[0x02, 0xE0, 0x2A],
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Double]),
+            &[],
+        );
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(_))
+        ));
+
+        // conv.u8 of a native-int operand: the identity, but the IL stack
+        // type becomes Int64 (a NativeInt source re-types) — otherwise
+        // `ret` sees a type mismatch (found by tests/convu.cs).
+        let (ee, info) = fixture(
+            &[0x02, 0x6E, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::NativeInt]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("conv.u8 of native int imports");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+    }
+
+    #[test]
     fn ldnull_pushes_a_null_ref_and_branches_on_it() {
         // ldnull; stloc.0; ldloc.0; brfalse.s L; ldc.i4.1; ret; L: ldc.i4.2; ret
         // — a Ref local holding null, branched on directly.
@@ -5643,6 +6044,234 @@ mod tests {
             matches!(&err, CompileError::Unsupported(m) if m.contains("value types")),
             "{err:?}"
         );
+    }
+
+    // --- step_10.7: the statics pack (ldsfld/ldsflda/stsfld) ---
+
+    #[test]
+    fn ldsfld_loads_through_the_static_address() {
+        // ldsfld int; ret — a Load at offset 0 through the EE-answered
+        // final address, a raw NativeInt constant.
+        let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::Load {
+                addr,
+                offset,
+                ty,
+                access,
+            } => {
+                assert_eq!(*offset, 0);
+                assert_eq!(*ty, Type::Int32);
+                assert_eq!(*access, MemAccess::Natural);
+                assert!(
+                    matches!(**addr, hir::Expr::Const(Const::NativeInt(_))),
+                    "the field's final address is a pointer constant"
+                );
+            }
+            _ => panic!("expected Expr::Load"),
+        }
+    }
+
+    #[test]
+    fn ldsflda_pushes_the_static_address_as_a_byref() {
+        // ldsflda; stloc.0 — the address stores into a ByRef local.
+        let il = [0x7F, 0x01, 0x00, 0x00, 0x04, 0x0A, 0x16, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::ByRef]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(0));
+        assert!(matches!(value, hir::Expr::Const(Const::NativeInt(_))));
+    }
+
+    #[test]
+    fn stsfld_of_an_int_stores_through_the_static_address() {
+        // ldc.i4.s 42; stsfld int; ldc.i4.0; ret.
+        let il = [0x1F, 0x2A, 0x80, 0x01, 0x00, 0x00, 0x04, 0x16, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "no cctor flag — no INITCLASS call");
+        match &stmts[0].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset,
+                value,
+                access,
+            } => {
+                assert_eq!(*offset, 0);
+                assert_eq!(*access, MemAccess::Natural);
+                assert!(matches!(addr, hir::Expr::Const(Const::NativeInt(_))));
+                assert_eq!(as_i32(value), 42);
+            }
+            _ => panic!("expected StmtKind::StoreInd"),
+        }
+    }
+
+    #[test]
+    fn stsfld_of_a_reference_goes_through_the_write_barrier() {
+        // stsfld <ref field> of null — the checked write barrier with the
+        // static address as arg 0 (a raw NativeInt const, not a Ref).
+        let il = [0x14, 0x80, 0x02, 0x00, 0x00, 0x04, 0x16, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(REF_FIELD_TOKEN, CorInfoType::Class);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::CHECKED_ASSIGN_REF),
+                    "the checked-write-barrier helper"
+                );
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::Void,
+                        args: vec![Type::ByRef, Type::Ref],
+                        has_this: false,
+                    }
+                );
+                assert!(matches!(args[0], hir::Expr::Const(Const::NativeInt(_))));
+                assert!(matches!(args[1], hir::Expr::Const(Const::NullRef)));
+            }
+            _ => panic!("expected the barrier helper Eval"),
+        }
+    }
+
+    #[test]
+    fn statics_emit_the_init_class_helper_before_the_access() {
+        // ldsfld with the INITCLASS flag and a USE_HELPER verdict: the
+        // INITCLASS Eval is the block's only statement; the load stays a
+        // tree (it reads the field after the cctor runs).
+        let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().init_class = true;
+        ee.init_class_result = CorInfoInitClassResult::USE_HELPER;
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::INITCLASS),
+                    "the INITCLASS helper"
+                );
+                assert_eq!(sig.ret, Type::Void);
+                assert_eq!(args.len(), 1, "the embedded owning-class handle");
+            }
+            _ => panic!("expected the INITCLASS helper call"),
+        }
+
+        // The same flag with a NOT_REQUIRED verdict (the default) emits
+        // nothing.
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().init_class = true;
+        let m = import(&info, &ee).expect("imports");
+        assert!(m.blocks[0].stmts.is_empty());
+    }
+
+    #[test]
+    fn stsfld_with_init_class_orders_value_then_cctor_then_store() {
+        // ldc.i4.s 42; stsfld int; ldc.i4.0; ret with a cctor: the value
+        // materializes into a temp, THEN the INITCLASS helper runs, THEN
+        // the store (the uniform value → cctor → store order).
+        let il = [0x1F, 0x2A, 0x80, 0x01, 0x00, 0x00, 0x04, 0x16, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().init_class = true;
+        ee.init_class_result = CorInfoInitClassResult::USE_HELPER;
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 3, "value temp store, INITCLASS, the store");
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(0), "the value temp is the first local");
+        assert_eq!(as_i32(value), 42);
+        assert!(matches!(
+            &stmts[1].kind,
+            hir::StmtKind::Eval(hir::Expr::Call { target: CallTarget::Helper(h), .. })
+                if *h == CorInfoHelpFunc::INITCLASS
+        ));
+        match &stmts[2].kind {
+            hir::StmtKind::StoreInd { value, .. } => {
+                assert_eq!(as_local(value), LocalId(0), "the temp's value stores");
+            }
+            _ => panic!("expected StmtKind::StoreInd"),
+        }
+    }
+
+    #[test]
+    fn statics_gate_instance_fields_and_unsupported_accessors() {
+        // stsfld of an instance field: BadIl (RyuJIT BADCODEs it too).
+        let il = [0x16, 0x80, 0x01, 0x00, 0x00, 0x04, 0x16, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_field(FIELD_TOKEN, CorInfoType::Int, 16);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+
+        // A thread-static accessor is a named Unsupported.
+        let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().accessor =
+            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS_MANAGED);
+        let err = import(&info, &ee).err().expect("TLS statics are out");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("ThreadStatic")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn boxed_static_struct_load_indirects_through_the_cell() {
+        // STATIC_IN_HEAP: the cell holds the frozen box object; the field
+        // address is box + TARGET_POINTER_SIZE (8). A struct-typed static
+        // loads as the StructVal of that address.
+        let (mut ee, class) = struct_ee(8, &[], None);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::ValueClass);
+        let field = &mut ee.fields.get_mut(&FIELD_TOKEN).unwrap();
+        field.value_class = Some(class);
+        field.in_heap = true;
+        let entry = sig(CorInfoType::Void, &[]);
+        // ldsfld S; pop; ret
+        let info = struct_info(
+            &mut ee,
+            &[0x7E, 0x01, 0x00, 0x00, 0x04, 0x26, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "the popped struct value Evals");
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(value) => {
+                let (addr, c) = as_struct_val(value);
+                assert_eq!(c, class);
+                match addr {
+                    hir::Expr::FieldAddr { obj, offset, .. } => {
+                        assert_eq!(*offset, 8, "past the object header");
+                        match &**obj {
+                            hir::Expr::Load {
+                                addr, offset, ty, ..
+                            } => {
+                                assert_eq!(*offset, 0);
+                                assert_eq!(*ty, Type::Ref);
+                                assert!(matches!(**addr, hir::Expr::Const(Const::NativeInt(_))));
+                            }
+                            _ => panic!("expected the cell Load"),
+                        }
+                    }
+                    _ => panic!("expected the box-data FieldAddr"),
+                }
+            }
+            _ => panic!("expected the popped-value Eval"),
+        }
     }
 
     #[test]
