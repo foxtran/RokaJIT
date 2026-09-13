@@ -20,6 +20,7 @@ use rokajit_ee::ee_info::EeInfo;
 use crate::error::{CompileError, CompileResult};
 use crate::ir::{lir, CallSig, Type};
 use crate::pipeline::CodegenOutput;
+use crate::structs::StructLayouts;
 
 /// A physical register, as an opaque target-local index. The core compares,
 /// copies, and stores these but never interprets the value; the mapping to
@@ -69,6 +70,17 @@ pub enum ArgLocation {
     /// On the stack, at a byte offset from the stack pointer at the call
     /// instruction.
     Stack { offset: u32 },
+    /// A register-passed struct (SysV eightbyte classification; step_10.9):
+    /// one register per eightbyte, per the descriptor's classes — integer
+    /// eightbytes take GPRs, SSE eightbytes take XMM registers. `sizes` and
+    /// `offsets` are the descriptor's `eightByteSizes`/`eightByteOffsets`;
+    /// moves must respect the sizes exactly.
+    StructRegs {
+        regs: [PhysReg; 2],
+        count: u8,
+        sizes: [u8; 2],
+        offsets: [u8; 2],
+    },
 }
 
 /// The ABI assignment for one call: where every argument and the return
@@ -103,13 +115,15 @@ pub trait Target {
     fn register_classes(&self) -> &'static [RegisterClass];
 
     /// The register class values of `ty` live in, or `None` when the target
-    /// does not keep the type in registers (e.g. `Type::Struct`, until
-    /// struct support lands).
-    fn class_of(&self, ty: Type) -> Option<RegClassId>;
+    /// does not keep the type on the frame/in registers. Structs are
+    /// memory-backed but legal whenever the layout side table knows the
+    /// class (step_10.9); `Void` never types a value.
+    fn class_of(&self, ty: Type, layouts: &StructLayouts) -> Option<RegClassId>;
 
     /// Assign a call's arguments and return value to registers/stack per
-    /// the target's ABI (SysV AMD64 on x64-Unix).
-    fn classify_call(&self, sig: &CallSig) -> CompileResult<CallAbi>;
+    /// the target's ABI (SysV AMD64 on x64-Unix). `layouts` answers the
+    /// struct-classification questions (step_10.9).
+    fn classify_call(&self, sig: &CallSig, layouts: &StructLayouts) -> CompileResult<CallAbi>;
 
     /// Required stack-pointer alignment in bytes at every call instruction
     /// (SysV AMD64: 16).

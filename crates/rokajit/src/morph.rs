@@ -46,6 +46,7 @@ pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
                     certify_expr(addr)?;
                     certify_expr(value)?;
                 }
+                hir::StmtKind::BlockZero { addr, .. } => certify_expr(addr)?,
                 hir::StmtKind::Eval(expr) => certify_expr(expr)?,
             }
         }
@@ -110,6 +111,7 @@ mod tests {
     use super::*;
     use crate::ir::{BlockId, CallSig, Const, LocalId, Type};
     use crate::pipeline::MethodInfo;
+    use crate::structs::StructLayouts;
     use rokajit_ee::enums::CorInfoType;
     use rokajit_ee::handles::MethodHandle;
     use rokajit_ee::mock::{MockEe, MockSig};
@@ -124,6 +126,8 @@ mod tests {
             ret,
             args: args.to_vec(),
             has_this: false,
+            ret_class: None,
+            arg_classes: Vec::new(),
         }
     }
 
@@ -143,6 +147,8 @@ mod tests {
                 ret: CorInfoType::Int,
                 args: vec![CorInfoType::Int],
                 has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
             },
         );
         let info = MethodInfo {
@@ -282,6 +288,8 @@ mod tests {
             ret: CorInfoType::Int,
             args: vec![CorInfoType::Int],
             has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
         };
         let (ee, info) = fixture(&il, &entry);
         let m = morph(crate::import::import(&info, &ee).expect("imports")).expect("morphs");
@@ -318,6 +326,7 @@ mod tests {
             eh_regions: Vec::new(),
             num_args: 0,
             num_il_locals: 0,
+            struct_layouts: StructLayouts::new(),
         };
         assert!(matches!(morph(method), Err(CompileError::Internal(_))));
     }
@@ -335,6 +344,7 @@ mod tests {
             eh_regions: Vec::new(),
             num_args: 0,
             num_il_locals: 0,
+            struct_layouts: StructLayouts::new(),
         });
         assert!(m.is_ok());
     }

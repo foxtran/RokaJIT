@@ -23,7 +23,13 @@
 //! `Unsupported`), instance field access `ldfld`/`stfld`/`ldflda` (static
 //! fields are out), and `newobj` (EE allocation helper + a direct
 //! constructor call; the reference-field store goes through the EE's
-//! checked-write-barrier helper). Anything else is
+//! checked-write-barrier helper). The step_10.9 value-type pack adds
+//! `initobj`/`ldobj`/`stobj`/`cpobj`, structs in signatures (args,
+//! returns — including the hidden return buffer — and locals, with SysV
+//! AMD64 eightbyte classification), struct instance methods (`this` as a
+//! byref), and struct-typed fields (loads yield the field address as a
+//! `StructVal`; stores are block copies, GC-embedding structs through the
+//! bulk-write-barrier helper). Anything else is
 //! [`CompileError::Unsupported`]; malformed IL is
 //! [`CompileError::BadIl`]. The importer never panics: every operand read
 //! is bounds-checked.
@@ -66,6 +72,7 @@ use crate::ir::{
     hir, BinaryOp, BlockId, CallSig, CallTarget, Const, IlOffset, LocalId, Type, UnaryOp,
 };
 use crate::pipeline::MethodInfo;
+use crate::structs::{layout_of, StructLayouts};
 
 /// Stage entry point (the body of [`crate::pipeline::import`]).
 pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> {
@@ -80,18 +87,45 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
     // The locals table: IL args (with `this` first when present), then the
     // IL locals from the locals signature. The importer appends its own
     // temps (the stloc interference spill — see `BlockImport::stloc`) after
-    // the IL locals.
+    // the IL locals. Layout facts for every value class mentioned anywhere
+    // in the method are queried once and cached in `struct_layouts`
+    // (step_10.9).
+    let mut struct_layouts = StructLayouts::new();
     let mut local_types = Vec::new();
-    if info.args.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0 {
-        // Class instance method: `this` is an object reference. (Value-type
-        // instance methods take a byref `this` — out of scope with structs.)
-        local_types.push(Type::Ref);
+    let has_this = info.args.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0;
+    if has_this {
+        // Class instance method: `this` is an object reference; value-type
+        // instance methods take a byref `this` (step_10.9 — mutations
+        // through it must reach the caller's memory).
+        let class = ee.get_method_class(info.ftn);
+        local_types.push(if ee.is_value_class(class) {
+            Type::ByRef
+        } else {
+            Type::Ref
+        });
     }
-    local_types.extend(sig_arg_types(&info.args, ee)?);
+    // The hidden return buffer (step_10.9): a method whose own return type
+    // is a non-register-passed struct takes an implicit ByRef argument
+    // immediately after `this` (the managed convention, clr-abi.md) and
+    // returns the buffer address in rax.
+    let ret_ty = sig_elem_type(
+        CorInfoType::from_raw(info.args.retType()),
+        ClassHandle::from_raw(info.args.retTypeClass),
+        ee,
+        &mut struct_layouts,
+    )?;
+    let retbuf = match ret_ty {
+        Type::Struct(class) if !struct_layouts[&class].sysv.passed_in_registers => {
+            let id = LocalId(local_types.len() as u32);
+            local_types.push(Type::ByRef);
+            Some(id)
+        }
+        _ => None,
+    };
+    local_types.extend(sig_arg_types(&info.args, ee, &mut struct_layouts)?);
     let num_args = local_types.len() as u32;
-    local_types.extend(sig_arg_types(&info.locals, ee)?);
+    local_types.extend(sig_arg_types(&info.locals, ee, &mut struct_layouts)?);
     let num_il_locals = local_types.len() as u32 - num_args;
-    let ret_ty = ir_type_raw(info.args.retType())?;
 
     let insns = decode(&info.il)?;
     let leaders = find_leaders(&info.il, &insns)?;
@@ -107,6 +141,8 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         num_args,
         num_il_locals,
         ret_ty,
+        retbuf,
+        struct_layouts,
         block_of,
         expected_depth: HashMap::new(),
         stack: Vec::new(),
@@ -150,12 +186,24 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         eh_regions: Vec::new(),
         num_args,
         num_il_locals,
+        struct_layouts: importer.struct_layouts,
     })
 }
 
 /// Maps an EE type to the IR's evaluation-stack vocabulary (ECMA-335
-/// §III.1.1.1: the sub-Int32 metadata types normalize to Int32).
-fn ir_type(ty: CorInfoType) -> CompileResult<Type> {
+/// §III.1.1.1: the sub-Int32 metadata types normalize to Int32). `class`
+/// is the value-class handle for `CorInfoType::ValueClass` elements
+/// (`getArgType`'s second answer, or the signature's `retTypeClass`); the
+/// class's layout is queried into `layouts` on first mention.
+fn sig_elem_type(
+    ty: Option<CorInfoType>,
+    class: Option<ClassHandle>,
+    ee: &dyn EeInfo,
+    layouts: &mut StructLayouts,
+) -> CompileResult<Type> {
+    let Some(ty) = ty else {
+        return Err(CompileError::BadIl("CorInfoType outside the header set"));
+    };
     Ok(match ty {
         CorInfoType::Void => Type::Void,
         CorInfoType::Bool
@@ -173,19 +221,18 @@ fn ir_type(ty: CorInfoType) -> CompileResult<Type> {
         CorInfoType::Class => Type::Ref,
         CorInfoType::ByRef => Type::ByRef,
         CorInfoType::ValueClass => {
-            return Err(CompileError::Unsupported("value types in signatures"));
+            let Some(class) = class else {
+                return Err(CompileError::BadIl(
+                    "value-class signature element without a class handle",
+                ));
+            };
+            layout_of(layouts, ee, class)?;
+            Type::Struct(class)
         }
         CorInfoType::Undef => {
             return Err(CompileError::BadIl("CORINFO_TYPE_UNDEF in signature"));
         }
     })
-}
-
-fn ir_type_raw(raw: ffi::CorInfoType) -> CompileResult<Type> {
-    match CorInfoType::from_raw(raw) {
-        Some(ty) => ir_type(ty),
-        None => Err(CompileError::BadIl("CorInfoType outside the header set")),
-    }
 }
 
 fn check_call_conv(call_conv: ffi::CorInfoCallConv) -> CompileResult<()> {
@@ -201,16 +248,22 @@ fn check_call_conv(call_conv: ffi::CorInfoCallConv) -> CompileResult<()> {
 }
 
 /// Walks a signature's argument list, bounded by `numArgs` (see the module
-/// docs: `getArgNext` is not an end-of-list signal on the real EE).
-fn sig_arg_types(sig: &ffi::CORINFO_SIG_INFO, ee: &dyn EeInfo) -> CompileResult<Vec<Type>> {
+/// docs: `getArgNext` is not an end-of-list signal on the real EE). The
+/// value-class handle `getArgType` reports for struct arguments is
+/// captured (step_10.9) and its layout queried into `layouts`.
+fn sig_arg_types(
+    sig: &ffi::CORINFO_SIG_INFO,
+    ee: &dyn EeInfo,
+    layouts: &mut StructLayouts,
+) -> CompileResult<Vec<Type>> {
     let mut types = Vec::with_capacity(sig.numArgs() as usize);
     let mut cursor = ArgListHandle::from_raw(sig.args);
     for _ in 0..sig.numArgs() {
         let Some(arg) = cursor else {
             return Err(CompileError::BadIl("sig arg list shorter than numArgs"));
         };
-        let (ty, _value_class) = ee.get_arg_type(sig, arg);
-        types.push(ir_type(ty)?);
+        let (ty, value_class) = ee.get_arg_type(sig, arg);
+        types.push(sig_elem_type(Some(ty), value_class, ee, layouts)?);
         cursor = ee.get_arg_next(arg);
     }
     Ok(types)
@@ -293,6 +346,14 @@ enum Op {
     /// `stfld` — instance field store; a reference-typed field stores
     /// through the EE's checked-write-barrier helper (the GC must be told).
     StFld(u32),
+    /// `cpobj` — struct copy between two addresses (type token).
+    CpObj(u32),
+    /// `ldobj` — struct load through an address (type token).
+    LdObj(u32),
+    /// `stobj` — struct store through an address (type token).
+    StObj(u32),
+    /// `initobj` — zero-init a value-type slot (type token).
+    InitObj(u32),
     Ret,
 }
 
@@ -489,11 +550,14 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x6D => Op::Conv(ConvKind::U4),
             0x6E => Op::Conv(ConvKind::U8),
             0x6F => Op::CallVirt(r.u32()?),
+            0x70 => Op::CpObj(r.u32()?),
+            0x71 => Op::LdObj(r.u32()?),
             0x72 => Op::LdStr(r.u32()?),
             0x73 => Op::NewObj(r.u32()?),
             0x7B => Op::LdFld(r.u32()?),
             0x7C => Op::LdFldA(r.u32()?),
             0x7D => Op::StFld(r.u32()?),
+            0x81 => Op::StObj(r.u32()?),
             0xFE => match r.u8()? {
                 0x01 => Op::Compare(BinaryOp::Eq),
                 0x02 => Op::Compare(BinaryOp::Gt),
@@ -506,6 +570,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                 0x0C => Op::LdLoc(r.u16()?),
                 0x0D => Op::LdLoca(r.u16()?),
                 0x0E => Op::StLoc(r.u16()?),
+                0x15 => Op::InitObj(r.u32()?),
                 _ => {
                     return Err(CompileError::Unsupported(
                         "0xFE-prefixed opcode outside the supported set",
@@ -585,6 +650,12 @@ struct BlockImport<'a> {
     num_args: u32,
     num_il_locals: u32,
     ret_ty: Type,
+    /// The hidden return buffer arg-local (a ByRef immediately after
+    /// `this`), present when the method's own return type is a
+    /// non-register-passed struct (step_10.9).
+    retbuf: Option<LocalId>,
+    /// Layout facts of every value class mentioned, queried once per class.
+    struct_layouts: StructLayouts,
     /// Leader offset → block index in layout order.
     block_of: HashMap<u32, u32>,
     /// Stack depth each block entry requires, as told by its predecessors.
@@ -756,11 +827,42 @@ impl BlockImport<'_> {
         Ok(LocalId(self.num_args + index))
     }
 
+    /// Maps an IL argument index (`ldarg`/`ldarga`/`starg`) to its local
+    /// slot. The hidden retbuf arg-local (step_10.9) sits between `this`
+    /// and the user arguments in the flat namespace but is NOT an IL
+    /// argument, so user-arg indices shift past it.
+    fn il_arg_id(&self, index: u32) -> CompileResult<LocalId> {
+        let this_count =
+            u32::from(self.info.args.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0);
+        let retbuf_count = u32::from(self.retbuf.is_some());
+        if index >= self.num_args - retbuf_count {
+            return Err(CompileError::BadIl("argument index out of range"));
+        }
+        Ok(LocalId(
+            index + if index >= this_count { retbuf_count } else { 0 },
+        ))
+    }
+
     /// A fresh importer temp, after the IL locals in the flat namespace.
     fn temp(&mut self, ty: Type) -> LocalId {
         let id = LocalId(self.local_types.len() as u32);
         self.local_types.push(ty);
         id
+    }
+
+    /// The expression a read of local `id` yields: a struct-typed slot
+    /// reads as its address (`StructVal` — struct values are memory-backed,
+    /// step_10.9), everything else is the plain local read.
+    fn local_value_expr(&self, id: LocalId) -> (Type, hir::Expr) {
+        let ty = self.local_types[id.0 as usize];
+        let expr = match ty {
+            Type::Struct(class) => hir::Expr::StructVal {
+                addr: Box::new(hir::Expr::LocalAddr(id)),
+                class,
+            },
+            _ => hir::Expr::Local(id),
+        };
+        (ty, expr)
     }
 
     /// `stloc`/`starg`: the value pops normally, but any tree still on the
@@ -784,6 +886,14 @@ impl BlockImport<'_> {
             if references_local(&self.stack[i].1, id) {
                 let tmp = self.temp(entry_ty);
                 let value = std::mem::replace(&mut self.stack[i].1, hir::Expr::Local(tmp));
+                // Struct values are addresses: the tree re-reads the spill
+                // temp through `StructVal`, never a bare `Local`.
+                if let Type::Struct(class) = entry_ty {
+                    self.stack[i].1 = hir::Expr::StructVal {
+                        addr: Box::new(hir::Expr::LocalAddr(tmp)),
+                        class,
+                    };
+                }
                 stmts.push(hir::Stmt {
                     il_offset,
                     kind: hir::StmtKind::Store { dst: tmp, value },
@@ -821,8 +931,12 @@ impl BlockImport<'_> {
                     il_offset,
                     kind: hir::StmtKind::Store { dst: tmp, value },
                 });
-                self.push(ty, hir::Expr::Local(tmp))?;
-                self.push(ty, hir::Expr::Local(tmp))?;
+                // A duplicated struct value re-reads the temp through
+                // `StructVal` (struct values are addresses, step_10.9).
+                let (ty, expr) = self.local_value_expr(tmp);
+                self.push(ty, expr)?;
+                let (_, expr) = self.local_value_expr(tmp);
+                self.push(ty, expr)?;
             }
         }
         Ok(())
@@ -834,10 +948,49 @@ impl BlockImport<'_> {
     fn pop_value(&mut self, stmts: &mut Vec<hir::Stmt>, il_offset: IlOffset) -> CompileResult<()> {
         let (_ty, value) = self.pop()?;
         if must_eval(&value) {
+            // The discarded tree's statement runs before anything later;
+            // pending trees below it read their memory first (the
+            // statement-before-tree rule — see `spill_stack`).
+            self.spill_stack(stmts, il_offset)?;
             stmts.push(hir::Stmt {
                 il_offset,
                 kind: hir::StmtKind::Eval(value),
             });
+        }
+        Ok(())
+    }
+
+    /// Spills every pending evaluation-stack tree into a fresh temp, in
+    /// stack order (bottom first), replacing each with a read of its temp.
+    /// Mandatory before pushing a statement while trees are pending: the
+    /// statement executes before the terminator/consumer's tree
+    /// evaluation, but IL semantics produced those values *before* the
+    /// side effect — e.g. `ceq …; initobj x; brfalse` must compare the
+    /// pre-initobj memory (found by Runtime_62524's silent wrong answer).
+    fn spill_stack(
+        &mut self,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        for i in 0..self.stack.len() {
+            let (ty, _) = &self.stack[i];
+            let ty = *ty;
+            let value = std::mem::replace(&mut self.stack[i].1, hir::Expr::Const(Const::Int32(0)));
+            // Constants and address-of-local trees can't observe the side
+            // effect (an address's identity doesn't change); everything
+            // else — reads of locals, memory, call results — must be
+            // evaluated before it.
+            if matches!(value, hir::Expr::LocalAddr(_) | hir::Expr::Const(_)) {
+                self.stack[i].1 = value;
+                continue;
+            }
+            let tmp = self.temp(ty);
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Store { dst: tmp, value },
+            });
+            let (_, expr) = self.local_value_expr(tmp);
+            self.stack[i].1 = expr;
         }
         Ok(())
     }
@@ -1012,7 +1165,11 @@ impl BlockImport<'_> {
         })
     }
 
-    fn ret(&mut self) -> CompileResult<hir::Terminator> {
+    fn ret(
+        &mut self,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<hir::Terminator> {
         if self.ret_ty == Type::Void {
             if !self.stack.is_empty() {
                 return Err(CompileError::BadIl(
@@ -1029,6 +1186,24 @@ impl BlockImport<'_> {
             return Err(CompileError::BadIl(
                 "more than the return value on the stack at ret",
             ));
+        }
+        if let Some(retbuf) = self.retbuf {
+            // The hidden-return-buffer convention (step_10.9): the struct
+            // value copies through the retbuf pointer, and the callee
+            // returns the buffer address in rax (clr-abi.md). The
+            // destination is the caller's frame, so no GC barrier is
+            // needed for the copy.
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::StoreInd {
+                    addr: hir::Expr::Local(retbuf),
+                    offset: 0,
+                    value,
+                },
+            });
+            return Ok(hir::Terminator::Return {
+                value: Some(hir::Expr::Local(retbuf)),
+            });
         }
         Ok(hir::Terminator::Return { value: Some(value) })
     }
@@ -1103,8 +1278,13 @@ impl BlockImport<'_> {
         if null_check_this && !has_this {
             return Err(CompileError::BadIl("callvirt on a static method"));
         }
-        let ret = ir_type_raw(call.sig.retType())?;
-        let arg_types = sig_arg_types(&call.sig, self.ee)?;
+        let ret = sig_elem_type(
+            CorInfoType::from_raw(call.sig.retType()),
+            ClassHandle::from_raw(call.sig.retTypeClass),
+            self.ee,
+            &mut self.struct_layouts,
+        )?;
+        let mut arg_types = sig_arg_types(&call.sig, self.ee, &mut self.struct_layouts)?;
 
         let mut args = Vec::with_capacity(arg_types.len() + usize::from(has_this));
         for &expected in arg_types.iter().rev() {
@@ -1134,6 +1314,39 @@ impl BlockImport<'_> {
                 "get_call_info returned a null method handle",
             ));
         };
+        if let Type::Struct(class) = ret {
+            if !self.struct_layouts[&class].sysv.passed_in_registers {
+                // The hidden return buffer (step_10.9): a call returning a
+                // non-register-passed struct takes the address of a fresh
+                // struct temp as an implicit argument immediately after
+                // `this` (the managed convention — NOT the PInvoke
+                // first-arg convention). The call runs for its retbuf
+                // write; the value is the temp.
+                self.spill_stack(stmts, il_offset)?;
+                let t = self.temp(ret);
+                args.insert(usize::from(has_this), hir::Expr::LocalAddr(t));
+                arg_types.insert(0, Type::ByRef);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Eval(hir::Expr::Call {
+                        target: CallTarget::Direct(method),
+                        sig: CallSig {
+                            ret,
+                            args: arg_types,
+                            has_this,
+                        },
+                        args,
+                    }),
+                });
+                return self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(hir::Expr::LocalAddr(t)),
+                        class,
+                    },
+                );
+            }
+        }
         let expr = hir::Expr::Call {
             target: CallTarget::Direct(method),
             sig: CallSig {
@@ -1144,6 +1357,7 @@ impl BlockImport<'_> {
             args,
         };
         if ret == Type::Void {
+            self.spill_stack(stmts, il_offset)?;
             stmts.push(hir::Stmt {
                 il_offset,
                 kind: hir::StmtKind::Eval(expr),
@@ -1158,8 +1372,10 @@ impl BlockImport<'_> {
     /// (step_10.4): the token-kind hint is `CORINFO_TOKENKIND_Field`
     /// (importer.cpp `impResolveToken` for the field opcodes), an
     /// unresolved token is BadIl, and static fields are out of the pack.
-    /// Returns the field handle and the EE-supplied instance offset.
-    fn resolve_instance_field(&mut self, token: u32) -> CompileResult<(FieldHandle, u32)> {
+    /// Returns the field handle, the EE-supplied instance offset, and
+    /// whether the field's declaring class is a value class (step_10.9:
+    /// such fields accept a ByRef receiver).
+    fn resolve_instance_field(&mut self, token: u32) -> CompileResult<(FieldHandle, u32, bool)> {
         let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
             t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
             t.tokenScope = self.info.args.scope;
@@ -1175,15 +1391,22 @@ impl BlockImport<'_> {
                 "static fields: not yet supported",
             ));
         }
-        Ok((field, self.ee.get_field_offset(field)))
+        let declaring_is_value_class =
+            ClassHandle::from_raw(resolved.hClass).is_some_and(|c| self.ee.is_value_class(c));
+        Ok((
+            field,
+            self.ee.get_field_offset(field),
+            declaring_is_value_class,
+        ))
     }
 
-    /// The IR type of a field, gated to the 10.4 pack: the full-width
-    /// integers, native ints/pointers, and object references. The
-    /// sub-Int32 metadata types need width-correct loads/stores and
-    /// floats/structs need machinery the pack doesn't have.
-    fn field_ir_type(&self, field: FieldHandle) -> CompileResult<Type> {
-        let (ty, _value_class) = self.ee.get_field_type(field);
+    /// The IR type of a field, gated to the object pack plus value-class
+    /// fields (step_10.9): the full-width integers, native ints/pointers,
+    /// object references, and structs (whose layout is queried into the
+    /// side table). The sub-Int32 metadata types need width-correct
+    /// loads/stores and floats need machinery the pack doesn't have.
+    fn field_ir_type(&mut self, field: FieldHandle) -> CompileResult<Type> {
+        let (ty, value_class) = self.ee.get_field_type(field);
         match ty {
             CorInfoType::Int | CorInfoType::UInt => Ok(Type::Int32),
             CorInfoType::Long | CorInfoType::ULong => Ok(Type::Int64),
@@ -1191,36 +1414,81 @@ impl BlockImport<'_> {
                 Ok(Type::NativeInt)
             }
             CorInfoType::Class => Ok(Type::Ref),
+            CorInfoType::ValueClass => {
+                sig_elem_type(Some(ty), value_class, self.ee, &mut self.struct_layouts)
+            }
             _ => Err(CompileError::Unsupported(
                 "field type outside the 10.4 object pack",
             )),
         }
     }
 
-    /// The receiver of a field access must be a class reference; a byref
-    /// receiver means a value-type field access (out of the pack).
-    fn pop_field_receiver(&mut self) -> CompileResult<hir::Expr> {
+    /// The receiver of a field access: a class reference (null-checked at
+    /// the access), or — when the field's declaring class is a value class
+    /// (`byref_ok`) — a byref into the struct OR the struct value itself
+    /// (csc emits `ldarg`/`ldloc` + `ldfld` for value reads: the value's
+    /// home is the receiver's memory). Byref/value receivers are never
+    /// null-checked: byrefs are managed pointers and a value is never
+    /// null. Returns the receiver (an address expression for the
+    /// value/byref forms) and whether it needs the explicit null check.
+    fn pop_field_receiver(
+        &mut self,
+        byref_ok: bool,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<(hir::Expr, bool)> {
         let (ty, obj) = self.pop()?;
-        if ty != Type::Ref {
-            return Err(CompileError::Unsupported(
+        match ty {
+            Type::Ref => Ok((obj, true)),
+            Type::ByRef if byref_ok => Ok((obj, false)),
+            Type::Struct(class) if byref_ok => {
+                let addr = self.struct_addr_of(obj, class, stmts, il_offset);
+                Ok((addr, false))
+            }
+            _ => Err(CompileError::Unsupported(
                 "field access on a non-class receiver (value types)",
-            ));
+            )),
         }
-        Ok(obj)
     }
 
     /// `ldfld` (0x7B): the load's address is the null-checked receiver —
     /// the null check is explicit and trap-based (RyuJIT's model: a load
     /// through the pointer, the hardware fault translated by the EE; the
-    /// offset-folding optimization is deliberately not tier 0's).
-    fn ldfld(&mut self, token: u32) -> CompileResult<()> {
-        let (field, offset) = self.resolve_instance_field(token)?;
+    /// offset-folding optimization is deliberately not tier 0's). A
+    /// struct-typed field (step_10.9) loads as its address: the value is a
+    /// `StructVal` of the field address.
+    fn ldfld(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let (field, offset, byref_ok) = self.resolve_instance_field(token)?;
         let ty = self.field_ir_type(field)?;
-        let obj = self.pop_field_receiver()?;
+        let (obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
+        let obj = if null_check {
+            hir::Expr::NullCheck { arg: Box::new(obj) }
+        } else {
+            obj
+        };
+        self.spill_stack(stmts, il_offset)?;
+        if let Type::Struct(class) = ty {
+            return self.push(
+                ty,
+                hir::Expr::StructVal {
+                    addr: Box::new(hir::Expr::FieldAddr {
+                        obj: Box::new(obj),
+                        field,
+                        offset,
+                    }),
+                    class,
+                },
+            );
+        }
         self.push(
             ty,
             hir::Expr::Load {
-                addr: Box::new(hir::Expr::NullCheck { arg: Box::new(obj) }),
+                addr: Box::new(obj),
                 offset,
                 ty,
             },
@@ -1229,13 +1497,23 @@ impl BlockImport<'_> {
 
     /// `ldflda` (0x7C): the field's address — type-agnostic (an address
     /// carries no field type), so the field-type gate does not apply.
-    fn ldflda(&mut self, token: u32) -> CompileResult<()> {
-        let (field, offset) = self.resolve_instance_field(token)?;
-        let obj = self.pop_field_receiver()?;
+    fn ldflda(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let (field, offset, byref_ok) = self.resolve_instance_field(token)?;
+        let (obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
+        let obj = if null_check {
+            hir::Expr::NullCheck { arg: Box::new(obj) }
+        } else {
+            obj
+        };
         self.push(
             Type::ByRef,
             hir::Expr::FieldAddr {
-                obj: Box::new(hir::Expr::NullCheck { arg: Box::new(obj) }),
+                obj: Box::new(obj),
                 field,
                 offset,
             },
@@ -1250,21 +1528,39 @@ impl BlockImport<'_> {
     /// must never see a null destination (an AV inside the helper would
     /// not translate to a NullReferenceException), so the destination
     /// address is built off the null-checked receiver.
+    ///
+    /// A struct-typed field (step_10.9) stores as a block copy; when the
+    /// struct embeds GC pointers the copy goes through
+    /// `CORINFO_HELP_BULK_WRITEBARRIER` (RyuJIT's own heap answer — it
+    /// applies the barrier per cell when the destination is in the heap
+    /// and is a plain copy otherwise).
     fn stfld(
         &mut self,
         token: u32,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let (field, offset) = self.resolve_instance_field(token)?;
+        let (field, offset, byref_ok) = self.resolve_instance_field(token)?;
         let ty = self.field_ir_type(field)?;
         let (vt, value) = self.pop()?;
         if vt != ty {
             return Err(CompileError::BadIl("stfld value type mismatch"));
         }
-        let obj = hir::Expr::NullCheck {
-            arg: Box::new(self.pop_field_receiver()?),
+        let (obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
+        let obj = if null_check {
+            hir::Expr::NullCheck { arg: Box::new(obj) }
+        } else {
+            obj
         };
+        self.spill_stack(stmts, il_offset)?;
+        if let Type::Struct(class) = ty {
+            let addr = hir::Expr::FieldAddr {
+                obj: Box::new(obj),
+                field,
+                offset,
+            };
+            return self.store_struct_through(addr, class, value, stmts, il_offset);
+        }
         let kind = if ty == Type::Ref {
             hir::StmtKind::Eval(hir::Expr::Call {
                 target: CallTarget::Helper(CorInfoHelpFunc::CHECKED_ASSIGN_REF),
@@ -1293,6 +1589,178 @@ impl BlockImport<'_> {
         Ok(())
     }
 
+    /// The address of a struct value: `StructVal` unwraps; anything else
+    /// (e.g. a register-passed call result) spills to a temp first and the
+    /// temp's address is the answer.
+    fn struct_addr_of(
+        &mut self,
+        value: hir::Expr,
+        class: ClassHandle,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> hir::Expr {
+        match value {
+            hir::Expr::StructVal { addr, .. } => *addr,
+            value => {
+                let t = self.temp(Type::Struct(class));
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store { dst: t, value },
+                });
+                hir::Expr::LocalAddr(t)
+            }
+        }
+    }
+
+    /// A struct store through a computed address (`stobj`/`cpobj`/struct
+    /// `stfld`): when the class embeds GC pointers the copy goes through
+    /// `CORINFO_HELP_BULK_WRITEBARRIER(dst, src, size)` — GC-correct for
+    /// heap destinations, a plain copy for stack ones (the helper checks);
+    /// otherwise a plain block copy (`StoreInd` of the `StructVal`).
+    fn store_struct_through(
+        &mut self,
+        addr: hir::Expr,
+        class: ClassHandle,
+        value: hir::Expr,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let layout = &self.struct_layouts[&class];
+        if layout.gc_cells.is_empty() {
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::StoreInd {
+                    addr,
+                    offset: 0,
+                    value,
+                },
+            });
+            return Ok(());
+        }
+        let size = layout.size as isize;
+        let src = self.struct_addr_of(value, class, stmts, il_offset);
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::BULK_WRITEBARRIER),
+                sig: CallSig {
+                    ret: Type::Void,
+                    args: vec![Type::ByRef, Type::ByRef, Type::NativeInt],
+                    has_this: false,
+                },
+                args: vec![addr, src, hir::Expr::Const(Const::NativeInt(size))],
+            }),
+        });
+        Ok(())
+    }
+
+    /// Class-token resolution for the struct opcodes (`ldobj`/`stobj`/
+    /// `cpobj`/`initobj`): the token-kind hint is `CORINFO_TOKENKIND_Class`
+    /// (importer.cpp `impResolveToken`, same as `newobj`'s class side).
+    fn resolve_value_class(&mut self, token: u32) -> CompileResult<ClassHandle> {
+        let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+            t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+            t.tokenScope = self.info.args.scope;
+            t.token = token;
+            t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class;
+        });
+        self.ee.resolve_token(&mut resolved);
+        let Some(class) = ClassHandle::from_raw(resolved.hClass) else {
+            return Err(CompileError::BadIl("type token did not resolve to a class"));
+        };
+        if !self.ee.is_value_class(class) {
+            return Err(CompileError::Unsupported(
+                "initobj/ldobj/stobj/cpobj of a non-value class",
+            ));
+        }
+        layout_of(&mut self.struct_layouts, self.ee, class)?;
+        Ok(class)
+    }
+
+    /// Pops the address operand of a struct memory opcode: a managed
+    /// byref or a native-int pointer (ECMA-335 §III.4.27: `&` or
+    /// `native int`).
+    fn pop_struct_addr(&mut self) -> CompileResult<hir::Expr> {
+        let (ty, addr) = self.pop()?;
+        if !matches!(ty, Type::ByRef | Type::NativeInt) {
+            return Err(CompileError::BadIl(
+                "struct opcode address must be a byref or native int",
+            ));
+        }
+        Ok(addr)
+    }
+
+    /// `ldobj` (0x71): the struct value at the address.
+    fn ldobj(&mut self, token: u32) -> CompileResult<()> {
+        let class = self.resolve_value_class(token)?;
+        let addr = self.pop_struct_addr()?;
+        self.push(
+            Type::Struct(class),
+            hir::Expr::StructVal {
+                addr: Box::new(addr),
+                class,
+            },
+        )
+    }
+
+    /// `stobj` (0x81): the struct value stores through the address.
+    fn stobj(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let class = self.resolve_value_class(token)?;
+        let (vt, value) = self.pop()?;
+        if vt != Type::Struct(class) {
+            return Err(CompileError::BadIl("stobj value type mismatch"));
+        }
+        let addr = self.pop_struct_addr()?;
+        self.spill_stack(stmts, il_offset)?;
+        self.store_struct_through(addr, class, value, stmts, il_offset)
+    }
+
+    /// `cpobj` (0x70): struct copy from the source address to the
+    /// destination address.
+    fn cpobj(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let class = self.resolve_value_class(token)?;
+        let src = self.pop_struct_addr()?;
+        let dst = self.pop_struct_addr()?;
+        self.spill_stack(stmts, il_offset)?;
+        self.store_struct_through(
+            dst,
+            class,
+            hir::Expr::StructVal {
+                addr: Box::new(src),
+                class,
+            },
+            stmts,
+            il_offset,
+        )
+    }
+
+    /// `initobj` (0xFE 15): zero-init the slot at the address.
+    fn initobj(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let class = self.resolve_value_class(token)?;
+        let addr = self.pop_struct_addr()?;
+        self.spill_stack(stmts, il_offset)?;
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::BlockZero { addr, class },
+        });
+        Ok(())
+    }
+
     /// `newobj` (0x73): allocate through the EE's `getNewHelper` helper
     /// (the `CORINFO_HELP_NEWFAST`/`NEWSFAST` families — the
     /// single-argument `(MethodTable*) -> Object*` forms), then run the
@@ -1318,6 +1786,15 @@ impl BlockImport<'_> {
                 "newobj token did not resolve to a class",
             ));
         };
+        // `newobj` of a value class stays out (step_10.9's scope rule):
+        // csc normally emits initobj+ldloca+call .ctor for struct
+        // construction, and the allocation-helper path would build a box
+        // (which then fails downstream with a misleading type mismatch).
+        if self.ee.is_value_class(class) {
+            return Err(CompileError::Unsupported(
+                "newobj of a value class (use initobj + call .ctor)",
+            ));
+        }
 
         // The static-constructor trigger: RyuJIT's newobj import queries
         // initClass with no field (not a field-trigger query), the method
@@ -1341,6 +1818,9 @@ impl BlockImport<'_> {
         };
         let class_const = || hir::Expr::Const(Const::NativeInt(class.as_raw() as isize));
 
+        // Pending stack trees (the constructor arguments included) must
+        // evaluate before the allocation side effects.
+        self.spill_stack(stmts, il_offset)?;
         if init.contains(CorInfoInitClassResult::USE_HELPER) {
             stmts.push(hir::Stmt {
                 il_offset,
@@ -1410,11 +1890,16 @@ impl BlockImport<'_> {
         if call.sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS == 0 {
             return Err(CompileError::BadIl("newobj on a static method"));
         }
-        let ret = ir_type_raw(call.sig.retType())?;
+        let ret = sig_elem_type(
+            CorInfoType::from_raw(call.sig.retType()),
+            ClassHandle::from_raw(call.sig.retTypeClass),
+            self.ee,
+            &mut self.struct_layouts,
+        )?;
         if ret != Type::Void {
             return Err(CompileError::BadIl("a constructor must return void"));
         }
-        let arg_types = sig_arg_types(&call.sig, self.ee)?;
+        let arg_types = sig_arg_types(&call.sig, self.ee, &mut self.struct_layouts)?;
         let mut args = Vec::with_capacity(arg_types.len() + 1);
         for &expected in arg_types.iter().rev() {
             let (ty, value) = self.pop()?;
@@ -1471,36 +1956,26 @@ impl BlockImport<'_> {
             match insn.op {
                 Op::Nop => {}
                 Op::LdArg(index) => {
-                    let index = u32::from(index);
-                    if index >= self.num_args {
-                        return Err(CompileError::BadIl("argument index out of range"));
-                    }
-                    self.push(
-                        self.local_types[index as usize],
-                        hir::Expr::Local(LocalId(index)),
-                    )?;
+                    let id = self.il_arg_id(u32::from(index))?;
+                    let (ty, expr) = self.local_value_expr(id);
+                    self.push(ty, expr)?;
                 }
                 Op::LdLoc(index) => {
                     let id = self.il_local_id(u32::from(index))?;
-                    self.push(self.local_types[id.0 as usize], hir::Expr::Local(id))?;
+                    let (ty, expr) = self.local_value_expr(id);
+                    self.push(ty, expr)?;
                 }
                 Op::StLoc(index) => {
                     let id = self.il_local_id(u32::from(index))?;
                     self.store_local(id, &mut stmts, il_offset)?;
                 }
                 Op::LdArgA(index) => {
-                    let index = u32::from(index);
-                    if index >= self.num_args {
-                        return Err(CompileError::BadIl("argument index out of range"));
-                    }
-                    self.push(Type::ByRef, hir::Expr::LocalAddr(LocalId(index)))?;
+                    let id = self.il_arg_id(u32::from(index))?;
+                    self.push(Type::ByRef, hir::Expr::LocalAddr(id))?;
                 }
                 Op::StArg(index) => {
-                    let index = u32::from(index);
-                    if index >= self.num_args {
-                        return Err(CompileError::BadIl("argument index out of range"));
-                    }
-                    self.store_local(LocalId(index), &mut stmts, il_offset)?;
+                    let id = self.il_arg_id(u32::from(index))?;
+                    self.store_local(id, &mut stmts, il_offset)?;
                 }
                 Op::LdLoca(index) => {
                     let id = self.il_local_id(u32::from(index))?;
@@ -1545,9 +2020,13 @@ impl BlockImport<'_> {
                     self.call(token, CallInfoFlags::CALLVIRT, true, &mut stmts, il_offset)?
                 }
                 Op::NewObj(token) => self.newobj(token, &mut stmts, il_offset)?,
-                Op::LdFld(token) => self.ldfld(token)?,
-                Op::LdFldA(token) => self.ldflda(token)?,
+                Op::LdFld(token) => self.ldfld(token, &mut stmts, il_offset)?,
+                Op::LdFldA(token) => self.ldflda(token, &mut stmts, il_offset)?,
                 Op::StFld(token) => self.stfld(token, &mut stmts, il_offset)?,
+                Op::CpObj(token) => self.cpobj(token, &mut stmts, il_offset)?,
+                Op::LdObj(token) => self.ldobj(token)?,
+                Op::StObj(token) => self.stobj(token, &mut stmts, il_offset)?,
+                Op::InitObj(token) => self.initobj(token, &mut stmts, il_offset)?,
                 Op::Br { target } => {
                     self.note_depth(target, self.stack.len())?;
                     terminator = Some(hir::Terminator::Jump {
@@ -1596,7 +2075,7 @@ impl BlockImport<'_> {
                         Some(self.branch(binary(op, lhs, rhs), target, insn.offset + insn.size)?);
                 }
                 Op::Ret => {
-                    terminator = Some(self.ret()?);
+                    terminator = Some(self.ret(&mut stmts, il_offset)?);
                 }
             }
         }
@@ -1636,6 +2115,8 @@ mod tests {
             ret,
             args: args.to_vec(),
             has_this: false,
+            ret_class: None,
+            arg_classes: Vec::new(),
         }
     }
 
@@ -1660,6 +2141,8 @@ mod tests {
                 ret: CorInfoType::Int,
                 args: vec![CorInfoType::Int],
                 has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
             },
         );
         let info = MethodInfo {
@@ -2190,6 +2673,8 @@ mod tests {
             ret: CorInfoType::Int,
             args: vec![CorInfoType::Int],
             has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
         };
         let (ee, info) = fixture(&il, &entry, &[]);
         let m = import(&info, &ee).expect("imports");
@@ -3032,6 +3517,8 @@ mod tests {
             ret: CorInfoType::Int,
             args: vec![CorInfoType::Int],
             has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
         };
         let (mut ee, info) = fixture(il, &entry, &[]);
         ee.add_field(FIELD_TOKEN, CorInfoType::Int, 16);
@@ -3117,6 +3604,8 @@ mod tests {
             ret: CorInfoType::Int,
             args: vec![CorInfoType::Int],
             has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
         };
         let (mut ee, info) = fixture_full(&il, &entry, &[CorInfoType::ByRef], 8, 0);
         ee.add_field(FIELD_TOKEN, CorInfoType::Int, 16);
@@ -3203,6 +3692,8 @@ mod tests {
                 ret: CorInfoType::Void,
                 args: vec![CorInfoType::Int],
                 has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
             },
         );
         let m = import(&info, &ee).expect("imports");
@@ -3268,6 +3759,8 @@ mod tests {
                 ret: CorInfoType::Void,
                 args: vec![],
                 has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
             },
         );
         ee.init_class_result = CorInfoInitClassResult::USE_HELPER;
@@ -3298,6 +3791,8 @@ mod tests {
                 ret: CorInfoType::Void,
                 args: vec![],
                 has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
             },
         );
         ee.new_helper = Some(CorInfoHelpFunc::NEWARR_1_PTR);
@@ -3305,6 +3800,45 @@ mod tests {
             import(&info, &ee),
             Err(CompileError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn newobj_of_a_value_class_is_rejected_early() {
+        // newobj of a struct: even when the EE would answer an accepted
+        // allocation helper, the class gate fires first — the alternative
+        // builds a box and fails downstream with a misleading `BadIl`
+        // (RecursiveTailCall's shape: `new Struct1(true)`).
+        let (mut ee, c) = struct_ee(1, &[], None);
+        ee.add_method(
+            CTOR_TOKEN,
+            MockSig {
+                ret: CorInfoType::Void,
+                args: vec![CorInfoType::Bool],
+                has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
+            },
+        );
+        // The mock resolves the NewObj token's hClass from the method
+        // handle by default; point the class token machinery at the value
+        // class instead.
+        ee.class_tokens.insert(0x0600_0004, c);
+        let entry = sig(CorInfoType::Void, &[]);
+        // ldc.i4.1; newobj CTOR; pop; ret
+        let info = struct_info(
+            &mut ee,
+            &[0x17, 0x73, 0x04, 0x00, 0x00, 0x06, 0x26, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let err = import(&info, &ee)
+            .err()
+            .expect("newobj of a value class is unsupported");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("newobj of a value class")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -3349,5 +3883,523 @@ mod tests {
             matches!(&err, CompileError::Unsupported(m) if m.contains("value types")),
             "{err:?}"
         );
+    }
+
+    // --- step_10.9: value types ---
+
+    use rokajit_ee::handles::ClassHandle;
+    use rokajit_ee::mock::sysv_descriptor;
+
+    const CLASS_TOKEN: u32 = 0x0200_0001;
+    const STRUCT_FIELD_TOKEN: u32 = 0x0400_0009;
+    const STRUCT_FN_TOKEN: u32 = 0x0600_0010;
+
+    const INT_EB: ffi::SystemVClassificationType =
+        ffi::SystemVClassificationType_SystemVClassificationTypeInteger;
+
+    /// A MockEe with one registered value class and a class token for it,
+    /// plus the usual three canned methods.
+    fn struct_ee(
+        size: u32,
+        gc_cells: &[(u32, bool)],
+        sysv: Option<ffi::SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR>,
+    ) -> (MockEe, ClassHandle) {
+        let mut ee = MockEe::default();
+        let class = ee.add_class(size, 8, gc_cells, sysv);
+        ee.class_tokens.insert(CLASS_TOKEN, class);
+        (ee, class)
+    }
+
+    fn struct_info(
+        ee: &mut MockEe,
+        il: &[u8],
+        entry: &MockSig,
+        locals: &[CorInfoType],
+        local_classes: &[Option<ClassHandle>],
+    ) -> MethodInfo {
+        MethodInfo {
+            ftn: MethodHandle::from_raw(1usize as ffi::CORINFO_METHOD_HANDLE).unwrap(),
+            il: il.to_vec(),
+            max_stack: 8,
+            eh_count: 0,
+            init_locals: false,
+            args: ee.make_method_sig(entry),
+            locals: ee.make_locals_sig_with_classes(locals, local_classes),
+        }
+    }
+
+    fn as_struct_val(e: &hir::Expr) -> (&hir::Expr, ClassHandle) {
+        match e {
+            hir::Expr::StructVal { addr, class } => (addr, *class),
+            _ => panic!("expected Expr::StructVal"),
+        }
+    }
+
+    #[test]
+    fn initobj_imports_as_a_block_zero() {
+        // ldloca.0; initobj C; ret — the local's slot zeroes.
+        let (mut ee, c) = struct_ee(12, &[], None);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x12, 0x00, 0xFE, 0x15, 0x01, 0x00, 0x00, 0x02, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass],
+            &[Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.locals[0].ty, Type::Struct(c));
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::BlockZero { addr, class } => {
+                assert_eq!(*class, c);
+                assert_eq!(as_local_addr(addr), LocalId(0));
+            }
+            _ => panic!("expected StmtKind::BlockZero"),
+        }
+        // The layout was queried into the side table.
+        assert_eq!(m.struct_layouts[&c].size, 12);
+    }
+
+    #[test]
+    fn ldobj_stobj_cpobj_import_as_struct_copies() {
+        let (mut ee, c) = struct_ee(8, &[], None);
+        // ldloca.0; ldobj C; stloc.1; ret — ldobj yields a StructVal of
+        // the address; the stloc stores it.
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x12, 0x00, 0x71, 0x01, 0x00, 0x00, 0x02, 0x0B, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass, CorInfoType::ValueClass],
+            &[Some(c), Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(1));
+        let (addr, class) = as_struct_val(value);
+        assert_eq!(class, c);
+        assert_eq!(as_local_addr(addr), LocalId(0));
+
+        // ldloca.0; ldloc.1; stobj C; ret — a StoreInd of the StructVal.
+        let (mut ee, c) = struct_ee(8, &[], None);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x12, 0x00, 0x07, 0x81, 0x01, 0x00, 0x00, 0x02, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass, CorInfoType::ValueClass],
+            &[Some(c), Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset,
+                value,
+            } => {
+                assert_eq!(as_local_addr(addr), LocalId(0));
+                assert_eq!(*offset, 0);
+                let (src, _) = as_struct_val(value);
+                assert_eq!(as_local_addr(src), LocalId(1));
+            }
+            _ => panic!("expected StmtKind::StoreInd"),
+        }
+
+        // ldloca.0; ldloca.1; cpobj C; ret — same shape, both addresses.
+        let (mut ee, c) = struct_ee(8, &[], None);
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x12, 0x00, 0x12, 0x01, 0x70, 0x01, 0x00, 0x00, 0x02, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass, CorInfoType::ValueClass],
+            &[Some(c), Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset,
+                value,
+            } => {
+                assert_eq!(as_local_addr(addr), LocalId(0));
+                assert_eq!(*offset, 0);
+                let (src, _) = as_struct_val(value);
+                assert_eq!(as_local_addr(src), LocalId(1));
+            }
+            _ => panic!("expected StmtKind::StoreInd"),
+        }
+    }
+
+    #[test]
+    fn struct_opcodes_reject_a_non_value_class() {
+        // A class token the mock resolves to nothing value-class-like.
+        let mut ee = MockEe::default();
+        ee.class_tokens.insert(
+            CLASS_TOKEN,
+            ClassHandle::from_raw(0x999usize as ffi::CORINFO_CLASS_HANDLE).unwrap(),
+        );
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x12, 0x00, 0xFE, 0x15, 0x01, 0x00, 0x00, 0x02, 0x2A],
+            &entry,
+            &[CorInfoType::Int],
+            &[],
+        );
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn struct_instance_method_this_is_a_byref() {
+        // The method's class is a value class: `this` is a ByRef arg and
+        // ldarg.0 yields it (mutations flow back to the caller's memory).
+        let (mut ee, c) = struct_ee(8, &[], None);
+        ee.method_classes.insert(1, c);
+        let entry = MockSig {
+            ret: CorInfoType::Void,
+            args: vec![],
+            has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        // ldarg.0; pop; ret.
+        let info = struct_info(&mut ee, &[0x02, 0x26, 0x2A], &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.num_args, 1);
+        assert_eq!(m.locals[0].ty, Type::ByRef);
+    }
+
+    #[test]
+    fn callee_side_retbuf_is_an_implicit_arg_after_this() {
+        // An instance method returning a 17-byte (memory-class) struct:
+        // locals are [this: ByRef, retbuf: ByRef, arg], and `ret` of the
+        // struct value block-copies through the retbuf and returns it.
+        let (mut ee, c) = struct_ee(17, &[], None);
+        ee.method_classes.insert(1, c);
+        let entry = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::Int],
+            has_this: true,
+            ret_class: Some(c),
+            arg_classes: Vec::new(),
+        };
+        // ldloc.0; ret — IL local 0 (the struct) is LocalId(3).
+        let info = struct_info(
+            &mut ee,
+            &[0x06, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass],
+            &[Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.num_args, 3);
+        assert_eq!(m.locals[0].ty, Type::ByRef, "this");
+        assert_eq!(m.locals[1].ty, Type::ByRef, "the hidden retbuf");
+        assert_eq!(m.locals[2].ty, Type::Int32);
+        assert_eq!(m.locals[3].ty, Type::Struct(c));
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::StoreInd { addr, value, .. } => {
+                assert_eq!(as_local(addr), LocalId(1), "copy through the retbuf");
+                let (src, _) = as_struct_val(value);
+                assert_eq!(as_local_addr(src), LocalId(3));
+            }
+            _ => panic!("expected the retbuf block copy"),
+        }
+        // The method returns the retbuf pointer (rax on return).
+        match &m.blocks[0].terminator {
+            hir::Terminator::Return { value: Some(v) } => {
+                assert_eq!(as_local(v), LocalId(1));
+            }
+            _ => panic!("expected Return of the retbuf pointer"),
+        }
+    }
+
+    #[test]
+    fn caller_side_retbuf_is_an_implicit_arg_after_this() {
+        let (mut ee, c) = struct_ee(17, &[], None);
+        // A static fn returning the 17-byte struct, one int arg.
+        ee.add_method(
+            STRUCT_FN_TOKEN,
+            MockSig {
+                ret: CorInfoType::ValueClass,
+                args: vec![CorInfoType::Int],
+                has_this: false,
+                ret_class: Some(c),
+                arg_classes: Vec::new(),
+            },
+        );
+        let entry = sig(CorInfoType::Void, &[]);
+        // ldc.i4.1; call F; pop; ret.
+        let info = struct_info(
+            &mut ee,
+            &[0x17, 0x28, 0x10, 0x00, 0x00, 0x06, 0x26, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { sig, args, .. }) => {
+                assert_eq!(sig.args, vec![Type::ByRef, Type::Int32]);
+                assert_eq!(sig.ret, Type::Struct(c));
+                assert!(!sig.has_this);
+                // The retbuf temp is the first local; it heads the args.
+                assert_eq!(as_local_addr(&args[0]), LocalId(0));
+                assert_eq!(as_i32(&args[1]), 1);
+                assert_eq!(m.locals[0].ty, Type::Struct(c));
+                assert_eq!(m.locals[0].kind, hir::LocalKind::Temp);
+            }
+            _ => panic!("expected the retbuf call"),
+        }
+    }
+
+    #[test]
+    fn retbuf_shifts_user_arg_indices() {
+        // Same retbuf shape as the callee-side test; IL `ldarg.1` must
+        // read the user argument (LocalId 2), not the retbuf (LocalId 1).
+        let (mut ee, c) = struct_ee(16, &[], None);
+        ee.method_classes.insert(1, c);
+        ee.add_struct_field(FIELD_TOKEN, c, 0);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().ty = CorInfoType::Int;
+        let entry = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::Int],
+            has_this: true,
+            ret_class: Some(c),
+            arg_classes: Vec::new(),
+        };
+        // ldloca.s 0; ldarg.1; stfld F; ldloc.0; ret — the user arg stores
+        // into the local struct's int field.
+        let info = struct_info(
+            &mut ee,
+            &[0x12, 0x00, 0x03, 0x7D, 0x01, 0x00, 0x00, 0x04, 0x06, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass],
+            &[Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::StoreInd { addr, value, .. } => {
+                assert_eq!(as_local_addr(addr), LocalId(3), "the struct local");
+                assert_eq!(as_local(value), LocalId(2), "the user arg, past the retbuf");
+            }
+            _ => panic!("expected the field store"),
+        }
+    }
+
+    #[test]
+    fn register_passed_struct_call_pushes_the_call_itself() {
+        let (mut ee, c) = struct_ee(16, &[], Some(sysv_descriptor(&[(INT_EB, 8), (INT_EB, 8)])));
+        ee.add_method(
+            STRUCT_FN_TOKEN,
+            MockSig {
+                ret: CorInfoType::ValueClass,
+                args: vec![],
+                has_this: false,
+                ret_class: Some(c),
+                arg_classes: Vec::new(),
+            },
+        );
+        let entry = sig(CorInfoType::Void, &[]);
+        // call F; stloc.0; ret — no retbuf anywhere.
+        let info = struct_info(
+            &mut ee,
+            &[0x28, 0x10, 0x00, 0x00, 0x06, 0x0A, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass],
+            &[Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(0));
+        match value {
+            hir::Expr::Call { sig, args, .. } => {
+                assert_eq!(sig.ret, Type::Struct(c));
+                assert!(sig.args.is_empty());
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected the struct-returning call as the value"),
+        }
+    }
+
+    #[test]
+    fn struct_field_load_yields_the_field_address() {
+        let (mut ee, c) = struct_ee(8, &[], None);
+        ee.add_struct_field(STRUCT_FIELD_TOKEN, c, 8);
+        let entry = sig(CorInfoType::Void, &[CorInfoType::Class]);
+        // ldarg.0; ldfld F; stloc.0; ret — a StructVal of the
+        // (null-checked) field address.
+        let info = struct_info(
+            &mut ee,
+            &[0x02, 0x7B, 0x09, 0x00, 0x00, 0x04, 0x0A, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass],
+            &[Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(1));
+        let (addr, class) = as_struct_val(value);
+        assert_eq!(class, c);
+        match addr {
+            hir::Expr::FieldAddr { obj, offset, .. } => {
+                assert_eq!(*offset, 8);
+                assert!(
+                    matches!(**obj, hir::Expr::NullCheck { .. }),
+                    "the reference receiver is null-checked"
+                );
+            }
+            _ => panic!("expected Expr::FieldAddr"),
+        }
+    }
+
+    #[test]
+    fn struct_field_access_on_a_byref_receiver_skips_the_null_check() {
+        // An int field declared in the value class (the mock ties the
+        // declaring class to `value_class`; the type is overridden back
+        // to Int): `this` is a byref, so no null check wraps it.
+        let (mut ee, c) = struct_ee(8, &[], None);
+        ee.method_classes.insert(1, c);
+        ee.add_struct_field(FIELD_TOKEN, c, 4);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().ty = CorInfoType::Int;
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![],
+            has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        // ldarg.0; ldfld F; ret.
+        let info = struct_info(
+            &mut ee,
+            &[0x02, 0x7B, 0x01, 0x00, 0x00, 0x04, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::Load { addr, offset, ty } => {
+                assert_eq!(*offset, 4);
+                assert_eq!(*ty, Type::Int32);
+                // No NullCheck wraps the byref receiver.
+                assert_eq!(as_local(addr), LocalId(0));
+            }
+            _ => panic!("expected a plain Load through the byref this"),
+        }
+    }
+
+    #[test]
+    fn stfld_of_a_gc_struct_field_uses_the_bulk_write_barrier() {
+        let (mut ee, c) = struct_ee(16, &[(8, false)], None);
+        ee.add_struct_field(STRUCT_FIELD_TOKEN, c, 8);
+        let entry = sig(CorInfoType::Void, &[CorInfoType::Class]);
+        // ldarg.0; ldloc.0; stfld F; ret — the destination may be heap,
+        // and the struct embeds a reference: the copy goes through
+        // CORINFO_HELP_BULK_WRITEBARRIER.
+        let info = struct_info(
+            &mut ee,
+            &[0x02, 0x06, 0x7D, 0x09, 0x00, 0x00, 0x04, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass],
+            &[Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(matches!(
+                    target,
+                    CallTarget::Helper(h) if *h == CorInfoHelpFunc::BULK_WRITEBARRIER
+                ));
+                assert_eq!(sig.args, vec![Type::ByRef, Type::ByRef, Type::NativeInt]);
+                assert_eq!(args.len(), 3);
+                // dst: the (null-checked) field address; src: the local's
+                // address; size: the layout's.
+                assert!(matches!(&args[0], hir::Expr::FieldAddr { .. }));
+                assert_eq!(as_local_addr(&args[1]), LocalId(1));
+            }
+            _ => panic!("expected the bulk-write-barrier call"),
+        }
+    }
+
+    #[test]
+    fn initobj_spills_pending_stack_trees_first() {
+        // Runtime_62524's shape: `bool k = a.Value == 1; a = default;
+        // if (k) return 1;` — csc keeps the compare on the evaluation
+        // stack across the initobj. IL order evaluates the compare
+        // BEFORE the zeroing, so the importer must spill the pending
+        // compare tree to a temp ahead of the BlockZero.
+        let (mut ee, c) = struct_ee(8, &[], None);
+        ee.add_struct_field(FIELD_TOKEN, c, 0);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().ty = CorInfoType::Int;
+        ee.add_struct_field(STRUCT_FIELD_TOKEN, c, 4);
+        ee.fields.get_mut(&STRUCT_FIELD_TOKEN).unwrap().ty = CorInfoType::Int;
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c)],
+        };
+        // ldarg.0; ldfld B; ldc.i4.1; ceq; ldarga.s 0; initobj C;
+        // brfalse.s +2; ldc.i4.1; ret; ldarg.0; ldfld A; ret
+        let info = struct_info(
+            &mut ee,
+            &[
+                0x02, 0x7B, 0x09, 0x00, 0x00, 0x04, 0x17, 0xFE, 0x01, 0x0F, 0x00, 0xFE, 0x15, 0x01,
+                0x00, 0x00, 0x02, 0x2C, 0x02, 0x17, 0x2A, 0x02, 0x7B, 0x01, 0x00, 0x00, 0x04, 0x2A,
+            ],
+            &entry,
+            &[CorInfoType::Bool],
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        // First statement: the spill of the compare tree into a temp.
+        let (dst, value) = store(&stmts[0]);
+        let (op, _, _) = as_binary(value);
+        assert_eq!(op, BinaryOp::Eq);
+        // Second: the BlockZero — AFTER the spill.
+        assert!(matches!(stmts[1].kind, hir::StmtKind::BlockZero { .. }));
+        // The branch condition reads the spilled temp, not the tree
+        // (brfalse compares it against zero).
+        match &m.blocks[0].terminator {
+            hir::Terminator::Branch { cond, .. } => {
+                let (_, lhs, _) = as_binary(cond);
+                assert_eq!(as_local(lhs), dst);
+            }
+            _ => panic!("expected Branch"),
+        }
+    }
+
+    #[test]
+    fn ldarg_of_a_struct_reads_the_slot_address() {
+        // A struct argument reads as StructVal of its frame slot.
+        let (mut ee, c) = struct_ee(8, &[], None);
+        let entry = MockSig {
+            ret: CorInfoType::Void,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c)],
+        };
+        // ldarg.0; stloc.0; ret.
+        let info = struct_info(
+            &mut ee,
+            &[0x02, 0x0A, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass],
+            &[Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.locals[0].ty, Type::Struct(c));
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(1));
+        let (addr, _) = as_struct_val(value);
+        assert_eq!(as_local_addr(addr), LocalId(0));
     }
 }

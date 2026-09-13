@@ -407,11 +407,15 @@ PANIC_RE = re.compile(r"rokajit: panic in compileMethod")
 # float-argument rule is gone; step_10.3 landed ldstr and the GC slot
 # table, so the slot-table rule is gone; step_10.4 landed the object
 # pack, so the byref-load/store and null-check lowering rules are gone;
-# messages evolve with the importer.)
+# messages evolve with the importer. step_10.9 landed value types: the
+# "value types in signatures" gate, the lowering "structs:" reject and the
+# tier-0 struct/stack-arg messages are gone; the bucket keeps the residual
+# struct rejects.)
 BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"EH regions|EH control flow|EH clauses|draining EH clauses"), "EH (try/catch/finally)"),
     (re.compile(r"generic methods"), "generics"),
-    (re.compile(r"value types in signatures|structs:|non-class receiver \(value types\)"), "structs & value types"),
+    (re.compile(r"non-class receiver \(value types\)|initobj/ldobj/stobj/cpobj of a non-value class|struct alignment above 16|SysV descriptor"), "structs & value types"),
+    (re.compile(r"newobj of a value class"), "newobj of a value class"),
     (re.compile(r"arrays:"), "arrays"),
     (re.compile(r"static fields"), "static fields"),
     (re.compile(r"field type outside the 10\.4 object pack"), "field types outside the object pack"),

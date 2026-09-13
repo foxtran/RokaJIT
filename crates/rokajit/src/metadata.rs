@@ -184,10 +184,18 @@ mod tests {
         fn register_classes(&self) -> &'static [crate::target::RegisterClass] {
             &[]
         }
-        fn class_of(&self, _ty: Type) -> Option<RegClassId> {
+        fn class_of(
+            &self,
+            _ty: Type,
+            _layouts: &crate::structs::StructLayouts,
+        ) -> Option<RegClassId> {
             Some(RegClassId(0))
         }
-        fn classify_call(&self, _sig: &CallSig) -> CompileResult<CallAbi> {
+        fn classify_call(
+            &self,
+            _sig: &CallSig,
+            _layouts: &crate::structs::StructLayouts,
+        ) -> CompileResult<CallAbi> {
             Err(CompileError::Unsupported("echo target"))
         }
         fn call_site_stack_alignment(&self) -> u32 {
@@ -246,6 +254,8 @@ mod tests {
         }
     }
 
+    use crate::structs::StructLayouts;
+
     fn empty_method() -> lir::Method {
         lir::Method {
             blocks: Vec::new(),
@@ -253,6 +263,7 @@ mod tests {
             eh_regions: Vec::new(),
             num_args: 0,
             num_il_locals: 0,
+            struct_layouts: StructLayouts::new(),
         }
     }
 
@@ -378,10 +389,18 @@ mod tests {
             fn register_classes(&self) -> &'static [crate::target::RegisterClass] {
                 &[]
             }
-            fn class_of(&self, _ty: Type) -> Option<RegClassId> {
+            fn class_of(
+                &self,
+                _ty: Type,
+                _layouts: &crate::structs::StructLayouts,
+            ) -> Option<RegClassId> {
                 None
             }
-            fn classify_call(&self, _sig: &CallSig) -> CompileResult<CallAbi> {
+            fn classify_call(
+                &self,
+                _sig: &CallSig,
+                _layouts: &crate::structs::StructLayouts,
+            ) -> CompileResult<CallAbi> {
                 Err(CompileError::Unsupported("bare"))
             }
             fn call_site_stack_alignment(&self) -> u32 {

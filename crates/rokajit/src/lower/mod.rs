@@ -44,6 +44,7 @@ use crate::ir::{
     hir, lir, BinaryOp, BlockId, CallSig, CallTarget, Const, IlOffset, LocalId, Type,
     IL_OFFSET_NONE,
 };
+use crate::structs::StructLayouts;
 use crate::target::Target;
 
 /// Term type: an unallocated LIR value (temp or local) referenced by a
@@ -61,16 +62,19 @@ pub struct Val(pub LocalId);
 pub struct Label(pub BlockId);
 
 /// The read-only context a ruleset sees: the method's locals table, for
-/// type-driven decisions (e.g. 32- vs 64-bit forms). Fallible lookups
-/// return `Option` so a ruleset guard treats an out-of-contract
-/// reference as "no rule matched" rather than panicking.
+/// type-driven decisions (e.g. 32- vs 64-bit forms), and the struct
+/// layout side table (step_10.9), for struct sizes and SysV
+/// classifications. Fallible lookups return `Option` so a ruleset guard
+/// treats an out-of-contract reference as "no rule matched" rather than
+/// panicking.
 pub struct Cx<'a> {
     locals: &'a [hir::Local],
+    layouts: &'a StructLayouts,
 }
 
 impl<'a> Cx<'a> {
-    pub fn new(locals: &'a [hir::Local]) -> Self {
-        Cx { locals }
+    pub fn new(locals: &'a [hir::Local], layouts: &'a StructLayouts) -> Self {
+        Cx { locals, layouts }
     }
 
     /// The type of a local/arg/temp slot.
@@ -81,6 +85,19 @@ impl<'a> Cx<'a> {
     /// The whole locals table, for rulesets that need more than types.
     pub fn locals(&self) -> &'a [hir::Local] {
         self.locals
+    }
+
+    /// The layout of a value class (step_10.9).
+    pub fn layout_of(
+        &self,
+        class: rokajit_ee::handles::ClassHandle,
+    ) -> Option<&crate::structs::StructLayout> {
+        self.layouts.get(&class)
+    }
+
+    /// The whole struct layout side table (call classification).
+    pub fn layouts(&self) -> &'a StructLayouts {
+        self.layouts
     }
 }
 
@@ -95,7 +112,7 @@ pub fn lower(method: hir::Method, target: &dyn Target) -> CompileResult<lir::Met
         return Err(CompileError::Unsupported("EH regions: not yet supported"));
     }
     for local in &method.locals {
-        if target.class_of(local.ty).is_none() {
+        if target.class_of(local.ty, &method.struct_layouts).is_none() {
             return Err(CompileError::Unsupported(
                 "a local's type has no register class on this target",
             ));
@@ -103,6 +120,7 @@ pub fn lower(method: hir::Method, target: &dyn Target) -> CompileResult<lir::Met
     }
     let mut fx = Flatten {
         locals: method.locals,
+        layouts: &method.struct_layouts,
     };
     let mut blocks = Vec::with_capacity(method.blocks.len());
     for (i, block) in method.blocks.iter().enumerate() {
@@ -115,17 +133,21 @@ pub fn lower(method: hir::Method, target: &dyn Target) -> CompileResult<lir::Met
         eh_regions: method.eh_regions,
         num_args: method.num_args,
         num_il_locals: method.num_il_locals,
+        struct_layouts: method.struct_layouts,
     })
 }
 
 /// The flattener's state: the locals table, grown with fresh temps as
-/// expression trees are decomposed. Temp ids follow the IR contract's
-/// flat `LocalId` namespace (temps come after args and IL locals).
-struct Flatten {
+/// expression trees are decomposed, and the struct layout side table
+/// (step_10.9 — the register-passed classification drives call results).
+/// Temp ids follow the IR contract's flat `LocalId` namespace (temps come
+/// after args and IL locals).
+struct Flatten<'a> {
     locals: Vec<hir::Local>,
+    layouts: &'a StructLayouts,
 }
 
-impl Flatten {
+impl Flatten<'_> {
     fn temp(&mut self, ty: Type) -> LocalId {
         let id = LocalId(self.locals.len() as u32);
         self.locals.push(hir::Local {
@@ -174,11 +196,27 @@ impl Flatten {
             match &stmt.kind {
                 hir::StmtKind::Store { dst, value } => {
                     let src = self.flatten_expr(value, &mut stmts, stmt.il_offset)?;
-                    Self::push(
-                        &mut stmts,
-                        stmt.il_offset,
-                        lir::StmtKind::Copy { dst: *dst, src },
-                    );
+                    // A struct store is a block copy into the destination's
+                    // frame slot (struct values are addresses, step_10.9);
+                    // frame destinations never need a GC barrier.
+                    if let Type::Struct(class) = self.locals[dst.0 as usize].ty {
+                        Self::push(
+                            &mut stmts,
+                            stmt.il_offset,
+                            lir::StmtKind::BlockCopy {
+                                dst_addr: lir::Operand::AddrOf(*dst),
+                                dst_offset: 0,
+                                src_addr: src,
+                                class,
+                            },
+                        );
+                    } else {
+                        Self::push(
+                            &mut stmts,
+                            stmt.il_offset,
+                            lir::StmtKind::Copy { dst: *dst, src },
+                        );
+                    }
                 }
                 hir::StmtKind::StoreInd {
                     addr,
@@ -190,13 +228,40 @@ impl Flatten {
                     // importer encoded (`stfld`: obj pushed before value).
                     let addr = self.flatten_expr(addr, &mut stmts, stmt.il_offset)?;
                     let src = self.flatten_expr(value, &mut stmts, stmt.il_offset)?;
+                    let addr = self.addr_value(addr, &mut stmts, stmt.il_offset);
+                    if let Some(class) = struct_class_of(value) {
+                        // A struct store through a computed address
+                        // (`stobj`/`cpobj`/struct `stfld`): a block copy.
+                        Self::push(
+                            &mut stmts,
+                            stmt.il_offset,
+                            lir::StmtKind::BlockCopy {
+                                dst_addr: addr,
+                                dst_offset: *offset,
+                                src_addr: src,
+                                class,
+                            },
+                        );
+                    } else {
+                        Self::push(
+                            &mut stmts,
+                            stmt.il_offset,
+                            lir::StmtKind::Store {
+                                addr,
+                                offset: *offset,
+                                src,
+                            },
+                        );
+                    }
+                }
+                hir::StmtKind::BlockZero { addr, class } => {
+                    let addr = self.flatten_expr(addr, &mut stmts, stmt.il_offset)?;
                     Self::push(
                         &mut stmts,
                         stmt.il_offset,
-                        lir::StmtKind::Store {
-                            addr,
-                            offset: *offset,
-                            src,
+                        lir::StmtKind::BlockZero {
+                            dst_addr: addr,
+                            class: *class,
                         },
                     );
                 }
@@ -227,6 +292,34 @@ impl Flatten {
             self.flatten_expr(expr, out, il)?;
         }
         Ok(())
+    }
+
+    /// A memory-access address as a pointer *value*: `AddrOf(l)` (a
+    /// `ldloca`-shaped address — struct field access through a byref,
+    /// step_10.9) materializes into a fresh ByRef temp first, because the
+    /// LIR `Load`/`Store` rules consume address values, not address-of
+    /// forms. Anything else passes through unchanged.
+    fn addr_value(
+        &mut self,
+        addr: lir::Operand,
+        out: &mut Vec<lir::Stmt>,
+        il: IlOffset,
+    ) -> lir::Operand {
+        match addr {
+            lir::Operand::AddrOf(l) => {
+                let dst = self.temp(Type::ByRef);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::Copy {
+                        dst,
+                        src: lir::Operand::AddrOf(l),
+                    },
+                );
+                lir::Operand::Temp(dst)
+            }
+            _ => addr,
+        }
     }
 
     /// Tree → flat statements; returns the operand holding the value.
@@ -268,6 +361,11 @@ impl Flatten {
             }
             hir::Expr::Call { target, sig, args } => {
                 match self.flatten_call(target, sig, args, out, il)? {
+                    // A struct call result lives in the call's destination
+                    // temp; the value is its address (step_10.9).
+                    Some(dst) if matches!(sig.ret, Type::Struct(_)) => {
+                        Ok(lir::Operand::AddrOf(dst))
+                    }
                     Some(dst) => Ok(lir::Operand::Temp(dst)),
                     // The importer's well-typedness guarantee makes a void
                     // call in value position unreachable.
@@ -277,6 +375,7 @@ impl Flatten {
             hir::Expr::Load { addr, offset, ty } => {
                 // Load through a byref at a constant offset (`ldfld`).
                 let addr = self.flatten_expr(addr, out, il)?;
+                let addr = self.addr_value(addr, out, il);
                 let dst = self.temp(*ty);
                 Self::push(
                     out,
@@ -293,8 +392,12 @@ impl Flatten {
             hir::Expr::FieldAddr { obj, offset, .. } => {
                 // A field address is `obj + offset`, a managed byref: the
                 // temp is ByRef-typed, so it is automatically an interior-
-                // pointer GC root at every safepoint.
+                // pointer GC root at every safepoint. An AddrOf object
+                // (a `ldloca`-shaped receiver) materializes into a byref
+                // temp first — the Binary rules consume values, not
+                // address-of forms.
                 let obj = self.flatten_expr(obj, out, il)?;
+                let obj = self.addr_value(obj, out, il);
                 let dst = self.temp(Type::ByRef);
                 Self::push(
                     out,
@@ -358,8 +461,11 @@ impl Flatten {
             hir::Expr::Cast { .. } | hir::Expr::Box { .. } => {
                 Err(CompileError::Unsupported("cast/box: not yet supported"))
             }
-            hir::Expr::StructVal { .. } => {
-                Err(CompileError::Unsupported("structs: not yet supported"))
+            hir::Expr::StructVal { addr, .. } => {
+                // A struct value IS its address (step_10.9): in LIR every
+                // struct-typed value is a ByRef operand naming the memory
+                // the value occupies.
+                self.flatten_expr(addr, out, il)
             }
         }
     }
@@ -394,10 +500,19 @@ impl Flatten {
                 CallTarget::Indirect(Box::new(self.flatten_expr(addr, out, il)?))
             }
         };
-        let dst = if sig.ret == Type::Void {
-            None
-        } else {
-            Some(self.temp(sig.ret))
+        let dst = match sig.ret {
+            Type::Void => None,
+            Type::Struct(class) => {
+                if self.layouts[&class].sysv.passed_in_registers {
+                    Some(self.temp(sig.ret))
+                } else {
+                    // A non-register-passed struct returns through the
+                    // hidden retbuf the importer already passed as an
+                    // argument — the call has no register result.
+                    None
+                }
+            }
+            _ => Some(self.temp(sig.ret)),
         };
         Self::push(
             out,
@@ -454,11 +569,30 @@ impl Flatten {
                 }
             }
             hir::Terminator::Return { value } => {
-                let value = value
-                    .as_ref()
-                    .map(|e| self.flatten_expr(e, out, IL_OFFSET_NONE))
-                    .transpose()?;
-                Self::push(out, IL_OFFSET_NONE, lir::StmtKind::Return { value });
+                if let Some(class) = value.as_ref().and_then(struct_class_of) {
+                    // A register-passed struct return (step_10.9): the
+                    // value's address; the ABI distribution into
+                    // rax/rdx/xmm0/xmm1 is the backend's lowering. The
+                    // non-register-passed form never reaches here — the
+                    // importer rewrote it to a block copy through the
+                    // hidden retbuf pointer plus a plain pointer return.
+                    let addr = value
+                        .as_ref()
+                        .map(|e| self.flatten_expr(e, out, IL_OFFSET_NONE))
+                        .transpose()?
+                        .ok_or(CompileError::Internal("struct return without a value"))?;
+                    Self::push(
+                        out,
+                        IL_OFFSET_NONE,
+                        lir::StmtKind::ReturnStruct { addr, class },
+                    );
+                } else {
+                    let value = value
+                        .as_ref()
+                        .map(|e| self.flatten_expr(e, out, IL_OFFSET_NONE))
+                        .transpose()?;
+                    Self::push(out, IL_OFFSET_NONE, lir::StmtKind::Return { value });
+                }
             }
             hir::Terminator::Switch { .. } => {
                 return Err(CompileError::Unsupported("switch: not yet supported"));
@@ -493,11 +627,27 @@ fn is_compare(op: BinaryOp) -> bool {
     )
 }
 
+/// The value class of a struct-typed expression (step_10.9), or `None`.
+/// Struct values reach lowering only as `StructVal` (address-shaped) or a
+/// struct-returning call — never as a bare `Local` (the importer builds
+/// the address form directly).
+fn struct_class_of(expr: &hir::Expr) -> Option<rokajit_ee::handles::ClassHandle> {
+    match expr {
+        hir::Expr::StructVal { class, .. } => Some(*class),
+        hir::Expr::Call { sig, .. } => match sig.ret {
+            Type::Struct(class) => Some(class),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ir::{hir, lir, BlockId, CallSig, Const, LocalId};
     use crate::pipeline::MethodInfo;
+    use crate::structs::StructLayouts;
     use crate::target::{CallAbi, RegClassId, RegisterClass};
     use rokajit_ee::enums::CorInfoType;
     use rokajit_ee::handles::MethodHandle;
@@ -515,13 +665,18 @@ mod tests {
         fn register_classes(&self) -> &'static [RegisterClass] {
             &[]
         }
-        fn class_of(&self, ty: Type) -> Option<RegClassId> {
+        fn class_of(&self, ty: Type, layouts: &StructLayouts) -> Option<RegClassId> {
             match ty {
+                Type::Struct(class) if layouts.contains_key(&class) => Some(RegClassId(0)),
                 Type::Struct(_) | Type::Void => None,
                 _ => Some(RegClassId(0)),
             }
         }
-        fn classify_call(&self, _sig: &CallSig) -> CompileResult<CallAbi> {
+        fn classify_call(
+            &self,
+            _sig: &CallSig,
+            _layouts: &StructLayouts,
+        ) -> CompileResult<CallAbi> {
             Err(CompileError::Unsupported("mock target"))
         }
         fn call_site_stack_alignment(&self) -> u32 {
@@ -549,6 +704,7 @@ mod tests {
             eh_regions: Vec::new(),
             num_args: 1,
             num_il_locals: 0,
+            struct_layouts: StructLayouts::new(),
         }
     }
 
@@ -933,6 +1089,240 @@ mod tests {
         ));
     }
 
+    // --- step_10.9: struct flattening ---
+
+    use crate::structs::{StructLayout, SysVClass, SysVPass};
+    use rokajit_ee::handles::ClassHandle;
+
+    fn class(raw: usize) -> ClassHandle {
+        ClassHandle::from_raw(raw as ffi::CORINFO_CLASS_HANDLE).unwrap()
+    }
+
+    fn layout(passed: bool) -> StructLayout {
+        let mut sysv = SysVPass::memory();
+        sysv.passed_in_registers = passed;
+        if passed {
+            sysv.count = 1;
+            sysv.classes[0] = SysVClass::Integer;
+            sysv.sizes[0] = 8;
+        }
+        StructLayout {
+            size: 8,
+            align: 8,
+            gc_cells: vec![],
+            sysv,
+        }
+    }
+
+    /// A method with two struct locals of class `c` (ids 0, 1) whose
+    /// layout is in the side table.
+    fn struct_method(c: ClassHandle, block: hir::Block) -> hir::Method {
+        let mut layouts = StructLayouts::new();
+        layouts.insert(c, layout(false));
+        hir::Method {
+            blocks: vec![block],
+            locals: vec![
+                local(Type::Struct(c), hir::LocalKind::IlLocal(0)),
+                local(Type::Struct(c), hir::LocalKind::IlLocal(1)),
+            ],
+            eh_regions: Vec::new(),
+            num_args: 0,
+            num_il_locals: 2,
+            struct_layouts: layouts,
+        }
+    }
+
+    #[test]
+    fn struct_store_lowers_to_a_block_copy() {
+        let c = class(0x51);
+        let m = struct_method(
+            c,
+            block(
+                0,
+                vec![hstmt(hir::StmtKind::Store {
+                    dst: LocalId(1),
+                    value: hir::Expr::StructVal {
+                        addr: Box::new(hir::Expr::LocalAddr(LocalId(0))),
+                        class: c,
+                    },
+                })],
+                hir::Terminator::Return { value: None },
+            ),
+        );
+        let m = lower_ok(m);
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::BlockCopy {
+                dst_addr,
+                dst_offset,
+                src_addr,
+                class,
+            } => {
+                assert_eq!(*dst_addr, lir::Operand::AddrOf(LocalId(1)));
+                assert_eq!(*dst_offset, 0);
+                assert_eq!(*src_addr, lir::Operand::AddrOf(LocalId(0)));
+                assert_eq!(*class, c);
+            }
+            _ => panic!("expected BlockCopy"),
+        }
+    }
+
+    #[test]
+    fn struct_storeind_lowers_to_a_block_copy_with_the_field_offset() {
+        let c = class(0x52);
+        let m = struct_method(
+            c,
+            block(
+                0,
+                vec![hstmt(hir::StmtKind::StoreInd {
+                    addr: hir::Expr::Local(LocalId(0)),
+                    offset: 8,
+                    value: hir::Expr::StructVal {
+                        addr: Box::new(hir::Expr::LocalAddr(LocalId(1))),
+                        class: c,
+                    },
+                })],
+                hir::Terminator::Return { value: None },
+            ),
+        );
+        let m = lower_ok(m);
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::BlockCopy {
+                dst_addr,
+                dst_offset,
+                src_addr,
+                class,
+            } => {
+                assert_eq!(*dst_addr, lir::Operand::Local(LocalId(0)));
+                assert_eq!(*dst_offset, 8);
+                assert_eq!(*src_addr, lir::Operand::AddrOf(LocalId(1)));
+                assert_eq!(*class, c);
+            }
+            _ => panic!("expected BlockCopy"),
+        }
+    }
+
+    #[test]
+    fn initobj_lowers_to_block_zero() {
+        let c = class(0x53);
+        let m = struct_method(
+            c,
+            block(
+                0,
+                vec![hstmt(hir::StmtKind::BlockZero {
+                    addr: hir::Expr::LocalAddr(LocalId(0)),
+                    class: c,
+                })],
+                hir::Terminator::Return { value: None },
+            ),
+        );
+        let m = lower_ok(m);
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::BlockZero { dst_addr, class } => {
+                assert_eq!(*dst_addr, lir::Operand::AddrOf(LocalId(0)));
+                assert_eq!(*class, c);
+            }
+            _ => panic!("expected BlockZero"),
+        }
+    }
+
+    #[test]
+    fn struct_return_lowers_to_return_struct_of_the_address() {
+        let c = class(0x54);
+        let m = struct_method(
+            c,
+            block(
+                0,
+                Vec::new(),
+                hir::Terminator::Return {
+                    value: Some(hir::Expr::StructVal {
+                        addr: Box::new(hir::Expr::LocalAddr(LocalId(0))),
+                        class: c,
+                    }),
+                },
+            ),
+        );
+        let m = lower_ok(m);
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::ReturnStruct { addr, class } => {
+                assert_eq!(*addr, lir::Operand::AddrOf(LocalId(0)));
+                assert_eq!(*class, c);
+            }
+            _ => panic!("expected ReturnStruct"),
+        }
+    }
+
+    #[test]
+    fn register_passed_struct_call_result_is_the_dst_temps_address() {
+        let c = class(0x55);
+        let mut m = struct_method(
+            c,
+            block(
+                0,
+                Vec::new(),
+                hir::Terminator::Return {
+                    value: Some(hir::Expr::Call {
+                        target: CallTarget::Direct(
+                            MethodHandle::from_raw(0x42usize as ffi::CORINFO_METHOD_HANDLE)
+                                .unwrap(),
+                        ),
+                        sig: CallSig {
+                            ret: Type::Struct(c),
+                            args: vec![],
+                            has_this: false,
+                        },
+                        args: vec![],
+                    }),
+                },
+            ),
+        );
+        m.struct_layouts.insert(c, layout(true));
+        let m = lower_ok(m);
+        let stmts = &m.blocks[0].stmts;
+        // The call's destination is a fresh struct temp (id 2, after the
+        // two IL locals); the ReturnStruct reads its address.
+        match &stmts[0].kind {
+            lir::StmtKind::Call { dst, .. } => assert_eq!(*dst, Some(LocalId(2))),
+            _ => panic!("expected Call"),
+        }
+        assert!(matches!(m.locals[2].ty, Type::Struct(_)));
+        match &stmts[1].kind {
+            lir::StmtKind::ReturnStruct { addr, .. } => {
+                assert_eq!(*addr, lir::Operand::AddrOf(LocalId(2)))
+            }
+            _ => panic!("expected ReturnStruct"),
+        }
+    }
+
+    #[test]
+    fn non_register_passed_struct_call_has_no_destination() {
+        // The retbuf temp the importer passed receives the value; the LIR
+        // call has no register result.
+        let c = class(0x56);
+        let m = struct_method(
+            c,
+            block(
+                0,
+                vec![hstmt(hir::StmtKind::Eval(hir::Expr::Call {
+                    target: CallTarget::Direct(
+                        MethodHandle::from_raw(0x42usize as ffi::CORINFO_METHOD_HANDLE).unwrap(),
+                    ),
+                    sig: CallSig {
+                        ret: Type::Struct(c),
+                        args: vec![Type::ByRef],
+                        has_this: false,
+                    },
+                    args: vec![hir::Expr::LocalAddr(LocalId(0))],
+                }))],
+                hir::Terminator::Return { value: None },
+            ),
+        );
+        let m = lower_ok(m);
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::Call { dst, .. } => assert_eq!(*dst, None),
+            _ => panic!("expected Call"),
+        }
+    }
+
     // --- end-to-end via the importer's MockEe fixtures (as morph's tests) ---
 
     const FIB_TOKEN: u32 = 0x0600_0001;
@@ -943,6 +1333,8 @@ mod tests {
             ret: CorInfoType::Int,
             args: vec![CorInfoType::Int],
             has_this: false,
+            ret_class: None,
+            arg_classes: Vec::new(),
         };
         ee.add_method(FIB_TOKEN, fib_sig.clone());
         let info = MethodInfo {

@@ -16,20 +16,26 @@ use crate::handles::{
 };
 
 impl ClassQueries for MockEe {
-    fn as_cor_info_type(&self, _cls: ClassHandle) -> CorInfoType {
-        CorInfoType::Class
+    fn as_cor_info_type(&self, cls: ClassHandle) -> CorInfoType {
+        if self.classes.contains_key(&(cls.as_raw() as usize)) {
+            CorInfoType::ValueClass
+        } else {
+            CorInfoType::Class
+        }
     }
 
-    fn is_value_class(&self, _cls: ClassHandle) -> bool {
-        false
+    fn is_value_class(&self, cls: ClassHandle) -> bool {
+        self.classes.contains_key(&(cls.as_raw() as usize))
     }
 
     fn get_class_attribs(&self, _cls: ClassHandle) -> ClassAttribs {
         self.class_attribs
     }
 
-    fn get_class_size(&self, _cls: ClassHandle) -> u32 {
-        8
+    fn get_class_size(&self, cls: ClassHandle) -> u32 {
+        self.classes
+            .get(&(cls.as_raw() as usize))
+            .map_or(8, |c| c.size)
     }
 
     fn get_type_for_primitive_numeric_class(&self, _cls: ClassHandle) -> Option<CorInfoType> {
@@ -102,12 +108,30 @@ impl ClassQueries for MockEe {
         false
     }
 
-    fn get_class_alignment_requirement(&self, _cls: ClassHandle, _double_align_hint: bool) -> u32 {
-        8
+    fn get_class_alignment_requirement(&self, cls: ClassHandle, _double_align_hint: bool) -> u32 {
+        self.classes
+            .get(&(cls.as_raw() as usize))
+            .map_or(8, |c| c.align)
     }
 
-    fn get_class_gc_layout(&self, _cls: ClassHandle, _gc_ptrs: &mut [u8]) -> u32 {
-        0
+    fn get_class_gc_layout(&self, cls: ClassHandle, gc_ptrs: &mut [u8]) -> u32 {
+        let Some(class) = self.classes.get(&(cls.as_raw() as usize)) else {
+            return 0;
+        };
+        for slot in gc_ptrs.iter_mut() {
+            *slot = ffi::CorInfoGCType_TYPE_GC_NONE as u8;
+        }
+        for &(offset, is_byref) in &class.gc_cells {
+            let idx = (offset / 8) as usize;
+            if let Some(slot) = gc_ptrs.get_mut(idx) {
+                *slot = if is_byref {
+                    ffi::CorInfoGCType_TYPE_GC_BYREF as u8
+                } else {
+                    ffi::CorInfoGCType_TYPE_GC_REF as u8
+                };
+            }
+        }
+        class.gc_cells.len() as u32
     }
 
     fn get_class_num_instance_fields(&self, _cls: ClassHandle) -> u32 {
@@ -254,9 +278,11 @@ impl ClassQueries for MockEe {
 
     fn get_system_v_amd64_pass_struct_in_register_descriptor(
         &self,
-        _struct_hnd: ClassHandle,
+        struct_hnd: ClassHandle,
     ) -> Option<ffi::SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR> {
-        None
+        self.classes
+            .get(&(struct_hnd.as_raw() as usize))
+            .and_then(|c| c.sysv)
     }
 
     fn get_swift_lowering(&self, _struct_hnd: ClassHandle) -> ffi::CORINFO_SWIFT_LOWERING {

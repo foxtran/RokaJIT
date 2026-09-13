@@ -26,8 +26,12 @@ impl MethodQueries for MockEe {
     }
 
     fn get_method_class(&self, ftn: MethodHandle) -> ClassHandle {
-        // The mock has one class; reuse the method handle's address as a
-        // stable, non-null stand-in.
+        // Overrides (struct instance methods, step_10.9) come from
+        // `method_classes`; otherwise reuse the method handle's address as
+        // a stable, non-null stand-in (never a registered value class).
+        if let Some(&class) = self.method_classes.get(&(ftn.as_raw() as usize)) {
+            return class;
+        }
         ClassHandle(ftn.0 as ffi::CORINFO_CLASS_HANDLE)
     }
 

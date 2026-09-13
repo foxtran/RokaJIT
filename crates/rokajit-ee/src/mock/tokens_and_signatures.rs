@@ -20,8 +20,16 @@ impl TokensAndSignatures for MockEe {
         }
         if let Some(field) = self.fields.get(&token.token) {
             token.hField = field.handle.as_raw();
-            // One mock class per field: reuse the field handle's address.
-            token.hClass = field.handle.as_raw() as ffi::CORINFO_CLASS_HANDLE;
+            // The declaring class: the field's value class when it is a
+            // struct field, else the field handle's address (step_10.4's
+            // one-mock-class-per-field stand-in).
+            token.hClass = match field.value_class {
+                Some(c) => c.as_raw(),
+                None => field.handle.as_raw() as ffi::CORINFO_CLASS_HANDLE,
+            };
+        }
+        if let Some(&class) = self.class_tokens.get(&token.token) {
+            token.hClass = class.as_raw();
         }
     }
 
@@ -79,7 +87,8 @@ impl TokensAndSignatures for MockEe {
         args: ArgListHandle,
     ) -> (CorInfoType, Option<ClassHandle>) {
         let (list, index) = Self::decode_cursor(args);
-        (self.arg_lists[list][index], None)
+        let arg = self.arg_lists[list][index];
+        (arg.ty, arg.class)
     }
 
     fn get_exact_classes(

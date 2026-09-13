@@ -28,12 +28,58 @@ mod relocations;
 mod tokens_and_signatures;
 
 /// A canned method signature — the stack-relevant shape only (importer
-/// fixtures; step_07.2).
+/// fixtures; step_07.2). `ret_class`/`arg_classes` carry the value-class
+/// handles of struct-typed elements (step_10.9); both are `None`/empty
+/// for struct-free signatures.
 #[derive(Clone)]
 pub struct MockSig {
     pub ret: CorInfoType,
     pub args: Vec<CorInfoType>,
     pub has_this: bool,
+    /// The value-class handle for a `CorInfoType::ValueClass` return.
+    pub ret_class: Option<ClassHandle>,
+    /// Per-argument value-class handles (`None` entries for non-struct
+    /// args); shorter-than-`args` is padded with `None`.
+    pub arg_classes: Vec<Option<ClassHandle>>,
+}
+
+/// One signature argument as the mock's cursor table stores it: the EE
+/// type plus the value-class handle `getArgType` reports for structs.
+#[derive(Copy, Clone)]
+pub struct MockArg {
+    pub ty: CorInfoType,
+    pub class: Option<ClassHandle>,
+}
+
+/// A canned value class (step_10.9): the layout and SysV descriptor facts
+/// the class queries answer with.
+pub struct MockClass {
+    /// The fake handle the class queries key on.
+    pub handle: ClassHandle,
+    pub size: u32,
+    pub align: u32,
+    /// GC-pointer cells as `(offset, is_byref)`; drives `get_class_gc_layout`.
+    pub gc_cells: Vec<(u32, bool)>,
+    /// The canned SysV descriptor; `None` answers "not register-passed".
+    pub sysv: Option<ffi::SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR>,
+}
+
+/// Builds a canned SysV descriptor from `(classification, size)` pairs
+/// (one per eightbyte, offsets 0/8). An empty slice builds the
+/// not-passed-in-registers answer.
+pub fn sysv_descriptor(
+    eightbytes: &[(ffi::SystemVClassificationType, u8)],
+) -> ffi::SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR {
+    let mut desc: ffi::SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR =
+        unsafe { std::mem::zeroed() };
+    desc.passedInRegisters = !eightbytes.is_empty();
+    desc.eightByteCount = eightbytes.len() as u8;
+    for (i, &(class, size)) in eightbytes.iter().enumerate() {
+        desc.eightByteClassifications[i] = class;
+        desc.eightByteSizes[i] = size;
+        desc.eightByteOffsets[i] = (i * 8) as u8;
+    }
+    desc
 }
 
 /// A canned method the mock resolves metadata tokens to.
@@ -54,6 +100,8 @@ pub struct MockField {
     pub offset: u32,
     pub ty: CorInfoType,
     pub is_static: bool,
+    /// The value-class handle for a struct-typed field (step_10.9).
+    pub value_class: Option<ClassHandle>,
 }
 
 /// Canned EE. Every query returns the stored/default value; output sinks
@@ -91,7 +139,17 @@ pub struct MockEe {
     pub entry_point_slots: HashMap<usize, usize>,
     /// Registered signature argument lists. Fake `ArgListHandle` cursors
     /// encode `(list, index)` — the mock never dereferences handles.
-    arg_lists: Vec<Vec<CorInfoType>>,
+    arg_lists: Vec<Vec<MockArg>>,
+    /// Canned value classes (step_10.9), keyed by the handle's raw value.
+    pub classes: HashMap<usize, MockClass>,
+    /// Metadata tokens `resolve_token` answers with a class handle
+    /// (the `ldobj`/`stobj`/`cpobj`/`initobj` operand tokens; step_10.9).
+    pub class_tokens: HashMap<u32, ClassHandle>,
+    /// Per-method declaring-class overrides for `get_method_class`, keyed
+    /// by the method handle's raw value (struct instance methods;
+    /// step_10.9). Absent handles keep the default (the method handle's
+    /// own address).
+    pub method_classes: HashMap<usize, ClassHandle>,
     /// Sink calls observed, newest last, as "(kind, detail)" strings.
     pub sink_log: RefCell<Vec<String>>,
     /// Buffers handed out by the fake `alloc_mem`/`alloc_gc_info`, kept
@@ -126,6 +184,7 @@ impl MockEe {
         &self,
         call_conv: ffi::CorInfoCallConv,
         ret: CorInfoType,
+        ret_class: Option<ClassHandle>,
         arg_list: usize,
     ) -> ffi::CORINFO_SIG_INFO {
         let mut sig: ffi::CORINFO_SIG_INFO = unsafe { std::mem::zeroed() };
@@ -135,6 +194,7 @@ impl MockEe {
         // pass it back to the EE.
         sig.scope = 0xC0DEusize as ffi::CORINFO_MODULE_HANDLE;
         sig.set_retType(ret.to_raw());
+        sig.retTypeClass = ret_class.map_or(std::ptr::null_mut(), |c| c.as_raw());
         sig.set_numArgs(self.arg_lists[arg_list].len() as u32);
         sig.args = Self::cursor_raw(arg_list, 0);
         sig
@@ -147,13 +207,32 @@ impl MockEe {
         } else {
             ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT
         };
-        self.build_sig_info(call_conv, method.sig.ret, method.arg_list)
+        self.build_sig_info(
+            call_conv,
+            method.sig.ret,
+            method.sig.ret_class,
+            method.arg_list,
+        )
+    }
+
+    /// Registers one argument list, pairing each type with its value-class
+    /// handle (padded with `None`).
+    fn push_arg_list(&mut self, args: &[CorInfoType], classes: &[Option<ClassHandle>]) -> usize {
+        let list = args
+            .iter()
+            .enumerate()
+            .map(|(i, &ty)| MockArg {
+                ty,
+                class: classes.get(i).copied().flatten(),
+            })
+            .collect();
+        self.arg_lists.push(list);
+        self.arg_lists.len() - 1
     }
 
     /// Registers a canned method under `token`; returns its fake handle.
     pub fn add_method(&mut self, token: u32, sig: MockSig) -> MethodHandle {
-        let arg_list = self.arg_lists.len();
-        self.arg_lists.push(sig.args.clone());
+        let arg_list = self.push_arg_list(&sig.args, &sig.arg_classes);
         // Non-null stand-in; the mock never dereferences handles.
         let raw = (0x1000 + 0x10 * self.methods.len()) as ffi::CORINFO_METHOD_HANDLE;
         let handle = MethodHandle::from_raw(raw).expect("fake handle is non-null");
@@ -163,6 +242,31 @@ impl MockEe {
                 handle,
                 sig,
                 arg_list,
+            },
+        );
+        handle
+    }
+
+    /// Registers a canned value class (step_10.9); returns its fake handle.
+    pub fn add_class(
+        &mut self,
+        size: u32,
+        align: u32,
+        gc_cells: &[(u32, bool)],
+        sysv: Option<ffi::SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR>,
+    ) -> ClassHandle {
+        // Non-null stand-in in a separate address band; the mock never
+        // dereferences handles.
+        let raw = (0x8000 + 0x10 * self.classes.len()) as ffi::CORINFO_CLASS_HANDLE;
+        let handle = ClassHandle::from_raw(raw).expect("fake handle is non-null");
+        self.classes.insert(
+            raw as usize,
+            MockClass {
+                handle,
+                size,
+                align,
+                gc_cells: gc_cells.to_vec(),
+                sysv,
             },
         );
         handle
@@ -182,16 +286,24 @@ impl MockEe {
                 offset,
                 ty,
                 is_static: false,
+                value_class: None,
             },
         );
+        handle
+    }
+
+    /// Registers a canned struct-typed instance field under `token`
+    /// (step_10.9); returns its fake handle.
+    pub fn add_struct_field(&mut self, token: u32, class: ClassHandle, offset: u32) -> FieldHandle {
+        let handle = self.add_field(token, CorInfoType::ValueClass, offset);
+        self.fields.get_mut(&token).unwrap().value_class = Some(class);
         handle
     }
 
     /// Builds the argument-signature mirror for a method the mock doesn't
     /// resolve tokens to — e.g. the entry method's `MethodInfo::args`.
     pub fn make_method_sig(&mut self, sig: &MockSig) -> ffi::CORINFO_SIG_INFO {
-        let arg_list = self.arg_lists.len();
-        self.arg_lists.push(sig.args.clone());
+        let arg_list = self.push_arg_list(&sig.args, &sig.arg_classes);
         let method = MockMethod {
             handle: MethodHandle::from_raw(1usize as ffi::CORINFO_METHOD_HANDLE)
                 .expect("fake handle is non-null"),
@@ -203,12 +315,23 @@ impl MockEe {
 
     /// Builds the locals-signature mirror (`CORINFO_CALLCONV_LOCAL_SIG`)
     /// for `MethodInfo::locals` — the only source of IL local types.
+    /// Struct-typed locals pass their class handles in `classes`
+    /// (step_10.9; shorter-than-`locals` is padded with `None`).
     pub fn make_locals_sig(&mut self, locals: &[CorInfoType]) -> ffi::CORINFO_SIG_INFO {
-        let arg_list = self.arg_lists.len();
-        self.arg_lists.push(locals.to_vec());
+        self.make_locals_sig_with_classes(locals, &[])
+    }
+
+    /// The class-carrying form of [`MockEe::make_locals_sig`].
+    pub fn make_locals_sig_with_classes(
+        &mut self,
+        locals: &[CorInfoType],
+        classes: &[Option<ClassHandle>],
+    ) -> ffi::CORINFO_SIG_INFO {
+        let arg_list = self.push_arg_list(locals, classes);
         self.build_sig_info(
             ffi::CorInfoCallConv_CORINFO_CALLCONV_LOCAL_SIG,
             CorInfoType::Void,
+            None,
             arg_list,
         )
     }

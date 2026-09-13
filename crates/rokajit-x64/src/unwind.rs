@@ -49,15 +49,31 @@ const RBP: u8 = 5;
 
 // End offsets of the frame contract's prolog instructions (the emitter
 // always produces exactly `push rbp; mov rbp, rsp; sub rsp, N`:
-// 55 / 48 89 E5 / 48 83 EC imm8).
+// 55 / 48 89 E5 / 48 83 EC imm8 — or `48 81 EC imm32`, 7 bytes, when N
+// doesn't fit the imm8 form, i.e. frames over 127 bytes; step_10.9).
 const AFTER_PUSH_RBP: u8 = 1;
 const AFTER_MOV_RBP_RSP: u8 = 4;
-const PROLOG_LEN: u8 = 8;
 
 /// The largest `UWOP_ALLOC_SMALL` allocation (`opinfo * 8 + 8`, opinfo 4
 /// bits) and the largest 16-bit-scaled `UWOP_ALLOC_LARGE`.
 const ALLOC_SMALL_MAX: u32 = 128;
 const ALLOC_LARGE_16_MAX: u32 = 0xFFFF * 8;
+
+/// The largest frame allocation the encoder's imm8 `sub rsp` form covers
+/// (`48 83 EC ib` — the assembler-canonical form for values that fit a
+/// sign-extended byte; larger frames encode `48 81 EC id`, three bytes
+/// longer).
+const SUB_RSP_IMM8_MAX: u32 = 127;
+
+/// The prolog length for a frame size: 1 (`push rbp`) + 3 (`mov rbp,
+/// rsp`) + 4 or 7 (`sub rsp, N`).
+fn prolog_len(frame_size: u32) -> u8 {
+    if frame_size <= SUB_RSP_IMM8_MAX {
+        8
+    } else {
+        11
+    }
+}
 
 /// The `Target::encode_unwind_info` body for x64: one root-fragment blob
 /// covering the whole hot chunk.
@@ -67,6 +83,7 @@ pub fn encode(input: &UnwindInput) -> CompileResult<Vec<UnwindBlob>> {
             "frame size outside the 8-aligned frame contract",
         ));
     }
+    let prolog_len = prolog_len(input.frame_size);
     // Unwind codes, reverse prolog order (undo order): the allocation, the
     // frame-pointer establishment, the rbp push.
     let mut codes = Vec::new();
@@ -75,15 +92,15 @@ pub fn encode(input: &UnwindInput) -> CompileResult<Vec<UnwindBlob>> {
             // ≤ 128 bytes, so the scaled size fits OpInfo's 4 bits.
             push_code(
                 &mut codes,
-                AFTER_SUB_RSP,
+                prolog_len,
                 UWOP_ALLOC_SMALL,
                 ((input.frame_size - 8) / 8) as u8,
             );
         } else if input.frame_size <= ALLOC_LARGE_16_MAX {
-            push_code(&mut codes, AFTER_SUB_RSP, UWOP_ALLOC_LARGE, 0);
+            push_code(&mut codes, prolog_len, UWOP_ALLOC_LARGE, 0);
             codes.extend_from_slice(&((input.frame_size / 8) as u16).to_le_bytes());
         } else {
-            push_code(&mut codes, AFTER_SUB_RSP, UWOP_ALLOC_LARGE, 1);
+            push_code(&mut codes, prolog_len, UWOP_ALLOC_LARGE, 1);
             codes.extend_from_slice(&input.frame_size.to_le_bytes());
         }
     }
@@ -93,7 +110,7 @@ pub fn encode(input: &UnwindInput) -> CompileResult<Vec<UnwindBlob>> {
     let count_of_unwind_codes = (codes.len() / 2) as u8;
     // UNWIND_INFO header: Version 1 (low 3 bits of byte 0); Flags 0 (the EE
     // overwrites them); FrameRegister rbp / FrameOffset 0 (byte 3 nibbles).
-    let mut bytes = vec![1u8, PROLOG_LEN, count_of_unwind_codes, RBP];
+    let mut bytes = vec![1u8, prolog_len, count_of_unwind_codes, RBP];
     bytes.extend_from_slice(&codes);
     Ok(vec![UnwindBlob {
         func_kind: CorJitFuncKind::Root,
@@ -103,11 +120,6 @@ pub fn encode(input: &UnwindInput) -> CompileResult<Vec<UnwindBlob>> {
         bytes,
     }])
 }
-
-/// The end offset of `sub rsp, N` is the same whether or not the frame
-/// size is zero (the emitter always emits the instruction); the unwind
-/// code for a zero frame is simply omitted (there is nothing to undo).
-const AFTER_SUB_RSP: u8 = PROLOG_LEN;
 
 /// One `UNWIND_CODE`: offset byte, then UnwindOp in the low nibble and
 /// OpInfo in the high nibble of the second byte (little-endian bitfield
@@ -200,19 +212,25 @@ mod tests {
 
     #[test]
     fn alloc_boundary_forms() {
-        // 128: the largest ALLOC_SMALL.
+        // 128: the largest ALLOC_SMALL — and the smallest frame whose
+        // `sub rsp, N` needs the imm32 form (step_10.9: the prolog is 11
+        // bytes, and the unwind code's offset tracks it).
         let blob = encode(&input(128)).expect("encodes").remove(0);
-        assert_eq!(blob.bytes[4..6], [0x08, (15 << 4) | UWOP_ALLOC_SMALL]);
+        assert_eq!(blob.bytes[1], 11, "SizeOfProlog follows the encoder");
+        assert_eq!(blob.bytes[4..6], [0x0B, (15 << 4) | UWOP_ALLOC_SMALL]);
         assert_eq!(blob.bytes[2], 3);
         // 136: the smallest 16-bit ALLOC_LARGE (size/8 as a trailing u16).
         let blob = encode(&input(136)).expect("encodes").remove(0);
         assert_eq!(blob.bytes[2], 4, "the size word counts as a code slot");
-        assert_eq!(&blob.bytes[4..8], &[0x08, UWOP_ALLOC_LARGE, 17, 0]);
+        assert_eq!(&blob.bytes[4..8], &[0x0B, UWOP_ALLOC_LARGE, 17, 0]);
         // 0x80000: past the 16-bit form → opinfo 1, size as a u32.
         let blob = encode(&input(0x80000)).expect("encodes").remove(0);
         assert_eq!(blob.bytes[2], 5);
         assert_eq!(blob.bytes[5] >> 4, 1);
         assert_eq!(&blob.bytes[6..10], &0x80000u32.to_le_bytes());
+        // 112: fits the imm8 form — the prolog stays 8 bytes.
+        let blob = encode(&input(112)).expect("encodes").remove(0);
+        assert_eq!(blob.bytes[1], 8);
     }
 
     #[test]

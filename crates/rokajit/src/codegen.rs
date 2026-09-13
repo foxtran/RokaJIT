@@ -45,6 +45,7 @@ use rokajit_ee::ee_info::EeInfo;
 use crate::error::{CompileError, CompileResult};
 use crate::ir::{hir, lir, LocalId, Type};
 use crate::pipeline::{CodegenOutput, GcRootSlot, Tier};
+use crate::structs::StructLayouts;
 use crate::target::{PhysReg, Target};
 
 /// Stage 4 body (the target-generic skeleton behind
@@ -361,26 +362,46 @@ impl ValueState {
 
 /// The GC root set, as a static per-offset fact (the frame-resident
 /// invariant): every local of `Ref`/`ByRef` type reports its frame slot,
-/// valid at every safepoint. `slots` is the target's frame layout,
-/// indexed by [`LocalId`].
-pub fn gc_roots(locals: &[hir::Local], slots: &[u32]) -> Vec<GcRootSlot> {
-    locals
-        .iter()
-        .zip(slots)
-        .filter_map(|(local, &offset)| match local.ty {
-            Type::Ref => Some(GcRootSlot {
+/// valid at every safepoint, and a struct local reports one slot per
+/// embedded GC pointer (slot offset + cell offset; byref cells set the
+/// interior flag; step_10.9). `slots` is the target's frame layout,
+/// indexed by [`LocalId`]; `layouts` answers the struct cell questions.
+///
+/// Struct cell addresses are `rbp - (slot_offset - cell_offset)`: a slot's
+/// bytes are `[rbp - slot_offset, rbp - slot_offset + size)`, so a cell at
+/// struct-relative offset `c` sits `slot_offset - c` bytes below `rbp`.
+/// Frame layout guarantees GC-cell struct slots are 8-aligned and
+/// 8-rounded, so every reported offset is 8-aligned as the slot-table
+/// encoder requires.
+pub fn gc_roots(locals: &[hir::Local], slots: &[u32], layouts: &StructLayouts) -> Vec<GcRootSlot> {
+    let mut roots = Vec::new();
+    for (local, &offset) in locals.iter().zip(slots) {
+        match local.ty {
+            Type::Ref => roots.push(GcRootSlot {
                 offset,
                 is_byref: false,
                 pinned: local.pinned,
             }),
-            Type::ByRef => Some(GcRootSlot {
+            Type::ByRef => roots.push(GcRootSlot {
                 offset,
                 is_byref: true,
                 pinned: local.pinned,
             }),
-            _ => None,
-        })
-        .collect()
+            Type::Struct(class) => {
+                let layout = &layouts[&class];
+                for cell in &layout.gc_cells {
+                    debug_assert_eq!((offset - cell.offset) % 8, 0);
+                    roots.push(GcRootSlot {
+                        offset: offset - cell.offset,
+                        is_byref: cell.is_byref,
+                        pinned: local.pinned,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    roots
 }
 
 #[cfg(test)]
@@ -581,7 +602,7 @@ mod tests {
             local(Type::ByRef, true),
             local(Type::Int64, false),
         ];
-        let roots = gc_roots(&locals, &[4, 8, 16, 24]);
+        let roots = gc_roots(&locals, &[4, 8, 16, 24], &StructLayouts::new());
         assert_eq!(
             roots,
             vec![
@@ -599,6 +620,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn struct_locals_report_one_slot_per_embedded_pointer() {
+        // A struct with a ref cell at offset 0 and a byref cell at offset
+        // 8 (step_10.9): two untracked slots, at frame offsets
+        // slot − cell_offset; the byref cell sets the interior flag.
+        let class = rokajit_ee::handles::ClassHandle::from_raw(0xAAusize as *mut u8 as _).unwrap();
+        let mut layouts = StructLayouts::new();
+        layouts.insert(
+            class,
+            crate::structs::StructLayout {
+                size: 16,
+                align: 8,
+                gc_cells: vec![
+                    crate::structs::GcCell {
+                        offset: 0,
+                        is_byref: false,
+                    },
+                    crate::structs::GcCell {
+                        offset: 8,
+                        is_byref: true,
+                    },
+                ],
+                sysv: crate::structs::SysVPass::memory(),
+            },
+        );
+        let local = |ty| hir::Local {
+            ty,
+            kind: hir::LocalKind::Temp,
+            pinned: false,
+        };
+        let locals = vec![local(Type::Int32), local(Type::Struct(class))];
+        // The struct slot's low byte is 24 below rbp.
+        let roots = gc_roots(&locals, &[4, 24], &layouts);
+        assert_eq!(
+            roots,
+            vec![
+                GcRootSlot {
+                    offset: 24,
+                    is_byref: false,
+                    pinned: false
+                },
+                GcRootSlot {
+                    offset: 16,
+                    is_byref: true,
+                    pinned: false
+                },
+            ]
+        );
+    }
+
     // --- the pipeline stage: tier gate + delegation ---
 
     struct CannedTarget;
@@ -610,12 +681,13 @@ mod tests {
         fn register_classes(&self) -> &'static [crate::target::RegisterClass] {
             &[]
         }
-        fn class_of(&self, _ty: Type) -> Option<RegClassId> {
+        fn class_of(&self, _ty: Type, _layouts: &StructLayouts) -> Option<RegClassId> {
             Some(RegClassId(0))
         }
         fn classify_call(
             &self,
             _sig: &crate::ir::CallSig,
+            _layouts: &StructLayouts,
         ) -> CompileResult<crate::target::CallAbi> {
             Err(CompileError::Unsupported("canned target"))
         }
@@ -656,6 +728,7 @@ mod tests {
             eh_regions: Vec::new(),
             num_args: 0,
             num_il_locals: 0,
+            struct_layouts: StructLayouts::new(),
         }
     }
 
@@ -679,12 +752,13 @@ mod tests {
             fn register_classes(&self) -> &'static [crate::target::RegisterClass] {
                 &[]
             }
-            fn class_of(&self, _ty: Type) -> Option<RegClassId> {
+            fn class_of(&self, _ty: Type, _layouts: &StructLayouts) -> Option<RegClassId> {
                 None
             }
             fn classify_call(
                 &self,
                 _sig: &crate::ir::CallSig,
+                _layouts: &StructLayouts,
             ) -> CompileResult<crate::target::CallAbi> {
                 Err(CompileError::Unsupported("bare target"))
             }

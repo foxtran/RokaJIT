@@ -23,6 +23,7 @@ pub mod unwind;
 use rokajit::error::CompileResult;
 use rokajit::ir::{lir, CallSig, Type};
 use rokajit::pipeline::CodegenOutput;
+use rokajit::structs::StructLayouts;
 use rokajit::target::{CallAbi, RegClassId, RegisterClass, Target};
 use rokajit_ee::ee_info::EeInfo;
 
@@ -39,21 +40,23 @@ impl Target for X64Target {
         &regs::REGISTER_CLASSES
     }
 
-    fn class_of(&self, ty: Type) -> Option<RegClassId> {
+    fn class_of(&self, ty: Type, layouts: &StructLayouts) -> Option<RegClassId> {
         match ty {
             // Integers, native ints, and GC pointers all live in GPRs.
             Type::Int32 | Type::Int64 | Type::NativeInt | Type::Ref | Type::ByRef => {
                 Some(regs::GPR_CLASS_ID)
             }
             Type::Float | Type::Double => Some(regs::XMM_CLASS_ID),
-            // Structs have no register class until struct support lands;
-            // Void never types a value.
+            // Structs are memory-backed (frame slots of exactly `size`
+            // bytes, step_10.9); they are legal whenever the layout side
+            // table knows the class. Void never types a value.
+            Type::Struct(class) if layouts.contains_key(&class) => Some(regs::GPR_CLASS_ID),
             Type::Struct(_) | Type::Void => None,
         }
     }
 
-    fn classify_call(&self, sig: &CallSig) -> CompileResult<CallAbi> {
-        codegen::classify_call(sig)
+    fn classify_call(&self, sig: &CallSig, layouts: &StructLayouts) -> CompileResult<CallAbi> {
+        codegen::classify_call(sig, layouts)
     }
 
     fn call_site_stack_alignment(&self) -> u32 {
@@ -104,6 +107,7 @@ mod tests {
     #[test]
     fn class_of_maps_the_ir_type_vocabulary() {
         let target = X64Target;
+        let layouts = StructLayouts::new();
         for ty in [
             Type::Int32,
             Type::Int64,
@@ -111,11 +115,11 @@ mod tests {
             Type::Ref,
             Type::ByRef,
         ] {
-            assert_eq!(target.class_of(ty), Some(regs::GPR_CLASS_ID));
+            assert_eq!(target.class_of(ty, &layouts), Some(regs::GPR_CLASS_ID));
         }
         for ty in [Type::Float, Type::Double] {
-            assert_eq!(target.class_of(ty), Some(regs::XMM_CLASS_ID));
+            assert_eq!(target.class_of(ty, &layouts), Some(regs::XMM_CLASS_ID));
         }
-        assert_eq!(target.class_of(Type::Void), None);
+        assert_eq!(target.class_of(Type::Void, &layouts), None);
     }
 }

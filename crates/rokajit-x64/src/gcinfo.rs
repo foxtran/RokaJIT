@@ -34,12 +34,14 @@
 //!   to `ReportUntracked`), so no live-state/chunk section is emitted.
 //!
 //! Untracked slot encoding: base (2 bits, `GC_FRAMEREG_REL` — rbp,
-//! matching the header's stack-base-register bit), the normalized offset
-//! as `varl_s` (`NORMALIZE_STACK_SLOT(x) = x >> 3`; the offset is the
-//! negative of the slot's bytes-below-rbp), and 2 flag bits
-//! (interior|pinned). A slot whose flags equal its predecessor's
-//! delta-encodes (`varl_u` of the normalized-offset difference, unsigned
-//! — hence the ascending sort).
+//! matching the header's stack-base-register bit), then — for the first
+//! slot and for every slot whose PREDECESSOR had any flag bit set —
+//! the normalized offset as `varl_s` (`NORMALIZE_STACK_SLOT(x) = x >> 3`;
+//! the offset is the negative of the slot's bytes-below-rbp) plus 2 flag
+//! bits (interior|pinned); when the predecessor's flags were zero, a
+//! bare `varl_u` offset delta instead (gcinfoencoder.cpp:1584-1595 — the
+//! decoder branches on the predecessor's flags, gcinfodecoder.cpp:1264,
+//! NOT on flag equality). Deltas are unsigned, hence the ascending sort.
 //!
 //! Bit packing is LSB-first within each byte (`BitStreamWriter::Write`,
 //! gcinfoencoder.h: the first bit written lands in bit 0 of the first
@@ -85,10 +87,21 @@ pub fn encode(input: &GcInfoInput) -> CompileResult<Vec<u8>> {
     }
     // Slot table: no register slots, no tracked stack slots, one
     // untracked stack slot per GC root (always-live — the tier-0 static
-    // root set). Delta encoding is unsigned, so sort by normalized
-    // offset ascending (= bytes-below-rbp descending).
+    // root set). Sort like the EE (gcinfoencoder.cpp:777-795): flagged
+    // (interior/pinned) slots first, plain slots last, offsets ascending
+    // within a flag group — so delta runs are always plain-flagged. The
+    // encoding rule (gcinfoencoder.cpp:1584-1595): the first slot is
+    // base + varl_s offset + flags; every later slot is base + varl_s
+    // offset + flags when the PREVIOUS slot had any flag bit set
+    // (interior/pinned), and a bare unsigned delta when the previous
+    // slot's flags were zero — the decoder branches on the previous
+    // flags (gcinfodecoder.cpp:1264), NOT on flag equality. Deltas are
+    // unsigned, hence offset-descending within the plain run.
     let mut roots = input.gc_roots.clone();
-    roots.sort_by_key(|r| std::cmp::Reverse(r.offset));
+    roots.sort_by_key(|r| {
+        let flags = u64::from(r.is_byref) | (u64::from(r.pinned) << 1);
+        (std::cmp::Reverse(flags), std::cmp::Reverse(r.offset))
+    });
     w.write(0, 1);
     if roots.is_empty() {
         w.write(0, 1);
@@ -109,7 +122,7 @@ pub fn encode(input: &GcInfoInput) -> CompileResult<Vec<u8>> {
         let norm = -((root.offset / 8) as i32);
         let flags = u64::from(root.is_byref) | (u64::from(root.pinned) << 1);
         w.write(GC_FRAMEREG_REL, 2);
-        if i == 0 || flags != last_flags {
+        if i == 0 || last_flags != 0 {
             w.write_varl_s(i64::from(norm), STACK_SLOT_ENCBASE);
             w.write(flags, 2);
         } else {
@@ -466,12 +479,79 @@ mod tests {
         assert_eq!(r.read(1), 1);
         assert_eq!(r.read_varl_u(NUM_STACK_SLOTS_ENCBASE), 0);
         assert_eq!(r.read_varl_u(NUM_UNTRACKED_SLOTS_ENCBASE), 2);
+        // Flagged slots sort first (gcinfoencoder.cpp:785), so the byref
+        // heads the table in full form...
         let first = read_untracked_slot(&mut r, None);
-        assert_eq!(first, (-2, 0));
-        // The byref slot's flags differ from its plain-ref predecessor,
-        // so it takes the full form, not the delta.
+        assert_eq!(first, (-1, 1), "rbp - 8, interior");
+        // ...and the plain ref follows it, also in full form, because the
+        // delta rule keys on the PREDECESSOR's flags being nonzero
+        // (gcinfoencoder.cpp:1586), not on flag equality.
         let second = read_untracked_slot(&mut r, None);
-        assert_eq!(second, (-1, 1), "rbp - 8, interior");
+        assert_eq!(second, (-2, 0));
+    }
+
+    /// Two byref roots in a row: both take the full form (the latent
+    /// pre-10.9 bug this regression guards — a delta between flagged
+    /// slots misaligns the whole table, gcinfodecoder.cpp:1264).
+    #[test]
+    fn consecutive_byref_roots_both_take_the_full_form() {
+        let mut i = input(9, &[]);
+        i.gc_roots.push(root(16, true, false));
+        i.gc_roots.push(root(8, true, false));
+        i.gc_roots.push(root(24, false, false));
+        let blob = encode(&i).expect("encodes");
+        let mut r = Reader {
+            bytes: &blob,
+            bit: 0,
+        };
+        assert_eq!(r.read(2), 0b10);
+        assert_eq!(r.read_varl_u(CODE_LENGTH_ENCBASE), 9);
+        assert_eq!(r.read_varl_u(NUM_SAFE_POINTS_ENCBASE), 0);
+        assert_eq!(r.read(2), 0b10);
+        assert_eq!(r.read_varl_u(NUM_STACK_SLOTS_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(NUM_UNTRACKED_SLOTS_ENCBASE), 3);
+        // Flagged first (offset-descending within the group): both
+        // byrefs in full form; then the plain ref in full form
+        // (predecessor flagged); no delta entries at all.
+        assert_eq!(read_untracked_slot(&mut r, None), (-2, 1));
+        assert_eq!(read_untracked_slot(&mut r, None), (-1, 1));
+        assert_eq!(read_untracked_slot(&mut r, None), (-3, 0));
+    }
+
+    /// A plain-ref run after the flagged slots delta-encodes.
+    #[test]
+    fn plain_roots_after_flagged_delta_encode() {
+        let mut i = input(9, &[]);
+        i.gc_roots.push(root(8, true, false));
+        i.gc_roots.push(root(16, false, false));
+        i.gc_roots.push(root(24, false, false));
+        let blob = encode(&i).expect("encodes");
+        let mut r = Reader {
+            bytes: &blob,
+            bit: 0,
+        };
+        assert_eq!(r.read(2), 0b10);
+        assert_eq!(r.read_varl_u(CODE_LENGTH_ENCBASE), 9);
+        assert_eq!(r.read_varl_u(NUM_SAFE_POINTS_ENCBASE), 0);
+        assert_eq!(r.read(2), 0b10);
+        assert_eq!(r.read_varl_u(NUM_STACK_SLOTS_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(NUM_UNTRACKED_SLOTS_ENCBASE), 3);
+        assert_eq!(
+            read_untracked_slot(&mut r, None),
+            (-1, 1),
+            "the byref first"
+        );
+        assert_eq!(
+            read_untracked_slot(&mut r, None),
+            (-3, 0),
+            "flag change: full"
+        );
+        // The second plain ref's predecessor has zero flags: the delta.
+        assert_eq!(
+            read_untracked_slot(&mut r, Some((-3, 0))),
+            (-2, 0),
+            "delta +1 from the previous plain ref"
+        );
     }
 
     /// Pinned sets the second flag bit.

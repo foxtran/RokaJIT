@@ -83,17 +83,21 @@ SUPPORTED = {
     0x6D,                    # conv.u4
     0x6E,                    # conv.u8
     0x6F,                    # callvirt (step_10.4, EE-devirtualized only)
+    0x70,                    # cpobj (step_10.9)
+    0x71,                    # ldobj (step_10.9)
     0x72,                    # ldstr (step_10.3)
     0x73,                    # newobj (step_10.4)
     0x7B,                    # ldfld (step_10.4)
     0x7C,                    # ldflda (step_10.4)
     0x7D,                    # stfld (step_10.4)
+    0x81,                    # stobj (step_10.9)
 }
 # Supported 0xFE-prefixed opcodes, by second byte (opcode.def):
 #   FE 01..05 = ceq, cgt, cgt.un, clt, clt.un
 #   FE 09 = ldarg, FE 0A = ldarga, FE 0B = starg
 #   FE 0C = ldloc, FE 0D = ldloca, FE 0E = stloc
-SUPPORTED_FE = {0x01, 0x02, 0x03, 0x04, 0x05, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E}
+#   FE 15 = initobj (step_10.9)
+SUPPORTED_FE = {0x01, 0x02, 0x03, 0x04, 0x05, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x15}
 
 # --- IL linear-scan operand-size tables -------------------------------------
 # Operand sizes for opcodes the scanner may encounter; anything not listed

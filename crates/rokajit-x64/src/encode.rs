@@ -928,6 +928,56 @@ impl Asm {
         self.emit_sse_enc(prefix, enc, opcode);
     }
 
+    /// `movzx r32, r/m8` (`0F B6`) or `movzx r32, r/m16` (`0F B7`) — the
+    /// narrow block-copy loads (step_10.9): a 1- or 2-byte chunk loads
+    /// zero-extended into the full register.
+    pub fn movzx_load(&mut self, size: u8, dst: Gpr, src: Mem) {
+        let opcode = match size {
+            1 => 0xB6,
+            2 => 0xB7,
+            _ => unreachable!("movzx_load covers 1- and 2-byte chunks"),
+        };
+        self.emit_modrm_insn(false, dst as u8, Rm::Mem(src), &[0x0F, opcode]);
+    }
+
+    /// `mov r/m8, r8` (`88 /r`) or `mov r/m16, r16` (`66 89 /r`) — the
+    /// narrow block-copy stores (step_10.9). The 8-bit form always carries
+    /// a REX prefix so `sil`/`dil` and r8+ stay encodable.
+    pub fn mov_store_narrow(&mut self, size: u8, dst: Mem, src: Gpr) {
+        match size {
+            1 => {
+                let enc = encode_modrm(false, src as u8, Rm::Mem(dst));
+                self.emit_u8(0x40 | enc.rex);
+                self.emit_u8(0x88);
+                self.emit_modrm_tail(enc);
+            }
+            2 => {
+                self.emit_u8(0x66);
+                let enc = encode_modrm(false, src as u8, Rm::Mem(dst));
+                if enc.rex != 0 {
+                    self.emit_u8(0x40 | enc.rex);
+                }
+                self.emit_u8(0x89);
+                self.emit_modrm_tail(enc);
+            }
+            _ => unreachable!("mov_store_narrow covers 1- and 2-byte chunks"),
+        }
+    }
+
+    /// The ModRM/SIB/displacement tail of an instruction whose opcode is
+    /// already emitted.
+    fn emit_modrm_tail(&mut self, enc: ModRmEnc) {
+        self.emit_u8(enc.modrm);
+        if let Some(sib) = enc.sib {
+            self.emit_u8(sib);
+        }
+        match enc.disp {
+            Disp::None => {}
+            Disp::D8(d) => self.emit_u8(d as u8),
+            Disp::D32(d) => self.emit_u32(d as u32),
+        }
+    }
+
     fn emit_u8(&mut self, v: u8) {
         self.buf.push(v);
     }
@@ -967,6 +1017,52 @@ mod tests {
         let mut asm = Asm::new();
         f(&mut asm);
         asm.finalize().expect("all labels bound").bytes
+    }
+
+    // ---- narrow block-copy moves (step_10.9) ----
+
+    #[test]
+    fn movzx_load_forms() {
+        // movzxb -4(%rbp), %eax
+        assert_eq!(
+            finish(|a| a.movzx_load(1, Rax, Mem::base_disp(Rbp, -4))),
+            [0x0F, 0xB6, 0x45, 0xFC]
+        );
+        // movzxw -4(%rbp), %eax
+        assert_eq!(
+            finish(|a| a.movzx_load(2, Rax, Mem::base_disp(Rbp, -4))),
+            [0x0F, 0xB7, 0x45, 0xFC]
+        );
+        // movzxb 8(%rsp), %r9d (REX.R, SIB)
+        assert_eq!(
+            finish(|a| a.movzx_load(1, R9, Mem::base_disp(Rsp, 8))),
+            [0x44, 0x0F, 0xB6, 0x4C, 0x24, 0x08]
+        );
+    }
+
+    #[test]
+    fn mov_store_narrow_forms() {
+        // movb %al, -4(%rbp) — a bare REX is always emitted so the
+        // uniform register set (sil/dil/r8b+) stays encodable.
+        assert_eq!(
+            finish(|a| a.mov_store_narrow(1, Mem::base_disp(Rbp, -4), Rax)),
+            [0x40, 0x88, 0x45, 0xFC]
+        );
+        // movb %sil, -4(%rbp)
+        assert_eq!(
+            finish(|a| a.mov_store_narrow(1, Mem::base_disp(Rbp, -4), Rsi)),
+            [0x40, 0x88, 0x75, 0xFC]
+        );
+        // movb %r8b, -4(%rbp) (REX.R)
+        assert_eq!(
+            finish(|a| a.mov_store_narrow(1, Mem::base_disp(Rbp, -4), R8)),
+            [0x44, 0x88, 0x45, 0xFC]
+        );
+        // movw %ax, 8(%rsp) (66 prefix, SIB)
+        assert_eq!(
+            finish(|a| a.mov_store_narrow(2, Mem::base_disp(Rsp, 8), Rax)),
+            [0x66, 0x89, 0x44, 0x24, 0x08]
+        );
     }
 
     // ---- mov reg/reg ----

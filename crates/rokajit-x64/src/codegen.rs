@@ -40,17 +40,75 @@ use rokajit::ir::lir::StmtKind;
 use rokajit::ir::{hir, lir, BinaryOp, CallSig, LocalId, Type, UnaryOp};
 use rokajit::lower::{Cx, Label};
 use rokajit::pipeline::{CodegenOutput, FrameInfo};
+#[cfg(test)]
+use rokajit::structs::{GcCell, SysVPass};
+use rokajit::structs::{StructLayout, StructLayouts};
 use rokajit::target::{ArgLocation, CallAbi, PhysReg};
 use rokajit_ee::ee_info::{const_lookup_addr, const_lookup_slot, EeInfo};
 use rokajit_ee::enums::{CorInfoHelpFunc, RelocType};
-use rokajit_ee::handles::MethodHandle;
+use rokajit_ee::handles::{ClassHandle, MethodHandle};
 
 use crate::encode::{Asm, Mem, Rm, RmX, Rmi};
 use crate::inst::{
-    ArithFOp, ArithOp, CondCode, FWidth, Inst, Place, ShiftOp, Src, Width, XmmPlace, XmmSrc,
+    ArithFOp, ArithOp, BlockAddr, CondCode, EbReg, FWidth, Inst, Place, ShiftOp, Src, Width,
+    XmmPlace, XmmSrc,
 };
 use crate::lower::{lower_frame, lower_stmt, width_of_ty, FrameReq};
 use crate::regs::{self, Gpr, Xmm};
+
+/// The largest block copy/zero emitted inline (unrolled 8/4/2/1 moves);
+/// larger blocks go through `CORINFO_HELP_MEMCPY`/`MEMSET` (step_10.9
+/// threshold decision).
+const BLOCK_INLINE_MAX: u32 = 64;
+
+/// The greedy 8/4/2/1 decomposition of a `size`-byte block: `(offset,
+/// chunk size)` pairs in ascending offset order.
+fn chunk_plan(size: u32) -> Vec<(u32, u8)> {
+    let mut plan = Vec::new();
+    let mut done = 0u32;
+    for chunk in [8u8, 4, 2, 1] {
+        while size - done >= u32::from(chunk) {
+            plan.push((done, chunk));
+            done += u32::from(chunk);
+        }
+    }
+    plan
+}
+
+/// The GPRs an instruction sequence pins to ABI duties (step_10.9):
+/// explicit fixed-register destinations (argument setup) and, when
+/// `pre_call` is false, the fixed registers result moves read (the return
+/// registers — live from the call until their store executes).
+fn fixed_gprs(insts: &[Inst], pre_call: bool) -> Vec<PhysReg> {
+    let mut v: Vec<PhysReg> = Vec::new();
+    let mut push = |g: Gpr| {
+        let p = g.phys();
+        if !v.contains(&p) {
+            v.push(p);
+        }
+    };
+    for inst in insts {
+        match *inst {
+            Inst::Mov {
+                dst: Place::Reg(g), ..
+            }
+            | Inst::Lea {
+                dst: Place::Reg(g), ..
+            }
+            | Inst::MovExt {
+                dst: Place::Reg(g), ..
+            }
+            | Inst::LoadEightbyte {
+                dst: EbReg::Gpr(g), ..
+            } if pre_call => push(g),
+            Inst::StoreEightbyte {
+                src: EbReg::Gpr(g), ..
+            } if !pre_call => push(g),
+            _ => {}
+        }
+    }
+    v
+}
 
 /// Tier-0 scratch pool: the caller-saved GPRs (SysV §3.2.1), in
 /// round-robin allocation order. Calls spill the whole pool, so no
@@ -102,8 +160,17 @@ fn gpr_of(reg: PhysReg) -> CompileResult<Gpr> {
 /// [`rokajit::target::Target::classify_call`] body). Integer-class values
 /// (pointers included) take [`regs::INT_ARG_REGS`] in order, floats take
 /// [`regs::FLOAT_ARG_REGS`]; overflow goes to 8-byte stack slots.
-/// Aggregates are outside the tier-0 subset.
-pub fn classify_call(sig: &CallSig) -> CompileResult<CallAbi> {
+/// Aggregates (step_10.9) follow the EE's eightbyte classification
+/// (`layouts`): a register-passed struct takes one register per eightbyte
+/// from its class's pool — but only when BOTH pools have room for the
+/// whole struct (otherwise the entire struct goes on the stack, 8-byte
+/// rounded); a struct the EE never classifies for registers is always a
+/// full-size stack copy. Return values: SSE eightbytes take
+/// [`regs::FLOAT_RETURN_REGS`], integer eightbytes
+/// [`regs::INT_RETURN_REGS`]; a non-register-passed struct returns the
+/// hidden-retbuf pointer in `rax` (the importer supplies the buffer as an
+/// implicit argument).
+pub fn classify_call(sig: &CallSig, layouts: &StructLayouts) -> CompileResult<CallAbi> {
     let mut int_n = 0usize;
     let mut float_n = 0usize;
     let mut stack_bytes = 0u32;
@@ -114,18 +181,54 @@ pub fn classify_call(sig: &CallSig) -> CompileResult<CallAbi> {
             &mut int_n,
             &mut float_n,
             &mut stack_bytes,
+            layouts,
         )?);
     }
     for &ty in &sig.args {
-        args.push(place_arg(ty, &mut int_n, &mut float_n, &mut stack_bytes)?);
+        args.push(place_arg(
+            ty,
+            &mut int_n,
+            &mut float_n,
+            &mut stack_bytes,
+            layouts,
+        )?);
     }
     let ret = match sig.ret {
         Type::Void => None,
         Type::Float | Type::Double => Some(ArgLocation::Reg(regs::FLOAT_RETURN_REG.phys())),
-        Type::Struct(_) => {
-            return Err(CompileError::Unsupported(
-                "struct return values: outside the tier-0 subset",
-            ));
+        Type::Struct(class) => {
+            let sysv = &layout_of(layouts, class)?.sysv;
+            if sysv.passed_in_registers {
+                // Per-register-file assignment: integer eightbytes take
+                // rax then rdx, SSE eightbytes xmm0 then xmm1.
+                let mut regs = [regs::INT_RETURN_REGS[0].phys(); 2];
+                let (mut i, mut f) = (0usize, 0usize);
+                for (k, class) in sysv.classes.iter().enumerate().take(sysv.count as usize) {
+                    regs[k] = if class.is_sse() {
+                        let r = regs::FLOAT_RETURN_REGS[f].phys();
+                        f += 1;
+                        r
+                    } else {
+                        let r = regs::INT_RETURN_REGS[i].phys();
+                        i += 1;
+                        r
+                    };
+                }
+                if sysv.count == 1 {
+                    regs[1] = regs[0];
+                }
+                Some(ArgLocation::StructRegs {
+                    regs,
+                    count: sysv.count,
+                    sizes: sysv.sizes,
+                    offsets: sysv.offsets,
+                })
+            } else {
+                // The hidden-return-buffer convention: the callee returns
+                // the buffer address in rax (clr-abi.md). The caller
+                // ignores it — the value is the retbuf temp it passed.
+                Some(ArgLocation::Reg(regs::INT_RETURN_REGS[0].phys()))
+            }
         }
         _ => Some(ArgLocation::Reg(regs::INT_RETURN_REGS[0].phys())),
     };
@@ -136,19 +239,27 @@ pub fn classify_call(sig: &CallSig) -> CompileResult<CallAbi> {
     })
 }
 
+/// The layout of a struct mentioned in a signature, or an upstream-bug
+/// error (the importer populates the side table for every class it emits).
+fn layout_of(layouts: &StructLayouts, class: ClassHandle) -> CompileResult<&StructLayout> {
+    layouts.get(&class).ok_or(CompileError::Internal(
+        "struct class missing from the layout side table",
+    ))
+}
+
 fn place_arg(
     ty: Type,
     int_n: &mut usize,
     float_n: &mut usize,
     stack_bytes: &mut u32,
+    layouts: &StructLayouts,
 ) -> CompileResult<ArgLocation> {
     let is_float = match ty {
         Type::Int32 | Type::Int64 | Type::NativeInt | Type::Ref | Type::ByRef => false,
         Type::Float | Type::Double => true,
-        Type::Struct(_) => {
-            return Err(CompileError::Unsupported(
-                "struct arguments: outside the tier-0 subset",
-            ));
+        Type::Struct(class) => {
+            let layout = layout_of(layouts, class)?;
+            return place_struct_arg(layout, int_n, float_n, stack_bytes);
         }
         Type::Void => return Err(CompileError::Internal("void-typed argument")),
     };
@@ -172,6 +283,58 @@ fn place_arg(
     }
 }
 
+/// The whole-struct rule for a struct argument (SysV + clr-abi.md): when
+/// the EE classifies the struct for registers AND both register pools
+/// have room for every eightbyte, each eightbyte takes the next register
+/// of its file; otherwise (either pool short, or the EE never classifies
+/// it) the ENTIRE struct goes on the stack as a full `size`-byte copy,
+/// 8-byte rounded.
+fn place_struct_arg(
+    layout: &StructLayout,
+    int_n: &mut usize,
+    float_n: &mut usize,
+    stack_bytes: &mut u32,
+) -> CompileResult<ArgLocation> {
+    let sysv = &layout.sysv;
+    if sysv.passed_in_registers {
+        let need_int = sysv.classes[..sysv.count as usize]
+            .iter()
+            .filter(|c| !c.is_sse())
+            .count();
+        let need_sse = sysv.count as usize - need_int;
+        if *int_n + need_int <= regs::INT_ARG_REGS.len()
+            && *float_n + need_sse <= regs::FLOAT_ARG_REGS.len()
+        {
+            let mut regs = [regs::INT_ARG_REGS[0].phys(); 2];
+            for (k, reg) in regs.iter_mut().enumerate().take(sysv.count as usize) {
+                *reg = if sysv.classes[k].is_sse() {
+                    let r = regs::FLOAT_ARG_REGS[*float_n].phys();
+                    *float_n += 1;
+                    r
+                } else {
+                    let r = regs::INT_ARG_REGS[*int_n].phys();
+                    *int_n += 1;
+                    r
+                };
+            }
+            // A one-eightbyte struct duplicates its register in the
+            // unused slot (a defined value, never read).
+            if sysv.count == 1 {
+                regs[1] = regs[0];
+            }
+            return Ok(ArgLocation::StructRegs {
+                regs,
+                count: sysv.count,
+                sizes: sysv.sizes,
+                offsets: sysv.offsets,
+            });
+        }
+    }
+    let offset = *stack_bytes;
+    *stack_bytes += layout.size.div_ceil(8) * 8;
+    Ok(ArgLocation::Stack { offset })
+}
+
 /// The `jcc` condition implementing the ordered half of a float compare
 /// branch (after any parity handling): equality maps to `je`, the
 /// ordered greater forms ride `ja`/`jae` (CF excludes unordered), the
@@ -192,34 +355,75 @@ fn float_jcc_tail(op: BinaryOp) -> CondCode {
 /// The frame layout: every local/arg/temp's slot offset below `rbp`, plus
 /// the 16-aligned frame size (the `sub rsp, N` immediate). Slot `i`'s
 /// bytes are `[rbp - slots[i], rbp - slots[i] + size)` — so `slots[i]` is
-/// the offset [`rokajit::pipeline::GcRootSlot`] records.
+/// the offset [`rokajit::pipeline::GcRootSlot`] records. The outgoing
+/// stack-argument area (step_10.9) sits below every slot, addressed
+/// `[rsp + off]` at call sites; `frame_size` covers it, so `rsp ≡ 0
+/// (mod 16)` holds at every call as before.
 pub struct FrameLayout {
     pub slots: Vec<u32>,
     pub frame_size: u32,
+    /// Bytes reserved below the slots for outgoing stack arguments (the
+    /// maximum `CallAbi::stack_arg_bytes` over the method's call sites).
+    pub outgoing_bytes: u32,
 }
 
 impl FrameLayout {
-    pub fn compute(method: &lir::Method) -> CompileResult<FrameLayout> {
+    pub fn compute(method: &lir::Method, outgoing_bytes: u32) -> CompileResult<FrameLayout> {
         let mut offset = 0u32;
         let mut slots = Vec::with_capacity(method.locals.len());
         for local in &method.locals {
             let (size, align) = match local.ty {
                 Type::Int32 | Type::Float => (4, 4),
                 Type::Int64 | Type::NativeInt | Type::Ref | Type::ByRef | Type::Double => (8, 8),
-                Type::Struct(_) => {
-                    return Err(CompileError::Unsupported(
-                        "struct local in tier-0 frame layout",
-                    ));
+                Type::Struct(class) => {
+                    let layout =
+                        method
+                            .struct_layouts
+                            .get(&class)
+                            .ok_or(CompileError::Internal(
+                                "struct local missing from the layout side table",
+                            ))?;
+                    // Slots are exactly `size` bytes at `align` alignment —
+                    // except structs embedding GC pointers: those round the
+                    // size up to 8 and force 8-alignment so every reported
+                    // root (slot offset − cell offset) stays 8-aligned for
+                    // the GC slot-table encoder.
+                    if layout.gc_cells.is_empty() {
+                        (layout.size, layout.align)
+                    } else {
+                        (layout.size.div_ceil(8) * 8, layout.align.max(8))
+                    }
                 }
                 Type::Void => return Err(CompileError::Internal("void-typed local")),
             };
-            offset = offset.div_ceil(align) * align + size;
+            // The slot's base (its lowest byte, at `rbp - slots[i]`) must
+            // meet the type's alignment, so the slot's *end* rounds up to
+            // `align` too — the tail padding is dead space. (For the
+            // scalar types size is a multiple of align and nothing
+            // changes; a 100-byte struct at 8-alignment would otherwise
+            // land on a 4-aligned base.)
+            offset = (offset.div_ceil(align) * align + size).div_ceil(align) * align;
             slots.push(offset);
         }
         Ok(FrameLayout {
             slots,
-            frame_size: offset.div_ceil(16) * 16,
+            frame_size: (offset + outgoing_bytes).div_ceil(16) * 16,
+            outgoing_bytes,
         })
+    }
+
+    /// The largest outgoing-argument area any call site in `method`
+    /// needs (0 when every argument of every call fits in registers).
+    pub fn max_outgoing_bytes(method: &lir::Method) -> CompileResult<u32> {
+        let mut max = 0u32;
+        for block in &method.blocks {
+            for stmt in &block.stmts {
+                if let StmtKind::Call { sig, .. } = &stmt.kind {
+                    max = max.max(classify_call(sig, &method.struct_layouts)?.stack_arg_bytes);
+                }
+            }
+        }
+        Ok(max)
     }
 }
 
@@ -227,8 +431,9 @@ impl FrameLayout {
 /// machine-code bytes plus the relocation/call-site/frame facts 07.7
 /// drains. Single pass over the blocks in layout order.
 pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<CodegenOutput> {
-    let layout = FrameLayout::compute(method)?;
-    let cx = Cx::new(&method.locals);
+    let outgoing = FrameLayout::max_outgoing_bytes(method)?;
+    let layout = FrameLayout::compute(method, outgoing)?;
+    let cx = Cx::new(&method.locals, &method.struct_layouts);
     let mut em = Emitter::new(method, layout, ee);
 
     let prolog = lower_frame(&FrameReq, &cx).ok_or(CompileError::Internal(
@@ -238,7 +443,7 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
         em.emit_inst(inst)?;
     }
     em.spill_incoming_args()?;
-    em.zero_init_slots();
+    em.zero_init_slots()?;
 
     for block in &method.blocks {
         em.asm.bind(Label(block.id));
@@ -257,9 +462,19 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
             if let StmtKind::Call { sig, .. } = &stmt.kind {
                 em.call_sig = Some(sig.clone());
             }
-            for inst in &insts {
+            // ABI-pinned registers that will hold live values during this
+            // statement (step_10.9): argument registers written by the
+            // pre-call moves, then the return registers after the call.
+            // Scratch allocation must exclude them — they are not
+            // value-machine-tracked.
+            em.fixed_dests = fixed_gprs(&insts, true);
+            for (i, inst) in insts.iter().enumerate() {
+                if matches!(inst, Inst::CallDirect { .. } | Inst::CallHelper { .. }) {
+                    em.fixed_dests = fixed_gprs(&insts[i + 1..], false);
+                }
                 em.emit_inst(inst)?;
             }
+            em.fixed_dests.clear();
             em.call_sig = None;
         }
         // A block whose terminator lowered to a fallthrough (jump-to-next
@@ -291,7 +506,11 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
         call_sites: em.call_sites,
         frame: FrameInfo {
             frame_size: em.layout.frame_size,
-            gc_roots: rokajit::codegen::gc_roots(&method.locals, &em.layout.slots),
+            gc_roots: rokajit::codegen::gc_roots(
+                &method.locals,
+                &em.layout.slots,
+                &method.struct_layouts,
+            ),
         },
     })
 }
@@ -303,6 +522,7 @@ struct Emitter<'a> {
     vs: ValueState,
     layout: FrameLayout,
     locals: &'a [hir::Local],
+    layouts: &'a StructLayouts,
     num_args: usize,
     /// `num_args + num_il_locals`: ids below this are IL args/locals
     /// (their slots are written on copy), above it temps (tag-tracked).
@@ -316,6 +536,13 @@ struct Emitter<'a> {
     /// Synthetic-label supply for the float-compare branch expansions
     /// (counts down from [`FIRST_SYNTHETIC_LABEL`]).
     next_synthetic: u32,
+    /// ABI-pinned registers currently holding live values (step_10.9):
+    /// argument registers already written during a call's setup, return
+    /// registers after it, and incoming argument registers during the
+    /// prolog spill. Scratch allocation must never clobber them (they are
+    /// not value-machine-tracked, so `take_scratch` would silently reuse
+    /// one).
+    fixed_dests: Vec<PhysReg>,
 }
 
 impl<'a> Emitter<'a> {
@@ -327,6 +554,7 @@ impl<'a> Emitter<'a> {
             vs: ValueState::new(&pool, &layout.slots, &tys),
             layout,
             locals: &method.locals,
+            layouts: &method.struct_layouts,
             num_args: method.num_args as usize,
             num_frame_fixed: (method.num_args + method.num_il_locals) as usize,
             ee,
@@ -334,7 +562,20 @@ impl<'a> Emitter<'a> {
             call_sites: Vec::new(),
             relocations: Vec::new(),
             next_synthetic: FIRST_SYNTHETIC_LABEL,
+            fixed_dests: Vec::new(),
         }
+    }
+
+    /// `fixed_dests ∪ extra` — the scratch-allocation exclusion list while
+    /// ABI registers hold live values.
+    fn scratch_exclude(&self, extra: &[PhysReg]) -> Vec<PhysReg> {
+        let mut v = self.fixed_dests.clone();
+        for &e in extra {
+            if !v.contains(&e) {
+                v.push(e);
+            }
+        }
+        v
     }
 
     fn ty_of(&self, id: LocalId) -> Type {
@@ -405,6 +646,7 @@ impl<'a> Emitter<'a> {
     fn wide_imm(&mut self, width: Width, src: Src, exclude: &[PhysReg]) -> CompileResult<Rmi> {
         if let Src::Imm(i) = src {
             if matches!(width, Width::W64) && i32::try_from(i).is_err() {
+                let exclude = &self.scratch_exclude(exclude);
                 let (p, moves) = self.vs.take_scratch(exclude);
                 self.apply(moves)?;
                 let g = gpr_of(p)?;
@@ -423,6 +665,7 @@ impl<'a> Emitter<'a> {
             Rmi::Reg(g) => Ok(Rm::Reg(g)),
             Rmi::Mem(m) => Ok(Rm::Mem(m)),
             Rmi::Imm(i) => {
+                let exclude = &self.scratch_exclude(exclude);
                 let (p, moves) = self.vs.take_scratch(exclude);
                 self.apply(moves)?;
                 let g = gpr_of(p)?;
@@ -465,7 +708,8 @@ impl<'a> Emitter<'a> {
     /// scratch (`mov`/`movabs` + `movq`/`movd`). This is the constant-load
     /// mechanism: no rodata pool, no relocations — the step_10.2 decision.
     fn materialize_bits(&mut self, dst: Xmm, width: FWidth, bits: u64) -> CompileResult<()> {
-        let (p, moves) = self.vs.take_scratch(&[]);
+        let exclude = &self.scratch_exclude(&[]);
+        let (p, moves) = self.vs.take_scratch(exclude);
         self.apply(moves)?;
         let g = gpr_of(p)?;
         let w = match width {
@@ -790,6 +1034,11 @@ impl<'a> Emitter<'a> {
     /// receiver already, so the synthesized signature is `has_this: false`).
     /// Float arguments arrive in XMM registers and store with
     /// `movss`/`movsd`; integer-class arguments with a GPR `mov`.
+    /// Struct arguments (step_10.9): register-passed eightbytes store with
+    /// their exact descriptor sizes; stack-passed scalars load from the
+    /// caller's outgoing area at `[rbp + 16 + offset]` (return address +
+    /// saved rbp above the locals); stack-passed structs block-copy from
+    /// there into the slot.
     fn spill_incoming_args(&mut self) -> CompileResult<()> {
         if self.num_args == 0 {
             return Ok(());
@@ -799,7 +1048,23 @@ impl<'a> Emitter<'a> {
             args: self.locals[..self.num_args].iter().map(|l| l.ty).collect(),
             has_this: false,
         };
-        let abi = classify_call(&sig)?;
+        let abi = classify_call(&sig, self.layouts)?;
+        // Incoming argument registers hold live values until their spill:
+        // scratch allocation (struct eightbyte shifts, stack-struct
+        // copies) must stay clear of the ones not yet spilled.
+        self.fixed_dests = abi
+            .args
+            .iter()
+            .flat_map(|loc| match loc {
+                ArgLocation::Reg(p) => vec![*p],
+                ArgLocation::StructRegs { regs, count, .. } => regs[..*count as usize]
+                    .iter()
+                    .copied()
+                    .filter(|p| Gpr::from_phys(*p).is_some())
+                    .collect(),
+                ArgLocation::Stack { .. } => vec![],
+            })
+            .collect();
         for (i, loc) in abi.args.iter().enumerate() {
             let id = LocalId(i as u32);
             match *loc {
@@ -816,26 +1081,69 @@ impl<'a> Emitter<'a> {
                         return Err(CompileError::Internal("PhysReg outside both classes"));
                     }
                 }
-                ArgLocation::Stack { .. } => {
-                    return Err(CompileError::Unsupported(
-                        "incoming stack arguments (argument-register overflow)",
-                    ));
+                ArgLocation::StructRegs {
+                    regs,
+                    count,
+                    sizes,
+                    offsets,
+                } => {
+                    for k in 0..count as usize {
+                        let src =
+                            match Gpr::from_phys(regs[k]) {
+                                Some(g) => EbReg::Gpr(g),
+                                None => EbReg::Xmm(Xmm::from_phys(regs[k]).ok_or(
+                                    CompileError::Internal("PhysReg outside both classes"),
+                                )?),
+                            };
+                        self.store_eightbyte_to_slot(id, u32::from(offsets[k]), sizes[k], src)?;
+                    }
+                }
+                ArgLocation::Stack { offset } => {
+                    let home = Mem::base_disp(regs::FRAME_POINTER, 16 + offset as i32);
+                    match self.ty_of(id) {
+                        Type::Float | Type::Double => {
+                            let fw = FWidth::of(self.ty_of(id)).unwrap();
+                            self.asm.mov_f_load(fw, SCRATCH_XMM_A, RmX::Mem(home));
+                            self.asm.mov_f_store(fw, self.own_slot(id), SCRATCH_XMM_A);
+                        }
+                        Type::Struct(class) => {
+                            let size = self.layouts[&class].size;
+                            self.block_copy_mem_to_slot(id, offset, size)?;
+                        }
+                        _ => {
+                            let width = self.width_of(id)?;
+                            let exclude = &self.scratch_exclude(&[]);
+                            let (p, moves) = self.vs.take_scratch(exclude);
+                            self.apply(moves)?;
+                            let g = gpr_of(p)?;
+                            self.asm.mov(width, Rm::Reg(g), Rmi::Mem(home));
+                            self.asm.mov(width, Rm::Mem(self.own_slot(id)), Rmi::Reg(g));
+                        }
+                    }
                 }
             }
         }
+        self.fixed_dests.clear();
         Ok(())
     }
 
     /// Zero the slots whose contents must be defined from the first
     /// safepoint on: IL locals (the init-locals flag does not reach LIR;
-    /// zeroing unconditionally is always permitted) and GC-typed temps
+    /// zeroing unconditionally is always permitted), GC-typed temps
     /// (reported roots, so their slots must hold a valid value even before
-    /// the temp's first definition).
-    fn zero_init_slots(&mut self) {
+    /// the temp's first definition), and struct temps embedding GC
+    /// pointers (same reason — the cells are reported roots). Struct
+    /// slots zero with inline decomposed stores (never a helper call in
+    /// the prolog).
+    fn zero_init_slots(&mut self) -> CompileResult<()> {
         for (i, local) in self.locals.iter().enumerate() {
             let is_il_local = i >= self.num_args && i < self.num_frame_fixed;
-            let is_gc_temp =
-                i >= self.num_frame_fixed && matches!(local.ty, Type::Ref | Type::ByRef);
+            let is_gc_temp = i >= self.num_frame_fixed
+                && match local.ty {
+                    Type::Ref | Type::ByRef => true,
+                    Type::Struct(class) => !self.layouts[&class].gc_cells.is_empty(),
+                    _ => false,
+                };
             if !(is_il_local || is_gc_temp) {
                 continue;
             }
@@ -847,9 +1155,13 @@ impl<'a> Emitter<'a> {
                 Type::Int64 | Type::NativeInt | Type::Ref | Type::ByRef | Type::Double => {
                     Width::W64
                 }
-                // Struct locals are rejected at frame layout; Void never
-                // types a local.
-                Type::Struct(_) | Type::Void => continue,
+                Type::Struct(class) => {
+                    let size = self.layouts[&class].size;
+                    self.block_zero_slot(LocalId(i as u32), size)?;
+                    continue;
+                }
+                // Void never types a local.
+                Type::Void => continue,
             };
             self.asm.mov(
                 width,
@@ -857,6 +1169,379 @@ impl<'a> Emitter<'a> {
                 Rmi::Imm(0),
             );
         }
+        Ok(())
+    }
+
+    // ---- step_10.9: struct ABI moves and block operations ----
+
+    /// The memory of the byte at struct-relative `offset` within a
+    /// local's frame slot (the slot's bytes are
+    /// `[rbp - slot, rbp - slot + size)`).
+    fn slot_mem_at(&self, id: LocalId, offset: u32) -> Mem {
+        Mem::base_disp(
+            regs::FRAME_POINTER,
+            -((self.vs.slot_of(id) - offset) as i32),
+        )
+    }
+
+    /// A block operand's address materialized into a scratch GPR: a
+    /// byref value reads from wherever it currently lives (register
+    /// reused directly when allowed), a frame-slot address is a `lea`.
+    fn block_addr_gpr(&mut self, addr: BlockAddr, exclude: &[PhysReg]) -> CompileResult<Gpr> {
+        if let BlockAddr::Val(v) = addr {
+            if let ReadSrc::Reg(p) = self.vs.read(v.0) {
+                if !exclude.contains(&p) && !self.fixed_dests.contains(&p) {
+                    return gpr_of(p);
+                }
+            }
+        }
+        let exclude = &self.scratch_exclude(exclude);
+        let (p, moves) = self.vs.take_scratch(exclude);
+        self.apply(moves)?;
+        let g = gpr_of(p)?;
+        match addr {
+            BlockAddr::FrameSlot(l) => {
+                self.asm
+                    .lea(g, self.slot_mem(self.layout.slots[l.0 as usize]));
+            }
+            BlockAddr::Val(v) => match self.vs.read(v.0) {
+                ReadSrc::Reg(src) => {
+                    let src = gpr_of(src)?;
+                    if src != g {
+                        self.asm.mov(Width::W64, Rm::Reg(g), Rmi::Reg(src));
+                    }
+                }
+                ReadSrc::Slot(off) => {
+                    self.asm
+                        .mov(Width::W64, Rm::Reg(g), Rmi::Mem(self.slot_mem(off)));
+                }
+                ReadSrc::Imm(i) => {
+                    self.asm.mov(Width::W64, Rm::Reg(g), Rmi::Imm(i));
+                }
+            },
+        }
+        Ok(g)
+    }
+
+    /// `dst := mem[size]` — an exact-width block-copy load (1- and
+    /// 2-byte chunks zero-extend).
+    fn load_chunk(&mut self, mem: Mem, size: u8, dst: Gpr) {
+        match size {
+            8 => self.asm.mov(Width::W64, Rm::Reg(dst), Rmi::Mem(mem)),
+            4 => self.asm.mov(Width::W32, Rm::Reg(dst), Rmi::Mem(mem)),
+            1 | 2 => self.asm.movzx_load(size, dst, mem),
+            _ => unreachable!("chunk sizes are 8/4/2/1"),
+        }
+    }
+
+    /// `mem[size] := src` — an exact-width block-copy store.
+    fn store_chunk(&mut self, mem: Mem, size: u8, src: Gpr) {
+        match size {
+            8 => self.asm.mov(Width::W64, Rm::Mem(mem), Rmi::Reg(src)),
+            4 => self.asm.mov(Width::W32, Rm::Mem(mem), Rmi::Reg(src)),
+            1 | 2 => self.asm.mov_store_narrow(size, mem, src),
+            _ => unreachable!("chunk sizes are 8/4/2/1"),
+        }
+    }
+
+    /// One struct eightbyte from an ABI register into a frame slot at
+    /// `offset`, respecting the descriptor's exact byte size (the callee
+    /// spill of a register-passed argument; a register-passed call
+    /// result landing in its destination slot). GPR eightbytes decompose
+    /// into 8/4/2/1 chunks (later chunks shift the register through a
+    /// scratch); SSE eightbyte sizes are always 4 or 8 (`movss`/`movsd`
+    /// are exact).
+    fn store_eightbyte_to_slot(
+        &mut self,
+        id: LocalId,
+        offset: u32,
+        size: u8,
+        src: EbReg,
+    ) -> CompileResult<()> {
+        match src {
+            EbReg::Xmm(x) => {
+                let fw = if size <= 4 { FWidth::S } else { FWidth::D };
+                self.asm.mov_f_store(fw, self.slot_mem_at(id, offset), x);
+            }
+            EbReg::Gpr(g) => {
+                let mut done = 0u32;
+                for (off, chunk) in chunk_plan(u32::from(size)) {
+                    let mem = self.slot_mem_at(id, offset + off);
+                    if off == 0 {
+                        self.store_chunk(mem, chunk, g);
+                    } else {
+                        let exclude = &self.scratch_exclude(&[g.phys()]);
+                        let (p, moves) = self.vs.take_scratch(exclude);
+                        self.apply(moves)?;
+                        let t = gpr_of(p)?;
+                        self.asm.mov(Width::W64, Rm::Reg(t), Rmi::Reg(g));
+                        self.asm.shift_imm(
+                            ShiftOp::Shr,
+                            Width::W64,
+                            Rm::Reg(t),
+                            i64::from(done * 8),
+                        );
+                        self.store_chunk(mem, chunk, t);
+                    }
+                    done += u32::from(chunk);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One struct eightbyte from memory into an ABI register (the caller
+    /// side of a register-passed struct argument; a register-passed
+    /// struct return). Exact-size loads decompose into 8/4/2/1 chunks,
+    /// later chunks composed with shift+or — never a wider read, since a
+    /// heap-resident struct can sit at the end of a committed page.
+    fn emit_load_eightbyte(
+        &mut self,
+        addr: BlockAddr,
+        disp: u32,
+        size: u8,
+        dst: EbReg,
+    ) -> CompileResult<()> {
+        match dst {
+            EbReg::Xmm(x) => {
+                let fw = if size <= 4 { FWidth::S } else { FWidth::D };
+                let g = self.block_addr_gpr(addr, &[])?;
+                self.asm
+                    .mov_f_load(fw, x, RmX::Mem(Mem::base_disp(g, disp as i32)));
+            }
+            EbReg::Gpr(dst_g) => {
+                let moves = self.vs.clobber(dst_g.phys());
+                self.apply(moves)?;
+                let g = self.block_addr_gpr(addr, &[dst_g.phys()])?;
+                let mut done = 0u32;
+                for (off, chunk) in chunk_plan(u32::from(size)) {
+                    let mem = Mem::base_disp(g, (disp + off) as i32);
+                    if off == 0 {
+                        self.load_chunk(mem, chunk, dst_g);
+                    } else {
+                        let exclude = &self.scratch_exclude(&[g.phys(), dst_g.phys()]);
+                        let (p, moves) = self.vs.take_scratch(exclude);
+                        self.apply(moves)?;
+                        let t = gpr_of(p)?;
+                        self.load_chunk(mem, chunk, t);
+                        self.asm.shift_imm(
+                            ShiftOp::Shl,
+                            Width::W64,
+                            Rm::Reg(t),
+                            i64::from(done * 8),
+                        );
+                        self.asm.or(Width::W64, Rm::Reg(dst_g), Rmi::Reg(t));
+                    }
+                    done += u32::from(chunk);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// An incoming stack-passed struct argument: `size` bytes from the
+    /// caller's outgoing area (`[rbp + 16 + offset]`) into the local's
+    /// slot, chunk by chunk through one scratch.
+    fn block_copy_mem_to_slot(&mut self, id: LocalId, offset: u32, size: u32) -> CompileResult<()> {
+        let exclude = &self.scratch_exclude(&[]);
+        let (p, moves) = self.vs.take_scratch(exclude);
+        self.apply(moves)?;
+        let t = gpr_of(p)?;
+        for (done, chunk) in chunk_plan(size) {
+            let from = Mem::base_disp(regs::FRAME_POINTER, (16 + offset + done) as i32);
+            self.load_chunk(from, chunk, t);
+            self.store_chunk(self.slot_mem_at(id, done), chunk, t);
+        }
+        Ok(())
+    }
+
+    /// Zero a struct slot in the prolog (IL locals zero-init; GC-cell
+    /// struct temps). Always inline: no call in the prolog region.
+    fn block_zero_slot(&mut self, id: LocalId, size: u32) -> CompileResult<()> {
+        let (p, moves) = self.vs.take_scratch(&[]);
+        self.apply(moves)?;
+        let z = gpr_of(p)?;
+        self.asm.xor(Width::W32, Rm::Reg(z), Rmi::Reg(z));
+        for (done, chunk) in chunk_plan(size) {
+            self.store_chunk(self.slot_mem_at(id, done), chunk, z);
+        }
+        Ok(())
+    }
+
+    /// A block copy between two memory addresses (`Inst::BlockCopy`):
+    /// inline unrolled chunks at or below [`BLOCK_INLINE_MAX`] bytes, the
+    /// EE's `CORINFO_HELP_MEMCPY` above.
+    fn emit_block_copy(
+        &mut self,
+        dst: BlockAddr,
+        dst_disp: u32,
+        src: BlockAddr,
+        size: u32,
+    ) -> CompileResult<()> {
+        if size > BLOCK_INLINE_MAX {
+            return self.emit_block_helper(CorInfoHelpFunc::MEMCPY, dst, dst_disp, Some(src), size);
+        }
+        let dst_g = self.block_addr_gpr(dst, &[])?;
+        let src_g = self.block_addr_gpr(src, &[dst_g.phys()])?;
+        for (done, chunk) in chunk_plan(size) {
+            let exclude = &self.scratch_exclude(&[dst_g.phys(), src_g.phys()]);
+            let (p, moves) = self.vs.take_scratch(exclude);
+            self.apply(moves)?;
+            let t = gpr_of(p)?;
+            self.load_chunk(Mem::base_disp(src_g, done as i32), chunk, t);
+            self.store_chunk(Mem::base_disp(dst_g, (dst_disp + done) as i32), chunk, t);
+        }
+        Ok(())
+    }
+
+    /// A block zero (`Inst::BlockZero`, `initobj`): inline at or below
+    /// [`BLOCK_INLINE_MAX`], `CORINFO_HELP_MEMSET` above. Zeroing needs
+    /// no write barrier even on the heap (storing null creates no
+    /// old→young edge).
+    fn emit_block_zero(&mut self, dst: BlockAddr, dst_disp: u32, size: u32) -> CompileResult<()> {
+        if size > BLOCK_INLINE_MAX {
+            return self.emit_block_helper(CorInfoHelpFunc::MEMSET, dst, dst_disp, None, size);
+        }
+        let dst_g = self.block_addr_gpr(dst, &[])?;
+        let exclude = &self.scratch_exclude(&[dst_g.phys()]);
+        let (p, moves) = self.vs.take_scratch(exclude);
+        self.apply(moves)?;
+        let z = gpr_of(p)?;
+        self.asm.xor(Width::W32, Rm::Reg(z), Rmi::Reg(z));
+        for (done, chunk) in chunk_plan(size) {
+            self.store_chunk(Mem::base_disp(dst_g, (dst_disp + done) as i32), chunk, z);
+        }
+        Ok(())
+    }
+
+    /// The helper-call form of a large block operation: `MEMCPY(dst,
+    /// src, size)` / `MEMSET(dst, 0, size)` through the EE's
+    /// `getHelperFtn` — the same emission path as any helper call (the
+    /// call site is a recorded GC safepoint; the frame-resident roots
+    /// stay authoritative).
+    fn emit_block_helper(
+        &mut self,
+        id: CorInfoHelpFunc,
+        dst: BlockAddr,
+        dst_disp: u32,
+        src: Option<BlockAddr>,
+        size: u32,
+    ) -> CompileResult<()> {
+        for g in [Gpr::Rdi, Gpr::Rsi, Gpr::Rdx] {
+            let moves = self.vs.clobber(g.phys());
+            self.apply(moves)?;
+        }
+        self.block_addr_into_reg(Gpr::Rdi, dst, dst_disp)?;
+        match src {
+            Some(src) => self.block_addr_into_reg(Gpr::Rsi, src, 0)?,
+            None => self.asm.mov(Width::W32, Rm::Reg(Gpr::Rsi), Rmi::Imm(0)),
+        }
+        self.asm
+            .mov(Width::W64, Rm::Reg(Gpr::Rdx), Rmi::Imm(i64::from(size)));
+        let lookup = self.ee.get_helper_ftn(id).entrypoint;
+        let addr = const_lookup_addr(&lookup);
+        let slot = const_lookup_slot(&lookup);
+        self.emit_call_lookup(None, addr, slot)
+    }
+
+    /// A block address into a specific ABI register (the block-helper
+    /// argument setup): value reads and frame-slot `lea`s, no scratch.
+    fn block_addr_into_reg(&mut self, reg: Gpr, addr: BlockAddr, disp: u32) -> CompileResult<()> {
+        match addr {
+            BlockAddr::FrameSlot(l) => {
+                self.asm
+                    .lea(reg, self.slot_mem(self.layout.slots[l.0 as usize]));
+            }
+            BlockAddr::Val(v) => match self.vs.read(v.0) {
+                ReadSrc::Reg(p) => {
+                    let g = gpr_of(p)?;
+                    if g != reg {
+                        self.asm.mov(Width::W64, Rm::Reg(reg), Rmi::Reg(g));
+                    }
+                }
+                ReadSrc::Slot(off) => {
+                    self.asm
+                        .mov(Width::W64, Rm::Reg(reg), Rmi::Mem(self.slot_mem(off)));
+                }
+                ReadSrc::Imm(i) => {
+                    self.asm.mov(Width::W64, Rm::Reg(reg), Rmi::Imm(i));
+                }
+            },
+        }
+        if disp != 0 {
+            self.asm
+                .add(Width::W64, Rm::Reg(reg), Rmi::Imm(i64::from(disp)));
+        }
+        Ok(())
+    }
+
+    /// `mov [rsp + offset], src` — an outgoing scalar stack argument.
+    /// A slot-resident source reloads through a scratch (no mem,mem
+    /// form); a too-wide constant materializes (the wide-imm rule).
+    fn emit_store_stack_arg(&mut self, width: Width, offset: u32, src: Src) -> CompileResult<()> {
+        let mem = Mem::base_disp(regs::STACK_POINTER, offset as i32);
+        match self.wide_imm(width, src, &[])? {
+            src @ (Rmi::Reg(_) | Rmi::Imm(_)) => self.asm.mov(width, Rm::Mem(mem), src),
+            Rmi::Mem(m) => {
+                let exclude = &self.scratch_exclude(&[]);
+                let (p, moves) = self.vs.take_scratch(exclude);
+                self.apply(moves)?;
+                let g = gpr_of(p)?;
+                self.asm.mov(width, Rm::Reg(g), Rmi::Mem(m));
+                self.asm.mov(width, Rm::Mem(mem), Rmi::Reg(g));
+            }
+        }
+        Ok(())
+    }
+
+    /// The float form of [`Emitter::emit_store_stack_arg`].
+    fn emit_store_stack_arg_f(
+        &mut self,
+        width: FWidth,
+        offset: u32,
+        src: XmmSrc,
+    ) -> CompileResult<()> {
+        let src = self.rmx_of(src, width, SCRATCH_XMM_A)?;
+        match src {
+            RmX::Reg(x) => {
+                self.asm
+                    .mov_f_store(width, Mem::base_disp(regs::STACK_POINTER, offset as i32), x)
+            }
+            RmX::Mem(m) => {
+                self.asm.mov_f_load(width, SCRATCH_XMM_A, RmX::Mem(m));
+                self.asm.mov_f_store(
+                    width,
+                    Mem::base_disp(regs::STACK_POINTER, offset as i32),
+                    SCRATCH_XMM_A,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// An outgoing stack-passed struct argument: `size` bytes from
+    /// `[addr]` to `[rsp + offset]`, always inline (no helper call in
+    /// the middle of argument setup).
+    fn emit_copy_stack_arg(
+        &mut self,
+        addr: BlockAddr,
+        offset: u32,
+        size: u32,
+    ) -> CompileResult<()> {
+        let src_g = self.block_addr_gpr(addr, &[])?;
+        for (done, chunk) in chunk_plan(size) {
+            let exclude = &self.scratch_exclude(&[src_g.phys()]);
+            let (p, moves) = self.vs.take_scratch(exclude);
+            self.apply(moves)?;
+            let t = gpr_of(p)?;
+            self.load_chunk(Mem::base_disp(src_g, done as i32), chunk, t);
+            self.store_chunk(
+                Mem::base_disp(regs::STACK_POINTER, (offset + done) as i32),
+                chunk,
+                t,
+            );
+        }
+        Ok(())
     }
 
     fn emit_inst(&mut self, inst: &Inst) -> CompileResult<()> {
@@ -956,6 +1641,38 @@ impl<'a> Emitter<'a> {
                 src,
             } => self.emit_store_mem(width, addr, disp, src),
             Inst::NullCheck { addr } => self.emit_null_check(addr),
+            Inst::LoadEightbyte {
+                addr,
+                disp,
+                size,
+                dst,
+            } => self.emit_load_eightbyte(addr, disp, size, dst),
+            Inst::StoreEightbyte {
+                local,
+                offset,
+                size,
+                src,
+            } => self.store_eightbyte_to_slot(local, offset, size, src),
+            Inst::StoreStackArg { width, offset, src } => {
+                self.emit_store_stack_arg(width, offset, src)
+            }
+            Inst::StoreStackArgF { width, offset, src } => {
+                self.emit_store_stack_arg_f(width, offset, src)
+            }
+            Inst::CopyStackArg { addr, offset, size } => {
+                self.emit_copy_stack_arg(addr, offset, size)
+            }
+            Inst::BlockCopy {
+                dst,
+                dst_disp,
+                src,
+                size,
+            } => self.emit_block_copy(dst, dst_disp, src, size),
+            Inst::BlockZero {
+                dst,
+                dst_disp,
+                size,
+            } => self.emit_block_zero(dst, dst_disp, size),
             Inst::Jcc { cc, target } => {
                 self.asm.jcc(cc, target);
                 Ok(())
@@ -1562,6 +2279,7 @@ mod tests {
             eh_regions: Vec::new(),
             num_args,
             num_il_locals,
+            struct_layouts: StructLayouts::new(),
         }
     }
 
@@ -1590,7 +2308,7 @@ mod tests {
             args: vec![Type::Int32, Type::Ref, Type::Int64],
             has_this: false,
         };
-        let abi = classify_call(&sig).expect("classifies");
+        let abi = classify_call(&sig, &StructLayouts::new()).expect("classifies");
         assert_eq!(
             abi.args,
             vec![
@@ -1610,7 +2328,7 @@ mod tests {
             args: vec![Type::Int32, Type::Double],
             has_this: true,
         };
-        let abi = classify_call(&sig).expect("classifies");
+        let abi = classify_call(&sig, &StructLayouts::new()).expect("classifies");
         assert_eq!(
             abi.args,
             vec![
@@ -1629,12 +2347,351 @@ mod tests {
             args: vec![Type::Int32; 8],
             has_this: false,
         };
-        let abi = classify_call(&sig).expect("classifies");
+        let abi = classify_call(&sig, &StructLayouts::new()).expect("classifies");
         assert_eq!(abi.args[5], ArgLocation::Reg(Gpr::R9.phys()));
         assert_eq!(abi.args[6], ArgLocation::Stack { offset: 0 });
         assert_eq!(abi.args[7], ArgLocation::Stack { offset: 8 });
         assert_eq!(abi.stack_arg_bytes, 16, "16-aligned outgoing area");
         assert_eq!(abi.ret, None);
+    }
+
+    // ---- SysV struct classification (step_10.9): descriptor → CallAbi ----
+    //
+    // The cases mirror runtime/src/tests/JIT/Directed/StructABI/StructABI.cs;
+    // the descriptors are canned (the EE computes them — classification is
+    // NOT reimplemented here; what we test is our mapping of a descriptor
+    // to registers/stack). sN = eightbyte size.
+
+    use rokajit::structs::SysVClass;
+
+    fn class(raw: usize) -> rokajit_ee::handles::ClassHandle {
+        rokajit_ee::handles::ClassHandle::from_raw(raw as *mut u8 as _).unwrap()
+    }
+
+    /// A canned descriptor: `(class, size)` per eightbyte, offsets 0/8.
+    fn sysv(eightbytes: &[(SysVClass, u8)]) -> SysVPass {
+        let mut pass = SysVPass::memory();
+        pass.passed_in_registers = !eightbytes.is_empty();
+        pass.count = eightbytes.len() as u8;
+        for (i, &(class, size)) in eightbytes.iter().enumerate() {
+            pass.classes[i] = class;
+            pass.sizes[i] = size;
+            pass.offsets[i] = (i * 8) as u8;
+        }
+        pass
+    }
+
+    /// One canned class in a fresh side table.
+    fn one_layout(
+        size: u32,
+        eightbytes: &[(SysVClass, u8)],
+    ) -> (StructLayouts, rokajit_ee::handles::ClassHandle) {
+        let c = class(0x9000 + size as usize);
+        let mut layouts = StructLayouts::new();
+        layouts.insert(
+            c,
+            StructLayout {
+                size,
+                align: 8,
+                gc_cells: vec![],
+                sysv: sysv(eightbytes),
+            },
+        );
+        (layouts, c)
+    }
+
+    fn struct_arg_abi(
+        layouts: &StructLayouts,
+        c: rokajit_ee::handles::ClassHandle,
+        pre: &[Type],
+    ) -> CallAbi {
+        let mut args = pre.to_vec();
+        args.push(Type::Struct(c));
+        classify_call(
+            &CallSig {
+                ret: Type::Void,
+                args,
+                has_this: false,
+            },
+            layouts,
+        )
+        .expect("classifies")
+    }
+
+    use SysVClass::{Integer as I, Sse as F};
+
+    #[test]
+    fn classify_single_eightbyte_structs() {
+        // SingleByte{byte} → [Integer s1]; SingleLong → [Integer s8];
+        // SingleFloat → [SSE s4]; SingleDouble → [SSE s8].
+        let (layouts, c) = one_layout(1, &[(I, 1)]);
+        let abi = struct_arg_abi(&layouts, c, &[]);
+        assert_eq!(
+            abi.args[0],
+            ArgLocation::StructRegs {
+                regs: [Gpr::Rdi.phys(), Gpr::Rdi.phys()],
+                count: 1,
+                sizes: [1, 0],
+                offsets: [0, 0],
+            }
+        );
+        let (layouts, c) = one_layout(8, &[(I, 8)]);
+        assert_eq!(
+            struct_arg_abi(&layouts, c, &[]).args[0],
+            ArgLocation::StructRegs {
+                regs: [Gpr::Rdi.phys(), Gpr::Rdi.phys()],
+                count: 1,
+                sizes: [8, 0],
+                offsets: [0, 0],
+            }
+        );
+        let (layouts, c) = one_layout(4, &[(F, 4)]);
+        assert_eq!(
+            struct_arg_abi(&layouts, c, &[]).args[0],
+            ArgLocation::StructRegs {
+                regs: [regs::Xmm::Xmm0.phys(); 2],
+                count: 1,
+                sizes: [4, 0],
+                offsets: [0, 0],
+            }
+        );
+        let (layouts, c) = one_layout(8, &[(F, 8)]);
+        assert_eq!(
+            struct_arg_abi(&layouts, c, &[]).args[0],
+            ArgLocation::StructRegs {
+                regs: [regs::Xmm::Xmm0.phys(); 2],
+                count: 1,
+                sizes: [8, 0],
+                offsets: [0, 0],
+            }
+        );
+    }
+
+    #[test]
+    fn classify_merged_and_mixed_eightbytes() {
+        // ByteAndFloat{byte;float} → one [Integer s8] (merge: Integer wins).
+        let (layouts, c) = one_layout(8, &[(I, 8)]);
+        assert!(matches!(
+            struct_arg_abi(&layouts, c, &[]).args[0],
+            ArgLocation::StructRegs {
+                regs: [r, _],
+                count: 1,
+                ..
+            } if r == Gpr::Rdi.phys()
+        ));
+        // LongAndFloat{ulong;float} → [Integer s8, SSE s4] → rdi + xmm0.
+        let (layouts, c) = one_layout(16, &[(I, 8), (F, 4)]);
+        assert_eq!(
+            struct_arg_abi(&layouts, c, &[]).args[0],
+            ArgLocation::StructRegs {
+                regs: [Gpr::Rdi.phys(), regs::Xmm::Xmm0.phys()],
+                count: 2,
+                sizes: [8, 4],
+                offsets: [0, 8],
+            }
+        );
+        // DoubleAndByte{double;byte} → [SSE s8, Integer s1] → xmm0 + rdi
+        // (per-register-file assignment, NOT declaration order).
+        let (layouts, c) = one_layout(16, &[(F, 8), (I, 1)]);
+        assert_eq!(
+            struct_arg_abi(&layouts, c, &[]).args[0],
+            ArgLocation::StructRegs {
+                regs: [regs::Xmm::Xmm0.phys(), Gpr::Rdi.phys()],
+                count: 2,
+                sizes: [8, 1],
+                offsets: [0, 8],
+            }
+        );
+        // TwoLongs → rdi + rsi; TwoFloats → one [SSE s8] → xmm0;
+        // TwoDoubles → xmm0 + xmm1.
+        let (layouts, c) = one_layout(16, &[(I, 8), (I, 8)]);
+        assert_eq!(
+            struct_arg_abi(&layouts, c, &[]).args[0],
+            ArgLocation::StructRegs {
+                regs: [Gpr::Rdi.phys(), Gpr::Rsi.phys()],
+                count: 2,
+                sizes: [8, 8],
+                offsets: [0, 8],
+            }
+        );
+        let (layouts, c) = one_layout(8, &[(F, 8)]);
+        assert!(matches!(
+            struct_arg_abi(&layouts, c, &[]).args[0],
+            ArgLocation::StructRegs { count: 1, .. }
+        ));
+        let (layouts, c) = one_layout(16, &[(F, 8), (F, 8)]);
+        assert_eq!(
+            struct_arg_abi(&layouts, c, &[]).args[0],
+            ArgLocation::StructRegs {
+                regs: [regs::Xmm::Xmm0.phys(), regs::Xmm::Xmm1.phys()],
+                count: 2,
+                sizes: [8, 8],
+                offsets: [0, 8],
+            }
+        );
+    }
+
+    #[test]
+    fn classify_memory_structs_go_on_the_stack() {
+        // A 17-byte struct and FourLongs (32 bytes): passedInRegisters =
+        // false → full-size stack copy, 8-rounded.
+        for (size, rounded) in [(17u32, 24u32), (32, 32)] {
+            let (layouts, c) = one_layout(size, &[]);
+            let abi = struct_arg_abi(&layouts, c, &[]);
+            assert_eq!(abi.args[0], ArgLocation::Stack { offset: 0 });
+            assert_eq!(abi.stack_arg_bytes, rounded.div_ceil(16) * 16);
+        }
+    }
+
+    #[test]
+    fn classify_register_exhaustion_sends_the_whole_struct_to_the_stack() {
+        // StructABI.cs's NotEnoughRegisters: 6 GPRs occupied, then
+        // TwoLongs — the ENTIRE struct goes on the stack (no splitting).
+        let (layouts, c) = one_layout(16, &[(I, 8), (I, 8)]);
+        let abi = struct_arg_abi(&layouts, c, &[Type::Int64; 6]);
+        assert_eq!(abi.args[6], ArgLocation::Stack { offset: 0 });
+        // ...but the float pool is untouched, so TwoDoubles still goes
+        // xmm0:xmm1 (EnoughRegisters).
+        let (layouts, c) = one_layout(16, &[(F, 8), (F, 8)]);
+        assert_eq!(
+            struct_arg_abi(&layouts, c, &[Type::Int64; 6]).args[6],
+            ArgLocation::StructRegs {
+                regs: [regs::Xmm::Xmm0.phys(), regs::Xmm::Xmm1.phys()],
+                count: 2,
+                sizes: [8, 8],
+                offsets: [0, 8],
+            }
+        );
+        // 5 GPRs occupied: TwoLongs still doesn't fit (needs 2) → stack.
+        let (layouts, c) = one_layout(16, &[(I, 8), (I, 8)]);
+        assert_eq!(
+            struct_arg_abi(&layouts, c, &[Type::Int64; 5]).args[5],
+            ArgLocation::Stack { offset: 0 }
+        );
+        // 5 GPRs + 1 XMM occupied, then LongAndFloat: one eightbyte per
+        // file → r9 + xmm1.
+        let (layouts, c) = one_layout(16, &[(I, 8), (F, 4)]);
+        let mut pre = vec![Type::Int64; 5];
+        pre.push(Type::Double);
+        assert_eq!(
+            struct_arg_abi(&layouts, c, &pre).args[6],
+            ArgLocation::StructRegs {
+                regs: [Gpr::R9.phys(), regs::Xmm::Xmm1.phys()],
+                count: 2,
+                sizes: [8, 4],
+                offsets: [0, 8],
+            }
+        );
+    }
+
+    #[test]
+    fn classify_hidden_retbuf_argument_order() {
+        // The importer models the hidden return buffer as a leading ByRef
+        // argument (immediately after `this`); classification places it in
+        // declaration order. Static method: retbuf in rdi.
+        let (layouts, c) = one_layout(17, &[]);
+        let abi = classify_call(
+            &CallSig {
+                ret: Type::Struct(c),
+                args: vec![Type::ByRef, Type::Int32],
+                has_this: false,
+            },
+            &layouts,
+        )
+        .expect("classifies");
+        assert_eq!(abi.args[0], ArgLocation::Reg(Gpr::Rdi.phys()), "retbuf");
+        assert_eq!(abi.args[1], ArgLocation::Reg(Gpr::Rsi.phys()));
+        // rax carries the buffer address back.
+        assert_eq!(abi.ret, Some(ArgLocation::Reg(Gpr::Rax.phys())));
+        // Instance method: this in rdi, retbuf in rsi, user args after.
+        let abi = classify_call(
+            &CallSig {
+                ret: Type::Struct(c),
+                args: vec![Type::ByRef, Type::Int32],
+                has_this: true,
+            },
+            &layouts,
+        )
+        .expect("classifies");
+        assert_eq!(abi.args[0], ArgLocation::Reg(Gpr::Rdi.phys()), "this");
+        assert_eq!(abi.args[1], ArgLocation::Reg(Gpr::Rsi.phys()), "retbuf");
+        assert_eq!(abi.args[2], ArgLocation::Reg(Gpr::Rdx.phys()));
+    }
+
+    #[test]
+    fn classify_struct_returns_per_register_file() {
+        // 1-EB Integer s3 → rax with a 3-byte size.
+        let (layouts, c) = one_layout(3, &[(I, 3)]);
+        let abi = classify_call(
+            &CallSig {
+                ret: Type::Struct(c),
+                args: vec![],
+                has_this: false,
+            },
+            &layouts,
+        )
+        .expect("classifies");
+        assert_eq!(
+            abi.ret,
+            Some(ArgLocation::StructRegs {
+                regs: [Gpr::Rax.phys(); 2],
+                count: 1,
+                sizes: [3, 0],
+                offsets: [0, 0],
+            })
+        );
+        // 2-EB mixed {long; float} → rax + xmm0.
+        let (layouts, c) = one_layout(16, &[(I, 8), (F, 4)]);
+        let abi = classify_call(
+            &CallSig {
+                ret: Type::Struct(c),
+                args: vec![],
+                has_this: false,
+            },
+            &layouts,
+        )
+        .expect("classifies");
+        assert_eq!(
+            abi.ret,
+            Some(ArgLocation::StructRegs {
+                regs: [Gpr::Rax.phys(), regs::Xmm::Xmm0.phys()],
+                count: 2,
+                sizes: [8, 4],
+                offsets: [0, 8],
+            })
+        );
+        // TwoDoubles → xmm0:xmm1.
+        let (layouts, c) = one_layout(16, &[(F, 8), (F, 8)]);
+        let abi = classify_call(
+            &CallSig {
+                ret: Type::Struct(c),
+                args: vec![],
+                has_this: false,
+            },
+            &layouts,
+        )
+        .expect("classifies");
+        assert_eq!(
+            abi.ret,
+            Some(ArgLocation::StructRegs {
+                regs: [regs::Xmm::Xmm0.phys(), regs::Xmm::Xmm1.phys()],
+                count: 2,
+                sizes: [8, 8],
+                offsets: [0, 8],
+            })
+        );
+        // Non-register-passed → the retbuf address in rax.
+        let (layouts, c) = one_layout(32, &[]);
+        let abi = classify_call(
+            &CallSig {
+                ret: Type::Struct(c),
+                args: vec![Type::ByRef],
+                has_this: false,
+            },
+            &layouts,
+        )
+        .expect("classifies");
+        assert_eq!(abi.ret, Some(ArgLocation::Reg(Gpr::Rax.phys())));
     }
 
     // ---- frame layout ----
@@ -1651,23 +2708,61 @@ mod tests {
             1,
             vec![],
         );
-        let layout = FrameLayout::compute(&m).expect("layout");
+        let layout = FrameLayout::compute(&m, 0).expect("layout");
         assert_eq!(layout.slots, vec![4, 16, 20]);
         assert_eq!(layout.frame_size, 32);
     }
 
+    /// Struct locals (step_10.9): a 12-byte struct at 8-alignment takes a
+    /// 12-byte slot; a struct embedding GC pointers rounds to 8 and
+    /// 8-aligns so the reported roots stay 8-aligned; a struct missing
+    /// from the side table is an upstream bug (Internal).
     #[test]
-    fn struct_locals_are_rejected_at_frame_layout() {
-        let class = rokajit_ee::handles::ClassHandle::from_raw(std::ptr::dangling_mut()).unwrap();
-        let m = method(
-            vec![local(Type::Struct(class), LocalKind::IlLocal(0))],
+    fn struct_locals_size_their_slots_from_the_layout() {
+        let small = rokajit_ee::handles::ClassHandle::from_raw(0x111usize as _).unwrap();
+        let with_gc = rokajit_ee::handles::ClassHandle::from_raw(0x222usize as _).unwrap();
+        let missing = rokajit_ee::handles::ClassHandle::from_raw(0x333usize as _).unwrap();
+        let mut layouts = StructLayouts::new();
+        layouts.insert(
+            small,
+            StructLayout {
+                size: 12,
+                align: 4,
+                gc_cells: vec![],
+                sysv: SysVPass::memory(),
+            },
+        );
+        layouts.insert(
+            with_gc,
+            StructLayout {
+                size: 12,
+                align: 4,
+                gc_cells: vec![GcCell {
+                    offset: 0,
+                    is_byref: false,
+                }],
+                sysv: SysVPass::memory(),
+            },
+        );
+        let mut m = method(
+            vec![
+                local(Type::Struct(small), LocalKind::IlLocal(0)),
+                local(Type::Struct(with_gc), LocalKind::IlLocal(1)),
+            ],
             0,
-            1,
+            2,
             vec![],
         );
+        m.struct_layouts = layouts;
+        let layout = FrameLayout::compute(&m, 0).expect("layout");
+        // small: 12 bytes at align 4; with_gc: rounded to 16 at align 8.
+        assert_eq!(layout.slots, vec![12, 32]);
+        assert_eq!(layout.frame_size, 32);
+        m.locals
+            .push(local(Type::Struct(missing), LocalKind::IlLocal(2)));
         assert!(matches!(
-            FrameLayout::compute(&m),
-            Err(CompileError::Unsupported(_))
+            FrameLayout::compute(&m, 0),
+            Err(CompileError::Internal(_))
         ));
     }
 
@@ -2208,10 +3303,11 @@ mod tests {
         );
     }
 
-    /// More than six integer arguments: the seventh arrives on the stack,
-    /// which tier-0 emission does not cover — a clean `Unsupported`.
+    /// More than six integer arguments: the seventh arrives on the stack
+    /// (step_10.9) — the prolog spill reloads it from the caller's
+    /// outgoing area at `[rbp + 16]` into the slot.
     #[test]
-    fn incoming_stack_args_are_unsupported() {
+    fn incoming_stack_args_spill_from_the_caller_frame() {
         let m = method(
             (0..7).map(int_arg).collect(),
             7,
@@ -2223,10 +3319,437 @@ mod tests {
                 })],
             )],
         );
-        assert!(matches!(
-            emit_tier0(&m, &MockEe::default()),
-            Err(CompileError::Unsupported(_))
-        ));
+        let out = emit_tier0(&m, &MockEe::default()).expect("emits");
+        // The prolog spills args 0..5 from rdi..r9 (slots 4,8,...,24),
+        // then arg 6: `mov eax, [rbp+16]`; `mov [rbp-28], eax`.
+        let bytes = &out.code.hot.bytes;
+        let tail = [
+            0x8B, 0x45, 0x10, // mov eax, [rbp+16]
+            0x89, 0x45, 0xE4, // mov [rbp-28], eax
+        ];
+        let at = bytes
+            .windows(tail.len())
+            .position(|w| w == tail)
+            .expect("the stack-arg spill is emitted");
+        assert!(at > 8, "after the frame prolog");
+        // And the returned arg 0 reads its own slot: mov eax, [rbp-4].
+        assert_eq!(&bytes[at + tail.len()..], &[0x8B, 0x45, 0xFC, 0xC9, 0xC3]);
+    }
+
+    // ---- step_10.9: struct ABI + block op byte tests ----
+
+    /// A fresh side table with one canned class.
+    fn layouts_for(
+        size: u32,
+        align: u32,
+        gc_cells: Vec<GcCell>,
+        eightbytes: &[(SysVClass, u8)],
+    ) -> (StructLayouts, rokajit_ee::handles::ClassHandle) {
+        let c = class(0x5000 + size as usize);
+        let mut layouts = StructLayouts::new();
+        layouts.insert(
+            c,
+            StructLayout {
+                size,
+                align,
+                gc_cells,
+                sysv: sysv(eightbytes),
+            },
+        );
+        (layouts, c)
+    }
+
+    fn struct_method(
+        locals: Vec<Local>,
+        num_args: u32,
+        num_il_locals: u32,
+        blocks: Vec<Block>,
+        layouts: StructLayouts,
+    ) -> lir::Method {
+        let mut m = method(locals, num_args, num_il_locals, blocks);
+        m.struct_layouts = layouts;
+        m
+    }
+
+    /// `stloc` of an 8-byte struct: a block copy slot-to-slot. Struct IL
+    /// locals zero-init in the prolog with decomposed stores.
+    #[test]
+    fn block_copy_small_struct_bytes() {
+        let (layouts, c) = layouts_for(8, 8, vec![], &[]);
+        let m = struct_method(
+            vec![
+                local(Type::Struct(c), LocalKind::IlLocal(0)),
+                local(Type::Struct(c), LocalKind::IlLocal(1)),
+            ],
+            0,
+            2,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BlockCopy {
+                        dst_addr: Operand::AddrOf(LocalId(1)),
+                        dst_offset: 0,
+                        src_addr: Operand::AddrOf(LocalId(0)),
+                        class: c,
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+            layouts,
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x31, 0xC0, // xorl %eax, %eax          — zero-init local 0
+            0x48, 0x89, 0x45, 0xF8, // movq %rax, -8(%rbp)
+            0x31, 0xC9, // xorl %ecx, %ecx          — zero-init local 1
+            0x48, 0x89, 0x4D, 0xF0, // movq %rcx, -16(%rbp)
+            0x48, 0x8D, 0x45, 0xF0, // leaq -16(%rbp), %rax  — dst
+            0x48, 0x8D, 0x4D, 0xF8, // leaq -8(%rbp), %rcx   — src
+            0x48, 0x8B, 0x11, // movq (%rcx), %rdx
+            0x48, 0x89, 0x10, // movq %rdx, (%rax)
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `initobj` of a 12-byte struct: inline decomposed zeroing (8+4).
+    #[test]
+    fn block_zero_initobj_bytes() {
+        let (layouts, c) = layouts_for(12, 4, vec![], &[]);
+        let m = struct_method(
+            vec![local(Type::Struct(c), LocalKind::IlLocal(0))],
+            0,
+            1,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BlockZero {
+                        dst_addr: Operand::AddrOf(LocalId(0)),
+                        class: c,
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+            layouts,
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x31, 0xC0, // xorl %eax, %eax          — prolog zero-init
+            0x48, 0x89, 0x45, 0xF4, // movq %rax, -12(%rbp)
+            0x89, 0x45, 0xFC, // movl %eax, -4(%rbp)
+            0x48, 0x8D, 0x45, 0xF4, // leaq -12(%rbp), %rax — the initobj
+            0x31, 0xC9, // xorl %ecx, %ecx
+            0x48, 0x89, 0x08, // movq %rcx, (%rax)
+            0x89, 0x48, 0x08, // movl %ecx, 8(%rax)
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// A 100-byte block copy: above the inline threshold → the
+    /// `CORINFO_HELP_MEMCPY` helper call. The 208-byte frame also
+    /// exercises the imm32 `sub rsp` prolog form.
+    #[test]
+    fn large_block_copy_uses_memcpy_helper() {
+        let (layouts, c) = layouts_for(100, 8, vec![], &[]);
+        let m = struct_method(
+            vec![
+                local(Type::Struct(c), LocalKind::Temp),
+                local(Type::Struct(c), LocalKind::Temp),
+            ],
+            0,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BlockCopy {
+                        dst_addr: Operand::AddrOf(LocalId(1)),
+                        dst_offset: 0,
+                        src_addr: Operand::AddrOf(LocalId(0)),
+                        class: c,
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+            layouts,
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x81, 0xEC, 0xD0, 0x00, 0x00, 0x00, // subq $208, %rsp
+            0x48, 0x8D, 0xBD, 0x30, 0xFF, 0xFF, 0xFF, // leaq -208(%rbp), %rdi
+            0x48, 0x8D, 0x75, 0x98, // leaq -104(%rbp), %rsi
+            0x48, 0xC7, 0xC2, 0x64, 0x00, 0x00, 0x00, // movq $100, %rdx
+            0xE8, 0, 0, 0, 0, // call rel32 (MEMCPY)
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].method, None, "a helper call site");
+        assert_eq!(out.relocations.len(), 1);
+    }
+
+    /// Seven integer arguments: the seventh stores into the outgoing
+    /// stack area at [rsp], sized into the frame.
+    #[test]
+    fn outgoing_stack_args_store_into_the_outgoing_area() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let sig = CallSig {
+            ret: Type::Void,
+            args: vec![Type::Int32; 7],
+            has_this: false,
+        };
+        let m = method(
+            vec![int_arg(0)],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Call {
+                        dst: None,
+                        target: rokajit::ir::CallTarget::Direct(f),
+                        sig,
+                        args: vec![Operand::Local(LocalId(0)); 7],
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &ee);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)   — arg spill
+            0x8B, 0x7D, 0xFC, // movl -4(%rbp), %edi
+            0x8B, 0x75, 0xFC, // movl -4(%rbp), %esi
+            0x8B, 0x55, 0xFC, // movl -4(%rbp), %edx
+            0x8B, 0x4D, 0xFC, // movl -4(%rbp), %ecx
+            0x44, 0x8B, 0x45, 0xFC, // movl -4(%rbp), %r8d
+            0x44, 0x8B, 0x4D, 0xFC, // movl -4(%rbp), %r9d
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax  — the stack arg
+            0x89, 0x04, 0x24, // movl %eax, (%rsp)
+            0xE8, 0, 0, 0, 0, // call rel32
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(out.frame.frame_size, 32);
+    }
+
+    /// A register-passed struct argument and result (TwoLongs): the
+    /// prolog spills rdi/rsi into the argument's slot, the call setup
+    /// reloads them from the address, and the result lands back in the
+    /// destination slot from rax/rdx.
+    #[test]
+    fn struct_arg_and_result_cross_the_call_in_registers() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let (layouts, c) = layouts_for(16, 8, vec![], &[(I, 8), (I, 8)]);
+        let sig = CallSig {
+            ret: Type::Struct(c),
+            args: vec![Type::Struct(c)],
+            has_this: false,
+        };
+        let m = struct_method(
+            vec![
+                local(Type::Struct(c), LocalKind::IlArg(0)),
+                local(Type::Struct(c), LocalKind::Temp),
+            ],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Call {
+                        dst: Some(LocalId(1)),
+                        target: rokajit::ir::CallTarget::Direct(f),
+                        sig,
+                        args: vec![Operand::AddrOf(LocalId(0))],
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+            layouts,
+        );
+        let out = emit(&m, &ee);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp
+            0x48, 0x89, 0x7D, 0xF0, // movq %rdi, -16(%rbp) — arg spill
+            0x48, 0x89, 0x75, 0xF8, // movq %rsi, -8(%rbp)
+            0x48, 0x8D, 0x45, 0xF0, // leaq -16(%rbp), %rax
+            0x48, 0x8B, 0x38, // movq (%rax), %rdi     — eightbyte 0
+            0x48, 0x8D, 0x4D, 0xF0, // leaq -16(%rbp), %rcx
+            0x48, 0x8B, 0x71, 0x08, // movq 8(%rcx), %rsi  — eightbyte 1
+            0xE8, 0, 0, 0, 0, // call rel32
+            0x48, 0x89, 0x45, 0xE0, // movq %rax, -32(%rbp) — the result
+            0x48, 0x89, 0x55, 0xE8, // movq %rdx, -24(%rbp)
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// A stack-passed struct argument (FourLongs, 32 bytes, after six
+    /// int64 arguments): the prolog copies it from the caller's outgoing
+    /// area at [rbp+16] into the slot, four 8-byte chunks.
+    #[test]
+    fn incoming_stack_struct_arg_copies_into_its_slot() {
+        let (layouts, c) = layouts_for(32, 8, vec![], &[]);
+        let mut locals: Vec<Local> = (0..6)
+            .map(|i| local(Type::Int64, LocalKind::IlArg(i)))
+            .collect();
+        locals.push(local(Type::Struct(c), LocalKind::IlArg(6)));
+        let m = struct_method(
+            locals,
+            7,
+            0,
+            vec![block(0, vec![stmt(StmtKind::Return { value: None })])],
+            layouts,
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x50, // subq $80, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)
+            0x48, 0x89, 0x75, 0xF0, // movq %rsi, -16(%rbp)
+            0x48, 0x89, 0x55, 0xE8, // movq %rdx, -24(%rbp)
+            0x48, 0x89, 0x4D, 0xE0, // movq %rcx, -32(%rbp)
+            0x4C, 0x89, 0x45, 0xD8, // movq %r8, -40(%rbp)
+            0x4C, 0x89, 0x4D, 0xD0, // movq %r9, -48(%rbp)
+            0x48, 0x8B, 0x45, 0x10, // movq 16(%rbp), %rax — the struct
+            0x48, 0x89, 0x45, 0xB0, // movq %rax, -80(%rbp)
+            0x48, 0x8B, 0x45, 0x18, // movq 24(%rbp), %rax
+            0x48, 0x89, 0x45, 0xB8, // movq %rax, -72(%rbp)
+            0x48, 0x8B, 0x45, 0x20, // movq 32(%rbp), %rax
+            0x48, 0x89, 0x45, 0xC0, // movq %rax, -64(%rbp)
+            0x48, 0x8B, 0x45, 0x28, // movq 40(%rbp), %rax
+            0x48, 0x89, 0x45, 0xC8, // movq %rax, -56(%rbp)
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// A register-passed struct return (TwoDoubles): one `movsd` per
+    /// eightbyte into xmm0/xmm1.
+    #[test]
+    fn register_passed_struct_return_loads_eightbytes() {
+        let (layouts, c) = layouts_for(16, 8, vec![], &[(F, 8), (F, 8)]);
+        let m = struct_method(
+            vec![local(Type::Struct(c), LocalKind::IlLocal(0))],
+            0,
+            1,
+            vec![block(
+                0,
+                vec![stmt(StmtKind::ReturnStruct {
+                    addr: Operand::AddrOf(LocalId(0)),
+                    class: c,
+                })],
+            )],
+            layouts,
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x31, 0xC0, // xorl %eax, %eax           — prolog zero-init
+            0x48, 0x89, 0x45, 0xF0, // movq %rax, -16(%rbp)
+            0x48, 0x89, 0x45, 0xF8, // movq %rax, -8(%rbp)
+            0x48, 0x8D, 0x45, 0xF0, // leaq -16(%rbp), %rax
+            0xF2, 0x0F, 0x10, 0x00, // movsd (%rax), %xmm0
+            0x48, 0x8D, 0x4D, 0xF0, // leaq -16(%rbp), %rcx
+            0xF2, 0x0F, 0x10, 0x49, 0x08, // movsd 8(%rcx), %xmm1
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// A 3-byte struct (SingleByte-3, one [Integer s3] eightbyte): every
+    /// move respects the exact size — the prolog spill stores 2+1 bytes,
+    /// the call setup loads 2+1 bytes, the result stores 2+1 bytes.
+    #[test]
+    fn three_byte_eightbyte_moves_are_exact() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let (layouts, c) = layouts_for(3, 1, vec![], &[(I, 3)]);
+        let sig = CallSig {
+            ret: Type::Struct(c),
+            args: vec![Type::Struct(c)],
+            has_this: false,
+        };
+        let m = struct_method(
+            vec![
+                local(Type::Struct(c), LocalKind::IlArg(0)),
+                local(Type::Struct(c), LocalKind::Temp),
+            ],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Call {
+                        dst: Some(LocalId(1)),
+                        target: rokajit::ir::CallTarget::Direct(f),
+                        sig,
+                        args: vec![Operand::AddrOf(LocalId(0))],
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+            layouts,
+        );
+        let out = emit(&m, &ee);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x66, 0x89, 0x7D, 0xFD, // movw %di, -3(%rbp)  — spill, 2 bytes
+            0x48, 0x89, 0xF8, // movq %rdi, %rax
+            0x48, 0xC1, 0xE8, 0x10, // shrq $16, %rax
+            0x40, 0x88, 0x45, 0xFF, // movb %al, -1(%rbp)  — +1 byte
+            0x48, 0x8D, 0x45, 0xFD, // leaq -3(%rbp), %rax
+            0x0F, 0xB7, 0x38, // movzxw (%rax), %edi  — load, 2 bytes
+            0x0F, 0xB6, 0x48, 0x02, // movzxb 2(%rax), %ecx
+            0x48, 0xC1, 0xE1, 0x10, // shlq $16, %rcx
+            0x48, 0x09, 0xCF, // orq %rcx, %rdi      — +1 byte
+            0xE8, 0, 0, 0, 0, // call rel32
+            0x66, 0x89, 0x45, 0xFA, // movw %ax, -6(%rbp)  — result, 2 bytes
+            0x48, 0x89, 0xC2, // movq %rax, %rdx
+            0x48, 0xC1, 0xEA, 0x10, // shrq $16, %rdx
+            0x40, 0x88, 0x55, 0xFC, // movb %dl, -4(%rbp)  — +1 byte
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
     }
 
     // ---- fib, end to end: exact IL bytes → machine-code bytes ----
@@ -2243,6 +3766,8 @@ mod tests {
             ret: CorInfoType::Int,
             args: vec![CorInfoType::Int],
             has_this: false,
+            ret_class: None,
+            arg_classes: Vec::new(),
         };
         ee.add_method(FIB_TOKEN, fib_sig.clone());
         let info = MethodInfo {
@@ -3160,6 +4685,8 @@ mod tests {
             ret: CorInfoType::Void,
             args: vec![CorInfoType::Class],
             has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
         };
         // ldarg.0; ldarg.1; stfld 0x04000002; ret
         let il = [0x02, 0x03, 0x7D, 0x02, 0x00, 0x00, 0x04, 0x2A];

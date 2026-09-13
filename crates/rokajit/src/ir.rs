@@ -23,6 +23,8 @@
 use rokajit_ee::enums::CorInfoHelpFunc;
 use rokajit_ee::handles::{ClassHandle, FieldHandle, MethodHandle};
 
+use crate::structs::StructLayouts;
+
 /// The IR's entire type vocabulary: the ECMA-335 evaluation-stack types.
 /// `Bool`/`Char`/`Short`/`Byte` are normalized to `Int32` at import
 /// (ECMA-335 §III.1.1.1); `Void` appears only in signatures, never as the
@@ -151,6 +153,9 @@ pub mod hir {
         /// Number of IL locals after the arguments (temps start at
         /// `num_args + num_il_locals`).
         pub num_il_locals: u32,
+        /// Layout facts of every value class the method mentions
+        /// (step_10.9; populated at import, one EE query set per class).
+        pub struct_layouts: StructLayouts,
     }
 
     /// One local/arg/temp slot.
@@ -193,6 +198,9 @@ pub mod hir {
             offset: u32,
             value: Expr,
         },
+        /// Zero a block of memory (`initobj`): `size_of(class)` bytes at
+        /// `addr` (step_10.9).
+        BlockZero { addr: Expr, class: ClassHandle },
         /// Evaluate and discard (expression statements: `pop` of a call
         /// result, etc.).
         Eval(Expr),
@@ -349,6 +357,9 @@ pub mod lir {
         pub eh_regions: Vec<hir::EhRegion>,
         pub num_args: u32,
         pub num_il_locals: u32,
+        /// Carried over from HIR (step_10.9): frame layout, call
+        /// classification, and GC roots consult it.
+        pub struct_layouts: StructLayouts,
     }
 
     pub struct Block {
@@ -447,6 +458,30 @@ pub mod lir {
         },
         NullCheck {
             arg: Operand,
+        },
+        /// Copy a struct value between two memory locations (struct
+        /// `stloc`/`starg`/`stfld`, `stobj`, `cpobj`, the hidden-retbuf
+        /// copy; step_10.9). Both operands are ByRef addresses; the copy
+        /// is `size_of(class)` bytes.
+        BlockCopy {
+            dst_addr: Operand,
+            dst_offset: u32,
+            src_addr: Operand,
+            class: ClassHandle,
+        },
+        /// Zero `size_of(class)` bytes at `dst_addr` (`initobj`).
+        BlockZero {
+            dst_addr: Operand,
+            class: ClassHandle,
+        },
+        /// `ret` of a register-passed struct value: `addr` is the value's
+        /// address (a ByRef operand). The non-register-passed form never
+        /// reaches LIR as a struct return — the importer rewrites it to a
+        /// block copy through the hidden retbuf pointer plus a plain
+        /// `Return` of that pointer.
+        ReturnStruct {
+            addr: Operand,
+            class: ClassHandle,
         },
         /// Conditional branch to `target`; fallthrough is the next
         /// statement (the compare is folded into the branch — the one

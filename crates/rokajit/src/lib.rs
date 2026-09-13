@@ -46,4 +46,5 @@ pub mod lower;
 pub mod metadata;
 pub mod morph;
 pub mod pipeline;
+pub mod structs;
 pub mod target;

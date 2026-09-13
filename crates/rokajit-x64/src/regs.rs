@@ -156,6 +156,10 @@ pub const FLOAT_ARG_REGS: [Xmm; 8] = [
 /// (SysV §3.2.3). Pointers (`Ref`/`ByRef`/`NativeInt`) return in `Rax`.
 pub const INT_RETURN_REGS: [Gpr; 2] = [Gpr::Rax, Gpr::Rdx];
 
+/// Float return registers; `Xmm1` joins `Xmm0` for two-eightbyte SSE
+/// struct returns (SysV §3.2.3; step_10.9).
+pub const FLOAT_RETURN_REGS: [Xmm; 2] = [Xmm::Xmm0, Xmm::Xmm1];
+
 /// Float return register (SysV §3.2.3).
 pub const FLOAT_RETURN_REG: Xmm = Xmm::Xmm0;
 

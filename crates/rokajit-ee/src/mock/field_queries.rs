@@ -13,7 +13,7 @@ impl FieldQueries for MockEe {
         self.fields
             .values()
             .find(|f| f.handle == field)
-            .map(|f| (f.ty, None))
+            .map(|f| (f.ty, f.value_class))
             // Unknown handles keep the original constant answer.
             .unwrap_or((CorInfoType::Int, None))
     }

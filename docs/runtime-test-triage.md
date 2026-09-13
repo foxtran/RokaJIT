@@ -31,12 +31,12 @@ under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 71 |
-| CRASH | 474 |
+| MATCH | 79 |
+| CRASH | 466 |
 | TIMEOUT | 2 |
 | COMPILE_FAIL | 2734 |
 
-Of the MATCHes, 70 exit 100 (the CoreCLR pass
+Of the MATCHes, 78 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -51,14 +51,14 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| unsupported IL opcode (importer) | 148 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/Array1.cs`<br>`JIT/CodeGenBringUpTests/Array2.cs`<br>`JIT/CodeGenBringUpTests/Array3.cs`<br>`JIT/CodeGenBringUpTests/Array4.cs`<br>… and 143 more |
-| structs & value types | 135 | `JIT/CodeGenBringUpTests/InitObj.cs`<br>`JIT/CodeGenBringUpTests/OpMembersOfStructLocal.cs`<br>`JIT/CodeGenBringUpTests/RecursiveTailCall.cs`<br>`JIT/CodeGenBringUpTests/StructFldAddr.cs`<br>`JIT/CodeGenBringUpTests/StructInstMethod.cs`<br>… and 130 more |
-| EH (try/catch/finally) | 91 | `JIT/CodeGenBringUpTests/ArrayExc.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>`JIT/CodeGenBringUpTests/DivConst.cs`<br>`JIT/CodeGenBringUpTests/Localloc.cs`<br>`JIT/CodeGenBringUpTests/LocallocB_N_PSP.cs`<br>… and 86 more |
-| non-direct calls (callvirt/calli) | 75 | `JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>`JIT/CodeGenBringUpTests/DblArea.cs`<br>`JIT/CodeGenBringUpTests/DblAvg2.cs`<br>… and 70 more |
-| field types outside the object pack | 11 | `JIT/Directed/LoopAlignment/LoopsToProcess.cs`<br>`JIT/Regression_2/Runtime_110958/Runtime_110985.cs`<br>`JIT/Regression_2/Runtime_53549/Runtime_53549.cs`<br>`JIT/Regression_2/Runtime_71118/Runtime_71118.cs`<br>`JIT/Regression_3/GitHub_65690/GitHub_65690.cs`<br>… and 6 more |
-| generics | 6 | `JIT/jit64/ebvts/cs/generics/generics/repro52.cs`<br>`JIT/opt/AssertionPropagation/DynBlkNullAssertions.cs`<br>`JIT/opt/Casts/tests.cs`<br>`JIT/opt/Devirtualization/EqualityComparer_GitHub_10050.cs`<br>`JIT/opt/Devirtualization/GitHub_59668.cs`<br>… and 1 more |
-| unsupported (unmapped): no x64 lowering rule matched an LIR statement | 5 | `JIT/jit64/gc/misc/9_and_alloca2.cs`<br>`JIT/jit64/gc/misc/9param.cs`<br>`JIT/jit64/gc/misc/test_noalloca.cs`<br>`JIT/jit64/gc/regress/vswhidbey/339415.cs`<br>`JIT/opt/OptimizeBools/optboolsreturn.cs` |
-| bad IL rejected by importer | 3 | `JIT/CodeGenBringUpTests/StaticCalls.cs`<br>`JIT/opt/Devirtualization/GitHub_10858.cs`<br>`JIT/opt/Inline/regression/bug595776/bug595776.cs` |
+| unsupported IL opcode (importer) | 205 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/Array1.cs`<br>`JIT/CodeGenBringUpTests/Array2.cs`<br>`JIT/CodeGenBringUpTests/Array3.cs`<br>`JIT/CodeGenBringUpTests/Array4.cs`<br>… and 200 more |
+| non-direct calls (callvirt/calli) | 100 | `JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>`JIT/CodeGenBringUpTests/DblArea.cs`<br>`JIT/CodeGenBringUpTests/DblAvg2.cs`<br>… and 95 more |
+| EH (try/catch/finally) | 92 | `JIT/CodeGenBringUpTests/ArrayExc.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>`JIT/CodeGenBringUpTests/DivConst.cs`<br>`JIT/CodeGenBringUpTests/Localloc.cs`<br>`JIT/CodeGenBringUpTests/LocallocB_N_PSP.cs`<br>… and 87 more |
+| bad IL rejected by importer | 27 | `JIT/CodeGenBringUpTests/StaticCalls.cs`<br>`JIT/Regression_2/Runtime_53549/Runtime_53549.cs`<br>`JIT/Regression_2/Runtime_71118/Runtime_71118.cs`<br>`JIT/Regression_3/GitHub_65988/GitHub_65988.cs`<br>`JIT/jit64/gc/misc/struct1_4.cs`<br>… and 22 more |
+| field types outside the object pack | 23 | `JIT/Directed/LoopAlignment/LoopsToProcess.cs`<br>`JIT/Methodical/structs/StructStackParams.cs`<br>`JIT/Regression_2/Runtime_109269/Runtime_109269.cs`<br>`JIT/Regression_2/Runtime_110958/Runtime_110985.cs`<br>`JIT/Regression_2/Runtime_81725/Runtime_81725.cs`<br>… and 18 more |
+| generics | 17 | `JIT/Regression_2/Runtime_131285/Runtime_131285.cs`<br>`JIT/Regression_2/Runtime_133120/Runtime_133120.cs`<br>`JIT/Regression_2/Runtime_72926/Runtime_72926.cs`<br>`JIT/jit64/ebvts/cs/generics/generics/repro52.cs`<br>`JIT/opt/AssertionPropagation/DynBlkNullAssertions.cs`<br>… and 12 more |
+| newobj of a value class | 1 | `JIT/CodeGenBringUpTests/RecursiveTailCall.cs` |
+| structs & value types | 1 | `JIT/Regression_2/Runtime_72506/Runtime_72506.cs` |
 
 ## COMPILE_FAIL by csc error class
 

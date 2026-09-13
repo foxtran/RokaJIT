@@ -28,7 +28,8 @@ use rokajit::lower::{Cx, Label, Val};
 use rokajit::target::ArgLocation;
 
 use crate::inst::{
-    Amode, ArithFOp, ArithOp, CondCode, FWidth, Inst, Place, ShiftOp, Src, Width, XmmPlace, XmmSrc,
+    Amode, ArithFOp, ArithOp, BlockAddr, CondCode, EbReg, FWidth, Inst, Place, ShiftOp, Src, Width,
+    XmmPlace, XmmSrc,
 };
 use crate::regs::{self, Gpr, Xmm};
 
@@ -147,12 +148,32 @@ fn operand_fwidth(cx: &Cx, op: Operand) -> Option<FWidth> {
     }
 }
 
-/// One argument setup move for a classified ABI location.
-fn arg_move(cx: &Cx, arg: &Operand, loc: &ArgLocation) -> Option<Inst> {
+/// The address operand of a struct value (step_10.9): `AddrOf` names a
+/// frame slot directly; a byref temp/local is a pointer value.
+fn block_addr(op: Operand) -> Option<BlockAddr> {
+    match op {
+        Operand::AddrOf(l) => Some(BlockAddr::FrameSlot(l)),
+        Operand::Temp(id) | Operand::Local(id) => Some(BlockAddr::Val(Val(id))),
+        Operand::Const(_) => None,
+    }
+}
+
+/// The fixed register of one struct eightbyte, as an [`EbReg`].
+fn eb_reg(phys: rokajit::target::PhysReg) -> Option<EbReg> {
+    if let Some(g) = Gpr::from_phys(phys) {
+        Some(EbReg::Gpr(g))
+    } else {
+        Xmm::from_phys(phys).map(EbReg::Xmm)
+    }
+}
+
+/// One argument's setup moves for a classified ABI location (step_10.9:
+/// several instructions for structs and stack arguments).
+fn arg_move(cx: &Cx, arg: &Operand, loc: &ArgLocation) -> Option<Vec<Inst>> {
     match *loc {
         ArgLocation::Reg(phys) => {
             if let Some(g) = Gpr::from_phys(phys) {
-                Some(match arg {
+                Some(vec![match arg {
                     Operand::AddrOf(l) => Inst::Lea {
                         dst: Place::Reg(g),
                         addr: Amode::FrameSlot(*l),
@@ -162,10 +183,10 @@ fn arg_move(cx: &Cx, arg: &Operand, loc: &ArgLocation) -> Option<Inst> {
                         dst: Place::Reg(g),
                         src: operand_src(*arg)?,
                     },
-                })
+                }])
             } else {
                 let x = Xmm::from_phys(phys)?;
-                Some(match arg {
+                Some(vec![match arg {
                     Operand::Const(k) => {
                         let (bits, width) = const_float(*k)?;
                         Inst::ConstF {
@@ -179,48 +200,147 @@ fn arg_move(cx: &Cx, arg: &Operand, loc: &ArgLocation) -> Option<Inst> {
                         dst: XmmPlace::Reg(x),
                         src: xmm_opnd(cx, *arg)?,
                     },
-                })
+                }])
             }
         }
-        // Outgoing stack arguments (7+ integer or 9+ float): outside the
-        // tier-0 subset for now.
-        ArgLocation::Stack { .. } => None,
+        ArgLocation::Stack { offset } => {
+            // Outgoing stack arguments (SysV register-pool overflow; the
+            // operand is a scalar here — structs arrive as StructRegs or
+            // a struct-classified Stack, which `arg_moves` splits out).
+            if let Some(width) = operand_width(cx, *arg) {
+                let mut insts = Vec::new();
+                let src = match arg {
+                    Operand::AddrOf(l) => {
+                        // An address constant has no `Src` form:
+                        // materialize through the fixed scratch r11 (never
+                        // an argument register).
+                        insts.push(Inst::Lea {
+                            dst: Place::Reg(Gpr::R11),
+                            addr: Amode::FrameSlot(*l),
+                        });
+                        Src::Reg(Gpr::R11)
+                    }
+                    _ => operand_src(*arg)?,
+                };
+                insts.push(Inst::StoreStackArg { width, offset, src });
+                Some(insts)
+            } else {
+                let width = operand_fwidth(cx, *arg)?;
+                Some(vec![Inst::StoreStackArgF {
+                    width,
+                    offset,
+                    src: xmm_opnd(cx, *arg)?,
+                }])
+            }
+        }
+        ArgLocation::StructRegs {
+            regs,
+            count,
+            sizes,
+            offsets,
+        } => {
+            // A register-passed struct argument: one exact-size load per
+            // eightbyte from the value's memory.
+            let addr = block_addr(*arg)?;
+            let mut insts = Vec::with_capacity(count as usize);
+            for k in 0..count as usize {
+                insts.push(Inst::LoadEightbyte {
+                    addr,
+                    disp: u32::from(offsets[k]),
+                    size: sizes[k],
+                    dst: eb_reg(regs[k])?,
+                });
+            }
+            Some(insts)
+        }
     }
 }
 
-/// The per-ABI argument setup for a call: one move per argument into its
+/// The per-ABI argument setup for a call: moves per argument into its
 /// SysV location, per the [`crate::codegen::classify_call`] assignment
-/// (integer-class values take [`regs::INT_ARG_REGS`] in order, floats take
-/// [`regs::FLOAT_ARG_REGS`]; entry 0 is the implicit `this` when present).
-/// `None` — no rule match — when an argument needs a stack slot.
+/// (entry 0 is the implicit `this` when present). A struct argument the
+/// ABI placed on the stack (whole-struct rule or never-classified) is a
+/// block copy into the outgoing area; its size comes from the signature
+/// and the layout side table.
 fn arg_moves(cx: &Cx, sig: &CallSig, args: &[Operand]) -> Option<Vec<Inst>> {
-    let abi = crate::codegen::classify_call(sig).ok()?;
-    args.iter()
-        .zip(&abi.args)
-        .map(|(arg, loc)| arg_move(cx, arg, loc))
-        .collect()
+    let abi = crate::codegen::classify_call(sig, cx.layouts()).ok()?;
+    let mut insts = Vec::new();
+    for (i, (arg, loc)) in args.iter().zip(&abi.args).enumerate() {
+        // The argument's IR type (entry 0 is `this` when present): a
+        // struct type with a Stack location is the stack-passed struct
+        // case.
+        let ty = if sig.has_this {
+            if i == 0 {
+                None
+            } else {
+                Some(sig.args[i - 1])
+            }
+        } else {
+            Some(sig.args[i])
+        };
+        match (ty, loc) {
+            // A struct argument the ABI placed on the stack (whole-struct
+            // rule or never-classified): a block copy into the outgoing
+            // area, sized from the layout side table.
+            (Some(Type::Struct(class)), ArgLocation::Stack { offset }) => {
+                let size = cx.layout_of(class)?.size;
+                insts.push(Inst::CopyStackArg {
+                    addr: block_addr(*arg)?,
+                    offset: *offset,
+                    size,
+                });
+            }
+            (Some(Type::Struct(_)), ArgLocation::StructRegs { .. }) => {
+                insts.extend(arg_move(cx, arg, loc)?);
+            }
+            (Some(Type::Struct(_)), _) => return None,
+            _ => insts.extend(arg_move(cx, arg, loc)?),
+        }
+    }
+    Some(insts)
 }
 
-/// The result move after a call, per the ABI return location (`rax` for
-/// integers, `xmm0` for floats).
-fn call_result_move(cx: &Cx, sig: &CallSig, dst: LocalId) -> Option<Inst> {
-    let abi = crate::codegen::classify_call(sig).ok()?;
+/// The result moves after a call, per the ABI return location (`rax` for
+/// integers, `xmm0` for floats, the eightbyte registers for a
+/// register-passed struct — stored into the destination slot with their
+/// exact sizes; step_10.9). A non-register-passed struct call has no
+/// destination (the retbuf temp received the value), so it never reaches
+/// here.
+fn call_result_move(cx: &Cx, sig: &CallSig, dst: LocalId) -> Option<Vec<Inst>> {
+    let abi = crate::codegen::classify_call(sig, cx.layouts()).ok()?;
     match abi.ret {
         Some(ArgLocation::Reg(phys)) => {
             if let Some(g) = Gpr::from_phys(phys) {
-                Some(Inst::Mov {
+                Some(vec![Inst::Mov {
                     width: width_of(cx, dst)?,
                     dst: Place::Val(Val(dst)),
                     src: Src::Reg(g),
-                })
+                }])
             } else {
                 let x = Xmm::from_phys(phys)?;
-                Some(Inst::MovF {
+                Some(vec![Inst::MovF {
                     width: fwidth_of(cx, dst)?,
                     dst: XmmPlace::Val(Val(dst)),
                     src: XmmSrc::Reg(x),
-                })
+                }])
             }
+        }
+        Some(ArgLocation::StructRegs {
+            regs,
+            count,
+            sizes,
+            offsets,
+        }) => {
+            let mut insts = Vec::with_capacity(count as usize);
+            for k in 0..count as usize {
+                insts.push(Inst::StoreEightbyte {
+                    local: dst,
+                    offset: u32::from(offsets[k]),
+                    size: sizes[k],
+                    src: eb_reg(regs[k])?,
+                });
+            }
+            Some(insts)
         }
         _ => None,
     }
@@ -631,8 +751,10 @@ rokajit::lower_rules! {
         => |_| vec![Inst::Jmp { target: Label(*target) }];
 
     /// `call m(args)` — direct: argument moves per the ABI classification
-    /// (mixed int/float signatures interleave the GPR and XMM sequences),
-    /// then the call, then the result out of `rax`/`xmm0`. `?` on the
+    /// (mixed int/float signatures interleave the GPR and XMM sequences;
+    /// struct arguments load per eightbyte or block-copy to the outgoing
+    /// stack area; step_10.9), then the call, then the result out of
+    /// `rax`/`xmm0`/the eightbyte registers. `?` on the
     /// result move aborts the match: a matched call whose destination
     /// can't receive the ABI return is an upstream bug, not a "try the
     /// next rule".
@@ -642,7 +764,7 @@ rokajit::lower_rules! {
             let mut insts = moves;
             insts.push(Inst::CallDirect { method: *method });
             if let Some(d) = dst {
-                insts.push(call_result_move(cx, sig, *d)?);
+                insts.extend(call_result_move(cx, sig, *d)?);
             }
             insts
         };
@@ -656,8 +778,69 @@ rokajit::lower_rules! {
             let mut insts = moves;
             insts.push(Inst::CallHelper { id: *id });
             if let Some(d) = dst {
-                insts.push(call_result_move(cx, sig, *d)?);
+                insts.extend(call_result_move(cx, sig, *d)?);
             }
+            insts
+        };
+
+    /// A struct block copy (`cpobj`/`stobj`, struct `stloc`/`starg`/
+    /// `stfld`, the hidden-retbuf copy; step_10.9): one descriptor; the
+    /// size comes from the layout side table. GC-barriered copies are
+    /// import-level helper calls and never reach here.
+    rule block_copy: BlockCopy { dst_addr, dst_offset, src_addr, class }
+        if let (Some(d), Some(s), Some(layout)) = (
+            block_addr(*dst_addr),
+            block_addr(*src_addr),
+            cx.layout_of(*class),
+        )
+        => |_| vec![Inst::BlockCopy {
+            dst: d,
+            dst_disp: *dst_offset,
+            src: s,
+            size: layout.size,
+        }];
+
+    /// `initobj`'s block zero.
+    rule block_zero: BlockZero { dst_addr, class }
+        if let (Some(d), Some(layout)) = (block_addr(*dst_addr), cx.layout_of(*class))
+        => |_| vec![Inst::BlockZero {
+            dst: d,
+            dst_disp: 0,
+            size: layout.size,
+        }];
+
+    /// `return <struct>` — a register-passed struct return (step_10.9):
+    /// one exact-size load per eightbyte into its return register
+    /// (integer eightbytes → rax then rdx, SSE → xmm0 then xmm1, per the
+    /// EE's classification), then the per-block epilog. The
+    /// non-register-passed form never reaches LIR (the importer rewrote
+    /// it through the hidden retbuf pointer).
+    rule return_struct: ReturnStruct { addr, class }
+        if let (Some(a), Some(layout)) = (block_addr(*addr), cx.layout_of(*class))
+        => |_| {
+            // The non-register-passed form never reaches LIR (the
+            // importer rewrote it through the hidden retbuf pointer).
+            layout.sysv.passed_in_registers.then_some(())?;
+            let mut insts = Vec::with_capacity(layout.sysv.count as usize + 2);
+            let (mut i, mut f) = (0usize, 0usize);
+            for k in 0..layout.sysv.count as usize {
+                let dst = if layout.sysv.classes[k].is_sse() {
+                    let r = EbReg::Xmm(regs::FLOAT_RETURN_REGS[f]);
+                    f += 1;
+                    r
+                } else {
+                    let r = EbReg::Gpr(regs::INT_RETURN_REGS[i]);
+                    i += 1;
+                    r
+                };
+                insts.push(Inst::LoadEightbyte {
+                    addr: a,
+                    disp: u32::from(layout.sysv.offsets[k]),
+                    size: layout.sysv.sizes[k],
+                    dst,
+                });
+            }
+            insts.extend(epilog());
             insts
         };
 
@@ -726,7 +909,7 @@ rokajit::lower_rules! {
 /// rulesets. A statement no rule matches is an `Unsupported` feature,
 /// not a panic (error-model decision).
 pub fn lower_method(method: &lir::Method) -> CompileResult<LoweredMethod> {
-    let cx = Cx::new(&method.locals);
+    let cx = Cx::new(&method.locals, &method.struct_layouts);
     let prolog = lower_frame(&FrameReq, &cx).ok_or(CompileError::Internal(
         "the catch-all frame rule must match",
     ))?;
@@ -756,6 +939,7 @@ mod tests {
     use super::*;
     use rokajit::ir::lir::StmtKind;
     use rokajit::ir::{hir, CallTarget, IlOffset, UnaryOp};
+    use rokajit::structs::StructLayouts;
     use rokajit_ee::handles::MethodHandle;
 
     /// Locals: three Int32 slots (0, 1, 2) and one Float slot (3), so
@@ -786,7 +970,7 @@ mod tests {
     }
 
     fn lower_one(s: &lir::Stmt) -> Option<Vec<Inst>> {
-        lower_stmt(s, &Cx::new(&locals()))
+        lower_stmt(s, &Cx::new(&locals(), &StructLayouts::new()))
     }
 
     fn val(i: u32) -> Place {
@@ -1006,7 +1190,7 @@ mod tests {
     }
 
     fn lower_with(locals: &[hir::Local], s: &lir::Stmt) -> Option<Vec<Inst>> {
-        lower_stmt(s, &Cx::new(locals))
+        lower_stmt(s, &Cx::new(locals, &StructLayouts::new()))
     }
 
     #[test]
@@ -1420,20 +1604,41 @@ mod tests {
     }
 
     #[test]
+    fn seven_int_args_overflow_to_an_outgoing_stack_store() {
+        // Seven integer arguments (step_10.9: stack args are supported):
+        // the first six take the GPR arg registers, the seventh stores to
+        // the outgoing area at [rsp+0].
+        let sig = rokajit::ir::CallSig {
+            ret: Type::Int32,
+            args: vec![Type::Int32; 7],
+            has_this: false,
+        };
+        let s = stmt(StmtKind::Call {
+            dst: Some(LocalId(2)),
+            target: CallTarget::Direct(handle(0x42)),
+            sig,
+            args: vec![Operand::Local(LocalId(0)); 7],
+        });
+        let insts = lower_one(&s).expect("matches");
+        assert_eq!(insts.len(), 9, "seven arg moves, the call, the result");
+        assert_eq!(
+            insts[6],
+            Inst::StoreStackArg {
+                width: Width::W32,
+                offset: 0,
+                src: vsrc(0),
+            }
+        );
+        assert!(matches!(insts[7], Inst::CallDirect { .. }));
+    }
+
+    #[test]
     fn calls_outside_the_subset_match_no_rule() {
         let sig = |n: usize| rokajit::ir::CallSig {
             ret: Type::Int32,
             args: vec![Type::Int32; n],
             has_this: false,
         };
-        // Seven integer arguments: the seventh needs a stack slot.
-        let s = stmt(StmtKind::Call {
-            dst: Some(LocalId(2)),
-            target: CallTarget::Direct(handle(0x42)),
-            sig: sig(7),
-            args: vec![Operand::Local(LocalId(0)); 7],
-        });
-        assert_eq!(lower_one(&s), None);
         // A float argument moves into xmm0 (step_10.2: the FP ABI).
         let s = stmt(StmtKind::Call {
             dst: Some(LocalId(2)),
@@ -1498,7 +1703,8 @@ mod tests {
 
     #[test]
     fn prolog_is_the_frame_contract_sequence() {
-        let prolog = lower_frame(&FrameReq, &Cx::new(&locals())).expect("frame rule matches");
+        let prolog = lower_frame(&FrameReq, &Cx::new(&locals(), &StructLayouts::new()))
+            .expect("frame rule matches");
         assert_eq!(
             prolog,
             vec![
@@ -1528,6 +1734,7 @@ mod tests {
             eh_regions: Vec::new(),
             num_args: 0,
             num_il_locals: 3,
+            struct_layouts: StructLayouts::new(),
         };
         assert!(matches!(
             lower_method(&method),
@@ -1554,7 +1761,7 @@ mod tests {
     }
 
     fn lower_obj(s: &lir::Stmt) -> Option<Vec<Inst>> {
-        lower_stmt(s, &Cx::new(&locals_obj()))
+        lower_stmt(s, &Cx::new(&locals_obj(), &StructLayouts::new()))
     }
 
     #[test]
@@ -1687,6 +1894,8 @@ mod tests {
             ret: CorInfoType::Int,
             args: vec![CorInfoType::Int],
             has_this: false,
+            ret_class: None,
+            arg_classes: Vec::new(),
         };
         ee.add_method(FIB_TOKEN, fib_sig.clone());
         let info = MethodInfo {
@@ -1849,7 +2058,7 @@ mod tests {
     }
 
     fn lower_f(s: &lir::Stmt) -> Option<Vec<Inst>> {
-        lower_stmt(s, &Cx::new(&locals_f()))
+        lower_stmt(s, &Cx::new(&locals_f(), &StructLayouts::new()))
     }
 
     fn xval(i: u32) -> XmmPlace {

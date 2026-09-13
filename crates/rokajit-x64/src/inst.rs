@@ -438,11 +438,93 @@ pub enum Inst {
     /// `sub rsp, <frame size>` — the size is codegen's frame-layout
     /// result; lowering only declares that a frame exists.
     AllocFrame,
+    // --- step_10.9: the struct ABI and block operations ---
+    /// Load `size` bytes (1..=8) from `[addr + disp]` into an ABI-pinned
+    /// register, zero-extended (GPR) or as `movss`/`movsd` (XMM). Used at
+    /// the call boundary for register-passed struct arguments and returns
+    /// (SysV eightbyte classification): the address is a struct value's
+    /// memory.
+    LoadEightbyte {
+        addr: BlockAddr,
+        disp: u32,
+        size: u8,
+        dst: EbReg,
+    },
+    /// Store `size` bytes (1..=8) from an ABI-pinned register into a
+    /// local's frame slot at byte `offset` within the slot — the callee
+    /// half of the struct ABI (incoming register-passed arguments, and a
+    /// register-passed struct call result landing in its destination
+    /// slot). The size is respected exactly: a 3-byte eightbyte stores 3
+    /// bytes, never 8 (frame slots are exactly `size` bytes).
+    StoreEightbyte {
+        local: LocalId,
+        offset: u32,
+        size: u8,
+        src: EbReg,
+    },
+    /// `mov [rsp + offset], src` — an outgoing scalar stack argument
+    /// (SysV register-pool overflow; step_10.9). `offset` is relative to
+    /// `rsp` at the call instruction; the outgoing area is sized into the
+    /// frame.
+    StoreStackArg { width: Width, offset: u32, src: Src },
+    /// The float form of [`Inst::StoreStackArg`] (`movss`/`movsd`).
+    StoreStackArgF {
+        width: FWidth,
+        offset: u32,
+        src: XmmSrc,
+    },
+    /// Copy `size` bytes from `[addr]` to `[rsp + offset]` — an outgoing
+    /// stack-passed struct argument (a whole struct that didn't fit the
+    /// register pools, or one the EE never classifies for registers).
+    /// Always inline (no helper call mid-argument-setup).
+    CopyStackArg {
+        addr: BlockAddr,
+        offset: u32,
+        size: u32,
+    },
+    /// Copy `size` bytes from `[src]` to `[dst + dst_disp]` (`cpobj`/
+    /// `stobj`, struct `stloc`/`starg`/`stfld`, the hidden-retbuf copy).
+    /// Codegen picks inline unrolled moves for small sizes or the EE's
+    /// `CORINFO_HELP_MEMCPY` for large ones; GC-barriered copies are
+    /// decided at import (the bulk-write-barrier helper call) and never
+    /// reach this descriptor.
+    BlockCopy {
+        dst: BlockAddr,
+        dst_disp: u32,
+        src: BlockAddr,
+        size: u32,
+    },
+    /// Zero `size` bytes at `[dst + dst_disp]` (`initobj`; struct local
+    /// zero-init is a prolog matter and doesn't use this descriptor).
+    BlockZero {
+        dst: BlockAddr,
+        dst_disp: u32,
+        size: u32,
+    },
     /// `leave` (`mov rsp, rbp; pop rbp`) — the frame teardown matching
     /// the [`Inst::Push`] + `mov rbp, rsp` + [`Inst::AllocFrame`] prolog.
     Leave,
     /// `ret`.
     Ret,
+}
+
+/// A block operation's address operand (step_10.9): either a byref value
+/// (loaded from its slot/register into a scratch GPR) or a local's own
+/// frame-slot address (`ldloca`-shaped — `lea`, no memory read).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum BlockAddr {
+    /// A byref value's current location.
+    Val(Val),
+    /// A local's frame slot address.
+    FrameSlot(LocalId),
+}
+
+/// An ABI-pinned register for one struct eightbyte: GPR for
+/// integer-class eightbytes, XMM for SSE.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum EbReg {
+    Gpr(Gpr),
+    Xmm(Xmm),
 }
 
 /// The fixed (architecture- or ABI-pinned) registers an instruction
