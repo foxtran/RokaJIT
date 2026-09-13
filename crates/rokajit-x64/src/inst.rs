@@ -49,8 +49,8 @@ pub enum Place {
 }
 
 /// A readable source: an unallocated value, a fixed physical register,
-/// or an immediate. Memory reads arrive with load support (a later
-/// step); frame-slot traffic is between codegen and the encoder.
+/// or an immediate. Memory reads are descriptor-level ([`Inst::LoadMem`]);
+/// frame-slot traffic is between codegen and the encoder.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Src {
     Val(Val),
@@ -388,6 +388,35 @@ pub enum Inst {
     MovExt { dst: Place, src: Src, signed: bool },
     /// `cmp lhs, rhs` — sets the flags a following `Jcc` consumes.
     Cmp { width: Width, lhs: Src, rhs: Src },
+    /// `mov width, dst, [addr + disp]` — a load through a computed
+    /// address (LIR `Load`: `ldfld`'s field read; step_10.4). `addr` is
+    /// the address *value* (usually a frame-resident GC reference), so
+    /// codegen materializes it into a scratch GPR before the load.
+    LoadMem {
+        width: Width,
+        dst: Place,
+        addr: Src,
+        disp: i32,
+    },
+    /// `mov [addr + disp], src` — a store through a computed address
+    /// (LIR `Store`: `stfld`'s non-reference field store; a reference
+    /// store is the write-barrier helper call instead). A too-wide
+    /// constant `src` materializes into a scratch register at codegen
+    /// (the `movq [mem], imm32` form sign-extends — the same wide-imm
+    /// rule as ALU ops).
+    StoreMem {
+        width: Width,
+        addr: Src,
+        disp: i32,
+        src: Src,
+    },
+    /// The explicit, trap-based null check (step_10.4): a 32-bit load
+    /// through the reference, its result unused — on a null `addr` the
+    /// hardware fault *is* the NullReferenceException, translated by the
+    /// EE's signal handler via the same unwind path as `idiv`'s #DE.
+    /// Always explicit: the offset-vs-page-size folding RyuJIT does is a
+    /// later optimization.
+    NullCheck { addr: Src },
     /// `jcc target` — reads the flags `Cmp` (or a future flag-setting
     /// instruction) left. Flag materialization is by adjacency: lowering
     /// emits the producer immediately before the consumer, and codegen

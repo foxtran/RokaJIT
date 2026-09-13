@@ -18,6 +18,11 @@ impl TokensAndSignatures for MockEe {
             // One mock class per method: reuse the method handle's address.
             token.hClass = method.handle.as_raw() as ffi::CORINFO_CLASS_HANDLE;
         }
+        if let Some(field) = self.fields.get(&token.token) {
+            token.hField = field.handle.as_raw();
+            // One mock class per field: reuse the field handle's address.
+            token.hClass = field.handle.as_raw() as ffi::CORINFO_CLASS_HANDLE;
+        }
     }
 
     fn find_sig(
@@ -152,12 +157,19 @@ impl TokensAndSignatures for MockEe {
         token: &mut ffi::CORINFO_RESOLVED_TOKEN,
         _constrained: Option<&ffi::CORINFO_RESOLVED_TOKEN>,
         _caller: MethodHandle,
-        _flags: CallInfoFlags,
+        flags: CallInfoFlags,
     ) -> ffi::CORINFO_CALL_INFO {
+        self.call_info_flags.borrow_mut().push(flags);
         let mut info: ffi::CORINFO_CALL_INFO = unsafe { std::mem::zeroed() };
         if let Some(method) = self.methods.get(&token.token) {
             info.hMethod = method.handle.as_raw();
-            info.kind = ffi::CORINFO_CALL_KIND_CORINFO_CALL;
+            // Designated tokens can a non-direct kind (a vtable dispatch),
+            // exercising the importer's "non-direct call kind" gate.
+            info.kind = if self.non_direct_calls.contains(&token.token) {
+                ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_VTABLE
+            } else {
+                ffi::CORINFO_CALL_KIND_CORINFO_CALL
+            };
             info.sig = self.method_sig_info(method);
         }
         info

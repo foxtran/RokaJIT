@@ -91,6 +91,22 @@ handle_newtype!(
     rokajit_ffi::CORINFO_CONTEXT_HANDLE,
     "Opaque EE reference to a generic context (`CORINFO_CONTEXT_HANDLE`)."
 );
+
+impl ContextHandle {
+    /// Builds a class context (`MAKE_CLASSCONTEXT`, corinfo.h:1030): a
+    /// `CORINFO_CONTEXT_HANDLE` is a method or class handle tagged in its
+    /// low bit (`CORINFO_CONTEXTFLAGS_CLASS` = 0x01, corinfo.h:1025), not
+    /// the bare handle. Passing an untagged class handle makes the EE take
+    /// the method branch of `GetTypeFromContext` and dereference the
+    /// MethodTable as a MethodDesc — a crash, not an error.
+    pub fn from_class(class: ClassHandle) -> Self {
+        const CORINFO_CONTEXTFLAGS_CLASS: usize = 0x01;
+        Self(
+            (class.as_raw() as usize | CORINFO_CONTEXTFLAGS_CLASS)
+                as rokajit_ffi::CORINFO_CONTEXT_HANDLE,
+        )
+    }
+}
 handle_newtype!(
     ObjectHandle,
     rokajit_ffi::CORINFO_OBJECT_HANDLE,

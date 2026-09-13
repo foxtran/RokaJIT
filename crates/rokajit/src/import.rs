@@ -18,7 +18,13 @@
 //! out), the compare-branch family `beq`..`blt.un` plus `brfalse`/
 //! `brtrue`/`br` (short and long forms; the null-check forms now also
 //! accept references, and the compare forms floats), `call`, and `ret`.
-//! Anything else is [`CompileError::Unsupported`]; malformed IL is
+//! The step_10.4 object pack adds `callvirt` (scoped: the EE must
+//! devirtualize to a direct call — a real vtable dispatch is
+//! `Unsupported`), instance field access `ldfld`/`stfld`/`ldflda` (static
+//! fields are out), and `newobj` (EE allocation helper + a direct
+//! constructor call; the reference-field store goes through the EE's
+//! checked-write-barrier helper). Anything else is
+//! [`CompileError::Unsupported`]; malformed IL is
 //! [`CompileError::BadIl`]. The importer never panics: every operand read
 //! is bounds-checked.
 //!
@@ -33,7 +39,10 @@
 //! spills every such tree to a temp first (RyuJIT's `impSpillLclRefs`).
 //!
 //! EE queries consumed (via `&dyn EeInfo`): `resolve_token`,
-//! `get_call_info`, `construct_string_literal` (for `ldstr`), and
+//! `get_call_info`, `construct_string_literal` (for `ldstr`), the field
+//! queries (`get_field_offset`/`get_field_type`/`is_field_static`),
+//! `embed_class_handle`, `init_class`, and `get_new_helper` (the object
+//! pack), and
 //! signature walking (`get_arg_type`/`get_arg_next`,
 //! bounded by `numArgs` — the real EE's `getArgNext` never returns null, so
 //! stepping past `numArgs` walks off the signature blob). The entry
@@ -44,8 +53,12 @@
 use std::collections::{BTreeSet, HashMap};
 
 use rokajit_ee::ee_info::{zeroed_out, EeInfo};
-use rokajit_ee::enums::{CallInfoFlags, CorInfoHelpFunc, CorInfoType, InfoAccessType};
-use rokajit_ee::handles::{ArgListHandle, MethodHandle, ModuleHandle};
+use rokajit_ee::enums::{
+    CallInfoFlags, CorInfoHelpFunc, CorInfoInitClassResult, CorInfoType, InfoAccessType,
+};
+use rokajit_ee::handles::{
+    ArgListHandle, ClassHandle, ContextHandle, FieldHandle, MethodHandle, ModuleHandle,
+};
 use rokajit_ffi as ffi;
 
 use crate::error::{CompileError, CompileResult};
@@ -266,6 +279,20 @@ enum Op {
         target: u32,
     },
     Call(u32),
+    /// `callvirt` — same resolution as `call`, but the receiver is
+    /// null-checked (ECMA-335 §III.4.2: NullReferenceException on a null
+    /// `this` even when the EE devirtualizes to a direct call).
+    CallVirt(u32),
+    /// `newobj` — allocation through the EE's `getNewHelper` helper plus a
+    /// direct constructor call.
+    NewObj(u32),
+    /// `ldfld` — instance field load (field metadata token).
+    LdFld(u32),
+    /// `ldflda` — instance field address, a `ByRef` value.
+    LdFldA(u32),
+    /// `stfld` — instance field store; a reference-typed field stores
+    /// through the EE's checked-write-barrier helper (the GC must be told).
+    StFld(u32),
     Ret,
 }
 
@@ -461,7 +488,12 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x6C => Op::Conv(ConvKind::R8),
             0x6D => Op::Conv(ConvKind::U4),
             0x6E => Op::Conv(ConvKind::U8),
+            0x6F => Op::CallVirt(r.u32()?),
             0x72 => Op::LdStr(r.u32()?),
+            0x73 => Op::NewObj(r.u32()?),
+            0x7B => Op::LdFld(r.u32()?),
+            0x7C => Op::LdFldA(r.u32()?),
+            0x7D => Op::StFld(r.u32()?),
             0xFE => match r.u8()? {
                 0x01 => Op::Compare(BinaryOp::Eq),
                 0x02 => Op::Compare(BinaryOp::Gt),
@@ -608,7 +640,7 @@ fn must_eval(expr: &hir::Expr) -> bool {
     match expr {
         hir::Expr::Const(_) | hir::Expr::Local(_) | hir::Expr::LocalAddr(_) => false,
         hir::Expr::StaticFieldAddr { .. } => false,
-        hir::Expr::Load { .. } => true, // can fault (null byref) — not built yet
+        hir::Expr::Load { .. } => true, // can fault (null byref)
         hir::Expr::FieldAddr { obj, .. } => must_eval(obj),
         hir::Expr::Unary { arg, .. } => must_eval(arg),
         hir::Expr::Binary { op, lhs, rhs } => {
@@ -1031,11 +1063,19 @@ impl BlockImport<'_> {
         }
     }
 
-    /// `call` (0x28): resolve the token, take the EE's verdict on how the
-    /// call is performed, and pop the call-site signature's arguments.
+    /// `call` (0x28) / `callvirt` (0x6F): resolve the token, take the EE's
+    /// verdict on how the call is performed, and pop the call-site
+    /// signature's arguments. `flags` carries the callvirt distinction to
+    /// the EE (`CORINFO_CALLINFO_CALLVIRT`); `null_check_this` wraps the
+    /// receiver in an explicit null check — required for callvirt
+    /// (ECMA-335 §III.4.2: NullReferenceException on a null `this` even
+    /// for a non-virtual target) and forbidden for `call` (§III.4.1
+    /// tolerates a null `this`).
     fn call(
         &mut self,
         token: u32,
+        flags: CallInfoFlags,
+        null_check_this: bool,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
@@ -1051,12 +1091,18 @@ impl BlockImport<'_> {
         self.ee.resolve_token(&mut resolved);
         let call = self
             .ee
-            .get_call_info(&mut resolved, None, self.info.ftn, CallInfoFlags::EMPTY);
+            .get_call_info(&mut resolved, None, self.info.ftn, flags);
         if call.kind != ffi::CORINFO_CALL_KIND_CORINFO_CALL {
+            // Direct calls only: for callvirt the EE devirtualizes
+            // non-virtual and provably-final targets; anything else is a
+            // real vtable/interface dispatch — a later step.
             return Err(CompileError::Unsupported("non-direct call kind"));
         }
         check_call_conv(call.sig.callConv)?;
         let has_this = call.sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0;
+        if null_check_this && !has_this {
+            return Err(CompileError::BadIl("callvirt on a static method"));
+        }
         let ret = ir_type_raw(call.sig.retType())?;
         let arg_types = sig_arg_types(&call.sig, self.ee)?;
 
@@ -1074,6 +1120,13 @@ impl BlockImport<'_> {
             if !matches!(ty, Type::Ref | Type::ByRef) {
                 return Err(CompileError::BadIl("`this` must be a reference"));
             }
+            let this = if null_check_this {
+                hir::Expr::NullCheck {
+                    arg: Box::new(this),
+                }
+            } else {
+                this
+            };
             args.insert(0, this);
         }
         let Some(method) = MethodHandle::from_raw(call.hMethod) else {
@@ -1099,6 +1152,297 @@ impl BlockImport<'_> {
             self.push(ret, expr)?;
         }
         Ok(())
+    }
+
+    /// Field-token resolution shared by `ldfld`/`stfld`/`ldflda`
+    /// (step_10.4): the token-kind hint is `CORINFO_TOKENKIND_Field`
+    /// (importer.cpp `impResolveToken` for the field opcodes), an
+    /// unresolved token is BadIl, and static fields are out of the pack.
+    /// Returns the field handle and the EE-supplied instance offset.
+    fn resolve_instance_field(&mut self, token: u32) -> CompileResult<(FieldHandle, u32)> {
+        let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+            t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+            t.tokenScope = self.info.args.scope;
+            t.token = token;
+            t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Field;
+        });
+        self.ee.resolve_token(&mut resolved);
+        let Some(field) = FieldHandle::from_raw(resolved.hField) else {
+            return Err(CompileError::BadIl("field token did not resolve"));
+        };
+        if self.ee.is_field_static(field) {
+            return Err(CompileError::Unsupported(
+                "static fields: not yet supported",
+            ));
+        }
+        Ok((field, self.ee.get_field_offset(field)))
+    }
+
+    /// The IR type of a field, gated to the 10.4 pack: the full-width
+    /// integers, native ints/pointers, and object references. The
+    /// sub-Int32 metadata types need width-correct loads/stores and
+    /// floats/structs need machinery the pack doesn't have.
+    fn field_ir_type(&self, field: FieldHandle) -> CompileResult<Type> {
+        let (ty, _value_class) = self.ee.get_field_type(field);
+        match ty {
+            CorInfoType::Int | CorInfoType::UInt => Ok(Type::Int32),
+            CorInfoType::Long | CorInfoType::ULong => Ok(Type::Int64),
+            CorInfoType::NativeInt | CorInfoType::NativeUInt | CorInfoType::Ptr => {
+                Ok(Type::NativeInt)
+            }
+            CorInfoType::Class => Ok(Type::Ref),
+            _ => Err(CompileError::Unsupported(
+                "field type outside the 10.4 object pack",
+            )),
+        }
+    }
+
+    /// The receiver of a field access must be a class reference; a byref
+    /// receiver means a value-type field access (out of the pack).
+    fn pop_field_receiver(&mut self) -> CompileResult<hir::Expr> {
+        let (ty, obj) = self.pop()?;
+        if ty != Type::Ref {
+            return Err(CompileError::Unsupported(
+                "field access on a non-class receiver (value types)",
+            ));
+        }
+        Ok(obj)
+    }
+
+    /// `ldfld` (0x7B): the load's address is the null-checked receiver —
+    /// the null check is explicit and trap-based (RyuJIT's model: a load
+    /// through the pointer, the hardware fault translated by the EE; the
+    /// offset-folding optimization is deliberately not tier 0's).
+    fn ldfld(&mut self, token: u32) -> CompileResult<()> {
+        let (field, offset) = self.resolve_instance_field(token)?;
+        let ty = self.field_ir_type(field)?;
+        let obj = self.pop_field_receiver()?;
+        self.push(
+            ty,
+            hir::Expr::Load {
+                addr: Box::new(hir::Expr::NullCheck { arg: Box::new(obj) }),
+                offset,
+                ty,
+            },
+        )
+    }
+
+    /// `ldflda` (0x7C): the field's address — type-agnostic (an address
+    /// carries no field type), so the field-type gate does not apply.
+    fn ldflda(&mut self, token: u32) -> CompileResult<()> {
+        let (field, offset) = self.resolve_instance_field(token)?;
+        let obj = self.pop_field_receiver()?;
+        self.push(
+            Type::ByRef,
+            hir::Expr::FieldAddr {
+                obj: Box::new(hir::Expr::NullCheck { arg: Box::new(obj) }),
+                field,
+                offset,
+            },
+        )
+    }
+
+    /// `stfld` (0x7D): an indirect store for a non-reference field. A
+    /// reference-typed field must inform the GC: the store goes through
+    /// the EE's checked write barrier (`JIT_CheckedWriteBarrier(dst,
+    /// src)` — `CORINFO_HELP_CHECKED_ASSIGN_REF`), whose two arguments are
+    /// exactly SysV's first two integer registers. The barrier itself
+    /// must never see a null destination (an AV inside the helper would
+    /// not translate to a NullReferenceException), so the destination
+    /// address is built off the null-checked receiver.
+    fn stfld(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let (field, offset) = self.resolve_instance_field(token)?;
+        let ty = self.field_ir_type(field)?;
+        let (vt, value) = self.pop()?;
+        if vt != ty {
+            return Err(CompileError::BadIl("stfld value type mismatch"));
+        }
+        let obj = hir::Expr::NullCheck {
+            arg: Box::new(self.pop_field_receiver()?),
+        };
+        let kind = if ty == Type::Ref {
+            hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::CHECKED_ASSIGN_REF),
+                sig: CallSig {
+                    ret: Type::Void,
+                    args: vec![Type::ByRef, Type::Ref],
+                    has_this: false,
+                },
+                args: vec![
+                    hir::Expr::FieldAddr {
+                        obj: Box::new(obj),
+                        field,
+                        offset,
+                    },
+                    value,
+                ],
+            })
+        } else {
+            hir::StmtKind::StoreInd {
+                addr: obj,
+                offset,
+                value,
+            }
+        };
+        stmts.push(hir::Stmt { il_offset, kind });
+        Ok(())
+    }
+
+    /// `newobj` (0x73): allocate through the EE's `getNewHelper` helper
+    /// (the `CORINFO_HELP_NEWFAST`/`NEWSFAST` families — the
+    /// single-argument `(MethodTable*) -> Object*` forms), then run the
+    /// constructor as a direct call on the fresh object, and push the
+    /// object. The class
+    /// handle is embedded as a raw `NativeInt` constant: a MethodTable* is
+    /// not an object reference and must never be GC-rooted as one.
+    fn newobj(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+            t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+            t.tokenScope = self.info.args.scope;
+            t.token = token;
+            t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_NewObj;
+        });
+        self.ee.resolve_token(&mut resolved);
+        let Some(class) = ClassHandle::from_raw(resolved.hClass) else {
+            return Err(CompileError::BadIl(
+                "newobj token did not resolve to a class",
+            ));
+        };
+
+        // The static-constructor trigger: RyuJIT's newobj import queries
+        // initClass with no field (not a field-trigger query), the method
+        // being compiled, and the class as the context
+        // (importer.cpp CEE_NEWOBJ / corinfo.h:2775's contract). A
+        // USE_HELPER verdict emits the CORINFO_HELP_INITCLASS call before
+        // the allocation. The context is a *tagged* class context
+        // (MAKE_CLASSCONTEXT) — an untagged class handle is interpreted
+        // as a method context by the EE and crashes it.
+        let context = ContextHandle::from_class(class);
+        let init = self.ee.init_class(None, Some(self.info.ftn), context);
+
+        // The allocation's MethodTable* operand, embedded directly; an
+        // indirection cell (R2R-style) needs load/reloc plumbing tier 0
+        // doesn't have.
+        let (embedded, indirection) = self.ee.embed_class_handle(class);
+        let (Some(class), None) = (embedded, indirection) else {
+            return Err(CompileError::Unsupported(
+                "class handle through an indirection cell",
+            ));
+        };
+        let class_const = || hir::Expr::Const(Const::NativeInt(class.as_raw() as isize));
+
+        if init.contains(CorInfoInitClassResult::USE_HELPER) {
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Eval(hir::Expr::Call {
+                    target: CallTarget::Helper(CorInfoHelpFunc::INITCLASS),
+                    sig: CallSig {
+                        ret: Type::Void,
+                        args: vec![Type::NativeInt],
+                        has_this: false,
+                    },
+                    args: vec![class_const()],
+                }),
+            });
+        }
+
+        let (helper, _has_side_effects) = self.ee.get_new_helper(&resolved, self.info.ftn);
+        // The single-argument (MethodTable*) -> Object* class-alloc helpers,
+        // minus the FINALIZE forms (a finalizable newobj needs the stack
+        // spill of RyuJIT's "finalizable newobj spill" — a later step) and
+        // NEWSFAST_ALIGN8_VC (boxed value classes — out with structs). The
+        // EE answers NEWSFAST for a plain small class (jitinterface.cpp
+        // getNewHelperStatic); NEWFAST is its slow fallback.
+        if !matches!(
+            helper,
+            CorInfoHelpFunc::NEWFAST
+                | CorInfoHelpFunc::NEWFAST_MAYBEFROZEN
+                | CorInfoHelpFunc::NEWSFAST
+                | CorInfoHelpFunc::NEWSFAST_ALIGN8
+        ) {
+            return Err(CompileError::Unsupported(
+                "allocation helper outside the newobj set",
+            ));
+        }
+
+        // The object lands in a fresh Ref temp — automatically a GC root
+        // (frame-resident, zero-initialized) across both safepoints (the
+        // allocation and the constructor call). The constructor is a
+        // direct call, so no null check wraps the fresh object:
+        // JIT_New* never returns null.
+        let t_obj = self.temp(Type::Ref);
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Store {
+                dst: t_obj,
+                value: hir::Expr::Call {
+                    target: CallTarget::Helper(helper),
+                    sig: CallSig {
+                        ret: Type::Ref,
+                        args: vec![Type::NativeInt],
+                        has_this: false,
+                    },
+                    args: vec![class_const()],
+                },
+            },
+        });
+
+        // The constructor: a direct instance call whose `this` is the
+        // fresh object, not a stack value (importer.cpp CEE_NEWOBJ's
+        // newObjThisPtr).
+        let call = self
+            .ee
+            .get_call_info(&mut resolved, None, self.info.ftn, CallInfoFlags::EMPTY);
+        if call.kind != ffi::CORINFO_CALL_KIND_CORINFO_CALL {
+            return Err(CompileError::Unsupported("non-direct call kind"));
+        }
+        check_call_conv(call.sig.callConv)?;
+        if call.sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS == 0 {
+            return Err(CompileError::BadIl("newobj on a static method"));
+        }
+        let ret = ir_type_raw(call.sig.retType())?;
+        if ret != Type::Void {
+            return Err(CompileError::BadIl("a constructor must return void"));
+        }
+        let arg_types = sig_arg_types(&call.sig, self.ee)?;
+        let mut args = Vec::with_capacity(arg_types.len() + 1);
+        for &expected in arg_types.iter().rev() {
+            let (ty, value) = self.pop()?;
+            if ty != expected {
+                return Err(CompileError::BadIl("call argument type mismatch"));
+            }
+            args.push(value);
+        }
+        args.reverse();
+        args.insert(0, hir::Expr::Local(t_obj));
+        let Some(ctor) = MethodHandle::from_raw(call.hMethod) else {
+            return Err(CompileError::BadIl(
+                "get_call_info returned a null method handle",
+            ));
+        };
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Direct(ctor),
+                sig: CallSig {
+                    ret: Type::Void,
+                    args: arg_types,
+                    has_this: true,
+                },
+                args,
+            }),
+        });
+        self.push(Type::Ref, hir::Expr::Local(t_obj))
     }
 
     /// Imports the instructions of block `b` (leader `leaders[b]`). The
@@ -1194,7 +1538,16 @@ impl BlockImport<'_> {
                     )?;
                 }
                 Op::Conv(kind) => self.conv(kind)?,
-                Op::Call(token) => self.call(token, &mut stmts, il_offset)?,
+                Op::Call(token) => {
+                    self.call(token, CallInfoFlags::EMPTY, false, &mut stmts, il_offset)?
+                }
+                Op::CallVirt(token) => {
+                    self.call(token, CallInfoFlags::CALLVIRT, true, &mut stmts, il_offset)?
+                }
+                Op::NewObj(token) => self.newobj(token, &mut stmts, il_offset)?,
+                Op::LdFld(token) => self.ldfld(token)?,
+                Op::LdFldA(token) => self.ldflda(token)?,
+                Op::StFld(token) => self.stfld(token, &mut stmts, il_offset)?,
                 Op::Br { target } => {
                     self.note_depth(target, self.stack.len())?;
                     terminator = Some(hir::Terminator::Jump {
@@ -1864,9 +2217,9 @@ mod tests {
 
     #[test]
     fn unknown_opcodes_are_unsupported() {
-        // callvirt, an undefined single byte, an unsupported 0xFE form.
+        // castclass, an undefined single byte, an unsupported 0xFE form.
         for il in [
-            &[0x6F, 0x01, 0x00, 0x00, 0x06, 0x2A][..],
+            &[0x74, 0x01, 0x00, 0x00, 0x06, 0x2A][..],
             &[0xFF, 0x2A][..],
             &[0xFE, 0x17, 0x2A][..],
         ] {
@@ -2663,5 +3016,338 @@ mod tests {
             import(&info, &ee),
             Err(CompileError::Unsupported(_))
         ));
+    }
+
+    // --- step_10.4: the object pack ---
+
+    const FIELD_TOKEN: u32 = 0x0400_0001;
+    const REF_FIELD_TOKEN: u32 = 0x0400_0002;
+    const CTOR_TOKEN: u32 = 0x0600_0004;
+
+    /// `int (this, int)` instance-method entry shape, with the two canned
+    /// field tokens registered (an Int32 field at offset 16, a Class field
+    /// at offset 24).
+    fn object_fixture(il: &[u8]) -> (MockEe, MethodInfo) {
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::Int],
+            has_this: true,
+        };
+        let (mut ee, info) = fixture(il, &entry, &[]);
+        ee.add_field(FIELD_TOKEN, CorInfoType::Int, 16);
+        ee.add_field(REF_FIELD_TOKEN, CorInfoType::Class, 24);
+        (ee, info)
+    }
+
+    fn as_null_check(e: &hir::Expr) -> &hir::Expr {
+        match e {
+            hir::Expr::NullCheck { arg } => arg,
+            _ => panic!("expected Expr::NullCheck"),
+        }
+    }
+
+    #[test]
+    fn callvirt_null_checks_this_and_passes_callvirt() {
+        // ldarg.0 (this); ldarg.1; callvirt int inst(int); ret.
+        let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
+        let (ee, info) = object_fixture(&il);
+        let m = import(&info, &ee).expect("imports");
+        let (sig, args) = as_call(return_value(&m, 0));
+        assert!(sig.has_this);
+        assert_eq!(args.len(), 2);
+        assert_eq!(as_local(as_null_check(&args[0])), LocalId(0));
+        assert_eq!(as_local(&args[1]), LocalId(1));
+        assert_eq!(
+            ee.call_info_flags.borrow().as_slice(),
+            [CallInfoFlags::CALLVIRT]
+        );
+
+        // `call` (0x28) on the same shape leaves `this` unchecked (ECMA-335
+        // §III.4.1 tolerates a null receiver) and passes no flags.
+        let il = [0x02, 0x03, 0x28, 0x03, 0x00, 0x00, 0x06, 0x2A];
+        let (ee, info) = object_fixture(&il);
+        let m = import(&info, &ee).expect("imports");
+        let (_, args) = as_call(return_value(&m, 0));
+        assert_eq!(as_local(&args[0]), LocalId(0));
+        assert_eq!(
+            ee.call_info_flags.borrow().as_slice(),
+            [CallInfoFlags::EMPTY]
+        );
+    }
+
+    #[test]
+    fn callvirt_gates_static_targets_and_non_direct_kinds() {
+        // callvirt of a static method is BadIl.
+        let il = [0x02, 0x6F, 0x01, 0x00, 0x00, 0x06, 0x2A];
+        let (ee, info) = object_fixture(&il);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+
+        // A real vtable dispatch (the EE declines to devirtualize) is out.
+        let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = object_fixture(&il);
+        ee.non_direct_calls.insert(INST_TOKEN);
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn ldfld_builds_a_null_checked_load() {
+        // ldarg.0; ldfld int@16; ret.
+        let il = [0x02, 0x7B, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (ee, info) = object_fixture(&il);
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::Load { addr, offset, ty } => {
+                assert_eq!(*offset, 16, "the EE-supplied offset");
+                assert_eq!(*ty, Type::Int32);
+                assert_eq!(as_local(as_null_check(addr)), LocalId(0));
+            }
+            _ => panic!("expected Expr::Load"),
+        }
+    }
+
+    #[test]
+    fn ldflda_pushes_a_byref_field_address() {
+        // ldarg.0; ldflda int@16; stloc.0; ldc.i4.0; ret — the address
+        // stores into a ByRef local.
+        let il = [0x02, 0x7C, 0x01, 0x00, 0x00, 0x04, 0x0A, 0x16, 0x2A];
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::Int],
+            has_this: true,
+        };
+        let (mut ee, info) = fixture_full(&il, &entry, &[CorInfoType::ByRef], 8, 0);
+        ee.add_field(FIELD_TOKEN, CorInfoType::Int, 16);
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(2), "the ByRef IL local follows this + arg");
+        match value {
+            hir::Expr::FieldAddr { obj, offset, .. } => {
+                assert_eq!(*offset, 16);
+                assert_eq!(as_local(as_null_check(obj)), LocalId(0));
+            }
+            _ => panic!("expected Expr::FieldAddr"),
+        }
+    }
+
+    #[test]
+    fn stfld_of_an_int_builds_store_ind() {
+        // ldarg.0; ldarg.1; stfld int@16; ldc.i4.0; ret.
+        let il = [0x02, 0x03, 0x7D, 0x01, 0x00, 0x00, 0x04, 0x16, 0x2A];
+        let (ee, info) = object_fixture(&il);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset,
+                value,
+            } => {
+                assert_eq!(*offset, 16);
+                assert_eq!(as_local(as_null_check(addr)), LocalId(0));
+                assert_eq!(as_local(value), LocalId(1));
+            }
+            _ => panic!("expected StmtKind::StoreInd"),
+        }
+    }
+
+    #[test]
+    fn stfld_of_a_reference_goes_through_the_write_barrier() {
+        // this.ref = value — the checked-write-barrier helper call:
+        // CHECKED_ASSIGN_REF(&this.ref, value), the FieldAddr as arg 0.
+        let il = [0x02, 0x14, 0x7D, 0x02, 0x00, 0x00, 0x04, 0x16, 0x2A];
+        let (ee, info) = object_fixture(&il);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::CHECKED_ASSIGN_REF),
+                    "the checked-write-barrier helper"
+                );
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::Void,
+                        args: vec![Type::ByRef, Type::Ref],
+                        has_this: false,
+                    }
+                );
+                assert_eq!(args.len(), 2);
+                match &args[0] {
+                    hir::Expr::FieldAddr { obj, offset, .. } => {
+                        assert_eq!(*offset, 24);
+                        assert_eq!(as_local(as_null_check(obj)), LocalId(0));
+                    }
+                    _ => panic!("expected Expr::FieldAddr"),
+                }
+                assert!(matches!(args[1], hir::Expr::Const(Const::NullRef)));
+            }
+            _ => panic!("expected the barrier helper Eval"),
+        }
+    }
+
+    #[test]
+    fn newobj_builds_the_alloc_store_and_ctor_eval() {
+        // ldc.i4.7; newobj C::.ctor(int); pop; ldc.i4.0; ret.
+        let il = [0x1D, 0x73, 0x04, 0x00, 0x00, 0x06, 0x26, 0x16, 0x2A];
+        let entry = sig(CorInfoType::Int, &[]);
+        let (mut ee, info) = fixture(&il, &entry, &[]);
+        ee.add_method(
+            CTOR_TOKEN,
+            MockSig {
+                ret: CorInfoType::Void,
+                args: vec![CorInfoType::Int],
+                has_this: true,
+            },
+        );
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "alloc store, ctor eval");
+
+        // t_obj = CORINFO_HELP_NEWFAST(class-as-NativeInt-const).
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(0), "the object temp is the first local");
+        assert_eq!(m.locals[0].ty, Type::Ref);
+        assert_eq!(m.locals[0].kind, hir::LocalKind::Temp);
+        match value {
+            hir::Expr::Call { target, sig, args } => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::NEWFAST),
+                    "the NEWFAST allocation helper"
+                );
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::Ref,
+                        args: vec![Type::NativeInt],
+                        has_this: false,
+                    }
+                );
+                assert!(
+                    matches!(args[0], hir::Expr::Const(Const::NativeInt(_))),
+                    "the class handle is a raw pointer constant, never a Ref"
+                );
+            }
+            _ => panic!("expected the allocation helper call"),
+        }
+
+        // C::.ctor(t_obj, 7) — `this` is the temp, not a stack value.
+        match &stmts[1].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(matches!(target, CallTarget::Direct(_)));
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::Void,
+                        args: vec![Type::Int32],
+                        has_this: true,
+                    }
+                );
+                assert_eq!(args.len(), 2);
+                assert_eq!(as_local(&args[0]), LocalId(0));
+                assert_eq!(as_i32(&args[1]), 7);
+            }
+            _ => panic!("expected the constructor Eval"),
+        }
+        // `pop` of the pushed object temp is pure: no third statement.
+    }
+
+    #[test]
+    fn newobj_with_a_cctor_emits_init_class_first() {
+        let il = [0x73, 0x04, 0x00, 0x00, 0x06, 0x26, 0x16, 0x2A];
+        let entry = sig(CorInfoType::Int, &[]);
+        let (mut ee, info) = fixture(&il, &entry, &[]);
+        ee.add_method(
+            CTOR_TOKEN,
+            MockSig {
+                ret: CorInfoType::Void,
+                args: vec![],
+                has_this: true,
+            },
+        );
+        ee.init_class_result = CorInfoInitClassResult::USE_HELPER;
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 3, "initclass, alloc store, ctor eval");
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::INITCLASS),
+                    "the INITCLASS helper"
+                );
+                assert_eq!(sig.ret, Type::Void);
+                assert_eq!(args.len(), 1);
+            }
+            _ => panic!("expected the INITCLASS helper call"),
+        }
+    }
+
+    #[test]
+    fn newobj_rejects_an_unknown_allocation_helper() {
+        let il = [0x73, 0x04, 0x00, 0x00, 0x06, 0x26, 0x16, 0x2A];
+        let entry = sig(CorInfoType::Int, &[]);
+        let (mut ee, info) = fixture(&il, &entry, &[]);
+        ee.add_method(
+            CTOR_TOKEN,
+            MockSig {
+                ret: CorInfoType::Void,
+                args: vec![],
+                has_this: true,
+            },
+        );
+        ee.new_helper = Some(CorInfoHelpFunc::NEWARR_1_PTR);
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn field_gates_static_fields_and_out_of_pack_types() {
+        // A static field token: ldfld is Unsupported with the named cause.
+        let il = [0x02, 0x7B, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = object_fixture(&il);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().is_static = true;
+        let err = import(&info, &ee)
+            .err()
+            .expect("static field is unsupported");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("static fields")),
+            "{err:?}"
+        );
+
+        // A Float field: outside the 10.4 pack.
+        let (mut ee, info) = object_fixture(&il);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().ty = CorInfoType::Float;
+        let err = import(&info, &ee)
+            .err()
+            .expect("float field is unsupported");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("object pack")),
+            "{err:?}"
+        );
+
+        // An unresolvable field token is BadIl.
+        let il = [0x02, 0x7B, 0x77, 0x00, 0x00, 0x04, 0x2A];
+        let (ee, info) = object_fixture(&il);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+
+        // A byref receiver (a value-type field access) is Unsupported.
+        let il = [0x12, 0x00, 0x7B, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let entry = sig(CorInfoType::Int, &[]);
+        let (mut ee, info) = fixture(&il, &entry, &[CorInfoType::Int]);
+        ee.add_field(FIELD_TOKEN, CorInfoType::Int, 16);
+        let err = import(&info, &ee)
+            .err()
+            .expect("byref receiver is unsupported");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("value types")),
+            "{err:?}"
+        );
     }
 }

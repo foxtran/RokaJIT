@@ -159,7 +159,9 @@ impl ClassQueries for MockEe {
         _method: Option<MethodHandle>,
         _context: ContextHandle,
     ) -> CorInfoInitClassResult {
-        CorInfoInitClassResult::NOT_REQUIRED
+        // The canned verdict; `CorInfoInitClassResult::EMPTY` is
+        // NOT_REQUIRED (bit value 0) — the default.
+        self.init_class_result
     }
 
     fn class_must_be_loaded_before_code_is_run(&self, _cls: ClassHandle) {}

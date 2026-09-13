@@ -234,8 +234,10 @@ fn epilog() -> Vec<Inst> {
 }
 
 rokajit::lower_rules! {
-    /// LIR statement → x64 instruction descriptors, for the fib subset
-    /// plus the step_10.1 scalar-cheap pack. Rules are tried in
+    /// LIR statement → x64 instruction descriptors, for the fib subset,
+    /// the step_10.1 scalar-cheap pack, the step_10.2 float pack, and the
+    /// step_10.4 object pack (loads/stores through computed addresses,
+    /// the trap-based null check). Rules are tried in
     /// declaration order; the more specific operand shapes (constants,
     /// addresses) precede the general value rules.
     pub fn lower_stmt(stmt: &lir::Stmt, cx: &Cx<'_>) -> Option<Vec<Inst>>
@@ -286,6 +288,45 @@ rokajit::lower_rules! {
             dst: XmmPlace::Val(Val(*dst)),
             src: s,
         }];
+
+    /// `t := [addr + disp]` — `ldfld`'s load through the (already
+    /// null-checked) object reference (step_10.4). The address operand is
+    /// usually a frame-resident GC ref; codegen loads it into a scratch
+    /// GPR first. Float field types match no rule (`width_of_ty` is the
+    /// GPR-width gate).
+    rule load_mem: Load { dst, addr, offset, ty }
+        if let (Some(w), Some(a)) = (width_of_ty(*ty), operand_src(*addr))
+        => |_| vec![Inst::LoadMem {
+            width: w,
+            dst: Place::Val(Val(*dst)),
+            addr: a,
+            disp: *offset as i32,
+        }];
+
+    /// `[addr + disp] := src` — `stfld`'s store through the (already
+    /// null-checked) object reference. A reference-typed store never
+    /// reaches here: the importer routes it through the write-barrier
+    /// helper call. The width is the source operand's.
+    rule store_mem: Store { addr, offset, src }
+        if let (Some(a), Some(s), Some(w)) = (
+            operand_src(*addr),
+            operand_src(*src),
+            operand_width(cx, *src),
+        )
+        => |_| vec![Inst::StoreMem {
+            width: w,
+            addr: a,
+            disp: *offset as i32,
+            src: s,
+        }];
+
+    /// The trap-based null check (step_10.4): a throwaway 32-bit load
+    /// through the reference — on null the hardware fault is the
+    /// NullReferenceException, via the EE's signal translation (the same
+    /// path `idiv`'s #DE rides, covered by the 07.7 unwind info).
+    rule null_check: NullCheck { arg }
+        if let Some(a) = operand_src(*arg)
+        => |_| vec![Inst::NullCheck { addr: a }];
 
     /// `t := a + b`, `a - b`, `a * b` — one three-operand descriptor;
     /// codegen emits the destructive two-operand pair. Constants ride
@@ -1474,11 +1515,13 @@ mod tests {
 
     #[test]
     fn unmatched_statement_is_unsupported_at_the_method_driver() {
+        // An array length read has no rule yet (arrays: a later pack).
         let method = lir::Method {
             blocks: vec![lir::Block {
                 id: BlockId(0),
-                stmts: vec![stmt(StmtKind::NullCheck {
-                    arg: Operand::Local(LocalId(0)),
+                stmts: vec![stmt(StmtKind::ArrLen {
+                    dst: LocalId(1),
+                    array: Operand::Local(LocalId(0)),
                 })],
             }],
             locals: locals(),
@@ -1490,6 +1533,144 @@ mod tests {
             lower_method(&method),
             Err(CompileError::Unsupported(_))
         ));
+    }
+
+    // --- step_10.4: the object pack rules ---
+
+    /// Locals: Ref 0 (`this`), Int32 1 (an int result), Ref 2 (a ref
+    /// result), ByRef 3 (a field-address temp).
+    fn locals_obj() -> Vec<hir::Local> {
+        let l = |ty: Type, i: u32| hir::Local {
+            ty,
+            kind: hir::LocalKind::IlLocal(i),
+            pinned: false,
+        };
+        vec![
+            l(Type::Ref, 0),
+            l(Type::Int32, 1),
+            l(Type::Ref, 2),
+            l(Type::ByRef, 3),
+        ]
+    }
+
+    fn lower_obj(s: &lir::Stmt) -> Option<Vec<Inst>> {
+        lower_stmt(s, &Cx::new(&locals_obj()))
+    }
+
+    #[test]
+    fn load_lowers_to_load_mem() {
+        // t1 := [this + 16] (an Int32 field read).
+        let s = stmt(StmtKind::Load {
+            dst: LocalId(1),
+            addr: Operand::Local(LocalId(0)),
+            offset: 16,
+            ty: Type::Int32,
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::LoadMem {
+                width: Width::W32,
+                dst: val(1),
+                addr: vsrc(0),
+                disp: 16,
+            }])
+        );
+        // A Ref-typed load is 64-bit.
+        let s = stmt(StmtKind::Load {
+            dst: LocalId(2),
+            addr: Operand::Local(LocalId(0)),
+            offset: 24,
+            ty: Type::Ref,
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::LoadMem {
+                width: Width::W64,
+                dst: val(2),
+                addr: vsrc(0),
+                disp: 24,
+            }])
+        );
+        // A float field load matches no rule (outside the 10.4 pack).
+        let s = stmt(StmtKind::Load {
+            dst: LocalId(1),
+            addr: Operand::Local(LocalId(0)),
+            offset: 8,
+            ty: Type::Double,
+        });
+        assert_eq!(lower_obj(&s), None);
+    }
+
+    #[test]
+    fn store_lowers_to_store_mem() {
+        // [this + 16] := t1 — width from the source operand.
+        let s = stmt(StmtKind::Store {
+            addr: Operand::Local(LocalId(0)),
+            offset: 16,
+            src: Operand::Local(LocalId(1)),
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::StoreMem {
+                width: Width::W32,
+                addr: vsrc(0),
+                disp: 16,
+                src: vsrc(1),
+            }])
+        );
+        // A constant source rides along as an immediate (W64 for null).
+        let s = stmt(StmtKind::Store {
+            addr: Operand::Local(LocalId(0)),
+            offset: 8,
+            src: Operand::Const(Const::Int32(0)),
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::StoreMem {
+                width: Width::W32,
+                addr: vsrc(0),
+                disp: 8,
+                src: Src::Imm(0),
+            }])
+        );
+    }
+
+    #[test]
+    fn null_check_lowers_to_the_trap_load() {
+        let s = stmt(StmtKind::NullCheck {
+            arg: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(lower_obj(&s), Some(vec![Inst::NullCheck { addr: vsrc(0) }]));
+        // A constant receiver (ldnull) still checks — it must fault.
+        let s = stmt(StmtKind::NullCheck {
+            arg: Operand::Const(Const::NullRef),
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::NullCheck { addr: Src::Imm(0) }])
+        );
+    }
+
+    #[test]
+    fn field_addr_add_lowers_through_the_arith_rule() {
+        // The flatten-emitted `ByRef dst := Ref lhs + NativeInt offset`:
+        // the existing arith rule covers it (ByRef is W64).
+        let s = stmt(StmtKind::Binary {
+            dst: LocalId(3),
+            op: BinaryOp::Add,
+            lhs: Operand::Local(LocalId(0)),
+            rhs: Operand::Const(Const::NativeInt(16)),
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::Arith {
+                op: ArithOp::Add,
+                width: Width::W64,
+                dst: val(3),
+                lhs: vsrc(0),
+                rhs: Src::Imm(16),
+            }])
+        );
     }
 
     // --- end-to-end: fib's exact IL bytes → descriptor sequence ---

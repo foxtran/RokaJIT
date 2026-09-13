@@ -20,7 +20,10 @@ impl Helpers for MockEe {
         _token: &ffi::CORINFO_RESOLVED_TOKEN,
         _caller: MethodHandle,
     ) -> (CorInfoHelpFunc, Option<bool>) {
-        (CorInfoHelpFunc::NEWFAST, Some(true))
+        (
+            self.new_helper.unwrap_or(CorInfoHelpFunc::NEWFAST),
+            Some(true),
+        )
     }
 
     fn get_casting_helper(

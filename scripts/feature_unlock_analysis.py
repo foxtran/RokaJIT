@@ -82,7 +82,12 @@ SUPPORTED = {
     0x6C,                    # conv.r8 (step_10.2)
     0x6D,                    # conv.u4
     0x6E,                    # conv.u8
+    0x6F,                    # callvirt (step_10.4, EE-devirtualized only)
     0x72,                    # ldstr (step_10.3)
+    0x73,                    # newobj (step_10.4)
+    0x7B,                    # ldfld (step_10.4)
+    0x7C,                    # ldflda (step_10.4)
+    0x7D,                    # stfld (step_10.4)
 }
 # Supported 0xFE-prefixed opcodes, by second byte (opcode.def):
 #   FE 01..05 = ceq, cgt, cgt.un, clt, clt.un

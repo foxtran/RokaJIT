@@ -244,9 +244,14 @@ pub mod hir {
             ty: Type,
         },
         /// Instance field access: object plus the EE-supplied offset.
+        /// `offset` is baked at import (`getFieldOffset`); lowering turns
+        /// the node into address arithmetic — `obj + offset` as a `ByRef`
+        /// (step_10.4; the `field` handle stays for EE lookups that need
+        /// it, e.g. the write barrier).
         FieldAddr {
             obj: Box<Expr>,
             field: FieldHandle,
+            offset: u32,
         },
         /// Static field address, as resolved by the EE.
         StaticFieldAddr {

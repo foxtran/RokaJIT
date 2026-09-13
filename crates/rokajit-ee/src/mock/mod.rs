@@ -45,6 +45,17 @@ pub struct MockMethod {
     arg_list: usize,
 }
 
+/// A canned instance field the mock resolves metadata tokens to and the
+/// field queries (`get_field_offset`/`get_field_type`/`is_field_static`)
+/// answer from (step_10.4).
+pub struct MockField {
+    /// The fake handle `resolve_token` hands back.
+    pub handle: FieldHandle,
+    pub offset: u32,
+    pub ty: CorInfoType,
+    pub is_static: bool,
+}
+
 /// Canned EE. Every query returns the stored/default value; output sinks
 /// record what they were handed so tests can assert on the flow.
 #[derive(Default)]
@@ -55,6 +66,21 @@ pub struct MockEe {
     /// Canned methods for `resolve_token`/`get_call_info`/`get_method_sig`,
     /// keyed by metadata token.
     pub methods: HashMap<u32, MockMethod>,
+    /// Canned fields for `resolve_token` and the field queries, keyed by
+    /// metadata token (step_10.4).
+    pub fields: HashMap<u32, MockField>,
+    /// Method tokens for which `get_call_info` cans a non-`CORINFO_CALL`
+    /// kind (the importer's "non-direct call kind" path; step_10.4).
+    pub non_direct_calls: std::collections::HashSet<u32>,
+    /// The flags each `get_call_info` call arrived with, in order
+    /// (step_10.4 tests: `call` passes EMPTY, `callvirt` CALLVIRT).
+    pub call_info_flags: RefCell<Vec<CallInfoFlags>>,
+    /// The canned `get_new_helper` verdict's helper; `None` cans
+    /// `CORINFO_HELP_NEWFAST` (step_10.4).
+    pub new_helper: Option<CorInfoHelpFunc>,
+    /// The canned `init_class` verdict (step_10.4). `EMPTY` is
+    /// `CORINFO_INITCLASS_NOT_REQUIRED` (bit value 0) — the default.
+    pub init_class_result: CorInfoInitClassResult,
     /// Canned directly-callable entry points for `get_function_entry_point`
     /// (step_07.5 codegen tests), keyed by the method handle's raw value.
     /// Absent handles get a zeroed lookup (`IAT_VALUE`, null address).
@@ -137,6 +163,25 @@ impl MockEe {
                 handle,
                 sig,
                 arg_list,
+            },
+        );
+        handle
+    }
+
+    /// Registers a canned instance field under `token` (step_10.4);
+    /// returns its fake handle.
+    pub fn add_field(&mut self, token: u32, ty: CorInfoType, offset: u32) -> FieldHandle {
+        // Non-null stand-in in a separate address band from method handles;
+        // the mock never dereferences handles.
+        let raw = (0x4000 + 0x10 * self.fields.len()) as ffi::CORINFO_FIELD_HANDLE;
+        let handle = FieldHandle::from_raw(raw).expect("fake handle is non-null");
+        self.fields.insert(
+            token,
+            MockField {
+                handle,
+                offset,
+                ty,
+                is_static: false,
             },
         );
         handle

@@ -28,8 +28,13 @@
 //! `div`/`rem` signed and unsigned, logic, shifts, and compare-as-value —
 //! a compare's temp is `Int32`), on integer and float operands alike
 //! (float `rem` arrives as a helper call from the importer), `neg`/`not`
-//! unary ops, and the `conv.*` nodes (int↔float included). Everything
-//! else — loads and stores through byrefs, switches, and EH — fails with
+//! unary ops, and the `conv.*` nodes (int↔float included). The step_10.4
+//! object pack adds: loads and stores through byrefs at a constant offset
+//! (`ldfld`/`stfld` — [`lir::StmtKind::Load`]/[`lir::StmtKind::Store`]),
+//! field addresses (`FieldAddr` flattens to a `ByRef`-typed `Add` of the
+//! object and the EE-supplied offset), and the explicit, trap-based null
+//! check (flattened to [`lir::StmtKind::NullCheck`], yielding the checked
+//! value unchanged). Everything else — switches, and EH — fails with
 //! [`CompileError::Unsupported`].
 
 mod dsl;
@@ -175,10 +180,25 @@ impl Flatten {
                         lir::StmtKind::Copy { dst: *dst, src },
                     );
                 }
-                hir::StmtKind::StoreInd { .. } => {
-                    return Err(CompileError::Unsupported(
-                        "store through a byref (stind/stfld): not yet supported",
-                    ));
+                hir::StmtKind::StoreInd {
+                    addr,
+                    offset,
+                    value,
+                } => {
+                    // Store through a byref at a constant offset (`stfld`).
+                    // Address first, then the value — the IL push order the
+                    // importer encoded (`stfld`: obj pushed before value).
+                    let addr = self.flatten_expr(addr, &mut stmts, stmt.il_offset)?;
+                    let src = self.flatten_expr(value, &mut stmts, stmt.il_offset)?;
+                    Self::push(
+                        &mut stmts,
+                        stmt.il_offset,
+                        lir::StmtKind::Store {
+                            addr,
+                            offset: *offset,
+                            src,
+                        },
+                    );
                 }
                 hir::StmtKind::Eval(expr) => {
                     self.flatten_eval(expr, &mut stmts, stmt.il_offset)?;
@@ -254,9 +274,40 @@ impl Flatten {
                     None => Err(CompileError::Internal("void call used as a value")),
                 }
             }
-            hir::Expr::Load { .. } | hir::Expr::FieldAddr { .. } => Err(CompileError::Unsupported(
-                "load through a byref / field access: not yet supported",
-            )),
+            hir::Expr::Load { addr, offset, ty } => {
+                // Load through a byref at a constant offset (`ldfld`).
+                let addr = self.flatten_expr(addr, out, il)?;
+                let dst = self.temp(*ty);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::Load {
+                        dst,
+                        addr,
+                        offset: *offset,
+                        ty: *ty,
+                    },
+                );
+                Ok(lir::Operand::Temp(dst))
+            }
+            hir::Expr::FieldAddr { obj, offset, .. } => {
+                // A field address is `obj + offset`, a managed byref: the
+                // temp is ByRef-typed, so it is automatically an interior-
+                // pointer GC root at every safepoint.
+                let obj = self.flatten_expr(obj, out, il)?;
+                let dst = self.temp(Type::ByRef);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::Binary {
+                        dst,
+                        op: BinaryOp::Add,
+                        lhs: obj,
+                        rhs: lir::Operand::Const(Const::NativeInt(*offset as isize)),
+                    },
+                );
+                Ok(lir::Operand::Temp(dst))
+            }
             hir::Expr::StaticFieldAddr { .. } => Err(CompileError::Unsupported(
                 "static fields: not yet supported",
             )),
@@ -293,8 +344,13 @@ impl Flatten {
                 );
                 Ok(lir::Operand::Temp(dst))
             }
-            hir::Expr::NullCheck { .. } => {
-                Err(CompileError::Unsupported("null checks: not yet supported"))
+            hir::Expr::NullCheck { arg } => {
+                // The explicit, trap-based null check (step_10.4): the
+                // checked value is the result — the statement exists purely
+                // for its fault.
+                let arg = self.flatten_expr(arg, out, il)?;
+                Self::push(out, il, lir::StmtKind::NullCheck { arg });
+                Ok(arg)
             }
             hir::Expr::ArrLen { .. } | hir::Expr::ArrElemAddr { .. } => {
                 Err(CompileError::Unsupported("arrays: not yet supported"))
@@ -727,38 +783,7 @@ mod tests {
 
     #[test]
     fn unsupported_nodes_fail_with_unsupported() {
-        // One representative per rejected family: a load through a byref
-        // in an expression, an indirect store, and a switch terminator.
-        let load = method_with(block(
-            0,
-            Vec::new(),
-            hir::Terminator::Return {
-                value: Some(hir::Expr::Load {
-                    addr: Box::new(hir::Expr::Local(LocalId(0))),
-                    offset: 0,
-                    ty: Type::Int32,
-                }),
-            },
-        ));
-        assert!(matches!(
-            lower(load, &MockTarget),
-            Err(CompileError::Unsupported(_))
-        ));
-
-        let store_ind = method_with(block(
-            0,
-            vec![hstmt(hir::StmtKind::StoreInd {
-                addr: hir::Expr::Local(LocalId(0)),
-                offset: 0,
-                value: hir::Expr::Const(Const::Int32(0)),
-            })],
-            hir::Terminator::Return { value: None },
-        ));
-        assert!(matches!(
-            lower(store_ind, &MockTarget),
-            Err(CompileError::Unsupported(_))
-        ));
-
+        // Switches remain outside the lowering subset.
         let switch = method_with(block(
             0,
             Vec::new(),
@@ -772,6 +797,122 @@ mod tests {
             lower(switch, &MockTarget),
             Err(CompileError::Unsupported(_))
         ));
+    }
+
+    // --- step_10.4: the object pack flattening ---
+
+    /// An instance-method shape: one Ref arg (`this`).
+    fn method_with_ref_arg(block: hir::Block) -> hir::Method {
+        let mut m = method_with(block);
+        m.locals[0] = local(Type::Ref, hir::LocalKind::IlArg(0));
+        m
+    }
+
+    #[test]
+    fn ldfld_load_flattens_to_null_check_then_load() {
+        // return this.x (an Int32 field at offset 8): NullCheck yields the
+        // checked receiver unchanged; the Load reads through it.
+        let m = lower_ok(method_with_ref_arg(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Load {
+                    addr: Box::new(hir::Expr::NullCheck {
+                        arg: Box::new(hir::Expr::Local(LocalId(0))),
+                    }),
+                    offset: 8,
+                    ty: Type::Int32,
+                }),
+            },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 3, "null check, load, return");
+        assert!(matches!(
+            stmts[0].kind,
+            lir::StmtKind::NullCheck {
+                arg: lir::Operand::Local(LocalId(0))
+            }
+        ));
+        match &stmts[1].kind {
+            lir::StmtKind::Load {
+                dst,
+                addr,
+                offset,
+                ty,
+            } => {
+                assert_eq!(*dst, LocalId(1), "fresh temp after the one arg");
+                assert_eq!(*addr, lir::Operand::Local(LocalId(0)));
+                assert_eq!(*offset, 8);
+                assert_eq!(*ty, Type::Int32);
+                assert_eq!(m.locals[1].ty, Type::Int32);
+            }
+            _ => panic!("expected Load"),
+        }
+    }
+
+    #[test]
+    fn stfld_flattens_address_then_value_in_push_order() {
+        // this.x = 42 — the address operand flattens before the value.
+        let m = lower_ok(method_with_ref_arg(block(
+            0,
+            vec![hstmt(hir::StmtKind::StoreInd {
+                addr: hir::Expr::NullCheck {
+                    arg: Box::new(hir::Expr::Local(LocalId(0))),
+                },
+                offset: 8,
+                value: hir::Expr::Const(Const::Int32(42)),
+            })],
+            hir::Terminator::Return { value: None },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 3, "null check, store, return");
+        assert!(matches!(stmts[0].kind, lir::StmtKind::NullCheck { .. }));
+        match &stmts[1].kind {
+            lir::StmtKind::Store { addr, offset, src } => {
+                assert_eq!(*addr, lir::Operand::Local(LocalId(0)));
+                assert_eq!(*offset, 8);
+                assert_eq!(*src, lir::Operand::Const(Const::Int32(42)));
+            }
+            _ => panic!("expected Store"),
+        }
+    }
+
+    #[test]
+    fn field_addr_flattens_to_a_byref_add() {
+        // &this.x: obj + the EE offset; the temp is ByRef-typed (an
+        // interior-pointer GC root).
+        let field = rokajit_ee::handles::FieldHandle::from_raw(0x300usize as _).unwrap();
+        let m = lower_ok(method_with_ref_arg(block(
+            0,
+            vec![hstmt(hir::StmtKind::Store {
+                dst: LocalId(0),
+                value: hir::Expr::FieldAddr {
+                    obj: Box::new(hir::Expr::NullCheck {
+                        arg: Box::new(hir::Expr::Local(LocalId(0))),
+                    }),
+                    field,
+                    offset: 12,
+                },
+            })],
+            hir::Terminator::Return { value: None },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 4, "null check, add, copy, return");
+        assert!(matches!(stmts[0].kind, lir::StmtKind::NullCheck { .. }));
+        match &stmts[1].kind {
+            lir::StmtKind::Binary { dst, op, lhs, rhs } => {
+                assert_eq!(*dst, LocalId(1));
+                assert_eq!(*op, BinaryOp::Add);
+                assert_eq!(*lhs, lir::Operand::Local(LocalId(0)));
+                assert_eq!(*rhs, lir::Operand::Const(Const::NativeInt(12)));
+                assert_eq!(
+                    m.locals[dst.0 as usize].ty,
+                    Type::ByRef,
+                    "the address temp is a byref root"
+                );
+            }
+            _ => panic!("expected Binary(Add)"),
+        }
     }
 
     #[test]

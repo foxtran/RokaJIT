@@ -9,16 +9,29 @@ use crate::enums::CorInfoType;
 use crate::handles::{ClassHandle, FieldHandle, MethodHandle, ObjectHandle};
 
 impl FieldQueries for MockEe {
-    fn get_field_type(&self, _field: FieldHandle) -> (CorInfoType, Option<ClassHandle>) {
-        (CorInfoType::Int, None)
+    fn get_field_type(&self, field: FieldHandle) -> (CorInfoType, Option<ClassHandle>) {
+        self.fields
+            .values()
+            .find(|f| f.handle == field)
+            .map(|f| (f.ty, None))
+            // Unknown handles keep the original constant answer.
+            .unwrap_or((CorInfoType::Int, None))
     }
 
-    fn get_field_offset(&self, _field: FieldHandle) -> u32 {
-        8
+    fn get_field_offset(&self, field: FieldHandle) -> u32 {
+        self.fields
+            .values()
+            .find(|f| f.handle == field)
+            .map(|f| f.offset)
+            .unwrap_or(8)
     }
 
-    fn is_field_static(&self, _field: FieldHandle) -> bool {
-        false
+    fn is_field_static(&self, field: FieldHandle) -> bool {
+        self.fields
+            .values()
+            .find(|f| f.handle == field)
+            .map(|f| f.is_static)
+            .unwrap_or(false)
     }
 
     fn get_field_info(

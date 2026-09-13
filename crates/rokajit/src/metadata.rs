@@ -199,6 +199,12 @@ mod tests {
             blob.extend(input.frame_size.to_le_bytes());
             blob.extend(input.safepoints.iter().flat_map(|o| o.to_le_bytes()));
             blob.push(input.gc_roots.len() as u8);
+            // Per root: the slot offset, then a flag byte (bit 0 = byref,
+            // bit 1 = pinned) — offsets and flags, not just the count.
+            for root in &input.gc_roots {
+                blob.extend(root.offset.to_le_bytes());
+                blob.push(u8::from(root.is_byref) | (u8::from(root.pinned) << 1));
+            }
             Ok(blob)
         }
         fn encode_unwind_info(&self, input: &UnwindInput) -> CompileResult<Vec<UnwindBlob>> {
@@ -268,6 +274,63 @@ mod tests {
         assert_eq!(meta.unwind[0].bytes, 32u32.to_le_bytes());
         assert!(meta.eh_clauses.is_empty());
         assert!(meta.il_map.is_empty());
+    }
+
+    /// The ref map (step_10.4): every GC-root slot reaches the GC-info
+    /// encoder with its offset and flags intact — a ref arg at its slot,
+    /// a ref IL local, and a byref temp (an interior pointer).
+    #[test]
+    fn gc_root_slots_drain_with_offsets_and_flags() {
+        let roots = vec![
+            GcRootSlot {
+                offset: 8,
+                is_byref: false,
+                pinned: false,
+            },
+            GcRootSlot {
+                offset: 16,
+                is_byref: false,
+                pinned: false,
+            },
+            GcRootSlot {
+                offset: 24,
+                is_byref: true,
+                pinned: false,
+            },
+        ];
+        let mut output = codegen_output(&[0xAA; 16], &[8]);
+        output.frame.gc_roots = roots.clone();
+        let meta = build_metadata(&output, &empty_method(), &EchoTarget).expect("renders");
+
+        // code_len, frame_size, one safepoint (8 + 5), then the roots.
+        assert_eq!(meta.gc_info[0..4], 16u32.to_le_bytes());
+        assert_eq!(meta.gc_info[4..8], 32u32.to_le_bytes());
+        assert_eq!(meta.gc_info[8..12], 13u32.to_le_bytes());
+        assert_eq!(meta.gc_info[12], 3, "three roots");
+        let mut at = 13;
+        for root in &roots {
+            assert_eq!(meta.gc_info[at..at + 4], root.offset.to_le_bytes());
+            assert_eq!(
+                meta.gc_info[at + 4],
+                u8::from(root.is_byref) | (u8::from(root.pinned) << 1),
+                "flags for the slot at {}",
+                root.offset
+            );
+            at += 5;
+        }
+        assert_eq!(meta.gc_info.len(), at, "no trailing bytes");
+
+        // Directly through the builder too (the channel's own API); no
+        // safepoints recorded, so the count byte follows the frame size.
+        let builder = MetadataBuilder::new(16, 32, roots);
+        let meta = builder.finish(&EchoTarget).expect("renders");
+        assert_eq!(meta.gc_info[8], 3);
+        assert_eq!(meta.gc_info[9..13], 8u32.to_le_bytes());
+        assert_eq!(meta.gc_info[13], 0);
+        assert_eq!(meta.gc_info[14..18], 16u32.to_le_bytes());
+        assert_eq!(meta.gc_info[18], 0);
+        assert_eq!(meta.gc_info[19..23], 24u32.to_le_bytes());
+        assert_eq!(meta.gc_info[23], 1, "the byref temp's flag");
     }
 
     /// The EH and IL-map sections are part of the channel even though

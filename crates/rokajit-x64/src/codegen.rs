@@ -943,6 +943,19 @@ impl<'a> Emitter<'a> {
             Inst::Setcc { cc, dst } => self.emit_setcc(cc, dst),
             Inst::MovExt { dst, src, signed } => self.emit_movext(dst, src, signed),
             Inst::Cmp { width, lhs, rhs } => self.emit_cmp(width, lhs, rhs),
+            Inst::LoadMem {
+                width,
+                dst,
+                addr,
+                disp,
+            } => self.emit_load_mem(width, dst, addr, disp),
+            Inst::StoreMem {
+                width,
+                addr,
+                disp,
+                src,
+            } => self.emit_store_mem(width, addr, disp, src),
+            Inst::NullCheck { addr } => self.emit_null_check(addr),
             Inst::Jcc { cc, target } => {
                 self.asm.jcc(cc, target);
                 Ok(())
@@ -1313,6 +1326,100 @@ impl<'a> Emitter<'a> {
             };
             self.asm.cmp(width, lhs_rm, rhs_rmi);
         }
+        Ok(())
+    }
+
+    /// A computed address value materialized into a scratch GPR: a
+    /// frame-resident reference (the common case — GC refs never stay in
+    /// registers) reloads from its slot; a constant goes through the
+    /// wide-imm rule (a null or frozen-ref constant is just an address).
+    fn addr_into(&mut self, src: Src) -> CompileResult<Gpr> {
+        let (p, moves) = self.vs.take_scratch(&[]);
+        self.apply(moves)?;
+        let g = gpr_of(p)?;
+        match self.wide_imm(Width::W64, src, &[p])? {
+            Rmi::Reg(r) => {
+                if r != g {
+                    self.asm.mov(Width::W64, Rm::Reg(g), Rmi::Reg(r));
+                }
+            }
+            Rmi::Mem(m) => self.asm.mov(Width::W64, Rm::Reg(g), Rmi::Mem(m)),
+            Rmi::Imm(i) => self.asm.mov(Width::W64, Rm::Reg(g), Rmi::Imm(i)),
+        }
+        Ok(g)
+    }
+
+    /// `mov width, dst, [addr + disp]` (LIR `Load`, `ldfld`): address into
+    /// one scratch, the load into another, the destination defined per the
+    /// value discipline (a Ref result goes frame-resident at once — the
+    /// root invariant).
+    fn emit_load_mem(
+        &mut self,
+        width: Width,
+        dst: Place,
+        addr: Src,
+        disp: i32,
+    ) -> CompileResult<()> {
+        let g = self.addr_into(addr)?;
+        let (p, moves) = self.vs.take_scratch(&[g.phys()]);
+        self.apply(moves)?;
+        let gd = gpr_of(p)?;
+        self.asm
+            .mov(width, Rm::Reg(gd), Rmi::Mem(Mem::base_disp(g, disp)));
+        match dst {
+            Place::Val(t) => self.define_temp_reg(t.0, gd),
+            Place::Reg(g2) => {
+                let moves = self.vs.clobber(g2.phys());
+                self.apply(moves)?;
+                if g2 != gd {
+                    self.asm.mov(width, Rm::Reg(g2), Rmi::Reg(gd));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// `mov [addr + disp], src` (LIR `Store`, `stfld` of a non-reference
+    /// field). A too-wide constant source materializes through a scratch
+    /// register (the wide-imm rule); a slot-resident source reloads
+    /// through one (no mem,mem form).
+    fn emit_store_mem(
+        &mut self,
+        width: Width,
+        addr: Src,
+        disp: i32,
+        src: Src,
+    ) -> CompileResult<()> {
+        let g = self.addr_into(addr)?;
+        match self.wide_imm(width, src, &[g.phys()])? {
+            src @ (Rmi::Reg(_) | Rmi::Imm(_)) => {
+                self.asm.mov(width, Rm::Mem(Mem::base_disp(g, disp)), src)
+            }
+            Rmi::Mem(m) => {
+                let (p, moves) = self.vs.take_scratch(&[g.phys()]);
+                self.apply(moves)?;
+                let gs = gpr_of(p)?;
+                self.asm.mov(width, Rm::Reg(gs), Rmi::Mem(m));
+                self.asm
+                    .mov(width, Rm::Mem(Mem::base_disp(g, disp)), Rmi::Reg(gs));
+            }
+        }
+        Ok(())
+    }
+
+    /// The explicit null check (step_10.4): the reference into one scratch
+    /// GPR, then a 32-bit load through it into a second scratch, result
+    /// unused — on null the hardware fault is the NullReferenceException
+    /// (the EE's signal translation, the same path `idiv`'s #DE rides).
+    /// Always explicit; folding the check into a small-offset access is a
+    /// later optimization.
+    fn emit_null_check(&mut self, addr: Src) -> CompileResult<()> {
+        let g = self.addr_into(addr)?;
+        let (p, moves) = self.vs.take_scratch(&[g.phys()]);
+        self.apply(moves)?;
+        let gd = gpr_of(p)?;
+        self.asm
+            .mov(Width::W32, Rm::Reg(gd), Rmi::Mem(Mem::base(g)));
         Ok(())
     }
 
@@ -2795,5 +2902,329 @@ mod tests {
             0xC9, 0xC3, // leave; ret
         ];
         assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    // ---- step_10.4: the object pack (loads/stores through refs, null checks) ----
+
+    fn ref_arg(i: u32) -> Local {
+        local(Type::Ref, LocalKind::IlArg(i))
+    }
+
+    /// `int f(C this) => this.x` (x: Int32 at offset 16) — the trap-based
+    /// null check (a throwaway 32-bit load through the reference) followed
+    /// by the field load.
+    #[test]
+    fn ldfld_int_method_bytes() {
+        let m = method(
+            vec![ref_arg(0), int_temp()],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::NullCheck {
+                        arg: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Load {
+                        dst: LocalId(1),
+                        addr: Operand::Local(LocalId(0)),
+                        offset: 16,
+                        ty: Type::Int32,
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg this
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax — the null check:
+            0x8B, 0x08, // movl (%rax), %ecx              — faults iff null
+            0x48, 0x8B, 0x55, 0xF8, // movq -8(%rbp), %rdx — the field load:
+            0x8B, 0x72, 0x10, // movl 16(%rdx), %esi
+            0x89, 0xF0, // movl %esi, %eax              — return value
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(
+            out.frame.gc_roots,
+            vec![rokajit::pipeline::GcRootSlot {
+                offset: 8,
+                is_byref: false,
+                pinned: false,
+            }]
+        );
+    }
+
+    /// `C f(C this) => this.r` (r: a Ref field at offset 24) — a Ref load
+    /// result is frame-resident at definition (the root invariant).
+    #[test]
+    fn ldfld_ref_result_is_frame_resident() {
+        let m = method(
+            vec![ref_arg(0), local(Type::Ref, LocalKind::Temp)],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::NullCheck {
+                        arg: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Load {
+                        dst: LocalId(1),
+                        addr: Operand::Local(LocalId(0)),
+                        offset: 24,
+                        ty: Type::Ref,
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)
+            0x48, 0xC7, 0x45, 0xF0, 0, 0, 0, 0, // movq $0, -16(%rbp) — root zero-init
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax
+            0x8B, 0x08, // movl (%rax), %ecx           — the null check
+            0x48, 0x8B, 0x55, 0xF8, // movq -8(%rbp), %rdx
+            0x48, 0x8B, 0x72, 0x18, // movq 24(%rdx), %rsi
+            0x48, 0x89, 0x75, 0xF0, // movq %rsi, -16(%rbp) — spilled at def
+            0x48, 0x8B, 0x45, 0xF0, // movq -16(%rbp), %rax — return value
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(
+            out.frame.gc_roots,
+            vec![
+                rokajit::pipeline::GcRootSlot {
+                    offset: 8,
+                    is_byref: false,
+                    pinned: false,
+                },
+                rokajit::pipeline::GcRootSlot {
+                    offset: 16,
+                    is_byref: false,
+                    pinned: false,
+                },
+            ]
+        );
+    }
+
+    /// `void f(C this, int v) { this.x = v; }` (x: Int32 at offset 16) —
+    /// the source reloads through a scratch (no mem,mem form).
+    #[test]
+    fn stfld_int_method_bytes() {
+        let m = method(
+            vec![ref_arg(0), int_arg(1)],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::NullCheck {
+                        arg: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Store {
+                        addr: Operand::Local(LocalId(0)),
+                        offset: 16,
+                        src: Operand::Local(LocalId(1)),
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg this
+            0x89, 0x75, 0xF4, // movl %esi, -12(%rbp)      — arg v
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax
+            0x8B, 0x08, // movl (%rax), %ecx           — the null check
+            0x48, 0x8B, 0x55, 0xF8, // movq -8(%rbp), %rdx — address scratch
+            0x8B, 0x75, 0xF4, // movl -12(%rbp), %esi   — source reload
+            0x89, 0x72, 0x10, // movl %esi, 16(%rdx)   — the store
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// A W64 store of a small constant (`null`) uses the imm32 form; one
+    /// past i32's range (a frozen-ref-style address) materializes through
+    /// `movabs` first — the same wide-imm rule as the ALU ops.
+    #[test]
+    fn stfld_constant_store_bytes() {
+        // this.r = null (r: Ref at offset 8).
+        let m = method(
+            vec![ref_arg(0)],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::NullCheck {
+                        arg: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Store {
+                        addr: Operand::Local(LocalId(0)),
+                        offset: 8,
+                        src: Operand::Const(Const::NullRef),
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax
+            0x8B, 0x08, // movl (%rax), %ecx           — the null check
+            0x48, 0x8B, 0x55, 0xF8, // movq -8(%rbp), %rdx
+            0x48, 0xC7, 0x42, 0x08, 0, 0, 0, 0, // movq $0, 8(%rdx)
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+
+        // this.r = <frozen object at 0x1_2345_6789> — the constant does
+        // not fit the sign-extended imm32 field, so it goes through a
+        // scratch (`movabs`).
+        let m = method(
+            vec![ref_arg(0)],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::NullCheck {
+                        arg: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Store {
+                        addr: Operand::Local(LocalId(0)),
+                        offset: 8,
+                        src: Operand::Const(Const::FrozenRef(0x1_2345_6789)),
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax
+            0x8B, 0x08, // movl (%rax), %ecx           — the null check
+            0x48, 0x8B, 0x55, 0xF8, // movq -8(%rbp), %rdx
+            0x48, 0xBE, 0x89, 0x67, 0x45, 0x23, 0x01, 0, 0, 0, // movabsq $0x123456789, %rsi
+            0x48, 0x89, 0x72, 0x08, // movq %rsi, 8(%rdx)
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `void f(C this, C v) { this.r = v; }` (r: Ref at offset 24), from
+    /// IL bytes through the whole pipeline: the importer routes the store
+    /// through `CORINFO_HELP_CHECKED_ASSIGN_REF(&this.r, v)` — the field
+    /// address materializes as a ByRef temp (a GC interior-pointer root)
+    /// computed as `this + 24`, and the helper's dst/src land in rdi/rsi.
+    #[test]
+    fn stfld_ref_write_barrier_end_to_end() {
+        use rokajit::pipeline::MethodInfo;
+        use rokajit_ee::enums::CorInfoType;
+        use rokajit_ee::mock::MockSig;
+
+        const REF_FIELD: u32 = 0x0400_0002;
+        let mut ee = MockEe::default();
+        ee.add_field(REF_FIELD, CorInfoType::Class, 24);
+        let entry = MockSig {
+            ret: CorInfoType::Void,
+            args: vec![CorInfoType::Class],
+            has_this: true,
+        };
+        // ldarg.0; ldarg.1; stfld 0x04000002; ret
+        let il = [0x02, 0x03, 0x7D, 0x02, 0x00, 0x00, 0x04, 0x2A];
+        let info = MethodInfo {
+            ftn: handle(1),
+            il: il.to_vec(),
+            max_stack: 8,
+            eh_count: 0,
+            init_locals: false,
+            args: ee.make_method_sig(&entry),
+            locals: ee.make_locals_sig(&[]),
+        };
+        let hir = rokajit::pipeline::import(&info, &ee).expect("imports");
+        let hir = rokajit::pipeline::morph(hir).expect("morphs");
+        let lir = rokajit::pipeline::lower(hir, &crate::X64Target).expect("lowers");
+        let out = rokajit::pipeline::codegen(&lir, &ee, &crate::X64Target, Tier::Tier0)
+            .expect("tier-0 codegen");
+
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg this
+            0x48, 0x89, 0x75, 0xF0, // movq %rsi, -16(%rbp) — arg v
+            0x48, 0xC7, 0x45, 0xE8, 0, 0, 0, 0, // movq $0, -24(%rbp) — ByRef temp root
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax
+            0x8B, 0x08, // movl (%rax), %ecx           — the null check
+            0x48, 0x8B, 0x55, 0xF8, // movq -8(%rbp), %rdx — &this.r:
+            0x48, 0x83, 0xC2, 0x18, // addq $24, %rdx
+            0x48, 0x89, 0x55, 0xE8, // movq %rdx, -24(%rbp) — ByRef root at def
+            0x48, 0x8B, 0x7D, 0xE8, // movq -24(%rbp), %rdi — barrier arg 0 (dst)
+            0x48, 0x8B, 0x75, 0xF0, // movq -16(%rbp), %rsi — barrier arg 1 (src)
+            0xE8, 0, 0, 0, 0, // call CHECKED_ASSIGN_REF (patched by 07.7)
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+
+        // The barrier call is a helper safepoint (no method/sig recorded);
+        // all three GC slots are roots, the ByRef temp flagged as such.
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].offset, 50);
+        assert_eq!(out.call_sites[0].method, None);
+        assert_eq!(out.call_sites[0].sig, None);
+        assert_eq!(out.relocations.len(), 1);
+        assert_eq!(out.relocations[0].offset, 51);
+        assert_eq!(
+            out.frame.gc_roots,
+            vec![
+                rokajit::pipeline::GcRootSlot {
+                    offset: 8,
+                    is_byref: false,
+                    pinned: false,
+                },
+                rokajit::pipeline::GcRootSlot {
+                    offset: 16,
+                    is_byref: false,
+                    pinned: false,
+                },
+                rokajit::pipeline::GcRootSlot {
+                    offset: 24,
+                    is_byref: true,
+                    pinned: false,
+                },
+            ]
+        );
     }
 }

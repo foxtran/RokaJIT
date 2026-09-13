@@ -405,18 +405,20 @@ PANIC_RE = re.compile(r"rokajit: panic in compileMethod")
 # (step_10.1 landed compare-as-value, unary/conv and the div/shift/logic
 # ops, so their rules are gone; step_10.2 landed floats, so the
 # float-argument rule is gone; step_10.3 landed ldstr and the GC slot
-# table, so the slot-table rule is gone; messages evolve with the
-# importer.)
+# table, so the slot-table rule is gone; step_10.4 landed the object
+# pack, so the byref-load/store and null-check lowering rules are gone;
+# messages evolve with the importer.)
 BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"EH regions|EH control flow|EH clauses|draining EH clauses"), "EH (try/catch/finally)"),
     (re.compile(r"generic methods"), "generics"),
-    (re.compile(r"value types in signatures|structs:"), "structs & value types"),
+    (re.compile(r"value types in signatures|structs:|non-class receiver \(value types\)"), "structs & value types"),
     (re.compile(r"arrays:"), "arrays"),
     (re.compile(r"static fields"), "static fields"),
-    (re.compile(r"byref / field access|byref \(stind/stfld\)"), "objects & fields (byref/field access)"),
+    (re.compile(r"field type outside the 10\.4 object pack"), "field types outside the object pack"),
+    (re.compile(r"allocation helper outside the newobj set"), "allocation helpers outside the newobj set"),
+    (re.compile(r"class handle through an indirection cell"), "class handle indirection (IAT_PVALUE/PPVALUE)"),
     (re.compile(r"cast/box"), "boxing & casts"),
     (re.compile(r"switch:"), "switch"),
-    (re.compile(r"null checks"), "null checks"),
     (re.compile(r"ldstr through a handle-cell"), "ldstr indirection (IAT_PVALUE/PPVALUE)"),
     (re.compile(r"non-direct call kind"), "non-direct calls (callvirt/calli)"),
     (re.compile(r"non-default calling convention"), "non-default calling conventions"),

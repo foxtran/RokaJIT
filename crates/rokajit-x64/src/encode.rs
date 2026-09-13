@@ -23,6 +23,7 @@
 //! | `Setcc`               | [`Asm::setcc`]                              |
 //! | `MovExt`              | [`Asm::movsxd`] / a 32-bit [`Asm::mov`]     |
 //! | `Cmp`                 | [`Asm::cmp`] (+ [`Asm::test`])              |
+//! | `LoadMem` / `StoreMem` / `NullCheck` | [`Asm::mov`] (reg↔mem, through a scratch-GPR address) |
 //! | `Jcc` / `Jmp`         | [`Asm::jcc`] / [`Asm::jmp`]                 |
 //! | `CallDirect` / `CallHelper` | [`Asm::call`]                       |
 //! | `Push` / `AllocFrame` | [`Asm::push`] / [`Asm::sub`] on `rsp`       |
