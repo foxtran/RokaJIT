@@ -46,6 +46,51 @@ pub enum Type {
     Struct(ClassHandle),
 }
 
+/// The shape of the memory cell a `Load`/`StoreInd` (HIR) or
+/// `Load`/`Store` (LIR) touches, when it is narrower than the value's
+/// stack type. Sub-Int32 fields (`ldfld`/`stfld` of `bool`/`char`/
+/// `sbyte`/…) are the source: ECMA-335 §III.1.1.1 normalizes the value
+/// to `Int32` on the evaluation stack, but the field keeps its metadata
+/// size — a 4-byte access would read or clobber the neighboring bytes.
+/// Loads extend to `Int32`, signed per the field's metadata type
+/// (ELEMENT_TYPE_I1/I2 sign-extend; BOOLEAN/CHAR/U1/U2 zero-extend);
+/// stores write only the low bytes (extension is a store-time no-op, so
+/// the store forms carry the width only).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MemAccess {
+    /// The type's natural width — every access except a sub-Int32 field.
+    Natural,
+    /// 1 byte, sign-extended on load (ELEMENT_TYPE_I1).
+    I8,
+    /// 1 byte, zero-extended on load (ELEMENT_TYPE_BOOLEAN/U1).
+    U8,
+    /// 2 bytes, sign-extended on load (ELEMENT_TYPE_I2).
+    I16,
+    /// 2 bytes, zero-extended on load (ELEMENT_TYPE_CHAR/U2).
+    U16,
+}
+
+impl MemAccess {
+    /// `true` when the access is the value type's natural width.
+    pub fn is_natural(self) -> bool {
+        matches!(self, MemAccess::Natural)
+    }
+
+    /// The cell size in bytes for a narrow access, `None` for `Natural`.
+    pub fn narrow_bytes(self) -> Option<u8> {
+        match self {
+            MemAccess::Natural => None,
+            MemAccess::I8 | MemAccess::U8 => Some(1),
+            MemAccess::I16 | MemAccess::U16 => Some(2),
+        }
+    }
+
+    /// `true` when a load of this shape sign-extends (the I1/I2 forms).
+    pub fn sign_extends(self) -> bool {
+        matches!(self, MemAccess::I8 | MemAccess::I16)
+    }
+}
+
 /// Identity of a local slot. Indices `0..num_args` are the IL arguments,
 /// `num_args..num_args+num_il_locals` the IL locals, everything above is a
 /// compiler temp. One flat namespace, like RyuJIT's `lvaTable`.
@@ -197,6 +242,9 @@ pub mod hir {
             addr: Expr,
             offset: u32,
             value: Expr,
+            /// The memory cell's shape (sub-Int32 fields; [`MemAccess::Natural`]
+            /// everywhere else).
+            access: MemAccess,
         },
         /// Zero a block of memory (`initobj`): `size_of(class)` bytes at
         /// `addr` (step_10.9).
@@ -258,6 +306,9 @@ pub mod hir {
             addr: Box<Expr>,
             offset: u32,
             ty: Type,
+            /// The memory cell's shape (sub-Int32 fields; [`MemAccess::Natural`]
+            /// everywhere else). Narrow accesses always produce `Int32`.
+            access: MemAccess,
         },
         /// Instance field access: object plus the EE-supplied offset.
         /// `offset` is baked at import (`getFieldOffset`); lowering turns
@@ -442,12 +493,14 @@ pub mod lir {
             addr: Operand,
             offset: u32,
             ty: Type,
+            access: MemAccess,
         },
         /// Store through a byref operand at a constant offset.
         Store {
             addr: Operand,
             offset: u32,
             src: Operand,
+            access: MemAccess,
         },
         /// **A call in LIR is always a top-level statement** whose result,
         /// if any, lands in a fresh temp. Arguments are operands — any

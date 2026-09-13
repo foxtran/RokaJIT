@@ -1946,6 +1946,31 @@ impl<'a> Emitter<'a> {
                 disp,
                 src,
             } => self.emit_store_mem(width, addr, disp, src),
+            Inst::LoadMemNarrow {
+                size,
+                signed,
+                dst,
+                addr,
+                disp,
+            } => self.emit_load_mem_narrow(size, signed, dst, addr, disp),
+            Inst::StoreMemNarrow {
+                size,
+                addr,
+                disp,
+                src,
+            } => self.emit_store_mem_narrow(size, addr, disp, src),
+            Inst::LoadMemF {
+                width,
+                dst,
+                addr,
+                disp,
+            } => self.emit_load_mem_f(width, dst, addr, disp),
+            Inst::StoreMemF {
+                width,
+                addr,
+                disp,
+                src,
+            } => self.emit_store_mem_f(width, addr, disp, src),
             Inst::NullCheck { addr } => self.emit_null_check(addr),
             Inst::LoadEightbyte {
                 addr,
@@ -2478,6 +2503,103 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// `movzx`/`movsx dst, [addr + disp]` — a sub-Int32 field load
+    /// (`ldfld` of bool/char/sbyte/…). Same two-scratch discipline as
+    /// [`Emitter::emit_load_mem`]; the result is a clean Int32.
+    fn emit_load_mem_narrow(
+        &mut self,
+        size: u8,
+        signed: bool,
+        dst: Place,
+        addr: Src,
+        disp: i32,
+    ) -> CompileResult<()> {
+        let g = self.addr_into(addr)?;
+        let (p, moves) = self.vs.take_scratch(&[g.phys()]);
+        self.apply(moves)?;
+        let gd = gpr_of(p)?;
+        let mem = Mem::base_disp(g, disp);
+        if signed {
+            self.asm.movsx_load(size, gd, mem);
+        } else {
+            self.asm.movzx_load(size, gd, mem);
+        }
+        match dst {
+            Place::Val(t) => self.define_temp_reg(t.0, gd),
+            Place::Reg(g2) => {
+                let moves = self.vs.clobber(g2.phys());
+                self.apply(moves)?;
+                if g2 != gd {
+                    self.asm.mov(Width::W32, Rm::Reg(g2), Rmi::Reg(gd));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// `mov [addr + disp], src_low` — a sub-Int32 field store. The narrow
+    /// forms have no immediate encoding, so a constant (and a
+    /// slot-resident value — no mem,mem) materializes into a scratch.
+    fn emit_store_mem_narrow(
+        &mut self,
+        size: u8,
+        addr: Src,
+        disp: i32,
+        src: Src,
+    ) -> CompileResult<()> {
+        let g = self.addr_into(addr)?;
+        let gs = match self.rmi_of(src)? {
+            Rmi::Reg(gs) => gs,
+            src @ (Rmi::Mem(_) | Rmi::Imm(_)) => {
+                let (p, moves) = self.vs.take_scratch(&[g.phys()]);
+                self.apply(moves)?;
+                let gs = gpr_of(p)?;
+                self.asm.mov(Width::W32, Rm::Reg(gs), src);
+                gs
+            }
+        };
+        self.asm.mov_store_narrow(size, Mem::base_disp(g, disp), gs);
+        Ok(())
+    }
+
+    /// `movss`/`movsd dst, [addr + disp]` — a float field load: the
+    /// address into a scratch GPR, the load into the XMM scratch, the
+    /// destination defined per the slot-resident float discipline.
+    fn emit_load_mem_f(
+        &mut self,
+        width: FWidth,
+        dst: XmmPlace,
+        addr: Src,
+        disp: i32,
+    ) -> CompileResult<()> {
+        let g = self.addr_into(addr)?;
+        self.asm
+            .mov_f_load(width, SCRATCH_XMM_A, RmX::Mem(Mem::base_disp(g, disp)));
+        self.define_xmm(dst, width, SCRATCH_XMM_A)
+    }
+
+    /// `movss`/`movsd [addr + disp], src` — a float field store. A
+    /// slot-resident source reloads through the XMM scratch (no mem,mem
+    /// SSE form).
+    fn emit_store_mem_f(
+        &mut self,
+        width: FWidth,
+        addr: Src,
+        disp: i32,
+        src: XmmSrc,
+    ) -> CompileResult<()> {
+        let g = self.addr_into(addr)?;
+        let x = match self.rmx_of(src, width, SCRATCH_XMM_A)? {
+            RmX::Reg(x) => x,
+            m @ RmX::Mem(_) => {
+                self.asm.mov_f_load(width, SCRATCH_XMM_A, m);
+                SCRATCH_XMM_A
+            }
+        };
+        self.asm.mov_f_store(width, Mem::base_disp(g, disp), x);
+        Ok(())
+    }
+
     /// The explicit null check (step_10.4): the reference into one scratch
     /// GPR, then a 32-bit load through it into a second scratch, result
     /// unused — on null the hardware fault is the NullReferenceException
@@ -2586,7 +2708,7 @@ mod tests {
     use super::*;
     use rokajit::ir::hir::{Local, LocalKind};
     use rokajit::ir::lir::{Block, BranchCond, Operand, Stmt, StmtKind};
-    use rokajit::ir::{BinaryOp, BlockId, Const, IL_OFFSET_NONE};
+    use rokajit::ir::{BinaryOp, BlockId, Const, MemAccess, IL_OFFSET_NONE};
     use rokajit::pipeline::Tier;
     use rokajit_ee::enums::CorJitFuncKind;
     use rokajit_ee::mock::MockEe;
@@ -4809,6 +4931,7 @@ mod tests {
                         addr: Operand::Local(LocalId(0)),
                         offset: 16,
                         ty: Type::Int32,
+                        access: MemAccess::Natural,
                     }),
                     stmt(StmtKind::Return {
                         value: Some(Operand::Temp(LocalId(1))),
@@ -4860,6 +4983,7 @@ mod tests {
                         addr: Operand::Local(LocalId(0)),
                         offset: 24,
                         ty: Type::Ref,
+                        access: MemAccess::Natural,
                     }),
                     stmt(StmtKind::Return {
                         value: Some(Operand::Temp(LocalId(1))),
@@ -4919,6 +5043,7 @@ mod tests {
                         addr: Operand::Local(LocalId(0)),
                         offset: 16,
                         src: Operand::Local(LocalId(1)),
+                        access: MemAccess::Natural,
                     }),
                     stmt(StmtKind::Return { value: None }),
                 ],
@@ -4962,6 +5087,7 @@ mod tests {
                         addr: Operand::Local(LocalId(0)),
                         offset: 8,
                         src: Operand::Const(Const::NullRef),
+                        access: MemAccess::Natural,
                     }),
                     stmt(StmtKind::Return { value: None }),
                 ],
@@ -4999,6 +5125,7 @@ mod tests {
                         addr: Operand::Local(LocalId(0)),
                         offset: 8,
                         src: Operand::Const(Const::FrozenRef(0x1_2345_6789)),
+                        access: MemAccess::Natural,
                     }),
                     stmt(StmtKind::Return { value: None }),
                 ],
@@ -5170,6 +5297,7 @@ mod tests {
                         addr: Operand::Temp(LocalId(4)),
                         offset: 0,
                         ty: Type::Int32,
+                        access: MemAccess::Natural,
                     }),
                     stmt(StmtKind::Copy {
                         dst: LocalId(1),

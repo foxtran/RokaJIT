@@ -238,6 +238,7 @@ impl Flatten<'_> {
                     addr,
                     offset,
                     value,
+                    access,
                 } => {
                     // Store through a byref at a constant offset (`stfld`).
                     // Address first, then the value — the IL push order the
@@ -266,6 +267,7 @@ impl Flatten<'_> {
                                 addr,
                                 offset: *offset,
                                 src,
+                                access: *access,
                             },
                         );
                     }
@@ -393,7 +395,12 @@ impl Flatten<'_> {
                     None => Err(CompileError::Internal("void call used as a value")),
                 }
             }
-            hir::Expr::Load { addr, offset, ty } => {
+            hir::Expr::Load {
+                addr,
+                offset,
+                ty,
+                access,
+            } => {
                 // Load through a byref at a constant offset (`ldfld`).
                 let addr = self.flatten_expr(addr, out, il)?;
                 let addr = self.addr_value(addr, out, il);
@@ -406,6 +413,7 @@ impl Flatten<'_> {
                         addr,
                         offset: *offset,
                         ty: *ty,
+                        access: *access,
                     },
                 );
                 Ok(lir::Operand::Temp(dst))
@@ -1022,6 +1030,7 @@ mod tests {
                     }),
                     offset: 8,
                     ty: Type::Int32,
+                    access: crate::ir::MemAccess::Natural,
                 }),
             },
         )));
@@ -1039,11 +1048,13 @@ mod tests {
                 addr,
                 offset,
                 ty,
+                access,
             } => {
                 assert_eq!(*dst, LocalId(1), "fresh temp after the one arg");
                 assert_eq!(*addr, lir::Operand::Local(LocalId(0)));
                 assert_eq!(*offset, 8);
                 assert_eq!(*ty, Type::Int32);
+                assert_eq!(*access, crate::ir::MemAccess::Natural);
                 assert_eq!(m.locals[1].ty, Type::Int32);
             }
             _ => panic!("expected Load"),
@@ -1061,6 +1072,7 @@ mod tests {
                 },
                 offset: 8,
                 value: hir::Expr::Const(Const::Int32(42)),
+                access: crate::ir::MemAccess::Natural,
             })],
             hir::Terminator::Return { value: None },
         )));
@@ -1068,10 +1080,16 @@ mod tests {
         assert_eq!(stmts.len(), 3, "null check, store, return");
         assert!(matches!(stmts[0].kind, lir::StmtKind::NullCheck { .. }));
         match &stmts[1].kind {
-            lir::StmtKind::Store { addr, offset, src } => {
+            lir::StmtKind::Store {
+                addr,
+                offset,
+                src,
+                access,
+            } => {
                 assert_eq!(*addr, lir::Operand::Local(LocalId(0)));
                 assert_eq!(*offset, 8);
                 assert_eq!(*src, lir::Operand::Const(Const::Int32(42)));
+                assert_eq!(*access, crate::ir::MemAccess::Natural);
             }
             _ => panic!("expected Store"),
         }
@@ -1224,6 +1242,7 @@ mod tests {
                         addr: Box::new(hir::Expr::LocalAddr(LocalId(1))),
                         class: c,
                     },
+                    access: crate::ir::MemAccess::Natural,
                 })],
                 hir::Terminator::Return { value: None },
             ),

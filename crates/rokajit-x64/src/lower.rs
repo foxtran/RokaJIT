@@ -23,7 +23,7 @@
 
 use rokajit::error::{CompileError, CompileResult};
 use rokajit::ir::lir::{BranchCond, Operand, StmtKind::*};
-use rokajit::ir::{lir, BinaryOp, BlockId, CallSig, Const, LocalId, Type};
+use rokajit::ir::{lir, BinaryOp, BlockId, CallSig, Const, LocalId, MemAccess, Type};
 use rokajit::lower::{Cx, Label, Val};
 use rokajit::target::ArgLocation;
 
@@ -59,6 +59,13 @@ pub(crate) fn width_of_ty(ty: Type) -> Option<Width> {
         Type::Int64 | Type::NativeInt | Type::Ref | Type::ByRef => Some(Width::W64),
         Type::Float | Type::Double | Type::Struct(_) | Type::Void => None,
     }
+}
+
+/// `Some(())` when the memory access is the type's natural width — a
+/// guard helper so the natural-width rules and the narrow/float field
+/// rules stay disjoint.
+fn natural_only(access: MemAccess) -> Option<()> {
+    access.is_natural().then_some(())
 }
 
 /// The width of a local/arg/temp slot.
@@ -412,12 +419,42 @@ rokajit::lower_rules! {
     /// `t := [addr + disp]` — `ldfld`'s load through the (already
     /// null-checked) object reference (step_10.4). The address operand is
     /// usually a frame-resident GC ref; codegen loads it into a scratch
-    /// GPR first. Float field types match no rule (`width_of_ty` is the
-    /// GPR-width gate).
-    rule load_mem: Load { dst, addr, offset, ty }
-        if let (Some(w), Some(a)) = (width_of_ty(*ty), operand_src(*addr))
+    /// GPR first. Natural-width GPR types only: floats match
+    /// `load_mem_f`, sub-Int32 fields match `load_mem_narrow`.
+    rule load_mem: Load { dst, addr, offset, ty, access }
+        if let (Some(w), Some(a), Some(())) = (
+            width_of_ty(*ty),
+            operand_src(*addr),
+            natural_only(*access),
+        )
         => |_| vec![Inst::LoadMem {
             width: w,
+            dst: Place::Val(Val(*dst)),
+            addr: a,
+            disp: *offset as i32,
+        }];
+
+    /// `t := [addr + disp]` — a float field load (`movss`/`movsd`).
+    rule load_mem_f: Load { dst, addr, offset, ty, access }
+        if let (Some(w), Some(a), Some(())) = (
+            FWidth::of(*ty),
+            operand_src(*addr),
+            natural_only(*access),
+        )
+        => |_| vec![Inst::LoadMemF {
+            width: w,
+            dst: XmmPlace::Val(Val(*dst)),
+            addr: a,
+            disp: *offset as i32,
+        }];
+
+    /// `t := [addr + disp]` — a sub-Int32 field load: `size` bytes,
+    /// zero- or sign-extended per the field's metadata type.
+    rule load_mem_narrow: Load { dst, addr, offset, access, .. }
+        if let (Some(size), Some(a)) = (access.narrow_bytes(), operand_src(*addr))
+        => |_| vec![Inst::LoadMemNarrow {
+            size,
+            signed: access.sign_extends(),
             dst: Place::Val(Val(*dst)),
             addr: a,
             disp: *offset as i32,
@@ -426,15 +463,48 @@ rokajit::lower_rules! {
     /// `[addr + disp] := src` — `stfld`'s store through the (already
     /// null-checked) object reference. A reference-typed store never
     /// reaches here: the importer routes it through the write-barrier
-    /// helper call. The width is the source operand's.
-    rule store_mem: Store { addr, offset, src }
-        if let (Some(a), Some(s), Some(w)) = (
+    /// helper call. The width is the source operand's. Natural-width GPR
+    /// sources only: floats match `store_mem_f`, sub-Int32 fields match
+    /// `store_mem_narrow`.
+    rule store_mem: Store { addr, offset, src, access }
+        if let (Some(a), Some(s), Some(w), Some(())) = (
             operand_src(*addr),
             operand_src(*src),
             operand_width(cx, *src),
+            natural_only(*access),
         )
         => |_| vec![Inst::StoreMem {
             width: w,
+            addr: a,
+            disp: *offset as i32,
+            src: s,
+        }];
+
+    /// `[addr + disp] := src` — a float field store (`movss`/`movsd`).
+    rule store_mem_f: Store { addr, offset, src, access }
+        if let (Some(a), Some(s), Some(w), Some(())) = (
+            operand_src(*addr),
+            xmm_opnd(cx, *src),
+            operand_fwidth(cx, *src),
+            natural_only(*access),
+        )
+        => |_| vec![Inst::StoreMemF {
+            width: w,
+            addr: a,
+            disp: *offset as i32,
+            src: s,
+        }];
+
+    /// `[addr + disp] := src_low` — a sub-Int32 field store: only the
+    /// low `size` bytes of the Int32 source write to memory.
+    rule store_mem_narrow: Store { addr, offset, src, access }
+        if let (Some(size), Some(a), Some(s)) = (
+            access.narrow_bytes(),
+            operand_src(*addr),
+            operand_src(*src),
+        )
+        => |_| vec![Inst::StoreMemNarrow {
+            size,
             addr: a,
             disp: *offset as i32,
             src: s,
@@ -1817,7 +1887,7 @@ mod tests {
     // --- step_10.4: the object pack rules ---
 
     /// Locals: Ref 0 (`this`), Int32 1 (an int result), Ref 2 (a ref
-    /// result), ByRef 3 (a field-address temp).
+    /// result), ByRef 3 (a field-address temp), Double 4 (a float slot).
     fn locals_obj() -> Vec<hir::Local> {
         let l = |ty: Type, i: u32| hir::Local {
             ty,
@@ -1829,6 +1899,7 @@ mod tests {
             l(Type::Int32, 1),
             l(Type::Ref, 2),
             l(Type::ByRef, 3),
+            l(Type::Double, 4),
         ]
     }
 
@@ -1844,6 +1915,7 @@ mod tests {
             addr: Operand::Local(LocalId(0)),
             offset: 16,
             ty: Type::Int32,
+            access: MemAccess::Natural,
         });
         assert_eq!(
             lower_obj(&s),
@@ -1860,6 +1932,7 @@ mod tests {
             addr: Operand::Local(LocalId(0)),
             offset: 24,
             ty: Type::Ref,
+            access: MemAccess::Natural,
         });
         assert_eq!(
             lower_obj(&s),
@@ -1870,14 +1943,59 @@ mod tests {
                 disp: 24,
             }])
         );
-        // A float field load matches no rule (outside the 10.4 pack).
+        // A float field load: `movsd` from memory (step_10.10).
         let s = stmt(StmtKind::Load {
-            dst: LocalId(1),
+            dst: LocalId(4),
             addr: Operand::Local(LocalId(0)),
             offset: 8,
             ty: Type::Double,
+            access: MemAccess::Natural,
         });
-        assert_eq!(lower_obj(&s), None);
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::LoadMemF {
+                width: FWidth::D,
+                dst: xval(4),
+                addr: vsrc(0),
+                disp: 8,
+            }])
+        );
+        // A sub-Int32 field load: zero- or sign-extended per the metadata
+        // type (step_10.10).
+        let s = stmt(StmtKind::Load {
+            dst: LocalId(1),
+            addr: Operand::Local(LocalId(0)),
+            offset: 4,
+            ty: Type::Int32,
+            access: MemAccess::U16,
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::LoadMemNarrow {
+                size: 2,
+                signed: false,
+                dst: val(1),
+                addr: vsrc(0),
+                disp: 4,
+            }])
+        );
+        let s = stmt(StmtKind::Load {
+            dst: LocalId(1),
+            addr: Operand::Local(LocalId(0)),
+            offset: 4,
+            ty: Type::Int32,
+            access: MemAccess::I8,
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::LoadMemNarrow {
+                size: 1,
+                signed: true,
+                dst: val(1),
+                addr: vsrc(0),
+                disp: 4,
+            }])
+        );
     }
 
     #[test]
@@ -1887,6 +2005,7 @@ mod tests {
             addr: Operand::Local(LocalId(0)),
             offset: 16,
             src: Operand::Local(LocalId(1)),
+            access: MemAccess::Natural,
         });
         assert_eq!(
             lower_obj(&s),
@@ -1902,6 +2021,7 @@ mod tests {
             addr: Operand::Local(LocalId(0)),
             offset: 8,
             src: Operand::Const(Const::Int32(0)),
+            access: MemAccess::Natural,
         });
         assert_eq!(
             lower_obj(&s),
@@ -1910,6 +2030,38 @@ mod tests {
                 addr: vsrc(0),
                 disp: 8,
                 src: Src::Imm(0),
+            }])
+        );
+        // A float field store: `movsd` to memory (step_10.10).
+        let s = stmt(StmtKind::Store {
+            addr: Operand::Local(LocalId(0)),
+            offset: 8,
+            src: Operand::Local(LocalId(4)),
+            access: MemAccess::Natural,
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::StoreMemF {
+                width: FWidth::D,
+                addr: vsrc(0),
+                disp: 8,
+                src: xsrc(4),
+            }])
+        );
+        // A sub-Int32 field store: only the low bytes write (step_10.10).
+        let s = stmt(StmtKind::Store {
+            addr: Operand::Local(LocalId(0)),
+            offset: 4,
+            src: Operand::Local(LocalId(1)),
+            access: MemAccess::U8,
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::StoreMemNarrow {
+                size: 1,
+                addr: vsrc(0),
+                disp: 4,
+                src: vsrc(1),
             }])
         );
     }

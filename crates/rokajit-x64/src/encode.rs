@@ -961,6 +961,18 @@ impl Asm {
         self.emit_modrm_insn(false, dst as u8, Rm::Mem(src), &[0x0F, opcode]);
     }
 
+    /// `movsx r32, r/m8` (`0F BE`) or `movsx r32, r/m16` (`0F BF`) — the
+    /// signed twin of [`Asm::movzx_load`]: sub-Int32 field loads of the
+    /// I1/I2 metadata types sign-extend (ECMA-335 §III.1.1.1).
+    pub fn movsx_load(&mut self, size: u8, dst: Gpr, src: Mem) {
+        let opcode = match size {
+            1 => 0xBE,
+            2 => 0xBF,
+            _ => unreachable!("movsx_load covers 1- and 2-byte chunks"),
+        };
+        self.emit_modrm_insn(false, dst as u8, Rm::Mem(src), &[0x0F, opcode]);
+    }
+
     /// `mov r/m8, r8` (`88 /r`) or `mov r/m16, r16` (`66 89 /r`) — the
     /// narrow block-copy stores (step_10.9). The 8-bit form always carries
     /// a REX prefix so `sil`/`dil` and r8+ stay encodable.

@@ -81,7 +81,7 @@ use rokajit_ffi as ffi;
 
 use crate::error::{CompileError, CompileResult};
 use crate::ir::{
-    hir, BinaryOp, BlockId, CallSig, CallTarget, Const, IlOffset, LocalId, Type, UnaryOp,
+    hir, BinaryOp, BlockId, CallSig, CallTarget, Const, IlOffset, LocalId, MemAccess, Type, UnaryOp,
 };
 use crate::pipeline::MethodInfo;
 use crate::structs::{layout_of, StructLayouts};
@@ -286,9 +286,52 @@ fn sig_elem_type(
     })
 }
 
+/// The stack type and memory shape of a *stored* element of EE type `ty`
+/// (a field, or the payload of an unboxed primitive): unlike
+/// [`sig_elem_type`] — the signature/eval-stack view — the sub-Int32
+/// types keep their cell width in [`MemAccess`], and `ByRef`/`Undef`/
+/// `Void` are rejected (no such storage is in the supported set).
+fn corinfo_mem_type(ty: CorInfoType) -> CompileResult<(Type, MemAccess)> {
+    Ok(match ty {
+        CorInfoType::Bool => (Type::Int32, MemAccess::U8),
+        CorInfoType::Char => (Type::Int32, MemAccess::U16),
+        // CORINFO_TYPE_BYTE is ELEMENT_TYPE_I1 — the SIGNED byte
+        // (jitinterface.cpp asCorInfoType's element map); UBYTE is U1.
+        CorInfoType::Byte => (Type::Int32, MemAccess::I8),
+        CorInfoType::UByte => (Type::Int32, MemAccess::U8),
+        CorInfoType::Short => (Type::Int32, MemAccess::I16),
+        CorInfoType::UShort => (Type::Int32, MemAccess::U16),
+        CorInfoType::Int | CorInfoType::UInt => (Type::Int32, MemAccess::Natural),
+        CorInfoType::Long | CorInfoType::ULong => (Type::Int64, MemAccess::Natural),
+        CorInfoType::NativeInt | CorInfoType::NativeUInt | CorInfoType::Ptr => {
+            (Type::NativeInt, MemAccess::Natural)
+        }
+        CorInfoType::Float => (Type::Float, MemAccess::Natural),
+        CorInfoType::Double => (Type::Double, MemAccess::Natural),
+        CorInfoType::Class => (Type::Ref, MemAccess::Natural),
+        _ => {
+            return Err(CompileError::Unsupported(
+                "field type outside the object pack",
+            ));
+        }
+    })
+}
+
 fn check_call_conv(call_conv: ffi::CorInfoCallConv) -> CompileResult<()> {
     if call_conv & ffi::CorInfoCallConv_CORINFO_CALLCONV_GENERIC != 0 {
         return Err(CompileError::Unsupported("generic methods"));
+    }
+    // CORINFO_CALLCONV_PARAMTYPE (corinfo.h:666): the method is shared
+    // generic code and takes a hidden instantiation argument after its
+    // declared parameters — e.g. a static method on a generic type
+    // (`MyG<T,U>.foo()`). The flag sits above the 4-bit convention mask,
+    // so the mask check alone lets it through; without it the compiled
+    // body would run with no generic context at all — a silent
+    // wrong-result, not a crash.
+    if call_conv & ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE != 0 {
+        return Err(CompileError::Unsupported(
+            "generic methods (shared code needs the hidden context argument)",
+        ));
     }
     if call_conv & ffi::CorInfoCallConv_CORINFO_CALLCONV_MASK
         != ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT
@@ -1730,6 +1773,7 @@ impl BlockImport<'_> {
                     addr: hir::Expr::Local(retbuf),
                     offset: 0,
                     value,
+                    access: MemAccess::Natural,
                 },
             });
             return Ok(hir::Terminator::Return {
@@ -1999,27 +2043,20 @@ impl BlockImport<'_> {
         ))
     }
 
-    /// The IR type of a field, gated to the object pack plus value-class
-    /// fields (step_10.9): the full-width integers, native ints/pointers,
-    /// object references, and structs (whose layout is queried into the
-    /// side table). The sub-Int32 metadata types need width-correct
-    /// loads/stores and floats need machinery the pack doesn't have.
-    fn field_ir_type(&mut self, field: FieldHandle) -> CompileResult<Type> {
+    /// The IR type and memory-access shape of a field (the step_10.4
+    /// object pack plus value-class fields, step_10.9, plus the float and
+    /// sub-Int32 field widths, step_10.10): the full-width integers,
+    /// native ints/pointers, floats, object references, and structs
+    /// (whose layout is queried into the side table). The sub-Int32
+    /// metadata types are `Int32` on the stack (ECMA-335 §III.1.1.1) but
+    /// keep their 1-/2-byte cell — [`MemAccess`] carries that shape.
+    fn field_mem_type(&mut self, field: FieldHandle) -> CompileResult<(Type, MemAccess)> {
         let (ty, value_class) = self.ee.get_field_type(field);
-        match ty {
-            CorInfoType::Int | CorInfoType::UInt => Ok(Type::Int32),
-            CorInfoType::Long | CorInfoType::ULong => Ok(Type::Int64),
-            CorInfoType::NativeInt | CorInfoType::NativeUInt | CorInfoType::Ptr => {
-                Ok(Type::NativeInt)
-            }
-            CorInfoType::Class => Ok(Type::Ref),
-            CorInfoType::ValueClass => {
-                sig_elem_type(Some(ty), value_class, self.ee, &mut self.struct_layouts)
-            }
-            _ => Err(CompileError::Unsupported(
-                "field type outside the 10.4 object pack",
-            )),
+        if let CorInfoType::ValueClass = ty {
+            let ty = sig_elem_type(Some(ty), value_class, self.ee, &mut self.struct_layouts)?;
+            return Ok((ty, MemAccess::Natural));
         }
+        corinfo_mem_type(ty)
     }
 
     /// The receiver of a field access: a class reference (null-checked at
@@ -2063,7 +2100,7 @@ impl BlockImport<'_> {
         il_offset: IlOffset,
     ) -> CompileResult<()> {
         let (field, offset, byref_ok) = self.resolve_instance_field(token)?;
-        let ty = self.field_ir_type(field)?;
+        let (ty, access) = self.field_mem_type(field)?;
         let (obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
         let obj = if null_check {
             hir::Expr::NullCheck { arg: Box::new(obj) }
@@ -2090,6 +2127,7 @@ impl BlockImport<'_> {
                 addr: Box::new(obj),
                 offset,
                 ty,
+                access,
             },
         )
     }
@@ -2140,7 +2178,7 @@ impl BlockImport<'_> {
         il_offset: IlOffset,
     ) -> CompileResult<()> {
         let (field, offset, byref_ok) = self.resolve_instance_field(token)?;
-        let ty = self.field_ir_type(field)?;
+        let (ty, access) = self.field_mem_type(field)?;
         let (vt, value) = self.pop()?;
         if vt != ty {
             return Err(CompileError::BadIl("stfld value type mismatch"));
@@ -2182,6 +2220,7 @@ impl BlockImport<'_> {
                 addr: obj,
                 offset,
                 value,
+                access,
             }
         };
         stmts.push(hir::Stmt { il_offset, kind });
@@ -2232,6 +2271,7 @@ impl BlockImport<'_> {
                     addr,
                     offset: 0,
                     value,
+                    access: MemAccess::Natural,
                 },
             });
             return Ok(());
@@ -2385,15 +2425,13 @@ impl BlockImport<'_> {
                 "newobj token did not resolve to a class",
             ));
         };
-        // `newobj` of a value class stays out (step_10.9's scope rule):
-        // csc normally emits initobj+ldloca+call .ctor for struct
-        // construction, and the allocation-helper path would build a box
-        // (which then fails downstream with a misleading type mismatch).
-        if self.ee.is_value_class(class) {
-            return Err(CompileError::Unsupported(
-                "newobj of a value class (use initobj + call .ctor)",
-            ));
-        }
+        // `newobj` of a value class (step_10.10): no allocation — csc's
+        // `new S(args)` is in-place construction (RyuJIT's impImportNewObj
+        // valuetype path): a fresh struct temp, zero-initialized (initobj
+        // semantics — a conforming constructor overwrites every field),
+        // the constructor called on the temp's address, and the temp
+        // itself pushed as the value.
+        let is_value_class = self.ee.is_value_class(class);
 
         // The static-constructor trigger: RyuJIT's newobj import queries
         // initClass with no field (not a field-trigger query), the method
@@ -2406,16 +2444,17 @@ impl BlockImport<'_> {
         let context = ContextHandle::from_class(class);
         let init = self.ee.init_class(None, Some(self.info.ftn), context);
 
-        // The allocation's MethodTable* operand, embedded directly; an
+        // The class's MethodTable* operand, embedded directly; an
         // indirection cell (R2R-style) needs load/reloc plumbing tier 0
-        // doesn't have.
+        // doesn't have. The reference path passes it to the allocation
+        // helper; both paths pass it to INITCLASS when a cctor runs.
         let (embedded, indirection) = self.ee.embed_class_handle(class);
-        let (Some(class), None) = (embedded, indirection) else {
+        let (Some(embedded), None) = (embedded, indirection) else {
             return Err(CompileError::Unsupported(
                 "class handle through an indirection cell",
             ));
         };
-        let class_const = || hir::Expr::Const(Const::NativeInt(class.as_raw() as isize));
+        let class_const = || hir::Expr::Const(Const::NativeInt(embedded.as_raw() as isize));
 
         // Pending stack trees (the constructor arguments included) must
         // evaluate before the allocation side effects.
@@ -2435,46 +2474,69 @@ impl BlockImport<'_> {
             });
         }
 
-        let (helper, _has_side_effects) = self.ee.get_new_helper(&resolved, self.info.ftn);
-        // The single-argument (MethodTable*) -> Object* class-alloc helpers,
-        // minus the FINALIZE forms (a finalizable newobj needs the stack
-        // spill of RyuJIT's "finalizable newobj spill" — a later step) and
-        // NEWSFAST_ALIGN8_VC (boxed value classes — out with structs). The
-        // EE answers NEWSFAST for a plain small class (jitinterface.cpp
-        // getNewHelperStatic); NEWFAST is its slow fallback.
-        if !matches!(
-            helper,
-            CorInfoHelpFunc::NEWFAST
-                | CorInfoHelpFunc::NEWFAST_MAYBEFROZEN
-                | CorInfoHelpFunc::NEWSFAST
-                | CorInfoHelpFunc::NEWSFAST_ALIGN8
-        ) {
-            return Err(CompileError::Unsupported(
-                "allocation helper outside the newobj set",
-            ));
-        }
-
-        // The object lands in a fresh Ref temp — automatically a GC root
-        // (frame-resident, zero-initialized) across both safepoints (the
-        // allocation and the constructor call). The constructor is a
-        // direct call, so no null check wraps the fresh object:
-        // JIT_New* never returns null.
-        let t_obj = self.temp(Type::Ref);
-        stmts.push(hir::Stmt {
-            il_offset,
-            kind: hir::StmtKind::Store {
-                dst: t_obj,
-                value: hir::Expr::Call {
-                    target: CallTarget::Helper(helper),
-                    sig: CallSig {
-                        ret: Type::Ref,
-                        args: vec![Type::NativeInt],
-                        has_this: false,
-                    },
-                    args: vec![class_const()],
+        // The value-class construction target, or the reference
+        // allocation, prepared before the constructor's arguments pop.
+        // `this_arg` is the constructor's receiver; `result` is the
+        // value the `newobj` pushes.
+        let (this_arg, result) = if is_value_class {
+            layout_of(&mut self.struct_layouts, self.ee, class)?;
+            let t = self.temp(Type::Struct(class));
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::BlockZero {
+                    addr: hir::Expr::LocalAddr(t),
+                    class,
                 },
-            },
-        });
+            });
+            (
+                hir::Expr::LocalAddr(t),
+                hir::Expr::StructVal {
+                    addr: Box::new(hir::Expr::LocalAddr(t)),
+                    class,
+                },
+            )
+        } else {
+            let (helper, _has_side_effects) = self.ee.get_new_helper(&resolved, self.info.ftn);
+            // The single-argument (MethodTable*) -> Object* class-alloc
+            // helpers, minus the FINALIZE forms (a finalizable newobj
+            // needs the stack spill of RyuJIT's "finalizable newobj
+            // spill" — a later step) and NEWSFAST_ALIGN8_VC (boxed value
+            // classes — out with structs). The EE answers NEWSFAST for a
+            // plain small class (jitinterface.cpp getNewHelperStatic);
+            // NEWFAST is its slow fallback.
+            if !matches!(
+                helper,
+                CorInfoHelpFunc::NEWFAST
+                    | CorInfoHelpFunc::NEWFAST_MAYBEFROZEN
+                    | CorInfoHelpFunc::NEWSFAST
+                    | CorInfoHelpFunc::NEWSFAST_ALIGN8
+            ) {
+                return Err(CompileError::Unsupported(
+                    "allocation helper outside the newobj set",
+                ));
+            }
+
+            // The object lands in a fresh Ref temp — automatically a GC
+            // root (frame-resident, zero-initialized) across both
+            // safepoints (the allocation and the constructor call).
+            let t_obj = self.temp(Type::Ref);
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Store {
+                    dst: t_obj,
+                    value: hir::Expr::Call {
+                        target: CallTarget::Helper(helper),
+                        sig: CallSig {
+                            ret: Type::Ref,
+                            args: vec![Type::NativeInt],
+                            has_this: false,
+                        },
+                        args: vec![class_const()],
+                    },
+                },
+            });
+            (hir::Expr::Local(t_obj), hir::Expr::Local(t_obj))
+        };
 
         // The constructor: a direct instance call whose `this` is the
         // fresh object, not a stack value (importer.cpp CEE_NEWOBJ's
@@ -2508,7 +2570,11 @@ impl BlockImport<'_> {
             args.push(value);
         }
         args.reverse();
-        args.insert(0, hir::Expr::Local(t_obj));
+        // The constructor: a direct instance call whose `this` is the
+        // fresh object/temp, not a stack value (importer.cpp CEE_NEWOBJ's
+        // newObjThisPtr). No null check wraps it: JIT_New* never returns
+        // null, and a fresh struct temp is never null.
+        args.insert(0, this_arg);
         let Some(ctor) = MethodHandle::from_raw(call.hMethod) else {
             return Err(CompileError::BadIl(
                 "get_call_info returned a null method handle",
@@ -2526,7 +2592,12 @@ impl BlockImport<'_> {
                 args,
             }),
         });
-        self.push(Type::Ref, hir::Expr::Local(t_obj))
+        let result_ty = if is_value_class {
+            Type::Struct(class)
+        } else {
+            Type::Ref
+        };
+        self.push(result_ty, result)
     }
 
     /// Resolves a class metadata token for the box/cast opcodes. `kind`
@@ -2769,12 +2840,8 @@ impl BlockImport<'_> {
         if !self.ee.is_value_class(class) {
             return self.cast_from_resolved(&resolved, class, true);
         }
-        let ty = sig_elem_type(
-            Some(self.ee.as_cor_info_type(class)),
-            Some(class),
-            self.ee,
-            &mut self.struct_layouts,
-        )?;
+        let raw = self.ee.as_cor_info_type(class);
+        let ty = sig_elem_type(Some(raw), Some(class), self.ee, &mut self.struct_layouts)?;
         let payload = self.unbox_payload_call(class)?;
         if let Type::Struct(class) = ty {
             self.push(
@@ -2785,21 +2852,27 @@ impl BlockImport<'_> {
                 },
             )
         } else {
+            // The boxed payload is a memory cell: a boxed bool/char/…
+            // occupies its metadata width, exactly like a field.
+            let (ty, access) = corinfo_mem_type(raw)?;
             self.push(
                 ty,
                 hir::Expr::Load {
                     addr: Box::new(payload),
                     offset: 0,
                     ty,
+                    access,
                 },
             )
         }
     }
 
     /// Imports the instructions of block `b` (leader `leaders[b]`). The
-    /// stack starts empty — a later pass over `expected_depth` proves that
-    /// assumption against every predecessor, so any leftover from the
-    /// previous block is discarded here.
+    /// stack starts empty — the entry check below rejects leaders a
+    /// predecessor already entered non-empty, and a later pass over
+    /// `expected_depth` proves the assumption against the remaining
+    /// (backward-edge) predecessors, so any leftover from the previous
+    /// block is discarded here.
     fn import_block(
         &mut self,
         b: usize,
@@ -2808,6 +2881,20 @@ impl BlockImport<'_> {
     ) -> CompileResult<hir::Block> {
         self.stack.clear();
         let start = leaders[b];
+        // A block an already-imported predecessor entered with a non-empty
+        // evaluation stack (a join carrying values — csc's ternary shape,
+        // e.g. `x + (c ? a : b)`) is outside the supported shape: reject
+        // it here, as Unsupported, rather than underflowing mid-block and
+        // misreporting valid IL as BadIl. (Backward edges are recorded
+        // only after the header imported; the post-pass over
+        // `expected_depth` in `import` is the backstop for those.)
+        if !self.catch_entries.contains(&start)
+            && self.expected_depth.get(&start).is_some_and(|&d| d != 0)
+        {
+            return Err(CompileError::Unsupported(
+                "evaluation-stack values crossing a block boundary",
+            ));
+        }
         let end = leaders
             .get(b + 1)
             .copied()
@@ -3497,6 +3584,26 @@ mod tests {
                 _ => panic!("expected Branch"),
             }
         }
+    }
+
+    #[test]
+    fn values_crossing_a_join_are_a_clean_unsupported_not_bad_il() {
+        // Regression for the post-10.6 triage: VerifyMagnitudePhase-
+        // Properties (GitHub_18362) — csc's `phase += (phase < 0) ? PI :
+        // -PI` evaluates `phase` before the ternary, so the conditional's
+        // arm blocks and their join carry evaluation-stack values. The
+        // importer doesn't support crossing values; the failure must be a
+        // clean Unsupported (the IL is valid), never a BadIl stack
+        // underflow mid-block.
+        //
+        // ldarg.0; ldarg.0; brfalse.s F; ldc.i4.1; br.s J; F: ldc.i4.2;
+        // J: add; ret.
+        let il = [0x02, 0x02, 0x2C, 0x03, 0x17, 0x2B, 0x01, 0x18, 0x58, 0x2A];
+        let err = import_ii(&il).err().expect("crossing values are out");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("crossing a block boundary")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -4971,7 +5078,9 @@ mod tests {
         let (ee, info) = object_fixture(&il);
         let m = import(&info, &ee).expect("imports");
         match return_value(&m, 0) {
-            hir::Expr::Load { addr, offset, ty } => {
+            hir::Expr::Load {
+                addr, offset, ty, ..
+            } => {
                 assert_eq!(*offset, 16, "the EE-supplied offset");
                 assert_eq!(*ty, Type::Int32);
                 assert_eq!(as_local(as_null_check(addr)), LocalId(0));
@@ -5019,6 +5128,7 @@ mod tests {
                 addr,
                 offset,
                 value,
+                ..
             } => {
                 assert_eq!(*offset, 16);
                 assert_eq!(as_local(as_null_check(addr)), LocalId(0));
@@ -5188,11 +5298,11 @@ mod tests {
     }
 
     #[test]
-    fn newobj_of_a_value_class_is_rejected_early() {
-        // newobj of a struct: even when the EE would answer an accepted
-        // allocation helper, the class gate fires first — the alternative
-        // builds a box and fails downstream with a misleading `BadIl`
-        // (RecursiveTailCall's shape: `new Struct1(true)`).
+    fn newobj_of_a_value_class_constructs_in_place() {
+        // csc's `new S(args)` for a struct: no allocation — a fresh
+        // zeroed struct temp, the constructor on its address, the temp as
+        // the pushed value (GitHub_18362's `new Complex(real, imaginary)`
+        // inside System.Numerics.Complex.Conjugate).
         let (mut ee, c) = struct_ee(1, &[], None);
         ee.add_method(
             CTOR_TOKEN,
@@ -5204,9 +5314,6 @@ mod tests {
                 arg_classes: Vec::new(),
             },
         );
-        // The mock resolves the NewObj token's hClass from the method
-        // handle by default; point the class token machinery at the value
-        // class instead.
         ee.class_tokens.insert(0x0600_0004, c);
         let entry = sig(CorInfoType::Void, &[]);
         // ldc.i4.1; newobj CTOR; pop; ret
@@ -5217,13 +5324,28 @@ mod tests {
             &[],
             &[],
         );
-        let err = import(&info, &ee)
-            .err()
-            .expect("newobj of a value class is unsupported");
-        assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("newobj of a value class")),
-            "{err:?}"
-        );
+        let m = import(&info, &ee).expect("newobj of a value class imports");
+        // No allocation helper was consulted.
+        assert!(ee.new_helper.is_none(), "a value class allocates nothing");
+        let stmts = &m.blocks[0].stmts;
+        // The zeroed temp (the only local — no args, no IL locals).
+        match &stmts[0].kind {
+            hir::StmtKind::BlockZero { addr, class } => {
+                assert_eq!(*class, c);
+                assert_eq!(as_local_addr(addr), LocalId(0));
+            }
+            _ => panic!("expected the BlockZero of the fresh temp"),
+        }
+        // The constructor on the temp's address, argument in push order.
+        match &stmts[1].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(matches!(target, CallTarget::Direct(_)));
+                assert!(sig.has_this);
+                assert_eq!(as_local_addr(&args[0]), LocalId(0), "byref this");
+                assert!(matches!(&args[1], hir::Expr::Const(Const::Int32(1))));
+            }
+            _ => panic!("expected the constructor call"),
+        }
     }
 
     #[test]
@@ -5240,12 +5362,12 @@ mod tests {
             "{err:?}"
         );
 
-        // A Float field: outside the 10.4 pack.
+        // A byref-typed field (a `ref` field of a ref struct) stays out.
         let (mut ee, info) = object_fixture(&il);
-        ee.fields.get_mut(&FIELD_TOKEN).unwrap().ty = CorInfoType::Float;
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().ty = CorInfoType::ByRef;
         let err = import(&info, &ee)
             .err()
-            .expect("float field is unsupported");
+            .expect("byref field is unsupported");
         assert!(
             matches!(&err, CompileError::Unsupported(m) if m.contains("object pack")),
             "{err:?}"
@@ -5266,6 +5388,128 @@ mod tests {
             .expect("byref receiver is unsupported");
         assert!(
             matches!(&err, CompileError::Unsupported(m) if m.contains("value types")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn float_and_subint_fields_import_with_their_access_shape() {
+        // Regression for the post-10.6 triage MISMATCHES
+        // (JIT/Regression_3/GitHub_18362, JIT/jit64/regress/vsw/471729):
+        // float and sub-Int32 fields used to be rejected by the field-type
+        // gate, and the test's own try/catch swallowed the resulting
+        // InvalidProgramException into a wrong exit code/stdout.
+        //
+        // A Double field loads as a Float64-typed value at the natural
+        // width: `double get_d() { return this.d; }`.
+        let il = [0x02, 0x7B, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let entry = MockSig {
+            ret: CorInfoType::Double,
+            args: vec![],
+            has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        let (mut ee, info) = fixture(&il, &entry, &[]);
+        ee.add_field(FIELD_TOKEN, CorInfoType::Double, 16);
+        let m = import(&info, &ee).expect("a double field imports");
+        match return_value(&m, 0) {
+            hir::Expr::Load {
+                addr,
+                offset,
+                ty,
+                access,
+            } => {
+                assert_eq!(*offset, 16);
+                assert_eq!(*ty, Type::Double);
+                assert_eq!(*access, MemAccess::Natural);
+                assert_eq!(as_local(as_null_check(addr)), LocalId(0));
+            }
+            _ => panic!("expected Expr::Load"),
+        }
+
+        // A bool field: Int32 on the stack, a 1-byte zero-extending cell.
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![],
+            has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        let (mut ee, info) = fixture(&il, &entry, &[]);
+        ee.add_field(FIELD_TOKEN, CorInfoType::Bool, 16);
+        let m = import(&info, &ee).expect("a bool field imports");
+        match return_value(&m, 0) {
+            hir::Expr::Load { ty, access, .. } => {
+                assert_eq!(*ty, Type::Int32);
+                assert_eq!(*access, MemAccess::U8);
+            }
+            _ => panic!("expected Expr::Load"),
+        }
+
+        // Every sub-Int32 metadata type maps to its width and ECMA-335
+        // §III.1.1.1 extension (I1/I2 sign, BOOLEAN/CHAR/U1/U2 zero).
+        for (cor, want) in [
+            (CorInfoType::Byte, MemAccess::I8),
+            (CorInfoType::UByte, MemAccess::U8),
+            (CorInfoType::Short, MemAccess::I16),
+            (CorInfoType::UShort, MemAccess::U16),
+            (CorInfoType::Char, MemAccess::U16),
+        ] {
+            let (mut ee, info) = fixture(&il, &entry, &[]);
+            ee.add_field(FIELD_TOKEN, cor, 16);
+            let m = import(&info, &ee).expect("sub-Int32 field imports");
+            match return_value(&m, 0) {
+                hir::Expr::Load { ty, access, .. } => {
+                    assert_eq!(*ty, Type::Int32);
+                    assert_eq!(*access, want, "{cor:?}");
+                }
+                _ => panic!("expected Expr::Load"),
+            }
+        }
+
+        // `stfld` of a bool: the Int32 stack value stores through the
+        // narrow cell.
+        let il = [0x02, 0x03, 0x7D, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let entry = MockSig {
+            ret: CorInfoType::Void,
+            args: vec![CorInfoType::Int],
+            has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        let (mut ee, info) = fixture(&il, &entry, &[]);
+        ee.add_field(FIELD_TOKEN, CorInfoType::Bool, 16);
+        let m = import(&info, &ee).expect("a bool stfld imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset,
+                value,
+                access,
+            } => {
+                assert_eq!(*offset, 16);
+                assert_eq!(*access, MemAccess::U8);
+                assert_eq!(as_local(as_null_check(addr)), LocalId(0));
+                assert_eq!(as_local(value), LocalId(1));
+            }
+            _ => panic!("expected StmtKind::StoreInd"),
+        }
+    }
+
+    #[test]
+    fn shared_generic_methods_are_rejected_by_the_callconv_gate() {
+        // Regression for the post-10.6 triage MISMATCH JIT/opt/Enum/shared:
+        // a static method on a generic type carries
+        // CORINFO_CALLCONV_PARAMTYPE (a hidden instantiation argument) —
+        // above the 4-bit convention mask, so the generic gate missed it
+        // and the method compiled with no generic context, silently
+        // producing the wrong answer.
+        let (ee, mut info) = fixture(&[0x2A], &sig(CorInfoType::Void, &[]), &[]);
+        info.args.callConv |= ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE;
+        let err = import(&info, &ee).err().expect("PARAMTYPE is generic");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("generic")),
             "{err:?}"
         );
     }
@@ -5381,6 +5625,7 @@ mod tests {
                 addr,
                 offset,
                 value,
+                ..
             } => {
                 assert_eq!(as_local_addr(addr), LocalId(0));
                 assert_eq!(*offset, 0);
@@ -5406,6 +5651,7 @@ mod tests {
                 addr,
                 offset,
                 value,
+                ..
             } => {
                 assert_eq!(as_local_addr(addr), LocalId(0));
                 assert_eq!(*offset, 0);
@@ -5668,7 +5914,9 @@ mod tests {
         );
         let m = import(&info, &ee).expect("imports");
         match return_value(&m, 0) {
-            hir::Expr::Load { addr, offset, ty } => {
+            hir::Expr::Load {
+                addr, offset, ty, ..
+            } => {
                 assert_eq!(*offset, 4);
                 assert_eq!(*ty, Type::Int32);
                 // No NullCheck wraps the byref receiver.
@@ -5973,7 +6221,9 @@ mod tests {
         // pop of a Load must_eval: one Eval of a Load through the unbox
         // call's byref.
         match &m.blocks[0].stmts[0].kind {
-            hir::StmtKind::Eval(hir::Expr::Load { addr, offset, ty }) => {
+            hir::StmtKind::Eval(hir::Expr::Load {
+                addr, offset, ty, ..
+            }) => {
                 assert_eq!(*offset, 0);
                 assert_eq!(*ty, Type::Int32);
                 let (helper, _, _) = as_helper_call(addr);

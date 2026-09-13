@@ -410,6 +410,45 @@ pub enum Inst {
         disp: i32,
         src: Src,
     },
+    /// `movzx`/`movsx dst, [addr + disp]` — a sub-Int32 field load
+    /// (LIR `Load` with a narrow [`rokajit::ir::MemAccess`]): the cell is `size` bytes
+    /// (1 or 2), the Int32 result extends zero or sign per `signed`
+    /// (ECMA-335 §III.1.1.1: I1/I2 sign-extend, BOOLEAN/CHAR/U1/U2
+    /// zero-extend).
+    LoadMemNarrow {
+        size: u8,
+        signed: bool,
+        dst: Place,
+        addr: Src,
+        disp: i32,
+    },
+    /// `mov [addr + disp], src_low` — a sub-Int32 field store (LIR
+    /// `Store` with a narrow [`rokajit::ir::MemAccess`]): only the low `size` bytes
+    /// (1 or 2) of the Int32 value write to memory.
+    StoreMemNarrow {
+        size: u8,
+        addr: Src,
+        disp: i32,
+        src: Src,
+    },
+    /// `movss`/`movsd dst, [addr + disp]` — a float field load (LIR
+    /// `Load` of a Float/Double type). Same address discipline as
+    /// [`Inst::LoadMem`]; the destination binds to an XMM slot.
+    LoadMemF {
+        width: FWidth,
+        dst: XmmPlace,
+        addr: Src,
+        disp: i32,
+    },
+    /// `movss`/`movsd [addr + disp], src` — a float field store (LIR
+    /// `Store` of a float source). A float value never needs a GC write
+    /// barrier.
+    StoreMemF {
+        width: FWidth,
+        addr: Src,
+        disp: i32,
+        src: XmmSrc,
+    },
     /// The explicit, trap-based null check (step_10.4): a 32-bit load
     /// through the reference, its result unused — on a null `addr` the
     /// hardware fault *is* the NullReferenceException, translated by the
