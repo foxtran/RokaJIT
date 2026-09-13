@@ -783,6 +783,62 @@ rokajit::lower_rules! {
             insts
         };
 
+    // --- step_10.6: the EH shapes ---
+
+    /// `throw` — the exception object into rdi (the normal first SysV
+    /// argument register; CORINFO_HELP_THROW's only parameter), the
+    /// never-returning helper call, then a NOP so the call's return
+    /// address stays inside its EH region / RUNTIME_FUNCTION
+    /// (clr-abi.md's padding rule).
+    rule throw_helper: Throw { exception }
+        if let Some(s) = operand_src(*exception)
+        => |_| vec![
+            Inst::Mov {
+                width: Width::W64,
+                dst: Place::Reg(Gpr::Rdi),
+                src: s,
+            },
+            Inst::CallHelper {
+                id: rokajit_ee::enums::CorInfoHelpFunc::THROW,
+            },
+            Inst::Nop,
+        ];
+
+    /// `leave` in the main body or a finally funclet — a plain jump.
+    /// (Inside a CATCH region a `Leave` is the funclet return instead;
+    /// that choice needs the region table, which the statement ruleset
+    /// context does not carry — codegen substitutes [`catch_leave`].)
+    rule leave_jump: Leave { target }
+        => |_| vec![Inst::Jmp { target: Label(*target) }];
+
+    /// A `leave` chain hop (a statement-less step block): call the
+    /// finally funclet (an in-chunk label; the call's return address is
+    /// the NOP, so it stays inside the enclosing region), then jump to
+    /// the continuation. Codegen elides the jump when the continuation
+    /// is the next block in layout.
+    rule call_finally: CallFinally { funclet, continuation }
+        => |_| vec![
+            Inst::CallLabel { target: Label(*funclet) },
+            Inst::Nop,
+            Inst::Jmp { target: Label(*continuation) },
+        ];
+
+    /// Catch-handler entry: the throwable arrives in rdi
+    /// (targetamd64.h REG_EXCEPTION_OBJECT — the VM's CallEHFunclet
+    /// contract) and lands in the destination's frame slot. `dst` is a
+    /// Ref temp, so the GC-root discipline materializes it immediately.
+    rule catch_arg: CatchArg { dst }
+        => |_| vec![Inst::Mov {
+            width: Width::W64,
+            dst: Place::Val(Val(*dst)),
+            src: Src::Reg(Gpr::Rdi),
+        }];
+
+    /// `endfinally` — the funclet epilog (`add rsp, N; ret`; N is
+    /// codegen's per-funclet stack adjustment). No rax result.
+    rule end_finally: EndFinally
+        => |_| vec![Inst::FuncletEpilog];
+
     /// A struct block copy (`cpobj`/`stobj`, struct `stloc`/`starg`/
     /// `stfld`, the hidden-retbuf copy; step_10.9): one descriptor; the
     /// size comes from the layout side table. GC-barriered copies are
@@ -903,6 +959,22 @@ rokajit::lower_rules! {
             },
             Inst::AllocFrame,
         ];
+}
+
+/// The catch-handler form of `leave` (step_10.6): the funclet return.
+/// The resume address goes in rax (`lea rax, [rip+target]`) — the VM
+/// resumes the parent frame there after the funclet's `ret` — then the
+/// funclet epilog. Codegen substitutes this for the `leave_jump` rule
+/// when the `Leave`'s block sits inside a CATCH region (a fact the
+/// statement ruleset's context does not carry).
+pub fn catch_leave(target: BlockId) -> Vec<Inst> {
+    vec![
+        Inst::LeaLabel {
+            dst: Gpr::Rax,
+            target: Label(target),
+        },
+        Inst::FuncletEpilog,
+    ]
 }
 
 /// Whole-method driver: prolog + every block's statements through the
@@ -1878,6 +1950,94 @@ mod tests {
                 rhs: Src::Imm(16),
             }])
         );
+    }
+
+    // --- step_10.6: the EH shapes ---
+
+    #[test]
+    fn throw_lowers_to_helper_call_and_nop() {
+        // The exception object (a Ref) into rdi, the never-returning
+        // CORINFO_HELP_THROW call, then the region-padding NOP.
+        let s = stmt(StmtKind::Throw {
+            exception: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W64,
+                    dst: Place::Reg(Gpr::Rdi),
+                    src: vsrc(0),
+                },
+                Inst::CallHelper {
+                    id: rokajit_ee::enums::CorInfoHelpFunc::THROW,
+                },
+                Inst::Nop,
+            ])
+        );
+    }
+
+    #[test]
+    fn leave_lowers_to_a_jump_and_the_catch_form_is_the_funclet_return() {
+        // Main body / finally handler: a plain jump.
+        let s = stmt(StmtKind::Leave { target: BlockId(3) });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::Jmp {
+                target: Label(BlockId(3))
+            }])
+        );
+        // Inside a catch region (codegen's dispatch): the funclet return
+        // — the resume address in rax, then the epilog.
+        assert_eq!(
+            catch_leave(BlockId(2)),
+            vec![
+                Inst::LeaLabel {
+                    dst: Gpr::Rax,
+                    target: Label(BlockId(2)),
+                },
+                Inst::FuncletEpilog,
+            ]
+        );
+    }
+
+    #[test]
+    fn call_finally_lowers_to_call_nop_jmp() {
+        let s = stmt(StmtKind::CallFinally {
+            funclet: BlockId(4),
+            continuation: BlockId(1),
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![
+                Inst::CallLabel {
+                    target: Label(BlockId(4)),
+                },
+                Inst::Nop,
+                Inst::Jmp {
+                    target: Label(BlockId(1)),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn catch_arg_stores_rdi_into_the_destination() {
+        let s = stmt(StmtKind::CatchArg { dst: LocalId(2) });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![Inst::Mov {
+                width: Width::W64,
+                dst: val(2),
+                src: Src::Reg(Gpr::Rdi),
+            }])
+        );
+    }
+
+    #[test]
+    fn end_finally_lowers_to_the_funclet_epilog() {
+        let s = stmt(StmtKind::EndFinally);
+        assert_eq!(lower_obj(&s), Some(vec![Inst::FuncletEpilog]));
     }
 
     // --- end-to-end: fib's exact IL bytes → descriptor sequence ---

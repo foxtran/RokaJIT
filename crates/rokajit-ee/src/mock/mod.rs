@@ -163,6 +163,9 @@ pub struct MockEe {
     /// step_10.9). Absent handles keep the default (the method handle's
     /// own address).
     pub method_classes: HashMap<usize, ClassHandle>,
+    /// Canned EH clauses returned by `get_eh_info` by index (10.6). Empty
+    /// keeps the old behavior (a zeroed clause).
+    pub eh_clauses: Vec<ffi::CORINFO_EH_CLAUSE>,
     /// Sink calls observed, newest last, as "(kind, detail)" strings.
     pub sink_log: RefCell<Vec<String>>,
     /// Buffers handed out by the fake `alloc_mem`/`alloc_gc_info`, kept

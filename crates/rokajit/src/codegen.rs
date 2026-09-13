@@ -857,8 +857,12 @@ mod tests {
                 call_sites: Vec::new(),
                 frame: crate::pipeline::FrameInfo {
                     frame_size: 16,
+                    outgoing_bytes: 0,
                     gc_roots: Vec::new(),
                 },
+                funclets: Vec::new(),
+                eh_clauses: Vec::new(),
+                interruptible_ranges: Vec::new(),
             })
         }
     }

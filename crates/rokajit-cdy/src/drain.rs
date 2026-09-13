@@ -29,7 +29,7 @@
 use std::ptr::NonNull;
 
 use rokajit::artifact::{ChunkRef, CompilationArtifact, EhClause};
-use rokajit::error::{CompileError, CompileResult};
+use rokajit::error::CompileResult;
 use rokajit_ee::ee_info::{AllocatedChunk, BoundaryMap, ChunkRequest, EeInfo};
 use rokajit_ee::enums::{AllocMemFlags, CorJitFuncKind};
 use rokajit_ee::handles::MethodHandle;
@@ -42,14 +42,8 @@ pub fn drain(
     ftn: MethodHandle,
     ee: &dyn EeInfo,
 ) -> CompileResult<(NonNull<u8>, u32)> {
-    if !artifact.eh_clauses.is_empty() {
-        // Unreachable today (the importer rejects EH methods and the
-        // metadata stage rejects EH regions); the class-token resolution
-        // the sink encoding needs arrives with EH support.
-        return Err(CompileError::Unsupported("draining EH clauses"));
-    }
-
-    // 1. Reserve unwind space before alloc_mem.
+    // 1. Reserve unwind space before alloc_mem (main blob first, then
+    // funclets — the artifact's unwind vec is already in that order).
     for blob in &artifact.unwind {
         ee.reserve_unwind_info(
             blob.func_kind != CorJitFuncKind::Root,
@@ -147,7 +141,7 @@ pub fn drain(
         );
     }
 
-    // 7. EH clauses (empty today; see the guard above).
+    // 7. EH clauses.
     if !artifact.eh_clauses.is_empty() {
         ee.set_eh_count(artifact.eh_clauses.len() as u32);
         for (index, clause) in artifact.eh_clauses.iter().enumerate() {
@@ -192,24 +186,29 @@ fn copy_into(chunk: AllocatedChunk, bytes: &[u8]) {
     }
 }
 
-/// Render an artifact EH clause as the sink's bindgen struct. Unreachable
-/// today (the guard at the top of [`drain`]); written so the channel is
-/// complete when EH lands.
+/// Render an artifact EH clause as the sink's bindgen struct.
+///
+/// - `flags` pass through verbatim: `EhClauseFlags`' bit values are the
+///   `CORINFO_EH_CLAUSE_FLAGS` constants, which corinfo.h:815-827 keeps in
+///   sync with the `COR_ILEXCEPTION_CLAUSE_*` values (corhdr.h:1148-1158):
+///   FILTER=1, FINALLY=2, FAULT=4, SAMETRY=0x10, typed catch = 0.
+/// - `try_end`/`handler_end` land in `TryLength`/`HandlerLength`: the
+///   artifact carries native END offsets (genReportEH repurposes the
+///   length fields, codegencommon.cpp:2727-2789).
+/// - `ClassToken(t)` writes the raw mdToken straight into the union (the
+///   VM resolves and type-tests it at dispatch); `FilterOffset(o)` writes
+///   the union's other member (filters are rejected at import, but the
+///   rendering is correct anyway).
 fn to_corinfo(clause: &EhClause) -> rokajit_ffi::CORINFO_EH_CLAUSE {
     use rokajit::artifact::ClassTokenOrFilter;
     let mut result: rokajit_ffi::CORINFO_EH_CLAUSE = unsafe { std::mem::zeroed() };
     result.Flags = clause.flags.to_raw();
     result.TryOffset = clause.try_offset;
-    result.TryLength = clause.try_length;
+    result.TryLength = clause.try_end;
     result.HandlerOffset = clause.handler_offset;
-    result.HandlerLength = clause.handler_length;
+    result.HandlerLength = clause.handler_end;
     match clause.class_or_filter {
-        // The typed-catch class token needs an EE query that arrives with
-        // EH support; the handle's address is a placeholder that no current
-        // pipeline can produce.
-        ClassTokenOrFilter::Class(handle) => {
-            result.__bindgen_anon_1.ClassToken = handle.as_raw() as usize as u32
-        }
+        ClassTokenOrFilter::ClassToken(token) => result.__bindgen_anon_1.ClassToken = token,
         ClassTokenOrFilter::FilterOffset(offset) => result.__bindgen_anon_1.FilterOffset = offset,
     }
     result
@@ -341,21 +340,90 @@ mod tests {
         );
     }
 
+    /// EH clauses drain (10.6): `set_eh_count` then `set_eh_info` per
+    /// clause, after `alloc_gc_info`; `xcptns_count` on `alloc_mem` is the
+    /// clause count; a funclet unwind blob reserves and allocates after
+    /// the root blob.
     #[test]
-    fn eh_clauses_are_a_named_unsupported() {
+    fn eh_clauses_drain_in_sink_order() {
         let mut artifact = fib_artifact();
+        artifact.unwind.push(UnwindBlob {
+            func_kind: CorJitFuncKind::Handler,
+            is_cold_code: false,
+            start_offset: 60,
+            end_offset: 73,
+            bytes: vec![0xDD; 6],
+        });
         artifact.eh_clauses.push(EhClause {
             flags: rokajit_ee::enums::EhClauseFlags::FINALLY,
-            try_offset: 0,
-            try_length: 8,
-            handler_offset: 8,
-            handler_length: 8,
-            class_or_filter: ClassTokenOrFilter::FilterOffset(0),
+            try_offset: 8,
+            try_end: 32,
+            handler_offset: 60,
+            handler_end: 73,
+            class_or_filter: ClassTokenOrFilter::ClassToken(0x0200_0042),
         });
-        assert!(matches!(
-            drain(&artifact, handle(1), &MockEe::default()),
-            Err(CompileError::Unsupported(_))
-        ));
+        let ee = MockEe::default();
+        drain(&artifact, handle(1), &ee).expect("drains");
+
+        let log = ee.sink_log.borrow();
+        let find = |prefix: &str| {
+            log.iter()
+                .position(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("{prefix} not called: {log:?}"))
+        };
+        let reserve_root = find("reserve_unwind_info(false, false, 10)");
+        let reserve_fn = find("reserve_unwind_info(true, false, 6)");
+        let alloc = find("alloc_mem(1, xcptns=1)");
+        let unwind_root = find("alloc_unwind_info(10, Root)");
+        let unwind_fn = find("alloc_unwind_info(6, Handler)");
+        let gc = find("alloc_gc_info(4)");
+        let eh_count = find("set_eh_count(1)");
+        let eh_info = find("set_eh_info(0)");
+        assert!(reserve_root < reserve_fn, "main blob first: {log:?}");
+        assert!(reserve_fn < alloc, "reserves before alloc_mem: {log:?}");
+        assert!(unwind_root < unwind_fn, "main blob first: {log:?}");
+        assert!(alloc < gc, "alloc before gc info: {log:?}");
+        assert!(gc < eh_count, "gc info before setEHcount: {log:?}");
+        assert!(eh_count < eh_info, "count before clauses: {log:?}");
+    }
+
+    /// The sink struct rendering: flags pass through verbatim, the
+    /// artifact's end offsets land in the `TryLength`/`HandlerLength`
+    /// fields (genReportEH's repurposing), and the union carries the raw
+    /// class token or the filter offset.
+    #[test]
+    fn eh_clause_renders_to_corinfo() {
+        let clause = EhClause {
+            flags: rokajit_ee::enums::EhClauseFlags::EMPTY,
+            try_offset: 8,
+            try_end: 32,
+            handler_offset: 60,
+            handler_end: 73,
+            class_or_filter: ClassTokenOrFilter::ClassToken(0x0200_0042),
+        };
+        let raw = to_corinfo(&clause);
+        assert_eq!(raw.Flags, 0, "typed catch");
+        assert_eq!((raw.TryOffset, raw.TryLength), (8, 32), "end offset");
+        assert_eq!((raw.HandlerOffset, raw.HandlerLength), (60, 73));
+        // SAFETY: ClassToken was the union member written.
+        assert_eq!(unsafe { raw.__bindgen_anon_1.ClassToken }, 0x0200_0042);
+
+        let clause = EhClause {
+            flags: rokajit_ee::enums::EhClauseFlags::FILTER,
+            class_or_filter: ClassTokenOrFilter::FilterOffset(44),
+            ..clause
+        };
+        let raw = to_corinfo(&clause);
+        assert_eq!(raw.Flags, 1, "CORINFO_EH_CLAUSE_FILTER");
+        // SAFETY: FilterOffset was the union member written.
+        assert_eq!(unsafe { raw.__bindgen_anon_1.FilterOffset }, 44);
+
+        let clause = EhClause {
+            flags: rokajit_ee::enums::EhClauseFlags::FINALLY
+                | rokajit_ee::enums::EhClauseFlags::SAMETRY,
+            ..clause
+        };
+        assert_eq!(to_corinfo(&clause).Flags, 0x12, "FINALLY | SAMETRY");
     }
 
     #[test]

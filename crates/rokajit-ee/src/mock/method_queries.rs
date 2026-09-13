@@ -35,8 +35,12 @@ impl MethodQueries for MockEe {
         ClassHandle(ftn.0 as ffi::CORINFO_CLASS_HANDLE)
     }
 
-    fn get_eh_info(&self, _ftn: MethodHandle, _index: u32) -> ffi::CORINFO_EH_CLAUSE {
-        unsafe { std::mem::zeroed() }
+    fn get_eh_info(&self, _ftn: MethodHandle, index: u32) -> ffi::CORINFO_EH_CLAUSE {
+        // Canned clauses by index (10.6); absent index = zeroed clause.
+        self.eh_clauses
+            .get(index as usize)
+            .copied()
+            .unwrap_or_else(|| unsafe { std::mem::zeroed() })
     }
 
     fn get_method_hash(&self, _ftn: MethodHandle) -> u32 {
@@ -192,5 +196,67 @@ impl MethodQueries for MockEe {
 
     fn get_continuation_type(&self, _data_size: usize, _obj_refs: &[bool]) -> Option<ClassHandle> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ee_info::MethodQueries;
+
+    fn handle(raw: usize) -> MethodHandle {
+        MethodHandle::from_raw(raw as *mut u8 as _).unwrap()
+    }
+
+    /// A canned clause comes back by index, verbatim; the union member is
+    /// the bindgen struct's (what the trait returns IS the EE's shape).
+    #[test]
+    fn canned_eh_clauses_are_returned_by_index() {
+        let ee = MockEe {
+            eh_clauses: vec![
+                {
+                    let mut c: ffi::CORINFO_EH_CLAUSE = unsafe { std::mem::zeroed() };
+                    c.Flags = 0; // typed catch
+                    c.TryOffset = 0;
+                    c.TryLength = 10;
+                    c.HandlerOffset = 12;
+                    c.HandlerLength = 6;
+                    c.__bindgen_anon_1.ClassToken = 0x0200_0042;
+                    c
+                },
+                {
+                    let mut c: ffi::CORINFO_EH_CLAUSE = unsafe { std::mem::zeroed() };
+                    c.Flags = ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FINALLY;
+                    c.TryOffset = 20;
+                    c.TryLength = 8;
+                    c.HandlerOffset = 30;
+                    c.HandlerLength = 4;
+                    c
+                },
+            ],
+            ..MockEe::default()
+        };
+        let first = ee.get_eh_info(handle(1), 0);
+        assert_eq!(first.Flags, 0);
+        assert_eq!((first.TryOffset, first.TryLength), (0, 10));
+        // SAFETY: ClassToken was the union member written above.
+        assert_eq!(unsafe { first.__bindgen_anon_1.ClassToken }, 0x0200_0042);
+        let second = ee.get_eh_info(handle(1), 1);
+        assert_eq!(
+            second.Flags,
+            ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FINALLY
+        );
+        assert_eq!((second.HandlerOffset, second.HandlerLength), (30, 4));
+    }
+
+    /// No canned clauses: the old behavior, a zeroed clause.
+    #[test]
+    fn eh_clauses_default_to_zeroed() {
+        let ee = MockEe::default();
+        let clause = ee.get_eh_info(handle(1), 0);
+        assert_eq!(clause.Flags, 0);
+        assert_eq!(clause.TryOffset, 0);
+        // SAFETY: a zeroed union reads as zero through either member.
+        assert_eq!(unsafe { clause.__bindgen_anon_1.ClassToken }, 0);
     }
 }

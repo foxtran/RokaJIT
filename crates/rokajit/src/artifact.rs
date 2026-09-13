@@ -24,7 +24,7 @@
 //! during compilation are plain `usize` values (data, not pointers).
 
 use rokajit_ee::enums::{AllocMemFlags, CorJitFuncKind, EhClauseFlags, RelocType};
-use rokajit_ee::handles::{ClassHandle, MethodHandle};
+use rokajit_ee::handles::MethodHandle;
 
 /// A successful compilation, ready to be drained into the EE's sinks in
 /// sink order (see the table above).
@@ -96,19 +96,33 @@ pub struct UnwindBlob {
 
 /// One EH clause with **native** offsets, drained to `setEHinfo`
 /// (corjit.h:242) as a `CORINFO_EH_CLAUSE` (corinfo.h:1619).
+///
+/// RyuJIT's `genReportEH` repurposes the `CORINFO_EH_CLAUSE` length fields
+/// as END offsets (runtime/src/coreclr/jit/codegencommon.cpp:2727-2789:
+/// `clause.TryLength = tryEnd; clause.HandlerLength = hndEnd;`), and this
+/// artifact follows that: `try_end`/`handler_end` are native END offsets
+/// relative to the hot-chunk start, NOT lengths.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct EhClause {
     pub flags: EhClauseFlags,
     pub try_offset: u32,
-    pub try_length: u32,
+    /// Native END offset of the try region, hot-chunk-relative (drained to
+    /// `TryLength`; see the struct docs).
+    pub try_end: u32,
     pub handler_offset: u32,
-    pub handler_length: u32,
-    /// The `ClassToken`/`FilterOffset` union member: the resolved class for
-    /// typed catches, the native filter offset for filter clauses.
+    /// Native END offset of the handler region, hot-chunk-relative (drained
+    /// to `HandlerLength`; see the struct docs).
+    pub handler_end: u32,
+    /// The `ClassToken`/`FilterOffset` union member.
     pub class_or_filter: ClassTokenOrFilter,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ClassTokenOrFilter {
-    Class(ClassHandle),
+    /// The raw mdToken from `getEHinfo`'s `CORINFO_EH_CLAUSE::ClassToken`,
+    /// carried straight through to `setEHinfo` — the VM resolves and
+    /// type-tests it at dispatch; no JIT-side handle query exists.
+    ClassToken(u32),
     FilterOffset(u32),
 }
 

@@ -32,20 +32,31 @@
 //!   the EE at emit time and recorded as a `RELATIVE32` relocation plus
 //!   a managed call site (a GC safepoint) for 07.7 to drain. EE helper
 //!   calls (float `rem`) share the path with no method handle recorded.
+//! - **EH funclets** (step_10.6): each EH region's handler blocks emit
+//!   after the main body as one funclet — prolog `sub rsp, N` (rbp stays
+//!   the PARENT's; N = the funclet's own aligned outgoing-argument
+//!   reservation + 8), epilog `add rsp, N; ret` (a catch `leave` first
+//!   loads the resume address into `rax`). Codegen records the funclet
+//!   ranges, the native EH clauses (innermost-first, SAMETRY on
+//!   same-try runs), and the fully-interruptible ranges (prologs and
+//!   epilogs excluded — a thread observed mid-epilog has a
+//!   half-torn-down frame).
 
-use rokajit::artifact::{CallSite, ChunkRef, CodeChunk, CodeChunks, Relocation};
+use rokajit::artifact::{
+    CallSite, ChunkRef, ClassTokenOrFilter, CodeChunk, CodeChunks, EhClause, Relocation,
+};
 use rokajit::codegen::{Loc, Move, ReadSrc, ValueState};
 use rokajit::error::{CompileError, CompileResult};
 use rokajit::ir::lir::StmtKind;
 use rokajit::ir::{hir, lir, BinaryOp, CallSig, LocalId, Type, UnaryOp};
 use rokajit::lower::{Cx, Label};
-use rokajit::pipeline::{CodegenOutput, FrameInfo};
+use rokajit::pipeline::{CodegenOutput, FrameInfo, FuncletInfo};
 #[cfg(test)]
 use rokajit::structs::{GcCell, SysVPass};
 use rokajit::structs::{StructLayout, StructLayouts};
 use rokajit::target::{ArgLocation, CallAbi, PhysReg};
 use rokajit_ee::ee_info::{const_lookup_addr, const_lookup_slot, EeInfo};
-use rokajit_ee::enums::{CorInfoHelpFunc, RelocType};
+use rokajit_ee::enums::{CorInfoHelpFunc, CorJitFuncKind, EhClauseFlags, RelocType};
 use rokajit_ee::handles::{ClassHandle, MethodHandle};
 
 use crate::encode::{Asm, Mem, Rm, RmX, Rmi};
@@ -427,14 +438,172 @@ impl FrameLayout {
     }
 }
 
+/// One planned funclet (step_10.6): the handler block span of an EH
+/// region (a contiguous run in the layout tail), the stack adjustment
+/// its prolog/epilog apply, and the region kind (a catch funclet
+/// receives the throwable in rdi).
+struct FuncletPlan {
+    start_block: usize,
+    end_block: usize,
+    sp_delta: u32,
+    is_catch: bool,
+}
+
+/// The funclets of an EH method (one per region's handler range), sorted
+/// by start block — emission order, since the importer lays the handler
+/// groups out at the tail. The stack adjustment is `align16(max
+/// outgoing-argument bytes over the funclet's calls) + 8`: the VM's
+/// funclet call enters with rsp ≡ 8 (mod 16), so a ≡ 8 (mod 16)
+/// adjustment re-aligns the funclet's own call sites.
+fn plan_funclets(method: &lir::Method) -> CompileResult<Vec<FuncletPlan>> {
+    if method.eh_regions.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The importer's rebuilt layout numbers block ids as layout indices;
+    // the offset table below keys on it.
+    for (i, b) in method.blocks.iter().enumerate() {
+        if b.id.0 as usize != i {
+            return Err(CompileError::Internal(
+                "EH layout: block ids are not the layout indices",
+            ));
+        }
+    }
+    let mut plans = Vec::with_capacity(method.eh_regions.len());
+    for r in &method.eh_regions {
+        let (hs, he) = (r.handler_start.0 as usize, r.handler_end.0 as usize);
+        let is_catch = match r.kind {
+            hir::EhRegionKind::Catch { .. } => true,
+            hir::EhRegionKind::Finally => false,
+            _ => {
+                return Err(CompileError::Internal(
+                    "filter/fault EH region survived the importer",
+                ));
+            }
+        };
+        if hs >= he || he > method.blocks.len() {
+            return Err(CompileError::Internal(
+                "EH handler range outside the block layout",
+            ));
+        }
+        plans.push(FuncletPlan {
+            start_block: hs,
+            end_block: he,
+            sp_delta: 0,
+            is_catch,
+        });
+    }
+    plans.sort_by_key(|p| p.start_block);
+    for w in plans.windows(2) {
+        if w[1].start_block < w[0].end_block {
+            return Err(CompileError::Internal(
+                "EH handler ranges overlap in the block layout",
+            ));
+        }
+    }
+    // Try ranges live in the main area: each must end at or before the
+    // first handler block.
+    let main_end = plans[0].start_block;
+    for r in &method.eh_regions {
+        let (ts, te) = (r.try_start.0 as usize, r.try_end.0 as usize);
+        if ts >= te || te > main_end {
+            return Err(CompileError::Internal("EH try range outside the main area"));
+        }
+    }
+    for p in &mut plans {
+        let mut max = 0u32;
+        for block in &method.blocks[p.start_block..p.end_block] {
+            for stmt in &block.stmts {
+                if let StmtKind::Call { sig, .. } = &stmt.kind {
+                    max = max.max(classify_call(sig, &method.struct_layouts)?.stack_arg_bytes);
+                }
+            }
+        }
+        p.sp_delta = max.div_ceil(16) * 16 + 8;
+    }
+    Ok(plans)
+}
+
+/// The native EH clause table (step_10.6): region block-ranges resolved
+/// to hot-relative native offsets, reordered for the VM — innermost
+/// first (a nested try starts later: try offset DESC, then try end ASC;
+/// genReportEH, codegencommon.cpp:2727-2789). Same-try clauses stay
+/// contiguous in EE order (the sort is stable) with SAMETRY added to
+/// the flags of the 2nd+ of each run.
+fn build_eh_clauses(
+    method: &lir::Method,
+    block_offsets: &[u32],
+    funclets: &[FuncletInfo],
+    plans: &[FuncletPlan],
+) -> CompileResult<Vec<EhClause>> {
+    let mut clauses = Vec::with_capacity(method.eh_regions.len());
+    for r in &method.eh_regions {
+        let fi = plans
+            .iter()
+            .position(|p| p.start_block == r.handler_start.0 as usize)
+            .ok_or(CompileError::Internal("EH region handler has no funclet"))?;
+        let (flags, class_or_filter) = match r.kind {
+            hir::EhRegionKind::Catch { class_token } => (
+                EhClauseFlags::EMPTY,
+                ClassTokenOrFilter::ClassToken(class_token),
+            ),
+            // A finally's ClassToken is unused; RyuJIT passes 0
+            // (`hndTyp = ebdTyp`, set for catches only).
+            hir::EhRegionKind::Finally => {
+                (EhClauseFlags::FINALLY, ClassTokenOrFilter::ClassToken(0))
+            }
+            _ => {
+                return Err(CompileError::Internal(
+                    "filter/fault EH region survived the importer",
+                ));
+            }
+        };
+        clauses.push(EhClause {
+            flags,
+            try_offset: block_offsets[r.try_start.0 as usize],
+            try_end: block_offsets[r.try_end.0 as usize],
+            handler_offset: funclets[fi].start_offset,
+            handler_end: funclets[fi].end_offset,
+            class_or_filter,
+        });
+    }
+    let mut order: Vec<usize> = (0..clauses.len()).collect();
+    order.sort_by(|&a, &b| {
+        clauses[b]
+            .try_offset
+            .cmp(&clauses[a].try_offset)
+            .then(clauses[a].try_end.cmp(&clauses[b].try_end))
+    });
+    let mut out: Vec<EhClause> = Vec::with_capacity(clauses.len());
+    for i in order {
+        let mut c = clauses[i];
+        if let Some(prev) = out.last() {
+            if (prev.try_offset, prev.try_end) == (c.try_offset, c.try_end) {
+                c.flags = c.flags | EhClauseFlags::SAMETRY;
+            }
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+
 /// Stage 4 emission for x64 (the `Target::emit_tier0` body): LIR →
 /// machine-code bytes plus the relocation/call-site/frame facts 07.7
-/// drains. Single pass over the blocks in layout order.
+/// drains. Single pass over the blocks in layout order; for an EH
+/// method the layout tail holds the handler groups, which emit as
+/// funclets (step_10.6).
 pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<CodegenOutput> {
     let outgoing = FrameLayout::max_outgoing_bytes(method)?;
     let layout = FrameLayout::compute(method, outgoing)?;
+    let plans = plan_funclets(method)?;
     let cx = Cx::new(&method.locals, &method.struct_layouts);
     let mut em = Emitter::new(method, layout, ee);
+    // Per-block funclet membership (None = the main area).
+    let mut block_funclet: Vec<Option<usize>> = vec![None; method.blocks.len()];
+    for (fi, p) in plans.iter().enumerate() {
+        for slot in block_funclet[p.start_block..p.end_block].iter_mut() {
+            *slot = Some(fi);
+        }
+    }
 
     let prolog = lower_frame(&FrameReq, &cx).ok_or(CompileError::Internal(
         "the catch-all frame rule must match",
@@ -442,16 +611,96 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
     for inst in &prolog {
         em.emit_inst(inst)?;
     }
+    // The main interruptible range opens after the frame allocation (rbp
+    // is established; the argument spill and zero-init that follow are
+    // rbp-relative and safe to include).
+    em.range_reopen();
     em.spill_incoming_args()?;
     em.zero_init_slots()?;
 
-    for block in &method.blocks {
-        em.asm.bind(Label(block.id));
+    let mut block_offsets = Vec::with_capacity(method.blocks.len());
+    let mut funclets: Vec<FuncletInfo> = Vec::with_capacity(plans.len());
+    let mut next_plan = 0usize;
+    for (bi, block) in method.blocks.iter().enumerate() {
+        // Funclet boundary: close the open segment (the main tail or the
+        // previous funclet's) and the previous funclet's extent, then
+        // the funclet prolog — just `sub rsp, N`: rbp stays the PARENT's
+        // frame pointer (the VM restored it), so locals and temps stay
+        // rbp-relative and the funclet's outgoing arguments ride its own
+        // rsp. The block label binds BEFORE the prolog: a `CallFinally`
+        // call targets the entry.
+        if next_plan < plans.len() && plans[next_plan].start_block == bi {
+            let plan = &plans[next_plan];
+            let at = em.asm.offset();
+            em.range_close_at(at);
+            if let Some(prev) = funclets.last_mut() {
+                prev.end_offset = at;
+            }
+            em.asm.bind(Label(block.id));
+            block_offsets.push(em.asm.offset());
+            let start = em.asm.offset();
+            em.asm.sub(
+                Width::W64,
+                Rm::Reg(regs::STACK_POINTER),
+                Rmi::Imm(i64::from(plan.sp_delta)),
+            );
+            let prolog_len = (em.asm.offset() - start) as u8;
+            em.cur_funclet_sp = Some(plan.sp_delta);
+            em.range_reopen();
+            funclets.push(FuncletInfo {
+                start_offset: start,
+                end_offset: 0, // patched at the next boundary / after the loop
+                prolog_len,
+                sp_delta: plan.sp_delta,
+                kind: CorJitFuncKind::Handler,
+            });
+            next_plan += 1;
+        } else {
+            em.asm.bind(Label(block.id));
+            block_offsets.push(em.asm.offset());
+        }
         em.vs.reset();
-        for stmt in &block.stmts {
-            let insts = lower_stmt(stmt, &cx).ok_or(CompileError::Unsupported(
-                "no x64 lowering rule matched an LIR statement",
-            ))?;
+        let in_catch = block_funclet[bi].is_some_and(|fi| plans[fi].is_catch);
+        for (si, stmt) in block.stmts.iter().enumerate() {
+            // EH shape guards (an importer-contract violation is an
+            // Internal error, not silent miscode):
+            if let StmtKind::CatchArg { .. } = &stmt.kind {
+                let ok = si == 0
+                    && matches!(block_funclet[bi],
+                        Some(fi) if plans[fi].is_catch && plans[fi].start_block == bi);
+                if !ok {
+                    return Err(CompileError::Internal(
+                        "CatchArg outside a catch funclet's entry statement",
+                    ));
+                }
+            }
+            if block_funclet[bi].is_some()
+                && matches!(
+                    stmt.kind,
+                    StmtKind::Return { .. } | StmtKind::ReturnStruct { .. }
+                )
+            {
+                return Err(CompileError::Internal(
+                    "return inside a funclet (out of 10.6 scope)",
+                ));
+            }
+            let mut insts = match &stmt.kind {
+                // Inside a CATCH region a `Leave` is the funclet return
+                // (the resume address in rax, then the epilog); the
+                // ruleset's plain-jump form covers everywhere else.
+                StmtKind::Leave { target } if in_catch => crate::lower::catch_leave(*target),
+                _ => lower_stmt(stmt, &cx).ok_or(CompileError::Unsupported(
+                    "no x64 lowering rule matched an LIR statement",
+                ))?,
+            };
+            // CallFinally's continuation jump elides when the
+            // continuation is the next block in layout (the fallthrough).
+            if let StmtKind::CallFinally { continuation, .. } = &stmt.kind {
+                if method.blocks.get(bi + 1).map(|b| b.id) == Some(*continuation) {
+                    let last = insts.pop();
+                    debug_assert!(matches!(last, Some(Inst::Jmp { .. })));
+                }
+            }
             // Join discipline: before an edge, every value becomes
             // frame-resident (before the compare, so the flag pair stays
             // adjacent — spills are `mov`s and don't clobber flags).
@@ -469,7 +718,10 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
             // value-machine-tracked.
             em.fixed_dests = fixed_gprs(&insts, true);
             for (i, inst) in insts.iter().enumerate() {
-                if matches!(inst, Inst::CallDirect { .. } | Inst::CallHelper { .. }) {
+                if matches!(
+                    inst,
+                    Inst::CallDirect { .. } | Inst::CallHelper { .. } | Inst::CallLabel { .. }
+                ) {
                     em.fixed_dests = fixed_gprs(&insts[i + 1..], false);
                 }
                 em.emit_inst(inst)?;
@@ -479,16 +731,31 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
         }
         // A block whose terminator lowered to a fallthrough (jump-to-next
         // elision) still ends in an edge: the successor must see the same
-        // frame-resident state. After a `Return` there is no edge.
-        if !matches!(
-            block.stmts.last().map(|s| &s.kind),
-            Some(StmtKind::Return { .. })
-        ) {
+        // frame-resident state. After a `Return` there is no edge — nor
+        // after the EH terminals (Throw never returns; EndFinally and the
+        // catch-Leave return out of the funclet).
+        let terminal = match block.stmts.last().map(|s| &s.kind) {
+            Some(StmtKind::Return { .. } | StmtKind::Throw { .. } | StmtKind::EndFinally) => true,
+            Some(StmtKind::Leave { .. }) => in_catch,
+            _ => false,
+        };
+        if !terminal {
             let moves = em.vs.spill_all();
             em.apply(moves)?;
         }
     }
+    // Close the last open segment and the last funclet's extent.
+    let total = em.asm.offset();
+    em.range_close_at(total);
+    if let Some(last) = funclets.last_mut() {
+        last.end_offset = total;
+    }
 
+    let eh_clauses = if plans.is_empty() {
+        Vec::new()
+    } else {
+        build_eh_clauses(method, &block_offsets, &funclets, &plans)?
+    };
     let code = em
         .asm
         .finalize()
@@ -506,12 +773,16 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
         call_sites: em.call_sites,
         frame: FrameInfo {
             frame_size: em.layout.frame_size,
+            outgoing_bytes: em.layout.outgoing_bytes,
             gc_roots: rokajit::codegen::gc_roots(
                 &method.locals,
                 &em.layout.slots,
                 &method.struct_layouts,
             ),
         },
+        funclets,
+        eh_clauses,
+        interruptible_ranges: em.ranges,
     })
 }
 
@@ -543,6 +814,21 @@ struct Emitter<'a> {
     /// not value-machine-tracked, so `take_scratch` would silently reuse
     /// one).
     fixed_dests: Vec<PhysReg>,
+    /// Whether the method has EH regions (step_10.6) — gates the
+    /// interruptible-range bookkeeping (a non-EH method emits no ranges
+    /// and keeps the slim GC header, byte-identical to pre-EH output).
+    eh: bool,
+    /// The current funclet's stack adjustment (its prolog's `sub rsp, N`),
+    /// `None` in the main area. `Inst::FuncletEpilog` reads it.
+    cur_funclet_sp: Option<u32>,
+    /// The fully-interruptible ranges under construction
+    /// (`CodegenOutput::interruptible_ranges`): a segment opens after a
+    /// prolog and closes at an epilog or a funclet boundary, so no range
+    /// covers a prolog or an epilog (a thread observed there has a
+    /// half-torn-down frame — RyuJIT's exclusion policy).
+    ranges: Vec<(u32, u32)>,
+    /// Start offset of the currently open interruptible segment.
+    seg_start: u32,
 }
 
 impl<'a> Emitter<'a> {
@@ -563,6 +849,26 @@ impl<'a> Emitter<'a> {
             relocations: Vec::new(),
             next_synthetic: FIRST_SYNTHETIC_LABEL,
             fixed_dests: Vec::new(),
+            eh: !method.eh_regions.is_empty(),
+            cur_funclet_sp: None,
+            ranges: Vec::new(),
+            seg_start: 0,
+        }
+    }
+
+    /// Close the open interruptible segment at `end` (an epilog start or
+    /// a funclet boundary). No-op for non-EH methods; empty segments drop.
+    fn range_close_at(&mut self, end: u32) {
+        if self.eh && self.seg_start < end {
+            self.ranges.push((self.seg_start, end));
+        }
+    }
+
+    /// Reopen the interruptible segment at the current offset (after the
+    /// main frame allocation, an epilog, or a funclet prolog).
+    fn range_reopen(&mut self) {
+        if self.eh {
+            self.seg_start = self.asm.offset();
         }
     }
 
@@ -1696,11 +2002,53 @@ impl<'a> Emitter<'a> {
                 Ok(())
             }
             Inst::Leave => {
+                // Main-area epilog: the interruptible segment closes at
+                // the `leave` — from it on, rbp is the caller's, so
+                // rbp-relative root reporting would read the wrong frame.
+                self.range_close_at(self.asm.offset());
                 self.asm.leave();
                 Ok(())
             }
             Inst::Ret => {
                 self.asm.ret();
+                self.range_reopen();
+                Ok(())
+            }
+            Inst::Nop => {
+                self.asm.nop();
+                Ok(())
+            }
+            Inst::CallLabel { target } => {
+                // A finally-funclet call: the same spill discipline as any
+                // call (the pool is caller-saved), but no EE lookup, no
+                // relocation, and no call-site record — the target is an
+                // in-chunk label, and an EH method is fully interruptible.
+                let moves = self.vs.spill_registers();
+                self.apply(moves)?;
+                self.asm.call_label(target);
+                Ok(())
+            }
+            Inst::LeaLabel { dst, target } => {
+                let moves = self.vs.clobber(dst.phys());
+                self.apply(moves)?;
+                self.asm.lea_rip(dst, target);
+                Ok(())
+            }
+            Inst::FuncletEpilog => {
+                let n = self
+                    .cur_funclet_sp
+                    .ok_or(CompileError::Internal("funclet epilog outside a funclet"))?;
+                // The segment closes at the `add`: the funclet's rsp
+                // unwind is in flight from here, then `ret` returns to
+                // the VM's funclet dispatch.
+                self.range_close_at(self.asm.offset());
+                self.asm.add(
+                    Width::W64,
+                    Rm::Reg(regs::STACK_POINTER),
+                    Rmi::Imm(i64::from(n)),
+                );
+                self.asm.ret();
+                self.range_reopen();
                 Ok(())
             }
         }
@@ -4863,5 +5211,516 @@ mod tests {
             0xC3, // ret
         ];
         assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    // ---- step_10.6: EH funclets ----
+
+    use rokajit::ir::hir::{EhRegion, EhRegionKind};
+    use rokajit::pipeline::FuncletInfo;
+    use rokajit_ee::enums::EhClauseFlags;
+
+    /// `try { x = 2 } finally { x = 5 } return x` — one finally funclet:
+    /// the step block calls it (the return address is the padding NOP),
+    /// the continuation jump elides (the continuation is the next block),
+    /// and the funclet is `sub rsp, 8` … `add rsp, 8; ret`.
+    #[test]
+    fn finally_funclet_method_bytes() {
+        let mut m = method(
+            vec![local(Type::Int32, LocalKind::IlLocal(0))],
+            0,
+            1,
+            vec![
+                block(
+                    0,
+                    vec![
+                        stmt(StmtKind::Copy {
+                            dst: LocalId(0),
+                            src: Operand::Const(Const::Int32(2)),
+                        }),
+                        stmt(StmtKind::CallFinally {
+                            funclet: BlockId(2),
+                            continuation: BlockId(1),
+                        }),
+                    ],
+                ),
+                block(
+                    1,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(0))),
+                    })],
+                ),
+                block(
+                    2,
+                    vec![
+                        stmt(StmtKind::Copy {
+                            dst: LocalId(0),
+                            src: Operand::Const(Const::Int32(5)),
+                        }),
+                        stmt(StmtKind::EndFinally),
+                    ],
+                ),
+            ],
+        );
+        m.eh_regions.push(EhRegion {
+            kind: EhRegionKind::Finally,
+            try_start: BlockId(0),
+            try_end: BlockId(1),
+            handler_start: BlockId(2),
+            handler_end: BlockId(3),
+        });
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0xC7, 0x45, 0xFC, 0, 0, 0, 0, // movl $0, -4(%rbp)  — zero-init
+            // B0 (offset 15): the try body
+            0xC7, 0x45, 0xFC, 0x02, 0, 0, 0, // movl $2, -4(%rbp)
+            0xE8, 0x06, 0, 0, 0, // call B2 (rel +6: the funclet at 33)
+            0x90, // nop — the return address stays inside the region
+            // B1 (offset 28): return x
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax
+            0xC9, 0xC3,
+            // B2 (offset 33): the finally funclet
+            0x48, 0x83, 0xEC, 0x08, // subq $8, %rsp   — funclet prolog
+            0xC7, 0x45, 0xFC, 0x05, 0, 0, 0, // movl $5, -4(%rbp)
+            0x48, 0x83, 0xC4, 0x08, // addq $8, %rsp   — funclet epilog
+            0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+
+        // One funclet: [33, 49), a 4-byte prolog, sp delta 8.
+        assert_eq!(
+            out.funclets,
+            vec![FuncletInfo {
+                start_offset: 33,
+                end_offset: 49,
+                prolog_len: 4,
+                sp_delta: 8,
+                kind: CorJitFuncKind::Handler,
+            }]
+        );
+        // Interruptible ranges: main [after AllocFrame, main epilog) and
+        // the funclet body [after prolog, epilog) — prologs and epilogs
+        // excluded.
+        assert_eq!(out.interruptible_ranges, vec![(8, 31), (37, 44)]);
+        // The clause: try = B0's bytes, handler = the funclet.
+        assert_eq!(out.eh_clauses.len(), 1);
+        let c = out.eh_clauses[0];
+        assert_eq!(c.flags, EhClauseFlags::FINALLY);
+        assert_eq!((c.try_offset, c.try_end), (15, 28));
+        assert_eq!((c.handler_offset, c.handler_end), (33, 49));
+        assert_eq!(c.class_or_filter, ClassTokenOrFilter::ClassToken(0));
+        // The funclet call is internal: no relocation, no call site.
+        assert!(out.relocations.is_empty() && out.call_sites.is_empty());
+    }
+
+    /// `try { x = 2; Thrower(); x = 3 } catch { x = 4 } return x` — the
+    /// catch funclet: the throwable (rdi) stored into its temp right after
+    /// the prolog, the `leave` exiting as `lea rax, [rip+resume]; add
+    /// rsp, N; ret`.
+    #[test]
+    fn catch_funclet_method_bytes() {
+        let thrower = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let mut m = method(
+            vec![
+                local(Type::Int32, LocalKind::IlLocal(0)),
+                local(Type::Ref, LocalKind::Temp),
+            ],
+            0,
+            1,
+            vec![
+                block(
+                    0,
+                    vec![
+                        stmt(StmtKind::Copy {
+                            dst: LocalId(0),
+                            src: Operand::Const(Const::Int32(2)),
+                        }),
+                        stmt(StmtKind::Call {
+                            dst: None,
+                            target: rokajit::ir::CallTarget::Direct(thrower),
+                            sig: CallSig {
+                                ret: Type::Void,
+                                args: vec![],
+                                has_this: false,
+                            },
+                            args: vec![],
+                        }),
+                        stmt(StmtKind::Copy {
+                            dst: LocalId(0),
+                            src: Operand::Const(Const::Int32(3)),
+                        }),
+                        stmt(StmtKind::Leave { target: BlockId(1) }),
+                    ],
+                ),
+                block(
+                    1,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(0))),
+                    })],
+                ),
+                block(
+                    2,
+                    vec![
+                        stmt(StmtKind::CatchArg { dst: LocalId(1) }),
+                        stmt(StmtKind::Copy {
+                            dst: LocalId(0),
+                            src: Operand::Const(Const::Int32(4)),
+                        }),
+                        stmt(StmtKind::Leave { target: BlockId(1) }),
+                    ],
+                ),
+            ],
+        );
+        m.eh_regions.push(EhRegion {
+            kind: EhRegionKind::Catch {
+                class_token: 0x0200_0002,
+            },
+            try_start: BlockId(0),
+            try_end: BlockId(1),
+            handler_start: BlockId(2),
+            handler_end: BlockId(3),
+        });
+        let out = emit(&m, &ee);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0xC7, 0x45, 0xFC, 0, 0, 0, 0, // movl $0, -4(%rbp)    — x
+            0x48, 0xC7, 0x45, 0xF0, 0, 0, 0, 0, // movq $0, -16(%rbp) — exc temp
+            // B0 (offset 23): the try body
+            0xC7, 0x45, 0xFC, 0x02, 0, 0, 0, // movl $2, -4(%rbp)
+            0xE8, 0, 0, 0, 0, // call Thrower (patched by 07.7)
+            0xC7, 0x45, 0xFC, 0x03, 0, 0, 0, // movl $3, -4(%rbp)
+            0xE9, 0, 0, 0, 0, // jmp B1 — the main-area leave (rel 0: next)
+            // B1 (offset 47): return x
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax
+            0xC9, 0xC3,
+            // B2 (offset 52): the catch funclet
+            0x48, 0x83, 0xEC, 0x08, // subq $8, %rsp
+            0x48, 0x89, 0x7D, 0xF0, // movq %rdi, -16(%rbp)  — CatchArg
+            0xC7, 0x45, 0xFC, 0x04, 0, 0, 0, // movl $4, -4(%rbp)
+            0x48, 0x8D, 0x05, 0xE5, 0xFF, 0xFF, 0xFF, // leaq -27(%rip), %rax → B1
+            0x48, 0x83, 0xC4, 0x08, // addq $8, %rsp
+            0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+
+        assert_eq!(
+            out.funclets,
+            vec![FuncletInfo {
+                start_offset: 52,
+                end_offset: 79,
+                prolog_len: 4,
+                sp_delta: 8,
+                kind: CorJitFuncKind::Handler,
+            }]
+        );
+        assert_eq!(out.interruptible_ranges, vec![(8, 50), (56, 74)]);
+        assert_eq!(out.eh_clauses.len(), 1);
+        let c = out.eh_clauses[0];
+        assert_eq!(c.flags, EhClauseFlags::EMPTY);
+        assert_eq!((c.try_offset, c.try_end), (23, 47));
+        assert_eq!((c.handler_offset, c.handler_end), (52, 79));
+        assert_eq!(
+            c.class_or_filter,
+            ClassTokenOrFilter::ClassToken(0x0200_0002)
+        );
+        // The managed call records a safepoint and a relocation; the
+        // funclet-internal call shape does not.
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].offset, 30);
+        assert_eq!(out.relocations.len(), 1);
+        assert_eq!(out.relocations[0].offset, 31);
+    }
+
+    /// `throw` (step_10.6): the exception into rdi, CORINFO_HELP_THROW,
+    /// the region-padding NOP — and the terminal-stmt handling: no
+    /// block-end spill follows (the call already spilled).
+    #[test]
+    fn throw_method_bytes() {
+        // An EH-less method that merely throws: Throw emits the same
+        // inside or outside a try, and the method keeps the slim GC
+        // header (no funclets, no clauses, no interruptible ranges).
+        let m = method(
+            vec![
+                local(Type::Ref, LocalKind::IlLocal(0)),
+                local(Type::Ref, LocalKind::Temp),
+            ],
+            0,
+            1,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Copy {
+                        dst: LocalId(1),
+                        src: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Throw {
+                        exception: Operand::Temp(LocalId(1)),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0xC7, 0x45, 0xF8, 0, 0, 0, 0, // movq $0, -8(%rbp)  — local
+            0x48, 0xC7, 0x45, 0xF0, 0, 0, 0, 0, // movq $0, -16(%rbp) — temp
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax  — t := local
+            0x48, 0x89, 0x45, 0xF0, // movq %rax, -16(%rbp) — Ref temp at def
+            0x48, 0x8B, 0x7D, 0xF0, // movq -16(%rbp), %rdi — the argument
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_THROW
+            0x90, // nop — the return address stays inside the region
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].method, None, "a helper call");
+        assert_eq!(out.relocations.len(), 1);
+        assert!(out.interruptible_ranges.is_empty(), "no EH regions");
+        assert!(out.funclets.is_empty() && out.eh_clauses.is_empty());
+    }
+
+    /// The EH clause ordering (genReportEH): innermost first (nested try
+    /// starts later), same-try clauses contiguous in EE order with
+    /// SAMETRY on the 2nd+ of the run.
+    #[test]
+    fn eh_clauses_order_innermost_first_with_sametry() {
+        // EE order: outer catch A, same-try catch B, inner catch C.
+        let mut m = method(vec![], 0, 0, vec![]);
+        for (token, ts, te, hs) in [
+            (0x0200_000Au32, 0u32, 4u32, 5u32), // A: outer try [0,4)
+            (0x0200_000B, 0, 4, 6),             // B: same try
+            (0x0200_000C, 1, 3, 7),             // C: nested inner [1,3)
+        ] {
+            m.eh_regions.push(EhRegion {
+                kind: EhRegionKind::Catch { class_token: token },
+                try_start: BlockId(ts),
+                try_end: BlockId(te),
+                handler_start: BlockId(hs),
+                handler_end: BlockId(hs + 1),
+            });
+        }
+        let block_offsets: Vec<u32> = (0..8).map(|i| i * 10).collect();
+        let plans: Vec<FuncletPlan> = [5, 6, 7]
+            .into_iter()
+            .map(|b| FuncletPlan {
+                start_block: b,
+                end_block: b + 1,
+                sp_delta: 8,
+                is_catch: true,
+            })
+            .collect();
+        let funclets: Vec<FuncletInfo> = [(100, 120), (120, 140), (140, 160)]
+            .into_iter()
+            .map(|(start_offset, end_offset)| FuncletInfo {
+                start_offset,
+                end_offset,
+                prolog_len: 4,
+                sp_delta: 8,
+                kind: CorJitFuncKind::Handler,
+            })
+            .collect();
+        let clauses = build_eh_clauses(&m, &block_offsets, &funclets, &plans).expect("clauses");
+        // C (inner) first, then A, then B with SAMETRY.
+        let tokens: Vec<u32> = clauses
+            .iter()
+            .map(|c| match c.class_or_filter {
+                ClassTokenOrFilter::ClassToken(t) => t,
+                _ => panic!("catch clauses carry tokens"),
+            })
+            .collect();
+        assert_eq!(tokens, vec![0x0200_000C, 0x0200_000A, 0x0200_000B]);
+        assert_eq!(clauses[0].flags, EhClauseFlags::EMPTY);
+        assert_eq!(clauses[1].flags, EhClauseFlags::EMPTY);
+        assert_eq!(
+            clauses[2].flags,
+            EhClauseFlags::EMPTY | EhClauseFlags::SAMETRY
+        );
+        // Native ranges: try offsets from the block table, handler ranges
+        // from the funclets.
+        assert_eq!((clauses[0].try_offset, clauses[0].try_end), (10, 30));
+        assert_eq!(
+            (clauses[0].handler_offset, clauses[0].handler_end),
+            (140, 160)
+        );
+        assert_eq!((clauses[1].try_offset, clauses[1].try_end), (0, 40));
+        assert_eq!(
+            (clauses[2].handler_offset, clauses[2].handler_end),
+            (120, 140)
+        );
+    }
+
+    /// A finally funclet with a seven-argument call: the funclet's own
+    /// outgoing-argument area sizes its `sub rsp, N` (sp_delta = 16 + 8
+    /// = 24), and the stack argument stores at [rsp] — the funclet's rsp,
+    /// not the parent's frame.
+    #[test]
+    fn funclet_with_outgoing_stack_args() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let sig = CallSig {
+            ret: Type::Void,
+            args: vec![Type::Int32; 7],
+            has_this: false,
+        };
+        let mut m = method(
+            vec![local(Type::Int32, LocalKind::IlLocal(0))],
+            0,
+            1,
+            vec![
+                block(
+                    0,
+                    vec![stmt(StmtKind::CallFinally {
+                        funclet: BlockId(2),
+                        continuation: BlockId(1),
+                    })],
+                ),
+                block(
+                    1,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(0))),
+                    })],
+                ),
+                block(
+                    2,
+                    vec![
+                        stmt(StmtKind::Call {
+                            dst: None,
+                            target: rokajit::ir::CallTarget::Direct(f),
+                            sig,
+                            args: vec![Operand::Const(Const::Int32(1)); 7],
+                        }),
+                        stmt(StmtKind::EndFinally),
+                    ],
+                ),
+            ],
+        );
+        m.eh_regions.push(EhRegion {
+            kind: EhRegionKind::Finally,
+            try_start: BlockId(0),
+            try_end: BlockId(1),
+            handler_start: BlockId(2),
+            handler_end: BlockId(3),
+        });
+        let out = emit(&m, &ee);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp (slot + 16 outgoing)
+            0xC7, 0x45, 0xFC, 0, 0, 0, 0, // movl $0, -4(%rbp)
+            // B0 (offset 15): the step block
+            0xE8, 0x06, 0, 0, 0, // call B2 (the funclet at 26)
+            0x90, // nop
+            // B1 (offset 21): return x
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax
+            0xC9, 0xC3,
+            // B2 (offset 26): the funclet
+            0x48, 0x83, 0xEC, 0x18, // subq $24, %rsp — align16(16) + 8
+            0xBF, 1, 0, 0, 0, // movl $1, %edi
+            0xBE, 1, 0, 0, 0, // movl $1, %esi
+            0xBA, 1, 0, 0, 0, // movl $1, %edx
+            0xB9, 1, 0, 0, 0, // movl $1, %ecx
+            0x41, 0xB8, 1, 0, 0, 0, // movl $1, %r8d
+            0x41, 0xB9, 1, 0, 0, 0, // movl $1, %r9d
+            0xC7, 0x04, 0x24, 1, 0, 0, 0, // movl $1, (%rsp) — stack arg
+            0xE8, 0, 0, 0, 0, // call f (patched by 07.7)
+            0x48, 0x83, 0xC4, 0x18, // addq $24, %rsp
+            0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(
+            out.funclets,
+            vec![FuncletInfo {
+                start_offset: 26,
+                end_offset: 79,
+                prolog_len: 4,
+                sp_delta: 24,
+                kind: CorJitFuncKind::Handler,
+            }]
+        );
+        assert_eq!(out.interruptible_ranges, vec![(8, 24), (30, 74)]);
+        // The main frame's outgoing area covers the funclet's call (the
+        // fat GC header reports it), even though the main area has none.
+        assert_eq!(out.frame.outgoing_bytes, 16);
+        // The managed call inside the funclet records a global
+        // hot-relative safepoint.
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].offset, 69);
+    }
+
+    /// Importer-contract violations are Internal errors: a CatchArg that
+    /// isn't a catch funclet's first statement, and a `return` inside a
+    /// funclet.
+    #[test]
+    fn eh_shape_violations_are_internal_errors() {
+        // CatchArg in the main body.
+        let mut m = method(
+            vec![local(Type::Ref, LocalKind::Temp)],
+            0,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::CatchArg { dst: LocalId(0) }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        m.eh_regions.push(EhRegion {
+            kind: EhRegionKind::Catch { class_token: 1 },
+            try_start: BlockId(0),
+            try_end: BlockId(1),
+            handler_start: BlockId(1),
+            handler_end: BlockId(1),
+        });
+        assert!(matches!(
+            emit_tier0(&m, &MockEe::default()),
+            Err(CompileError::Internal(_))
+        ));
+
+        // A Return inside a finally funclet.
+        let mut m = method(
+            vec![],
+            0,
+            0,
+            vec![
+                block(
+                    0,
+                    vec![stmt(StmtKind::CallFinally {
+                        funclet: BlockId(2),
+                        continuation: BlockId(1),
+                    })],
+                ),
+                block(1, vec![stmt(StmtKind::Return { value: None })]),
+                block(
+                    2,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Const(Const::Int32(0))),
+                    })],
+                ),
+            ],
+        );
+        m.eh_regions.push(EhRegion {
+            kind: EhRegionKind::Finally,
+            try_start: BlockId(0),
+            try_end: BlockId(1),
+            handler_start: BlockId(2),
+            handler_end: BlockId(3),
+        });
+        assert!(matches!(
+            emit_tier0(&m, &MockEe::default()),
+            Err(CompileError::Internal(_))
+        ));
     }
 }

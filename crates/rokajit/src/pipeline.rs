@@ -27,6 +27,7 @@
 //! delegates to its implementing module.
 
 use rokajit_ee::ee_info::EeInfo;
+use rokajit_ee::enums::CorJitFuncKind;
 use rokajit_ee::handles::MethodHandle;
 use rokajit_ffi::CORINFO_SIG_INFO;
 
@@ -100,6 +101,32 @@ pub struct CodegenOutput {
     pub call_sites: Vec<CallSite>,
     /// Frame and GC-root facts for the metadata stage.
     pub frame: FrameInfo,
+    /// Funclets in emission order; emitted after the main body in the hot
+    /// chunk.
+    pub funclets: Vec<FuncletInfo>,
+    /// EH clauses with native hot-relative offsets, in VM order
+    /// (innermost-first; SAMETRY already applied to flags by codegen).
+    pub eh_clauses: Vec<EhClause>,
+    /// Fully-interruptible ranges `[start, end)`, native hot-relative,
+    /// sorted, disjoint. EMPTY = partially interruptible method (the slim
+    /// GC-info header).
+    pub interruptible_ranges: Vec<(u32, u32)>,
+}
+
+/// One funclet (an EH handler body emitted after the main body), described
+/// for the unwind/GC-info encoders.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct FuncletInfo {
+    /// Native `[start, end)` offsets, hot-chunk-relative.
+    pub start_offset: u32,
+    pub end_offset: u32,
+    /// Length of the funclet prolog (`sub rsp, N`); also the unwind code's
+    /// offset.
+    pub prolog_len: u8,
+    /// Bytes the funclet prolog subtracts from rsp (8-aligned, ≥ 8).
+    pub sp_delta: u32,
+    /// Always [`CorJitFuncKind::Handler`] today (filters are Unsupported).
+    pub kind: CorJitFuncKind,
 }
 
 /// Target-generic facts about the compiled frame, recorded by codegen.
@@ -107,6 +134,11 @@ pub struct FrameInfo {
     /// Frame size in bytes (IL locals + temps + spill area), excluding the
     /// return address and any saved frame pointer.
     pub frame_size: u32,
+    /// The frame's outgoing-argument area in bytes — the maximum
+    /// `CallAbi::stack_arg_bytes` over the method's call sites (0 when no
+    /// call overflows the register pools). The fat GC header reports it
+    /// (`SizeOfStackOutgoingAndScratchArea`).
+    pub outgoing_bytes: u32,
     /// Frame slots that hold GC pointers. In tier 0 every GC-ref local is
     /// frame-resident for its whole scope (Winch-style), so this one set is
     /// the root set at *every* safepoint; per-safepoint liveness arrives

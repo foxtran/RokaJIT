@@ -22,7 +22,8 @@
 //!   `callSite += m_pCallSiteSizes[...]`, gcinfoencoder.cpp:1100, already
 //!   applied — [`GcInfoInput::safepoints`]). Each offset is written in
 //!   `CeilOfLog2(code_len)` bits (`NORMALIZE_CODE_OFFSET` is the identity
-//!   on AMD64).
+//!   on AMD64). EH methods are fully interruptible and carry NO safepoints
+//!   (the count varl is 0 — see the fat-header path below).
 //! - **Slot table**: no register slots (every GC reference is
 //!   frame-resident), no *tracked* stack slots, and one **untracked**
 //!   stack slot per GC-root frame slot (gcinfoencoder.cpp:1432-1605).
@@ -47,16 +48,49 @@
 //! gcinfoencoder.h: the first bit written lands in bit 0 of the first
 //! byte), matching `BitStreamReader` in gcinfodecoder.h.
 //!
+//! ## The fat header (10.6 EH methods)
+//!
+//! Non-empty [`GcInfoInput::interruptible_ranges`] selects the
+//! fully-interruptible encoding; the slim path above stays byte-identical
+//! for empty ranges. Layout (encoder `Build`, gcinfoencoder.cpp:942-1162;
+//! decoder read order, gcinfodecoder.cpp:294-411):
+//!
+//! - Slim bit 1, then the 10-bit fat-flags word
+//!   (`GC_INFO_FLAGS_BIT_SIZE`, gcinfodecoder.h:257) with exactly
+//!   `GC_INFO_HAS_STACK_BASE_REGISTER` (0x40 — rbp, normalized to 0) and
+//!   `GC_INFO_WANTS_REPORT_ONLY_LEAF` (0x80 — RyuJIT sets it for any
+//!   method with funclets, gcencode.cpp:3998-4004, to avoid
+//!   double-reporting the parent frame) set. The macro
+//!   `GCINFO_WRITE_VARL_U(..., ENCBASE, RangeSize)`'s third parameter is a
+//!   MEASURE_GCINFO size counter only (gcinfoencoder.cpp:47-103) — it does
+//!   not affect the encoding.
+//! - Code length (TOTAL: main body + funclets), then the normalized stack
+//!   base register (0), then `NORMALIZE_SIZE_OF_STACK_AREA(outgoing) =
+//!   outgoing >> 3` (`SIZE_OF_STACK_AREA_ENCBASE=3`; AMD64 has
+//!   `HAS_FIXED_STACK_PARAMETER_SCRATCH_AREA`, gcinfotypes.h:620).
+//! - `NUM_SAFE_POINTS` varl = 0 (no safepoint offsets follow), then
+//!   `NUM_INTERRUPTIBLE_RANGES` (`NUM_INTERRUPTIBLE_RANGES_ENCBASE=1`),
+//!   then per range `varl_u(start - last_stop,
+//!   INTERRUPTIBLE_RANGE_DELTA1_ENCBASE=6)` and `varl_u(len - 1,
+//!   INTERRUPTIBLE_RANGE_DELTA2_ENCBASE=6)` (gcinfoencoder.cpp:1143-1162;
+//!   the decoder adds the 1 back, gcinfodecoder.cpp:604).
+//! - The untracked slot table, unchanged from the slim path.
+//! - With zero tracked slots there are no lifetime transitions, so the
+//!   fully-interruptible chunk section collapses to the chunk-pointer-size
+//!   varl (`POINTER_SIZE_ENCBASE=3`) encoding 0 — and the encoder's
+//!   `numUsedSlots == 0` early exit (gcinfoencoder.cpp:1448) skips even
+//!   that when the slot table is empty.
+//!
 //! Not yet encoded (named causes, later steps): tracked GC-root slots
-//! (per-safepoint liveness — a tier-1 contract extension), interruptible
-//! ranges, and every fat-header feature.
+//! (per-safepoint liveness — a tier-1 contract extension), GS cookie,
+//! generics context, reverse-pinvoke frame, EnC.
 
 use rokajit::error::{CompileError, CompileResult};
 use rokajit::metadata::GcInfoInput;
 
 /// `AMD64GcInfoEncoding::CODE_LENGTH_ENCBASE` (gcinfotypes.h:595).
 const CODE_LENGTH_ENCBASE: u32 = 8;
-/// `AMD64GcInfoEncoding::NUM_SAFE_POINTS_ENCBASE` (gcinfotypes.h:617).
+/// `AMD64GcInfoEncoding::NUM_SAFE_POINTS_ENCBASE` (gcinfotypes.h:614).
 const NUM_SAFE_POINTS_ENCBASE: u32 = 2;
 /// `AMD64GcInfoEncoding::NUM_STACK_SLOTS_ENCBASE` (gcinfotypes.h:603).
 const NUM_STACK_SLOTS_ENCBASE: u32 = 2;
@@ -68,22 +102,79 @@ const STACK_SLOT_ENCBASE: u32 = 6;
 const STACK_SLOT_DELTA_ENCBASE: u32 = 4;
 /// `GcStackSlotBase::GC_FRAMEREG_REL` (gcinfotypes.h:74).
 const GC_FRAMEREG_REL: u64 = 2;
+/// `AMD64GcInfoEncoding::STACK_BASE_REGISTER_ENCBASE` (gcinfotypes.h:598).
+const STACK_BASE_REGISTER_ENCBASE: u32 = 3;
+/// `AMD64GcInfoEncoding::SIZE_OF_STACK_AREA_ENCBASE` (gcinfotypes.h:599).
+const SIZE_OF_STACK_AREA_ENCBASE: u32 = 3;
+/// `AMD64GcInfoEncoding::NUM_INTERRUPTIBLE_RANGES_ENCBASE`
+/// (gcinfotypes.h:615).
+const NUM_INTERRUPTIBLE_RANGES_ENCBASE: u32 = 1;
+/// `AMD64GcInfoEncoding::INTERRUPTIBLE_RANGE_DELTA1_ENCBASE`
+/// (gcinfotypes.h:608).
+const INTERRUPTIBLE_RANGE_DELTA1_ENCBASE: u32 = 6;
+/// `AMD64GcInfoEncoding::INTERRUPTIBLE_RANGE_DELTA2_ENCBASE`
+/// (gcinfotypes.h:609).
+const INTERRUPTIBLE_RANGE_DELTA2_ENCBASE: u32 = 6;
+/// `AMD64GcInfoEncoding::POINTER_SIZE_ENCBASE` (gcinfotypes.h:617).
+const POINTER_SIZE_ENCBASE: u32 = 3;
+/// The fat-header flags word (`GC_INFO_FLAGS_BIT_SIZE = 10`,
+/// gcinfodecoder.h:257): `GC_INFO_HAS_STACK_BASE_REGISTER` (0x40) |
+/// `GC_INFO_WANTS_REPORT_ONLY_LEAF` (0x80).
+const FAT_FLAGS_EH: u64 = 0xC0;
 
 /// The `Target::encode_gc_info` body for x64.
 pub fn encode(input: &GcInfoInput) -> CompileResult<Vec<u8>> {
     let mut w = BitWriter::new();
-    // Slim header: slim-encoding bit 0, then "has stack base register" —
-    // set, because the tier-0 frame is rbp-based and GC slot offsets are
-    // rbp-relative (rbp normalizes to 0, so no fat header is needed).
-    w.write(0, 1);
-    w.write(1, 1);
-    w.write_varl_u(input.code_len, CODE_LENGTH_ENCBASE);
-    let mut safepoints = input.safepoints.clone();
-    safepoints.sort_unstable();
-    w.write_varl_u(safepoints.len() as u32, NUM_SAFE_POINTS_ENCBASE);
-    let offset_bits = ceil_log2(input.code_len);
-    for safepoint in safepoints {
-        w.write(u64::from(safepoint), offset_bits);
+    // Non-empty interruptible ranges ⇒ an EH method: the fat
+    // fully-interruptible header (see the module docs). The slim path is
+    // byte-identical to pre-EH output.
+    let fully_interruptible = !input.interruptible_ranges.is_empty();
+    if fully_interruptible {
+        w.write(1, 1);
+        w.write(FAT_FLAGS_EH, 10);
+        w.write_varl_u(input.code_len, CODE_LENGTH_ENCBASE);
+        // rbp: NORMALIZE_STACK_BASE_REGISTER(5) = 5 ^ 5 = 0.
+        w.write_varl_u(0, STACK_BASE_REGISTER_ENCBASE);
+        // NORMALIZE_SIZE_OF_STACK_AREA(x) = x >> 3.
+        if !input.outgoing_area_size.is_multiple_of(8) {
+            return Err(CompileError::Internal(
+                "outgoing argument area not 8-aligned",
+            ));
+        }
+        w.write_varl_u(input.outgoing_area_size >> 3, SIZE_OF_STACK_AREA_ENCBASE);
+        // Fully interruptible: zero safepoints, then the ranges,
+        // delta-encoded (start delta from the previous range's stop, then
+        // the length minus one — gcinfoencoder.cpp:1143-1162).
+        w.write_varl_u(0, NUM_SAFE_POINTS_ENCBASE);
+        w.write_varl_u(
+            input.interruptible_ranges.len() as u32,
+            NUM_INTERRUPTIBLE_RANGES_ENCBASE,
+        );
+        let mut last_stop = 0u32;
+        for &(start, end) in &input.interruptible_ranges {
+            if start < last_stop || end <= start {
+                return Err(CompileError::Internal(
+                    "interruptible ranges not sorted, disjoint, and non-empty",
+                ));
+            }
+            w.write_varl_u(start - last_stop, INTERRUPTIBLE_RANGE_DELTA1_ENCBASE);
+            w.write_varl_u(end - start - 1, INTERRUPTIBLE_RANGE_DELTA2_ENCBASE);
+            last_stop = end;
+        }
+    } else {
+        // Slim header: slim-encoding bit 0, then "has stack base register" —
+        // set, because the tier-0 frame is rbp-based and GC slot offsets are
+        // rbp-relative (rbp normalizes to 0, so no fat header is needed).
+        w.write(0, 1);
+        w.write(1, 1);
+        w.write_varl_u(input.code_len, CODE_LENGTH_ENCBASE);
+        let mut safepoints = input.safepoints.clone();
+        safepoints.sort_unstable();
+        w.write_varl_u(safepoints.len() as u32, NUM_SAFE_POINTS_ENCBASE);
+        let offset_bits = ceil_log2(input.code_len);
+        for safepoint in safepoints {
+            w.write(u64::from(safepoint), offset_bits);
+        }
     }
     // Slot table: no register slots, no tracked stack slots, one
     // untracked stack slot per GC root (always-live — the tier-0 static
@@ -104,6 +195,8 @@ pub fn encode(input: &GcInfoInput) -> CompileResult<Vec<u8>> {
     });
     w.write(0, 1);
     if roots.is_empty() {
+        // The encoder's numUsedSlots == 0 early exit
+        // (gcinfoencoder.cpp:1448): no chunk-pointer section either.
         w.write(0, 1);
         return Ok(w.finish());
     }
@@ -130,6 +223,12 @@ pub fn encode(input: &GcInfoInput) -> CompileResult<Vec<u8>> {
         }
         last_norm = norm;
         last_flags = flags;
+    }
+    if fully_interruptible {
+        // No tracked slots ⇒ no lifetime transitions ⇒ every chunk
+        // pointer is zero: the section collapses to the pointer-size varl
+        // encoding CeilOfLog2(0 + 1) = 0 (gcinfoencoder.cpp:2089-2098).
+        w.write_varl_u(0, POINTER_SIZE_ENCBASE);
     }
     Ok(w.finish())
 }
@@ -230,6 +329,8 @@ mod tests {
             frame_size: 32,
             gc_roots: Vec::new(),
             safepoints: safepoints.to_vec(),
+            interruptible_ranges: Vec::new(),
+            outgoing_area_size: 0,
         }
     }
 
@@ -591,5 +692,123 @@ mod tests {
         assert_eq!(ceil_log2(73), 7);
         assert_eq!(ceil_log2(128), 7);
         assert_eq!(ceil_log2(129), 8);
+    }
+
+    /// An EH-shaped input: total code length 100 (main + one funclet),
+    /// interruptible ranges covering the main body [8, 73) and the
+    /// funclet body [84, 96).
+    fn eh_input() -> GcInfoInput {
+        GcInfoInput {
+            code_len: 100,
+            interruptible_ranges: vec![(8, 73), (84, 96)],
+            ..input(100, &[37, 56])
+        }
+    }
+
+    /// Read one interruptible range in the decoder's order
+    /// (gcinfodecoder.cpp:599-617): start delta from the previous range's
+    /// stop, then the length minus one.
+    fn read_range(r: &mut Reader, last_stop: u32) -> (u32, u32) {
+        let start = last_stop + r.read_varl_u(INTERRUPTIBLE_RANGE_DELTA1_ENCBASE) as u32;
+        let stop = start + r.read_varl_u(INTERRUPTIBLE_RANGE_DELTA2_ENCBASE) as u32 + 1;
+        (start, stop)
+    }
+
+    /// The slim regression pin: empty ranges keep the exact pre-EH
+    /// encoding (the other tests above pin the same bytes against
+    /// hand-computed bit streams).
+    #[test]
+    fn empty_ranges_keep_the_slim_encoding() {
+        let blob = encode(&input(73, &[37, 56])).expect("encodes");
+        assert_eq!(blob, [0x26, 0x51, 0x09, 0x07], "the fib blob");
+        assert_eq!(blob[0] & 1, 0, "slim bit");
+    }
+
+    /// Fat header, no roots: hand-computed bit stream (LSB-first).
+    ///   [0] fat=1
+    ///   [1..10]  flags 0xC0 (stack-base-register | report-only-leaf)
+    ///   [11..19] varl8(100): 100 = 64+32+4 → 0,0,1,0,0,1,1,0 + ext 0
+    ///   [20..23] varl3(0): the normalized stack base register (rbp → 0)
+    ///   [24..27] varl3(0): outgoing area 0 >> 3
+    ///   [28..30] varl2(0): no safepoints (fully interruptible)
+    ///   [31..34] varl1(2 ranges): 0,1 | 1,0
+    ///   [35..41] varl6(8):  start delta 8 - 0
+    ///   [42..55] varl6(64): length-1 = 73-8-1 = 64 (two 7-bit chunks:
+    ///            0+cont, then 1)
+    ///   [56..62] varl6(11): start delta 84 - 73
+    ///   [63..69] varl6(11): length-1 = 96-84-1
+    ///   [70] no register slots, [71] no stack/untracked slots
+    ///   (no chunk-pointer varl: the empty slot table early-exits,
+    ///   gcinfoencoder.cpp:1448)
+    #[test]
+    fn fat_header_blob_is_byte_exact() {
+        let blob = encode(&eh_input()).expect("encodes");
+        assert_eq!(blob, [0x81, 0x21, 0x03, 0x00, 0x43, 0x00, 0x03, 0x8B, 0x05]);
+    }
+
+    /// Decode the fat blob back in the VM's read order
+    /// (gcinfodecoder.cpp:294-411): fat flags word, TOTAL code length,
+    /// normalized stack base register, outgoing area, zero safepoints,
+    /// then the ranges — the slot table and chunk-pointer varl follow.
+    #[test]
+    fn fat_header_decodes_back() {
+        let mut i = eh_input();
+        i.outgoing_area_size = 32;
+        i.gc_roots.push(root(16, false, false));
+        let blob = encode(&i).expect("encodes");
+        let mut r = Reader {
+            bytes: &blob,
+            bit: 0,
+        };
+        assert_eq!(r.read(1), 1, "fat header");
+        assert_eq!(
+            r.read(10),
+            0xC0,
+            "HAS_STACK_BASE_REGISTER | WANTS_REPORT_ONLY_LEAF"
+        );
+        assert_eq!(
+            r.read_varl_u(CODE_LENGTH_ENCBASE),
+            100,
+            "TOTAL code length (main + funclet)"
+        );
+        assert_eq!(
+            r.read_varl_u(STACK_BASE_REGISTER_ENCBASE),
+            0,
+            "rbp normalizes to 0"
+        );
+        assert_eq!(r.read_varl_u(SIZE_OF_STACK_AREA_ENCBASE), 4, "32 >> 3");
+        assert_eq!(r.read_varl_u(NUM_SAFE_POINTS_ENCBASE), 0, "no safepoints");
+        assert_eq!(r.read_varl_u(NUM_INTERRUPTIBLE_RANGES_ENCBASE), 2);
+        let first = read_range(&mut r, 0);
+        assert_eq!(first, (8, 73), "the main body range");
+        let second = read_range(&mut r, first.1);
+        assert_eq!(second, (84, 96), "the funclet body range");
+        // The untracked slot table is unchanged from the slim path.
+        assert_eq!(r.read(1), 0, "no register slots");
+        assert_eq!(r.read(1), 1, "stack slots follow");
+        assert_eq!(r.read_varl_u(NUM_STACK_SLOTS_ENCBASE), 0, "none tracked");
+        assert_eq!(r.read_varl_u(NUM_UNTRACKED_SLOTS_ENCBASE), 1);
+        assert_eq!(read_untracked_slot(&mut r, None), (-2, 0), "rbp - 16");
+        // No tracked slots ⇒ no transitions ⇒ the chunk-pointer section is
+        // just the pointer-size varl encoding 0.
+        assert_eq!(r.read_varl_u(POINTER_SIZE_ENCBASE), 0);
+        assert!(blob.len() * 8 - r.bit < 8, "only padding remains");
+    }
+
+    /// Contract violations in the ranges are upstream bugs, not encodings.
+    #[test]
+    fn bad_ranges_are_internal_errors() {
+        // Empty range.
+        let mut i = eh_input();
+        i.interruptible_ranges = vec![(8, 8)];
+        assert!(matches!(encode(&i), Err(CompileError::Internal(_))));
+        // Overlapping the previous range's stop.
+        let mut i = eh_input();
+        i.interruptible_ranges = vec![(8, 73), (72, 96)];
+        assert!(matches!(encode(&i), Err(CompileError::Internal(_))));
+        // The outgoing area must survive >> 3.
+        let mut i = eh_input();
+        i.outgoing_area_size = 12;
+        assert!(matches!(encode(&i), Err(CompileError::Internal(_))));
     }
 }

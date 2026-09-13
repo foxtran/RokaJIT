@@ -90,12 +90,16 @@ SUPPORTED = {
     0x74,                    # castclass (step_10.5)
     0x75,                    # isinst (step_10.5)
     0x79,                    # unbox (step_10.5)
+    0x7A,                    # throw (step_10.6)
     0x7B,                    # ldfld (step_10.4)
     0x7C,                    # ldflda (step_10.4)
     0x7D,                    # stfld (step_10.4)
     0x81,                    # stobj (step_10.9)
     0x8C,                    # box (step_10.5)
     0xA5,                    # unbox.any (step_10.5)
+    0xDC,                    # endfinally (step_10.6)
+    0xDD,                    # leave (step_10.6)
+    0xDE,                    # leave.s (step_10.6)
 }
 # Supported 0xFE-prefixed opcodes, by second byte (opcode.def):
 #   FE 01..05 = ceq, cgt, cgt.un, clt, clt.un
@@ -286,7 +290,7 @@ def il_opcodes(data, secs, rva):
         flags = struct.unpack_from("<H", data, off)[0]
         size = struct.unpack_from("<I", data, off + 4)[0]
         il = data[off + 12: off + 12 + size]
-        eh = bool(flags & 0x8) or bool(b & 0x30)  # MoreSects
+        eh = bool(flags & 0x8)  # MoreSects (bit 0x10 is InitLocals, not EH)
     ops, i = set(), 0
     while i < len(il):
         op = il[i]
@@ -370,9 +374,11 @@ def scan_tests(results):
 
 
 def unsupported_by_test(per_test):
-    """{test: frozenset of unsupported opcodes} for non-EH tests only."""
+    """{test: frozenset of unsupported opcodes}. EH tests are no longer
+    excluded: step_10.6 implemented try/catch/finally, so EH-bearing
+    tests enter the unlock pool like any other."""
     return {t: frozenset(o for o in ops if not is_supported(o))
-            for t, (ops, eh) in per_test.items() if not eh}
+            for t, (ops, _eh) in per_test.items()}
 
 
 def greedy_ladder(unsup):
@@ -424,7 +430,6 @@ def main(argv=None):
 
     results = load_results(RESULTS)
     per_test, unmatched, anomalies = scan_tests(results)
-    eh_blocked = sum(1 for _, eh in per_test.values() if eh)
 
     if unmatched:
         print(f"note: {unmatched} bin/ dlls have no matching test in "
@@ -448,8 +453,6 @@ def main(argv=None):
         return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
 
     print(f"tests scanned: {len(per_test)}")
-    print(f"EH-blocked tests (need step 10.6 EH support, excluded from "
-          f"the unlock pool): {eh_blocked}")
 
     print("\n== Solo-unlock: tests whose only unsupported opcode is X ==")
     for o, n in ranked(solo)[:TABLE_LIMIT]:

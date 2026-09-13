@@ -232,6 +232,14 @@ pub mod hir {
         Leave {
             target: BlockId,
         },
+        /// Call a finally funclet, then continue at `continuation` — one
+        /// hop of a `leave` chain (step_10.6). Only ever terminates a
+        /// synthetic statement-less step block sitting immediately after
+        /// the try region being exited.
+        CallFinally {
+            funclet: BlockId,
+            continuation: BlockId,
+        },
         /// `endfinally` / `endfilter` at the end of a funclet.
         EndFinally,
     }
@@ -319,9 +327,20 @@ pub mod hir {
             addr: Box<Expr>,
             class: ClassHandle,
         },
+        /// The exception object a catch handler is entered with (type
+        /// `Ref`; step_10.6). Legal only as the value of the synthesized
+        /// first store of a catch handler's entry block — the funclet's
+        /// incoming argument register is not a value anywhere else.
+        CatchArg,
     }
 
-    /// An EH region over a contiguous block range (half-open).
+    /// An EH region over a contiguous block range (half-open). In the
+    /// importer's layout (step_10.6) the main-area blocks come first in
+    /// IL order — with synthetic `CallFinally` step blocks spliced in —
+    /// and each clause's handler blocks form one contiguous group at the
+    /// tail. A try range IL-containing a nested handler maps to just its
+    /// main blocks: `try_start..try_end` is that run, the handler having
+    /// moved to the tail.
     pub struct EhRegion {
         pub kind: EhRegionKind,
         pub try_start: BlockId,
@@ -331,8 +350,12 @@ pub mod hir {
     }
 
     pub enum EhRegionKind {
+        /// A typed catch; `class_token` is the raw mdToken from the EE's
+        /// `getEHinfo`, passed through to the artifact untouched (the VM
+        /// resolves and type-tests it — no JIT-side handle query exists
+        /// for it). step_10.6.
         Catch {
-            class: ClassHandle,
+            class_token: u32,
         },
         Finally,
         Fault,
@@ -506,6 +529,19 @@ pub mod lir {
         },
         Leave {
             target: BlockId,
+        },
+        /// Catch-handler entry (step_10.6): the throwable (the funclet's
+        /// incoming argument-register value) lands in `dst`. Always the
+        /// first statement of a catch handler's entry block.
+        CatchArg {
+            dst: LocalId,
+        },
+        /// Call a finally funclet, then continue at `continuation` — one
+        /// hop of a `leave` chain (step_10.6). Always the block's last
+        /// statement.
+        CallFinally {
+            funclet: BlockId,
+            continuation: BlockId,
         },
         EndFinally,
     }

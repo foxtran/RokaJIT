@@ -29,7 +29,16 @@
 //! AMD64 eightbyte classification), struct instance methods (`this` as a
 //! byref), and struct-typed fields (loads yield the field address as a
 //! `StructVal`; stores are block copies, GC-embedding structs through the
-//! bulk-write-barrier helper). Anything else is
+//! bulk-write-barrier helper). The step_10.6 EH pack adds `throw`,
+//! `leave`/`leave.s`, and `endfinally`, plus the EH clause table:
+//! typed-catch and finally clauses become contiguous block ranges (main
+//! blocks first in IL order — with synthetic `CallFinally` step blocks
+//! spliced in — then each clause's handler blocks grouped at the tail), a
+//! catch handler's entry block starts with a synthesized store of the
+//! exception object ([`hir::Expr::CatchArg`]), and a `leave` that crosses
+//! finally handlers becomes a chain of step blocks ending in
+//! [`hir::Terminator::CallFinally`] hops. Filter and fault clauses and
+//! `rethrow`/`endfilter` are Unsupported. Anything else is
 //! [`CompileError::Unsupported`]; malformed IL is
 //! [`CompileError::BadIl`]. The importer never panics: every operand read
 //! is bounds-checked.
@@ -39,7 +48,10 @@
 //! boundary** — values crossing a boundary are legal IL but need temp
 //! materialization, which is a later step; they are rejected as
 //! `Unsupported` (so the ir-design stack-height invariant holds vacuously
-//! for everything the importer accepts). A value may, however, stay on
+//! for everything the importer accepts). The one exception is a catch
+//! handler's entry block: the VM enters it with the exception object on
+//! the stack, modeled as a synthesized depth-1 entry (step_10.6). A
+//! value may, however, stay on
 //! the stack across a `stloc` *within* a block: a tree that references
 //! the store's destination observed the pre-store value, so `stloc`
 //! spills every such tree to a temp first (RyuJIT's `impSpillLclRefs`).
@@ -76,9 +88,6 @@ use crate::structs::{layout_of, StructLayouts};
 
 /// Stage entry point (the body of [`crate::pipeline::import`]).
 pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> {
-    if info.eh_count > 0 {
-        return Err(CompileError::Unsupported("EH regions"));
-    }
     if info.il.is_empty() {
         return Err(CompileError::BadIl("empty IL stream"));
     }
@@ -128,11 +137,18 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
     let num_il_locals = local_types.len() as u32 - num_args;
 
     let insns = decode(&info.il)?;
-    let leaders = find_leaders(&info.il, &insns)?;
+    let clauses = fetch_clauses(info, ee)?;
+    validate_clauses(&clauses, &insns, info.il.len() as u32)?;
+    let leaders = find_leaders(&info.il, &insns, &clauses)?;
     let block_of = leaders
         .iter()
         .enumerate()
         .map(|(i, &offset)| (offset, i as u32))
+        .collect();
+    let catch_entries: BTreeSet<u32> = clauses
+        .iter()
+        .filter(|c| matches!(c.kind, ClauseKind::Catch { .. }))
+        .map(|c| c.handler_start)
         .collect();
     let mut importer = BlockImport {
         ee,
@@ -146,15 +162,27 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         block_of,
         expected_depth: HashMap::new(),
         stack: Vec::new(),
+        clauses,
+        catch_entries,
+        chains: Vec::new(),
     };
     let mut blocks = Vec::with_capacity(leaders.len());
     for b in 0..leaders.len() {
         blocks.push(importer.import_block(b, &leaders, &insns)?);
     }
-    // Every block was imported assuming an empty entry stack; a predecessor
-    // that recorded a non-zero depth means values cross a boundary.
-    for &depth in importer.expected_depth.values() {
-        if depth != 0 {
+    // Every block was imported assuming an empty entry stack — except a
+    // catch handler's entry block, which starts with the synthesized
+    // exception push (depth 1). A predecessor that recorded a different
+    // depth means values cross a boundary — or, for a catch entry, that
+    // something falls or branches into the handler.
+    for (&leader, &depth) in &importer.expected_depth {
+        if importer.catch_entries.contains(&leader) {
+            if depth != 1 {
+                return Err(CompileError::BadIl(
+                    "inconsistent stack depth at a merge point",
+                ));
+            }
+        } else if depth != 0 {
             return Err(CompileError::Unsupported(
                 "evaluation-stack values crossing a block boundary",
             ));
@@ -180,10 +208,33 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
             }
         })
         .collect();
+    // With EH clauses the block list is rebuilt (step_10.6): main-area
+    // blocks in IL order with the `leave` chains' step blocks spliced in,
+    // then each clause's handler blocks grouped at the tail; ids and the
+    // region table follow the new order.
+    let (blocks, eh_regions) = if importer.clauses.is_empty() {
+        (blocks, Vec::new())
+    } else {
+        let ranges: Vec<(u32, u32)> = (0..leaders.len())
+            .map(|b| {
+                (
+                    leaders[b],
+                    leaders.get(b + 1).copied().unwrap_or(info.il.len() as u32),
+                )
+            })
+            .collect();
+        rebuild_blocks(
+            blocks,
+            &ranges,
+            &importer.clauses,
+            &importer.chains,
+            &importer.block_of,
+        )?
+    };
     Ok(hir::Method {
         blocks,
         locals,
-        eh_regions: Vec::new(),
+        eh_regions,
         num_args,
         num_il_locals,
         struct_layouts: importer.struct_layouts,
@@ -368,6 +419,15 @@ enum Op {
     /// `unbox.any` — boxed value to the value itself: `unbox` + `ldobj`
     /// for a value class, `castclass` for anything else (type token).
     UnboxAny(u32),
+    /// `throw` — raise the stack-top exception reference.
+    Throw,
+    /// `leave`/`leave.s` — exit the enclosing protected region(s) for
+    /// `target` (absolute IL offset), emptying the evaluation stack.
+    Leave {
+        target: u32,
+    },
+    /// `endfinally` — return from a finally funclet.
+    EndFinally,
     Ret,
 }
 
@@ -571,12 +631,26 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x74 => Op::CastClass(r.u32()?),
             0x75 => Op::IsInst(r.u32()?),
             0x79 => Op::Unbox(r.u32()?),
+            0x7A => Op::Throw,
             0x7B => Op::LdFld(r.u32()?),
             0x7C => Op::LdFldA(r.u32()?),
             0x7D => Op::StFld(r.u32()?),
             0x81 => Op::StObj(r.u32()?),
             0x8C => Op::Box(r.u32()?),
             0xA5 => Op::UnboxAny(r.u32()?),
+            0xDC => Op::EndFinally,
+            0xDD => {
+                let d = r.i32()?;
+                Op::Leave {
+                    target: branch_target(il.len(), r.ip, d)?,
+                }
+            }
+            0xDE => {
+                let d = r.i8()?;
+                Op::Leave {
+                    target: branch_target(il.len(), r.ip, i32::from(d))?,
+                }
+            }
             0xFE => match r.u8()? {
                 0x01 => Op::Compare(BinaryOp::Eq),
                 0x02 => Op::Compare(BinaryOp::Gt),
@@ -589,7 +663,11 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                 0x0C => Op::LdLoc(r.u16()?),
                 0x0D => Op::LdLoca(r.u16()?),
                 0x0E => Op::StLoc(r.u16()?),
+                0x11 => {
+                    return Err(CompileError::Unsupported("endfilter (EH filter clauses)"));
+                }
                 0x15 => Op::InitObj(r.u32()?),
+                0x1A => return Err(CompileError::Unsupported("rethrow")),
                 _ => {
                     return Err(CompileError::Unsupported(
                         "0xFE-prefixed opcode outside the supported set",
@@ -614,17 +692,41 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
 /// Computes block-start offsets (in layout order) and validates branch
 /// targets: every target must land on an instruction boundary, conditional
 /// branches must have a fallthrough, and code after an unconditional
-/// transfer must be a branch target (i.e. reachable).
-fn find_leaders(il: &[u8], insns: &[Insn]) -> CompileResult<Vec<u32>> {
+/// transfer must be a branch target (i.e. reachable). EH region
+/// boundaries (try/handler starts and ends) and `leave` targets are
+/// block starts too (step_10.6).
+fn find_leaders(il: &[u8], insns: &[Insn], clauses: &[Clause]) -> CompileResult<Vec<u32>> {
     let mut is_boundary = vec![false; il.len()];
     for insn in insns {
         is_boundary[insn.offset as usize] = true;
     }
 
     let mut leaders: BTreeSet<u32> = BTreeSet::from([0]);
+    for clause in clauses {
+        for boundary in [
+            clause.try_start,
+            clause.try_end,
+            clause.handler_start,
+            clause.handler_end,
+        ] {
+            // A region end at the very end of the method starts no block.
+            if boundary as usize == il.len() {
+                continue;
+            }
+            if !is_boundary[boundary as usize] {
+                return Err(CompileError::BadIl(
+                    "EH region boundary is not an instruction boundary",
+                ));
+            }
+            leaders.insert(boundary);
+        }
+    }
     for insn in insns {
         match insn.op {
-            Op::Br { target } | Op::BrZero { target, .. } | Op::BrCmp { target, .. } => {
+            Op::Br { target }
+            | Op::BrZero { target, .. }
+            | Op::BrCmp { target, .. }
+            | Op::Leave { target } => {
                 if !is_boundary[target as usize] {
                     return Err(CompileError::BadIl(
                         "branch target is not an instruction boundary",
@@ -645,7 +747,10 @@ fn find_leaders(il: &[u8], insns: &[Insn]) -> CompileResult<Vec<u32>> {
         }
     }
     for (i, insn) in insns.iter().enumerate() {
-        if matches!(insn.op, Op::Br { .. } | Op::Ret) {
+        if matches!(
+            insn.op,
+            Op::Br { .. } | Op::Ret | Op::Throw | Op::Leave { .. } | Op::EndFinally
+        ) {
             if let Some(next) = insns.get(i + 1) {
                 if !leaders.contains(&next.offset) {
                     return Err(CompileError::BadIl(
@@ -656,6 +761,404 @@ fn find_leaders(il: &[u8], insns: &[Insn]) -> CompileResult<Vec<u32>> {
         }
     }
     Ok(leaders.into_iter().collect())
+}
+
+/// One EH clause in IL space (step_10.6), translated from
+/// `CORINFO_EH_CLAUSE`: unlike the native table (codegencommon.cpp
+/// `genReportEH`), the IL form's lengths are LENGTHS, so the half-open
+/// ranges here are computed as start + length.
+struct Clause {
+    kind: ClauseKind,
+    try_start: u32,
+    try_end: u32,
+    handler_start: u32,
+    handler_end: u32,
+}
+
+enum ClauseKind {
+    /// A typed catch; the raw mdToken from the EE, passed through to the
+    /// artifact (the VM resolves and type-tests it).
+    Catch {
+        class_token: u32,
+    },
+    Finally,
+}
+
+/// The method's EH clauses from `get_eh_info` (step_10.6). Only typed
+/// catches and finallys are in scope; filters and faults are named
+/// Unsupported.
+fn fetch_clauses(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<Vec<Clause>> {
+    let mut clauses = Vec::with_capacity(info.eh_count as usize);
+    for i in 0..info.eh_count {
+        let raw = ee.get_eh_info(info.ftn, i);
+        let flags = raw.Flags;
+        if flags & ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FILTER != 0 {
+            return Err(CompileError::Unsupported("EH filter clauses"));
+        }
+        if flags & ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FAULT != 0 {
+            return Err(CompileError::Unsupported("EH fault clauses"));
+        }
+        // SAMETRY is a JIT→EE table flag the EE never reports here.
+        let kind = match flags & !ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_SAMETRY {
+            ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_NONE => ClauseKind::Catch {
+                // SAFETY: a NONE clause's union member is ClassToken.
+                class_token: unsafe { raw.__bindgen_anon_1.ClassToken },
+            },
+            ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FINALLY => ClauseKind::Finally,
+            _ => return Err(CompileError::BadIl("unknown EH clause flags")),
+        };
+        let bounds = |start: u32, len: u32| {
+            start
+                .checked_add(len)
+                .ok_or(CompileError::BadIl("EH region outside the IL stream"))
+        };
+        clauses.push(Clause {
+            kind,
+            try_start: raw.TryOffset,
+            try_end: bounds(raw.TryOffset, raw.TryLength)?,
+            handler_start: raw.HandlerOffset,
+            handler_end: bounds(raw.HandlerOffset, raw.HandlerLength)?,
+        });
+    }
+    Ok(clauses)
+}
+
+/// The EH well-formedness the importer relies on (step_10.6): regions
+/// are non-empty and in-bounds, a clause's handler is disjoint from its
+/// own try, and every pair of try/handler ranges is disjoint, nested, or
+/// — for try ranges only — equal (multiple catch clauses on one try).
+/// Each try must also protect at least one instruction that no handler
+/// covers (the layout rebuild maps a try to its *main* blocks).
+fn validate_clauses(clauses: &[Clause], insns: &[Insn], il_len: u32) -> CompileResult<()> {
+    for c in clauses {
+        if c.try_start >= c.try_end || c.handler_start >= c.handler_end {
+            return Err(CompileError::BadIl("empty EH region"));
+        }
+        if c.try_end > il_len || c.handler_end > il_len {
+            return Err(CompileError::BadIl("EH region outside the IL stream"));
+        }
+        if c.handler_start < c.try_end && c.try_start < c.handler_end {
+            return Err(CompileError::BadIl("EH handler overlaps its own try"));
+        }
+        let protects_something = insns.iter().any(|insn| {
+            insn.offset >= c.try_start
+                && insn.offset < c.try_end
+                && !clauses
+                    .iter()
+                    .any(|h| insn.offset >= h.handler_start && insn.offset < h.handler_end)
+        });
+        if !protects_something {
+            return Err(CompileError::BadIl(
+                "EH try region protects no instructions",
+            ));
+        }
+    }
+    let mut regions = Vec::with_capacity(clauses.len() * 2);
+    for c in clauses {
+        regions.push((c.try_start, c.try_end, true));
+        regions.push((c.handler_start, c.handler_end, false));
+    }
+    for (i, &(s1, e1, try1)) in regions.iter().enumerate() {
+        for &(s2, e2, try2) in &regions[i + 1..] {
+            let disjoint = e1 <= s2 || e2 <= s1;
+            let equal = s1 == s2 && e1 == e2;
+            let nested = (s1 >= s2 && e1 <= e2) || (s2 >= s1 && e2 <= e1);
+            if disjoint || nested && (try1 && try2 || !equal) {
+                continue;
+            }
+            return Err(CompileError::BadIl("improperly nested EH regions"));
+        }
+    }
+    Ok(())
+}
+
+/// The clause whose HANDLER region is the innermost containing `offset`
+/// (step_10.6): catch handler entries are entered with the exception on
+/// the stack, and `leave` inside a catch handler is the funclet's
+/// return-the-resume-address form.
+fn innermost_handler(clauses: &[Clause], offset: u32) -> Option<usize> {
+    clauses
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| offset >= c.handler_start && offset < c.handler_end)
+        .min_by_key(|(_, c)| c.handler_end - c.handler_start)
+        .map(|(i, _)| i)
+}
+
+/// The finally clauses a `leave` at `site` must invoke to reach `target`
+/// (step_10.6): every finally clause whose try region contains the site
+/// but not the target, innermost first.
+fn finally_chain(clauses: &[Clause], site: u32, target: u32) -> Vec<usize> {
+    let mut chain: Vec<usize> = clauses
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            matches!(c.kind, ClauseKind::Finally)
+                && site >= c.try_start
+                && site < c.try_end
+                && !(target >= c.try_start && target < c.try_end)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    // Region validation guarantees proper nesting, so span order is
+    // nesting order.
+    chain.sort_by_key(|&i| clauses[i].try_end - clauses[i].try_start);
+    chain
+}
+
+/// A `leave` whose path crosses one or more finally handlers, recorded
+/// at import for the layout rebuild (step_10.6).
+struct LeaveChain {
+    /// The pre-rebuild block index of the leave site.
+    source: usize,
+    /// The finally clauses to invoke, innermost first.
+    hops: Vec<usize>,
+    /// The leave's target IL offset (a leader).
+    target: u32,
+    /// A leave inside a catch handler keeps its `Leave` terminator —
+    /// the funclet returns the resume address, which is the first step
+    /// block — where a plain-body leave ends its block in a `Jump`.
+    from_catch: bool,
+}
+
+/// One synthetic block of a leave chain: `hop < hops.len()` is a
+/// `CallFinally` step for that hop's clause, `hop == hops.len()` is the
+/// chain's final `Leave { target }` block. Spliced immediately after the
+/// last main block of the try the hop exits, so its native code lands
+/// outside that try but inside the enclosing region (clr-abi.md
+/// §Invoking Finallys: the call's return address must not be in the try
+/// being exited).
+struct Step {
+    /// The pre-rebuild main-area block this step splices after.
+    anchor: usize,
+    /// Span of the try range the hop exits (ordering: innermost first).
+    exit_span: u32,
+    chain: usize,
+    hop: usize,
+}
+
+/// Rebuilds the block list for an EH method (step_10.6): main-area
+/// blocks in IL order (a block is main-area iff its IL range lies
+/// outside every handler region) with the leave chains' step blocks
+/// spliced after their anchor blocks, then the handler blocks grouped
+/// per clause at the tail (groups in handler IL order, IL order within a
+/// group). BlockIds are renumbered to layout order, every terminator
+/// target is remapped, and the `eh_regions` table is computed over the
+/// new order.
+fn rebuild_blocks(
+    mut blocks: Vec<hir::Block>,
+    ranges: &[(u32, u32)],
+    clauses: &[Clause],
+    chains: &[LeaveChain],
+    block_of: &HashMap<u32, u32>,
+) -> CompileResult<(Vec<hir::Block>, Vec<hir::EhRegion>)> {
+    let n = blocks.len();
+    // EH region boundaries are leaders, so a block lies entirely inside
+    // or outside each handler range.
+    let handler_of: Vec<Option<usize>> = ranges
+        .iter()
+        .map(|&(start, _)| {
+            clauses
+                .iter()
+                .position(|c| start >= c.handler_start && start < c.handler_end)
+        })
+        .collect();
+    let is_main = |i: usize| handler_of[i].is_none();
+    let in_try = |i: usize, c: &Clause| ranges[i].0 >= c.try_start && ranges[i].0 < c.try_end;
+    // The anchor a step block splices after: the last main block of the
+    // try being exited. Validation guarantees the try protects at least
+    // one non-handler instruction, so the block exists.
+    let anchor_of = |c: &Clause| -> CompileResult<usize> {
+        (0..n)
+            .rfind(|&i| is_main(i) && in_try(i, c))
+            .ok_or(CompileError::Internal("EH try region has no main blocks"))
+    };
+
+    let mut steps: Vec<Step> = Vec::new();
+    for (ch, chain) in chains.iter().enumerate() {
+        for (hop, &clause) in chain.hops.iter().enumerate() {
+            steps.push(Step {
+                anchor: anchor_of(&clauses[clause])?,
+                exit_span: clauses[clause].try_end - clauses[clause].try_start,
+                chain: ch,
+                hop,
+            });
+        }
+        // The final Leave block rides on the last hop's anchor.
+        let &last = chain
+            .hops
+            .last()
+            .ok_or(CompileError::Internal("leave chain with no hops"))?;
+        steps.push(Step {
+            anchor: anchor_of(&clauses[last])?,
+            exit_span: clauses[last].try_end - clauses[last].try_start,
+            chain: ch,
+            hop: chain.hops.len(),
+        });
+    }
+
+    // The new order: mains, with each anchor's steps right after it
+    // (innermost-exiting first), then the handler groups.
+    enum Item {
+        Orig(usize),
+        Step(usize, usize),
+    }
+    let mut order: Vec<Item> = Vec::with_capacity(n + steps.len());
+    for i in 0..n {
+        if !is_main(i) {
+            continue;
+        }
+        order.push(Item::Orig(i));
+        let mut here: Vec<&Step> = steps.iter().filter(|s| s.anchor == i).collect();
+        here.sort_by_key(|s| (s.exit_span, s.chain, s.hop));
+        order.extend(here.iter().map(|s| Item::Step(s.chain, s.hop)));
+    }
+    let mut clause_order: Vec<usize> = (0..clauses.len()).collect();
+    clause_order.sort_by_key(|&c| clauses[c].handler_start);
+    for &c in &clause_order {
+        order.extend((0..n).filter(|&i| handler_of[i] == Some(c)).map(Item::Orig));
+    }
+
+    // Renumber: originals and steps get their layout position as the id.
+    let mut new_id = vec![0u32; n];
+    let mut step_id: HashMap<(usize, usize), u32> = HashMap::new();
+    for (pos, item) in order.iter().enumerate() {
+        match *item {
+            Item::Orig(i) => new_id[i] = pos as u32,
+            Item::Step(ch, hop) => {
+                step_id.insert((ch, hop), pos as u32);
+            }
+        }
+    }
+    let remap = |id: &mut BlockId, new_id: &[u32]| *id = BlockId(new_id[id.0 as usize]);
+
+    let mut out: Vec<hir::Block> = Vec::with_capacity(order.len());
+    let mut blocks: Vec<Option<hir::Block>> = blocks.drain(..).map(Some).collect();
+    for (pos, item) in order.iter().enumerate() {
+        match *item {
+            Item::Orig(i) => {
+                let mut block = blocks[i].take().expect("one slot per block");
+                block.id = BlockId(pos as u32);
+                match &mut block.terminator {
+                    hir::Terminator::Jump { target } | hir::Terminator::Leave { target } => {
+                        remap(target, &new_id)
+                    }
+                    hir::Terminator::Branch { then, else_, .. } => {
+                        remap(then, &new_id);
+                        remap(else_, &new_id);
+                    }
+                    hir::Terminator::Switch {
+                        targets, default, ..
+                    } => {
+                        for target in targets {
+                            remap(target, &new_id);
+                        }
+                        remap(default, &new_id);
+                    }
+                    hir::Terminator::Return { .. }
+                    | hir::Terminator::Throw { .. }
+                    | hir::Terminator::EndFinally => {}
+                    hir::Terminator::CallFinally { .. } => {
+                        return Err(CompileError::Internal(
+                            "CallFinally on an imported (non-step) block",
+                        ));
+                    }
+                }
+                out.push(block);
+            }
+            Item::Step(ch, hop) => {
+                let chain = &chains[ch];
+                let terminator = if hop < chain.hops.len() {
+                    let handler_entry = block_of
+                        .get(&clauses[chain.hops[hop]].handler_start)
+                        .ok_or(CompileError::Internal("handler entry is not a block start"))?;
+                    hir::Terminator::CallFinally {
+                        funclet: BlockId(new_id[*handler_entry as usize]),
+                        continuation: BlockId(step_id[&(ch, hop + 1)]),
+                    }
+                } else {
+                    let target = block_of
+                        .get(&chain.target)
+                        .ok_or(CompileError::Internal("leave target is not a block start"))?;
+                    hir::Terminator::Leave {
+                        target: BlockId(new_id[*target as usize]),
+                    }
+                };
+                out.push(hir::Block {
+                    id: BlockId(pos as u32),
+                    stmts: Vec::new(),
+                    terminator,
+                });
+            }
+        }
+    }
+    // The chain source blocks: a plain-body leave ends Jump(first step);
+    // a leave from a catch handler keeps the funclet-returning Leave
+    // form, aimed at the first step block (the VM resumes there).
+    for (ch, chain) in chains.iter().enumerate() {
+        let first_step = BlockId(step_id[&(ch, 0)]);
+        let block = &mut out[new_id[chain.source] as usize];
+        block.terminator = if chain.from_catch {
+            hir::Terminator::Leave { target: first_step }
+        } else {
+            hir::Terminator::Jump { target: first_step }
+        };
+    }
+
+    // The region table over the new layout. A try range maps to its run
+    // of main blocks — a nested handler's IL moved to the tail — extended
+    // over any step blocks trailing its last main block whose hop exits a
+    // STRICTLY INNER try (the coincident-try-end case: the call exiting
+    // the inner try must still sit inside this region).
+    let mut regions = Vec::with_capacity(clauses.len());
+    for (ci, c) in clauses.iter().enumerate() {
+        let try_start = (0..n)
+            .filter(|&i| is_main(i) && in_try(i, c))
+            .map(|i| new_id[i])
+            .min()
+            .ok_or(CompileError::Internal("EH try region has no main blocks"))?;
+        let mut try_end = (0..n)
+            .filter(|&i| is_main(i) && in_try(i, c))
+            .map(|i| new_id[i])
+            .max()
+            .expect("non-empty above")
+            + 1;
+        while let Some(Item::Step(ch, hop)) = order.get(try_end as usize) {
+            let chain = &chains[*ch];
+            let exit_clause = chain.hops[(*hop).min(chain.hops.len() - 1)];
+            let exit_try = &clauses[exit_clause];
+            let strictly_inner = exit_clause != ci
+                && exit_try.try_start >= c.try_start
+                && exit_try.try_end <= c.try_end
+                && (exit_try.try_start > c.try_start || exit_try.try_end < c.try_end);
+            if !strictly_inner {
+                break;
+            }
+            try_end += 1;
+        }
+        let handler_start = (0..n)
+            .filter(|&i| handler_of[i] == Some(ci))
+            .map(|i| new_id[i])
+            .min()
+            .ok_or(CompileError::Internal("EH handler region has no blocks"))?;
+        let handler_end = (0..n)
+            .filter(|&i| handler_of[i] == Some(ci))
+            .map(|i| new_id[i])
+            .max()
+            .expect("non-empty above")
+            + 1;
+        regions.push(hir::EhRegion {
+            kind: match clauses[ci].kind {
+                ClauseKind::Catch { class_token } => hir::EhRegionKind::Catch { class_token },
+                ClauseKind::Finally => hir::EhRegionKind::Finally,
+            },
+            try_start: BlockId(try_start),
+            try_end: BlockId(try_end),
+            handler_start: BlockId(handler_start),
+            handler_end: BlockId(handler_end),
+        });
+    }
+    Ok((out, regions))
 }
 
 /// Per-compilation state for the block-import pass: the eval-stack
@@ -680,6 +1183,15 @@ struct BlockImport<'a> {
     /// Stack depth each block entry requires, as told by its predecessors.
     expected_depth: HashMap<u32, usize>,
     stack: Vec<(Type, hir::Expr)>,
+    /// The method's EH clauses in IL space (step_10.6); empty for the
+    /// fib subset.
+    clauses: Vec<Clause>,
+    /// Handler-entry offsets of the catch clauses: those blocks are
+    /// entered with the exception object on the eval stack.
+    catch_entries: BTreeSet<u32>,
+    /// `leave`s whose path crosses finally handlers, for the layout
+    /// rebuild (step_10.6).
+    chains: Vec<LeaveChain>,
 }
 
 fn binary(op: BinaryOp, lhs: hir::Expr, rhs: hir::Expr) -> hir::Expr {
@@ -695,7 +1207,7 @@ fn binary(op: BinaryOp, lhs: hir::Expr, rhs: hir::Expr) -> hir::Expr {
 /// references the store's destination must keep the pre-store value.
 fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
     match expr {
-        hir::Expr::Const(_) | hir::Expr::StaticFieldAddr { .. } => false,
+        hir::Expr::Const(_) | hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => false,
         hir::Expr::Local(l) | hir::Expr::LocalAddr(l) => *l == id,
         hir::Expr::Load { addr, .. } => references_local(addr, id),
         hir::Expr::FieldAddr { obj, .. } => references_local(obj, id),
@@ -729,7 +1241,7 @@ fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
 fn must_eval(expr: &hir::Expr) -> bool {
     match expr {
         hir::Expr::Const(_) | hir::Expr::Local(_) | hir::Expr::LocalAddr(_) => false,
-        hir::Expr::StaticFieldAddr { .. } => false,
+        hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => false,
         hir::Expr::Load { .. } => true, // can fault (null byref)
         hir::Expr::FieldAddr { obj, .. } => must_eval(obj),
         hir::Expr::Unary { arg, .. } => must_eval(arg),
@@ -1225,6 +1737,74 @@ impl BlockImport<'_> {
             });
         }
         Ok(hir::Terminator::Return { value: Some(value) })
+    }
+
+    /// `throw` (0x7A, step_10.6): the pending stack trees evaluate in IL
+    /// order before the throw (the spill), then the exception pops — it
+    /// must be a reference.
+    fn throw(
+        &mut self,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<hir::Terminator> {
+        self.spill_stack(stmts, il_offset)?;
+        let (ty, exception) = self.pop()?;
+        if ty != Type::Ref {
+            return Err(CompileError::BadIl("throw operand must be a reference"));
+        }
+        Ok(hir::Terminator::Throw { exception })
+    }
+
+    /// `leave`/`leave.s` (step_10.6): the evaluation stack empties
+    /// (ECMA-335 §III.2.38) — pending trees still evaluate first, for
+    /// their side effects. A leave whose path crosses finally handlers
+    /// records a chain for the layout rebuild (which splices in the
+    /// `CallFinally` step blocks); anything else is the plain `Leave`
+    /// terminator — inside a catch handler, the funclet's
+    /// return-the-resume-address form.
+    fn leave(
+        &mut self,
+        b: usize,
+        target: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<hir::Terminator> {
+        self.spill_stack(stmts, il_offset)?;
+        self.stack.clear();
+        self.note_depth(target, 0)?;
+        let hops = finally_chain(&self.clauses, il_offset.0, target);
+        if !hops.is_empty() {
+            let from_catch = matches!(
+                innermost_handler(&self.clauses, il_offset.0),
+                Some(c) if matches!(self.clauses[c].kind, ClauseKind::Catch { .. })
+            );
+            self.chains.push(LeaveChain {
+                source: b,
+                hops,
+                target,
+                from_catch,
+            });
+        }
+        Ok(hir::Terminator::Leave {
+            target: self.block_id(target)?,
+        })
+    }
+
+    /// `endfinally` (0xDC, step_10.6): valid only inside a finally
+    /// handler — the funclet's plain return. The stack resets, with
+    /// pending trees evaluated first for their side effects.
+    fn endfinally(
+        &mut self,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<hir::Terminator> {
+        match innermost_handler(&self.clauses, il_offset.0) {
+            Some(c) if matches!(self.clauses[c].kind, ClauseKind::Finally) => {}
+            _ => return Err(CompileError::BadIl("endfinally outside a finally handler")),
+        }
+        self.spill_stack(stmts, il_offset)?;
+        self.stack.clear();
+        Ok(hir::Terminator::EndFinally)
     }
 
     /// `ldstr` (0x72): the EE constructs and interns the literal — RyuJIT's
@@ -2237,6 +2817,24 @@ impl BlockImport<'_> {
 
         let mut stmts = Vec::new();
         let mut terminator = None;
+        // A catch handler's entry block is entered by the VM with the
+        // exception object on the eval stack (step_10.6): a synthesized
+        // store of the funclet's incoming argument into a fresh Ref temp
+        // — an ordinary always-live untracked root, zeroed by the main
+        // prolog — and a read of that temp as the initial stack (depth 1,
+        // which the expected-depth check enforces against any IL-level
+        // predecessor).
+        if self.catch_entries.contains(&start) {
+            let exc = self.temp(Type::Ref);
+            stmts.push(hir::Stmt {
+                il_offset: IlOffset(start),
+                kind: hir::StmtKind::Store {
+                    dst: exc,
+                    value: hir::Expr::CatchArg,
+                },
+            });
+            self.push(Type::Ref, hir::Expr::Local(exc))?;
+        }
         for insn in &insns[first..last] {
             let il_offset = IlOffset(insn.offset);
             match insn.op {
@@ -2367,6 +2965,15 @@ impl BlockImport<'_> {
                 }
                 Op::Ret => {
                     terminator = Some(self.ret(&mut stmts, il_offset)?);
+                }
+                Op::Throw => {
+                    terminator = Some(self.throw(&mut stmts, il_offset)?);
+                }
+                Op::Leave { target } => {
+                    terminator = Some(self.leave(b, target, &mut stmts, il_offset)?);
+                }
+                Op::EndFinally => {
+                    terminator = Some(self.endfinally(&mut stmts, il_offset)?);
                 }
             }
         }
@@ -3125,13 +3732,499 @@ mod tests {
         ));
     }
 
+    // --- step_10.6: EH (try/catch/finally) ---
+
+    /// A canned typed-catch clause (flags NONE; raw class mdToken).
+    fn catch_clause(
+        try_start: u32,
+        try_len: u32,
+        handler_start: u32,
+        handler_len: u32,
+        class_token: u32,
+    ) -> ffi::CORINFO_EH_CLAUSE {
+        let mut clause: ffi::CORINFO_EH_CLAUSE = unsafe { std::mem::zeroed() };
+        clause.Flags = ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_NONE;
+        clause.TryOffset = try_start;
+        clause.TryLength = try_len;
+        clause.HandlerOffset = handler_start;
+        clause.HandlerLength = handler_len;
+        clause.__bindgen_anon_1.ClassToken = class_token;
+        clause
+    }
+
+    /// A canned finally clause.
+    fn finally_clause(
+        try_start: u32,
+        try_len: u32,
+        handler_start: u32,
+        handler_len: u32,
+    ) -> ffi::CORINFO_EH_CLAUSE {
+        let mut clause = catch_clause(try_start, try_len, handler_start, handler_len, 0);
+        clause.Flags = ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FINALLY;
+        clause
+    }
+
+    /// A fixture with canned EH clauses installed on the mock (and
+    /// `eh_count` matching), `void f()` shape with `locals`.
+    fn eh_fixture(
+        il: &[u8],
+        locals: &[CorInfoType],
+        clauses: &[ffi::CORINFO_EH_CLAUSE],
+    ) -> (MockEe, MethodInfo) {
+        let (mut ee, mut info) = fixture_full(
+            il,
+            &sig(CorInfoType::Void, &[]),
+            locals,
+            8,
+            clauses.len() as u32,
+        );
+        ee.eh_clauses = clauses.to_vec();
+        info.eh_count = clauses.len() as u32;
+        (ee, info)
+    }
+
+    /// The try/finally shape of RyuJIT's B1 reference
+    /// (target/eh-ref/B1o0.disasm.txt):
+    /// `0: nop; 1: leave.s +1 (-> 4); 3: endfinally; 4: ret` with a
+    /// finally clause try [0,3), handler [3,4).
+    const TRY_FINALLY_IL: [u8; 5] = [0x00, 0xDE, 0x01, 0xDC, 0x2A];
+
+    fn as_leave(t: &hir::Terminator) -> BlockId {
+        match t {
+            hir::Terminator::Leave { target } => *target,
+            _ => panic!("expected Terminator::Leave"),
+        }
+    }
+
+    fn as_jump(t: &hir::Terminator) -> BlockId {
+        match t {
+            hir::Terminator::Jump { target } => *target,
+            _ => panic!("expected Terminator::Jump"),
+        }
+    }
+
+    fn as_call_finally(t: &hir::Terminator) -> (BlockId, BlockId) {
+        match t {
+            hir::Terminator::CallFinally {
+                funclet,
+                continuation,
+            } => (*funclet, *continuation),
+            _ => panic!("expected Terminator::CallFinally"),
+        }
+    }
+
     #[test]
-    fn eh_regions_are_unsupported() {
-        let (ee, info) = fixture_full(&[0x2A], &sig(CorInfoType::Void, &[]), &[], 8, 1);
+    fn throw_pops_a_reference_after_spilling() {
+        // ldarg.0; call fib; ldnull; throw — the pending call tree
+        // evaluates (into a spill temp) before the throw, and the throw
+        // consumes the reference.
+        let il = [0x02, 0x28, 0x01, 0x00, 0x00, 0x06, 0x14, 0x7A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Int]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.blocks.len(), 1);
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "just the spill store");
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(1), "the spill temp follows the one arg");
+        assert!(matches!(value, hir::Expr::Call { .. }));
+        match &m.blocks[0].terminator {
+            hir::Terminator::Throw { exception } => {
+                assert!(matches!(exception, hir::Expr::Const(Const::NullRef)));
+            }
+            _ => panic!("expected Terminator::Throw"),
+        }
+    }
+
+    #[test]
+    fn throw_of_a_non_reference_is_bad_il() {
+        // ldc.i4.0; throw.
         assert!(matches!(
-            import(&info, &ee),
-            Err(CompileError::Unsupported(_))
+            import_ii(&[0x16, 0x7A]),
+            Err(CompileError::BadIl(_))
         ));
+        // throw on an empty stack underflows.
+        assert!(matches!(import_ii(&[0x7A]), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn leave_forms_decode_and_import() {
+        // nop; leave.s -3 (-> 0) — the negative-delta short form loops to
+        // the method start. No enclosing region: a plain Leave. (One
+        // block: the nop falls through into the leave.)
+        let (ee, info) = fixture(&[0x00, 0xDE, 0xFD], &sig(CorInfoType::Void, &[]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.blocks.len(), 1);
+        assert_eq!(as_leave(&m.blocks[0].terminator), BlockId(0));
+
+        // The long form (i32 delta): nop; leave -6 (-> 0).
+        let il = [0x00, 0xDD, 0xFA, 0xFF, 0xFF, 0xFF];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.blocks.len(), 1);
+        assert_eq!(as_leave(&m.blocks[0].terminator), BlockId(0));
+    }
+
+    #[test]
+    fn rethrow_and_endfilter_stay_unsupported() {
+        let err = import_ii(&[0xFE, 0x1A]).err().expect("rethrow");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("rethrow")),
+            "{err:?}"
+        );
+        let err = import_ii(&[0xFE, 0x11]).err().expect("endfilter");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("filter")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn try_finally_builds_a_call_finally_step_block() {
+        let (ee, info) = eh_fixture(&TRY_FINALLY_IL, &[], &[finally_clause(0, 3, 3, 1)]);
+        let m = import(&info, &ee).expect("imports");
+        // Layout: [b0 (try body), S1 (step), L (leave), T (ret), H
+        // (handler)]. The leave at offset 1 crosses the finally.
+        assert_eq!(m.blocks.len(), 5);
+        assert_eq!(as_jump(&m.blocks[0].terminator), BlockId(1));
+        let (funclet, continuation) = as_call_finally(&m.blocks[1].terminator);
+        assert_eq!(funclet, BlockId(4), "the handler group sits at the tail");
+        assert_eq!(continuation, BlockId(2));
+        assert!(
+            m.blocks[1].stmts.is_empty() && m.blocks[2].stmts.is_empty(),
+            "step blocks carry no statements"
+        );
+        assert_eq!(as_leave(&m.blocks[2].terminator), BlockId(3));
+        assert!(matches!(
+            m.blocks[3].terminator,
+            hir::Terminator::Return { value: None }
+        ));
+        assert!(matches!(
+            m.blocks[4].terminator,
+            hir::Terminator::EndFinally
+        ));
+        assert_eq!(m.eh_regions.len(), 1);
+        let region = &m.eh_regions[0];
+        assert!(matches!(region.kind, hir::EhRegionKind::Finally));
+        assert_eq!(region.try_start, BlockId(0));
+        assert_eq!(region.try_end, BlockId(1), "the try is just b0");
+        assert_eq!(region.handler_start, BlockId(4));
+        assert_eq!(region.handler_end, BlockId(5));
+    }
+
+    #[test]
+    fn try_catch_synthesizes_the_exception_store() {
+        // 0: nop; 1: leave.s +3 (-> 6); 3: stloc.0; 4: leave.s +0 (-> 6);
+        // 6: ret — a catch handler that pops the exception into local 0
+        // and leaves.
+        let il = [0x00, 0xDE, 0x03, 0x0A, 0xDE, 0x00, 0x2A];
+        let (ee, info) = eh_fixture(
+            &il,
+            &[CorInfoType::Class],
+            &[catch_clause(0, 3, 3, 3, 0x0200_0042)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        // Layout: [b0 (try), b2 (ret), H (catch)] — no finally, no steps.
+        assert_eq!(m.blocks.len(), 3);
+        assert_eq!(as_leave(&m.blocks[0].terminator), BlockId(1));
+        // The catch handler's entry: Store(exc_temp, CatchArg) first,
+        // then the IL stloc.0 reads the temp (the depth-1 entry stack).
+        let handler = &m.blocks[2];
+        let (dst, value) = store(&handler.stmts[0]);
+        assert!(matches!(value, hir::Expr::CatchArg));
+        assert_eq!(m.locals[dst.0 as usize].ty, Type::Ref);
+        assert_eq!(m.locals[dst.0 as usize].kind, hir::LocalKind::Temp);
+        let (dst0, value0) = store(&handler.stmts[1]);
+        assert_eq!(dst0, LocalId(0), "the IL local");
+        assert_eq!(as_local(value0), dst, "the caught exception read back");
+        assert_eq!(handler.stmts[0].il_offset, IlOffset(3));
+        // The handler's leave is the plain funclet-return form.
+        assert_eq!(as_leave(&handler.terminator), BlockId(1));
+        assert_eq!(m.eh_regions.len(), 1);
+        let region = &m.eh_regions[0];
+        match region.kind {
+            hir::EhRegionKind::Catch { class_token } => {
+                assert_eq!(class_token, 0x0200_0042, "the raw mdToken passes through")
+            }
+            _ => panic!("expected a Catch region"),
+        }
+        assert_eq!((region.try_start, region.try_end), (BlockId(0), BlockId(1)));
+        assert_eq!(
+            (region.handler_start, region.handler_end),
+            (BlockId(2), BlockId(3))
+        );
+    }
+
+    #[test]
+    fn nested_finallys_build_an_innermost_first_step_chain() {
+        // The B2 shape (target/eh-ref/B2o0.disasm.txt):
+        // 0: nop; 1: nop; 2: leave.s +4 (-> 8); 4: endfinally;
+        // 5: leave.s +1 (-> 8); 7: endfinally; 8: ret
+        // inner finally: try [1,4), handler [4,5); outer: try [0,7),
+        // handler [7,8). The leave at 2 crosses both; the leave at 5
+        // crosses the outer only.
+        let il = [0x00, 0x00, 0xDE, 0x04, 0xDC, 0xDE, 0x01, 0xDC, 0x2A];
+        let (ee, info) = eh_fixture(
+            &il,
+            &[],
+            &[finally_clause(1, 3, 4, 1), finally_clause(0, 7, 7, 1)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        // Original blocks: b0 [0,1), b1 [1,4) (leave), b2 [4,5) (inner
+        // handler), b3 [5,7) (leave), b4 [7,8) (outer handler), b5 [8,9)
+        // (ret). Layout:
+        //   b0, b1, S1(inner hop of b1's chain), b3,
+        //   S2(outer hop of b1's chain), L(b1's chain),
+        //   S1'(b3's chain), L'(b3's chain), b5,
+        //   then the handler groups: b2 (inner), b4 (outer).
+        assert_eq!(m.blocks.len(), 11);
+        // b1 -> S1 (id 2) -> S2 (id 4) -> L (id 5) -> b5 (id 8).
+        assert_eq!(as_jump(&m.blocks[1].terminator), BlockId(2));
+        assert_eq!(
+            as_call_finally(&m.blocks[2].terminator),
+            (BlockId(9), BlockId(4))
+        );
+        assert_eq!(
+            as_call_finally(&m.blocks[4].terminator),
+            (BlockId(10), BlockId(5))
+        );
+        assert_eq!(as_leave(&m.blocks[5].terminator), BlockId(8));
+        // b3 -> S1' (id 6) -> L' (id 7) -> b5.
+        assert_eq!(as_jump(&m.blocks[3].terminator), BlockId(6));
+        assert_eq!(
+            as_call_finally(&m.blocks[6].terminator),
+            (BlockId(10), BlockId(7))
+        );
+        assert_eq!(as_leave(&m.blocks[7].terminator), BlockId(8));
+        // The funclets.
+        assert!(matches!(
+            m.blocks[9].terminator,
+            hir::Terminator::EndFinally
+        ));
+        assert!(matches!(
+            m.blocks[10].terminator,
+            hir::Terminator::EndFinally
+        ));
+        // Region table: the inner try is just b1; the outer try's main
+        // run is b0..b3 — which the inner-exit step S1 (id 2) sits
+        // inside, so its CallFinally's return address is attributed to
+        // the outer try.
+        assert_eq!(m.eh_regions.len(), 2);
+        let inner = &m.eh_regions[0];
+        assert_eq!((inner.try_start, inner.try_end), (BlockId(1), BlockId(2)));
+        assert_eq!(
+            (inner.handler_start, inner.handler_end),
+            (BlockId(9), BlockId(10))
+        );
+        let outer = &m.eh_regions[1];
+        assert_eq!(
+            (outer.try_start, outer.try_end),
+            (BlockId(0), BlockId(4)),
+            "the outer try spans its main blocks plus the inner hop's step block"
+        );
+        assert_eq!(
+            (outer.handler_start, outer.handler_end),
+            (BlockId(10), BlockId(11))
+        );
+        // The outer-exit steps (ids 4, 6) lie outside the outer try.
+        assert!(outer.try_end <= BlockId(4));
+    }
+
+    #[test]
+    fn leave_from_a_catch_across_a_finally_aims_at_the_step_block() {
+        // 0: nop; 1: nop; 2: leave.s +3 (-> 7); 4: stloc.0;
+        // 5: leave.s +3 (-> 10); 7: leave.s +1 (-> 10); 9: endfinally;
+        // 10: ret
+        // inner catch: try [1,4), handler [4,7); outer finally:
+        // try [0,9), handler [9,10). The catch handler's leave (offset
+        // 5) crosses the outer finally: the VM runs no finallys on
+        // resume (exceptionhandling.cpp ResumeAfterCatch), so the catch
+        // funclet must return the STEP BLOCK's address — clr-abi.md's
+        // ThreadAbort example shape.
+        let il = [
+            0x00, 0x00, 0xDE, 0x03, 0x0A, 0xDE, 0x03, 0xDE, 0x01, 0xDC, 0x2A,
+        ];
+        let (ee, info) = eh_fixture(
+            &il,
+            &[CorInfoType::Class],
+            &[
+                catch_clause(1, 3, 4, 3, 0x0200_0007),
+                finally_clause(0, 9, 9, 1),
+            ],
+        );
+        let m = import(&info, &ee).expect("imports");
+        // Original blocks: b0 [0,1), b1 [1,4) (leave), b2 [4,7) (catch,
+        // leave), b3 [7,9) (leave), b4 [9,10) (finally), b5 [10,11)
+        // (ret). Only b2's and b3's leaves cross the outer finally.
+        // Layout: b0, b1, b3, S(b2's chain), L, S'(b3's chain), L', b5,
+        // then handlers: b2, b4.
+        assert_eq!(m.blocks.len(), 10);
+        // The catch handler is at the tail (id 8) and keeps a Leave —
+        // but aimed at its chain's first step block (id 3), not at b5.
+        assert_eq!(as_leave(&m.blocks[8].terminator), BlockId(3));
+        assert_eq!(
+            as_call_finally(&m.blocks[3].terminator),
+            (BlockId(9), BlockId(4))
+        );
+        assert_eq!(as_leave(&m.blocks[4].terminator), BlockId(7));
+        // b3's own chain: Jump to S' (id 5).
+        assert_eq!(as_jump(&m.blocks[2].terminator), BlockId(5));
+        assert_eq!(
+            as_call_finally(&m.blocks[5].terminator),
+            (BlockId(9), BlockId(6))
+        );
+        assert_eq!(as_leave(&m.blocks[6].terminator), BlockId(7));
+        // The inner try body leave crosses nothing (its target is inside
+        // the outer try): a plain Leave to b3 (id 2).
+        assert_eq!(as_leave(&m.blocks[1].terminator), BlockId(2));
+        // The outer try's main run: b0, b1, b3 — ids 0..3; no step of an
+        // inner try trails it (the chains exit the outer try itself).
+        let outer = &m.eh_regions[1];
+        assert_eq!((outer.try_start, outer.try_end), (BlockId(0), BlockId(3)));
+        // Handler groups in handler IL order: the catch (id 8), then the
+        // finally (id 9).
+        let catch = &m.eh_regions[0];
+        assert_eq!(
+            (catch.handler_start, catch.handler_end),
+            (BlockId(8), BlockId(9))
+        );
+        assert_eq!(
+            (outer.handler_start, outer.handler_end),
+            (BlockId(9), BlockId(10))
+        );
+    }
+
+    #[test]
+    fn same_try_multiple_catches_keep_clause_order() {
+        // 0: nop; 1: leave.s +4 (-> 7); 3: leave.s +2 (-> 7);
+        // 5: leave.s +0 (-> 7); 7: ret — one try [0,3) with two catch
+        // handlers [3,5) and [5,7).
+        let il = [0x00, 0xDE, 0x04, 0xDE, 0x02, 0xDE, 0x00, 0x2A];
+        let (ee, info) = eh_fixture(
+            &il,
+            &[],
+            &[
+                catch_clause(0, 3, 5, 2, 0x0200_00AA),
+                catch_clause(0, 3, 3, 2, 0x0200_00BB),
+            ],
+        );
+        let m = import(&info, &ee).expect("imports");
+        // Handler groups at the tail follow the handler IL order (not
+        // the clause registration order): [3,5) then [5,7).
+        assert_eq!(m.blocks.len(), 4);
+        assert_eq!(m.eh_regions.len(), 2);
+        let (r0, r1) = (&m.eh_regions[0], &m.eh_regions[1]);
+        // Both clauses share the try span.
+        assert_eq!((r0.try_start, r0.try_end), (BlockId(0), BlockId(1)));
+        assert_eq!((r1.try_start, r1.try_end), (BlockId(0), BlockId(1)));
+        // Clause 0's handler ([5,7) in IL) is the second group.
+        assert_eq!((r0.handler_start, r0.handler_end), (BlockId(3), BlockId(4)));
+        assert_eq!((r1.handler_start, r1.handler_end), (BlockId(2), BlockId(3)));
+        match r0.kind {
+            hir::EhRegionKind::Catch { class_token } => assert_eq!(class_token, 0x0200_00AA),
+            _ => panic!("expected Catch"),
+        }
+    }
+
+    #[test]
+    fn filter_and_fault_clauses_are_named_unsupported() {
+        let mut filter = catch_clause(0, 3, 3, 1, 0);
+        filter.Flags = ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FILTER;
+        let (ee, info) = eh_fixture(&TRY_FINALLY_IL, &[], &[filter]);
+        let err = import(&info, &ee).err().expect("filter clause");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("EH filter clauses")),
+            "{err:?}"
+        );
+        let mut fault = catch_clause(0, 3, 3, 1, 0);
+        fault.Flags = ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FAULT;
+        let (ee, info) = eh_fixture(&TRY_FINALLY_IL, &[], &[fault]);
+        let err = import(&info, &ee).err().expect("fault clause");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("EH fault clauses")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_eh_tables_are_bad_il() {
+        // Partially overlapping try regions: neither nests.
+        let (ee, info) = eh_fixture(
+            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A],
+            &[],
+            &[finally_clause(0, 5, 5, 1), finally_clause(3, 4, 7, 1)],
+        );
+        let err = import(&info, &ee).err().expect("overlapping tries");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("nested")),
+            "{err:?}"
+        );
+        // A handler overlapping its own try.
+        let (ee, info) = eh_fixture(&[0x00, 0xDC, 0x2A], &[], &[finally_clause(0, 2, 1, 1)]);
+        let err = import(&info, &ee)
+            .err()
+            .expect("handler inside its own try");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("overlaps its own try")),
+            "{err:?}"
+        );
+        // A region end past the IL stream.
+        let (ee, info) = eh_fixture(&TRY_FINALLY_IL, &[], &[finally_clause(0, 3, 3, 9)]);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+        // A region boundary mid-instruction (the leave.s operand).
+        let (ee, info) = eh_fixture(&TRY_FINALLY_IL, &[], &[finally_clause(0, 2, 3, 1)]);
+        let err = import(&info, &ee).err().expect("mid-instruction boundary");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("instruction boundary")),
+            "{err:?}"
+        );
+        // An empty region.
+        let (ee, info) = eh_fixture(&TRY_FINALLY_IL, &[], &[finally_clause(0, 0, 3, 1)]);
+        let err = import(&info, &ee).err().expect("empty region");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("empty EH region")),
+            "{err:?}"
+        );
+        // A try covering only handler IL protects nothing.
+        let il = [0x00, 0x00, 0xDC, 0xDC, 0x2A];
+        let (ee, info) = eh_fixture(
+            &il,
+            &[],
+            &[
+                finally_clause(0, 2, 2, 1), // inner: try [0,2), handler [2,3)
+                finally_clause(2, 1, 3, 1), // outer: try [2,3), handler [3,4)
+            ],
+        );
+        let err = import(&info, &ee).err().expect("try of pure handler IL");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("protects no instructions")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn falling_into_a_catch_handler_is_bad_il() {
+        // 0: nop; 1: stloc.0; 2: ret — the try body (try [0,1)) falls
+        // through into the catch handler at 1 instead of leaving.
+        let il = [0x00, 0x0A, 0x2A];
+        let (ee, info) = eh_fixture(&il, &[CorInfoType::Class], &[catch_clause(0, 1, 1, 1, 1)]);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn endfinally_outside_a_finally_handler_is_bad_il() {
+        // No clauses at all.
+        assert!(matches!(import_ii(&[0xDC]), Err(CompileError::BadIl(_))));
+        // Inside a CATCH handler.
+        // 0: nop; 1: leave.s +2 (-> 5); 3: stloc.0; 4: endfinally; 5: ret.
+        let il = [0x00, 0xDE, 0x02, 0x0A, 0xDC, 0x2A];
+        let (ee, info) = eh_fixture(&il, &[CorInfoType::Class], &[catch_clause(0, 3, 3, 2, 1)]);
+        let err = import(&info, &ee)
+            .err()
+            .expect("endfinally in a catch handler");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("endfinally")),
+            "{err:?}"
+        );
     }
 
     // --- step_10.1: the scalar-cheap pack ---

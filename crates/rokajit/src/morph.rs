@@ -57,6 +57,11 @@ pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
                 value: Some(value), ..
             } => certify_expr(value)?,
             hir::Terminator::Throw { exception } => certify_expr(exception)?,
+            // The step_10.6 EH terminators carry no expressions: `leave`,
+            // a `CallFinally` step, and `endfinally` reference blocks only.
+            hir::Terminator::Leave { .. }
+            | hir::Terminator::CallFinally { .. }
+            | hir::Terminator::EndFinally => {}
             _ => {}
         }
     }
@@ -72,7 +77,8 @@ fn certify_expr(expr: &hir::Expr) -> CompileResult<()> {
         hir::Expr::Const(_)
         | hir::Expr::Local(_)
         | hir::Expr::LocalAddr(_)
-        | hir::Expr::StaticFieldAddr { .. } => {}
+        | hir::Expr::StaticFieldAddr { .. }
+        | hir::Expr::CatchArg => {}
         hir::Expr::Load { addr, .. } => certify_expr(addr)?,
         hir::Expr::FieldAddr { obj, .. } => certify_expr(obj)?,
         hir::Expr::Unary { arg, .. } => certify_expr(arg)?,
@@ -329,6 +335,63 @@ mod tests {
             struct_layouts: StructLayouts::new(),
         };
         assert!(matches!(morph(method), Err(CompileError::Internal(_))));
+    }
+
+    #[test]
+    fn eh_nodes_certify() {
+        // The step_10.6 shapes: a Throw whose exception is a (complete)
+        // call tree, a CatchArg entry store, and the no-expression
+        // Leave / CallFinally / EndFinally terminators.
+        let target = MethodHandle::from_raw(2usize as ffi::CORINFO_METHOD_HANDLE).unwrap();
+        let method = hir::Method {
+            blocks: vec![
+                hir::Block {
+                    id: BlockId(0),
+                    stmts: Vec::new(),
+                    terminator: hir::Terminator::Throw {
+                        exception: hir::Expr::Call {
+                            target: CallTarget::Direct(target),
+                            sig: CallSig {
+                                ret: Type::Ref,
+                                args: Vec::new(),
+                                has_this: false,
+                            },
+                            args: Vec::new(),
+                        },
+                    },
+                },
+                hir::Block {
+                    id: BlockId(1),
+                    stmts: Vec::new(),
+                    terminator: hir::Terminator::CallFinally {
+                        funclet: BlockId(3),
+                        continuation: BlockId(2),
+                    },
+                },
+                hir::Block {
+                    id: BlockId(2),
+                    stmts: Vec::new(),
+                    terminator: hir::Terminator::Leave { target: BlockId(0) },
+                },
+                hir::Block {
+                    id: BlockId(3),
+                    stmts: vec![hir::Stmt {
+                        il_offset: crate::ir::IlOffset(0),
+                        kind: hir::StmtKind::Store {
+                            dst: LocalId(0),
+                            value: hir::Expr::CatchArg,
+                        },
+                    }],
+                    terminator: hir::Terminator::EndFinally,
+                },
+            ],
+            locals: Vec::new(),
+            eh_regions: Vec::new(),
+            num_args: 0,
+            num_il_locals: 0,
+            struct_layouts: StructLayouts::new(),
+        };
+        morph(method).expect("the EH shapes certify");
     }
 
     #[test]

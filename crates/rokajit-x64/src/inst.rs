@@ -503,9 +503,32 @@ pub enum Inst {
     },
     /// `leave` (`mov rsp, rbp; pop rbp`) — the frame teardown matching
     /// the [`Inst::Push`] + `mov rbp, rsp` + [`Inst::AllocFrame`] prolog.
+    /// Main-area returns only; a funclet never re-establishes rbp, so its
+    /// exit is [`Inst::FuncletEpilog`] (step_10.6).
     Leave,
     /// `ret`.
     Ret,
+    // --- step_10.6: the EH shapes ---
+    /// `nop` (0x90) — padding after a call whose return address must stay
+    /// inside its EH region / RUNTIME_FUNCTION (the `Throw` and
+    /// `CallFinally` shapes; clr-abi.md's region-padding rule).
+    Nop,
+    /// `call rel32` to an in-chunk label (a `CallFinally` step block
+    /// calling its finally funclet). Resolved by the assembler's label
+    /// fixups — no EE lookup, no relocation, no managed-call-site record
+    /// (an EH method is fully interruptible: the safepoint list is empty).
+    /// The spill discipline is any call's (the scratch pool is
+    /// caller-saved), which codegen applies.
+    CallLabel { target: Label },
+    /// `lea dst, [rip + rel32]` — a code address materialized into a
+    /// register (a catch funclet's resume address into `rax` for the
+    /// funclet-exit `ret`; the VM resumes the parent frame there). The
+    /// displacement is a label fixup, resolved at finalize.
+    LeaLabel { dst: Gpr, target: Label },
+    /// Funclet epilog: `add rsp, N; ret`. Like [`Inst::AllocFrame`], the
+    /// adjustment is codegen's per-funclet fact (the funclet's own
+    /// outgoing-argument reservation), not a lowering-time one.
+    FuncletEpilog,
 }
 
 /// A block operation's address operand (step_10.9): either a byref value
@@ -581,10 +604,12 @@ impl Inst {
                 uses: &[],
                 defs: &[Gpr::Rcx],
             },
-            Inst::CallDirect { .. } | Inst::CallHelper { .. } => FixedRegs {
-                uses: &[],
-                defs: CALL_DEFS,
-            },
+            Inst::CallDirect { .. } | Inst::CallHelper { .. } | Inst::CallLabel { .. } => {
+                FixedRegs {
+                    uses: &[],
+                    defs: CALL_DEFS,
+                }
+            }
             _ => NO_FIXED,
         }
     }

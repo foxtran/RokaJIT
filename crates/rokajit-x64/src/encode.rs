@@ -800,6 +800,27 @@ impl Asm {
         self.emit_u32(0);
     }
 
+    /// `call rel32` (E8) to an in-chunk label (a funclet entry,
+    /// step_10.6): the displacement is a label fixup, resolved at
+    /// finalize. No [`CallReloc`] — the target is not an EE address.
+    pub fn call_label(&mut self, target: Label) {
+        self.emit_u8(0xE8);
+        self.emit_rel32_fixup(target);
+    }
+
+    /// `lea dst, [rip + rel32]` (8D /r with mod=00 r/m=101) — a code
+    /// address materialized into a register (a catch funclet's resume
+    /// address, step_10.6). The displacement is a label fixup; the
+    /// finalize rule (`target − (field_end)`) is exactly rip-relative
+    /// addressing, since rip reads as the next instruction's address.
+    pub fn lea_rip(&mut self, dst: Gpr, target: Label) {
+        let d = dst as u8;
+        self.emit_u8(0x48 | ((d >> 3) << 2)); // REX.W (+ REX.R for r8+)
+        self.emit_u8(0x8D);
+        self.emit_u8(0x05 | ((d & 7) << 3)); // mod=00, r/m=101 → [rip + disp32]
+        self.emit_rel32_fixup(target);
+    }
+
     /// `call rel32` (E8) with a placeholder displacement and no
     /// [`CallReloc`] record: codegen records the relocation through its
     /// own drain, and helper calls have no method handle to key one on.
@@ -1606,6 +1627,50 @@ mod tests {
                 0xC3,
             ]
         );
+    }
+
+    // ---- step_10.6: funclet call / resume-address forms ----
+
+    #[test]
+    fn call_label_fixup() {
+        // call l; nop; l: ret — disp = 1 from the rel32 field's end.
+        let bytes = finish(|a| {
+            a.call_label(label(1));
+            a.nop();
+            a.bind(label(1));
+            a.ret();
+        });
+        assert_eq!(bytes, [0xE8, 0x01, 0x00, 0x00, 0x00, 0x90, 0xC3]);
+    }
+
+    #[test]
+    fn lea_rip_fixup() {
+        // leaq [rip + l], %rax; nop; l: ret — the target is the address
+        // of `ret`: disp = 1 (the field ends at the nop, llvm-mc:
+        // `lea 1f(%rip), %rax`).
+        let bytes = finish(|a| {
+            a.lea_rip(Rax, label(1));
+            a.nop();
+            a.bind(label(1));
+            a.ret();
+        });
+        assert_eq!(
+            bytes,
+            [0x48, 0x8D, 0x05, 0x01, 0x00, 0x00, 0x00, 0x90, 0xC3]
+        );
+        // A high destination register: REX.R (leaq 1f(%rip), %r9).
+        let bytes = finish(|a| {
+            a.lea_rip(R9, label(1));
+            a.bind(label(1));
+        });
+        assert_eq!(bytes, [0x4C, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00]);
+        // Backward reference: l: nop; leaq [rip + l], %rax — disp = -8.
+        let bytes = finish(|a| {
+            a.bind(label(0));
+            a.nop();
+            a.lea_rip(Rax, label(0));
+        });
+        assert_eq!(bytes, [0x90, 0x48, 0x8D, 0x05, 0xF8, 0xFF, 0xFF, 0xFF]);
     }
 
     #[test]

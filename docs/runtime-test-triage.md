@@ -31,12 +31,13 @@ under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 83 |
-| CRASH | 462 |
+| MATCH | 93 |
+| MISMATCH | 3 |
+| CRASH | 449 |
 | TIMEOUT | 2 |
 | COMPILE_FAIL | 2734 |
 
-Of the MATCHes, 82 exit 100 (the CoreCLR pass
+Of the MATCHes, 92 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -51,13 +52,12 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| unsupported IL opcode (importer) | 175 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/Array1.cs`<br>`JIT/CodeGenBringUpTests/Array2.cs`<br>`JIT/CodeGenBringUpTests/Array3.cs`<br>`JIT/CodeGenBringUpTests/Array4.cs`<br>… and 170 more |
-| non-direct calls (callvirt/calli) | 104 | `JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>`JIT/CodeGenBringUpTests/DblArea.cs`<br>`JIT/CodeGenBringUpTests/DblAvg2.cs`<br>… and 99 more |
-| EH (try/catch/finally) | 92 | `JIT/CodeGenBringUpTests/ArrayExc.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>`JIT/CodeGenBringUpTests/DivConst.cs`<br>`JIT/CodeGenBringUpTests/Localloc.cs`<br>`JIT/CodeGenBringUpTests/LocallocB_N_PSP.cs`<br>… and 87 more |
+| unsupported IL opcode (importer) | 228 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/Array1.cs`<br>`JIT/CodeGenBringUpTests/Array2.cs`<br>`JIT/CodeGenBringUpTests/Array3.cs`<br>`JIT/CodeGenBringUpTests/Array4.cs`<br>… and 223 more |
+| non-direct calls (callvirt/calli) | 120 | `JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>`JIT/CodeGenBringUpTests/DblArea.cs`<br>`JIT/CodeGenBringUpTests/DblAvg2.cs`<br>… and 115 more |
 | newobj of a value class | 42 | `JIT/CodeGenBringUpTests/RecursiveTailCall.cs`<br>`JIT/Regression_2/Runtime_53549/Runtime_53549.cs`<br>`JIT/Regression_2/Runtime_71118/Runtime_71118.cs`<br>`JIT/Regression_3/GitHub_65988/GitHub_65988.cs`<br>`JIT/jit64/gc/misc/struct1_4.cs`<br>… and 37 more |
-| field types outside the object pack | 24 | `JIT/CodeGenBringUpTests/StructReturn.cs`<br>`JIT/Directed/LoopAlignment/LoopsToProcess.cs`<br>`JIT/Methodical/structs/StructStackParams.cs`<br>`JIT/Regression_2/Runtime_109269/Runtime_109269.cs`<br>`JIT/Regression_2/Runtime_110958/Runtime_110985.cs`<br>… and 19 more |
-| generics | 18 | `JIT/Regression_2/Runtime_131285/Runtime_131285.cs`<br>`JIT/Regression_2/Runtime_133120/Runtime_133120.cs`<br>`JIT/Regression_2/Runtime_72926/Runtime_72926.cs`<br>`JIT/jit64/ebvts/cs/generics/generics/repro52.cs`<br>`JIT/opt/AssertionPropagation/DynBlkNullAssertions.cs`<br>… and 13 more |
-| bad IL rejected by importer | 6 | `JIT/CodeGenBringUpTests/StaticCalls.cs`<br>`JIT/opt/Devirtualization/GitHub_10858.cs`<br>`JIT/opt/Inline/regression/bug595776/bug595776.cs`<br>`JIT/opt/Inline/tests/fact.cs`<br>`JIT/opt/OSR/tailrecurse.cs`<br>… and 1 more |
+| field types outside the object pack | 28 | `JIT/CodeGenBringUpTests/StructReturn.cs`<br>`JIT/Directed/LoopAlignment/LoopsToProcess.cs`<br>`JIT/Methodical/structs/StructStackParams.cs`<br>`JIT/Regression_2/Runtime_109269/Runtime_109269.cs`<br>`JIT/Regression_2/Runtime_110958/Runtime_110985.cs`<br>… and 23 more |
+| generics | 23 | `JIT/Regression_2/Runtime_131285/Runtime_131285.cs`<br>`JIT/Regression_2/Runtime_133120/Runtime_133120.cs`<br>`JIT/Regression_2/Runtime_72926/Runtime_72926.cs`<br>`JIT/jit64/ebvts/cs/generics/generics/repro52.cs`<br>`JIT/opt/AssertionPropagation/DynBlkNullAssertions.cs`<br>… and 18 more |
+| bad IL rejected by importer | 8 | `JIT/CodeGenBringUpTests/StaticCalls.cs`<br>`JIT/jit64/gc/misc/eh1.cs`<br>`JIT/jit64/regress/vsw/524070/test1.cs`<br>`JIT/opt/Devirtualization/GitHub_10858.cs`<br>`JIT/opt/Inline/regression/bug595776/bug595776.cs`<br>… and 3 more |
 | structs & value types | 1 | `JIT/Regression_2/Runtime_72506/Runtime_72506.cs` |
 
 ## COMPILE_FAIL by csc error class
@@ -93,4 +93,7 @@ RokaJIT failures with no `CompileError` marker in stderr — either
 silent-wrong-result bugs (MISMATCH with a clean run) or crashes the
 error model didn't classify. Each carries its stderr signature.
 
-None.
+| Test | Category | Detail | Stderr signature |
+| --- | --- | --- | --- |
+| `JIT/Regression_2/Runtime_124749/Runtime_124749.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/opt/Enum/shared.cs` | MISMATCH | ref=100 ours=0 | (no stderr output) |

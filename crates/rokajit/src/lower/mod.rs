@@ -34,7 +34,10 @@
 //! field addresses (`FieldAddr` flattens to a `ByRef`-typed `Add` of the
 //! object and the EE-supplied offset), and the explicit, trap-based null
 //! check (flattened to [`lir::StmtKind::NullCheck`], yielding the checked
-//! value unchanged). Everything else — switches, and EH — fails with
+//! value unchanged). The step_10.6 EH pack lowers `throw`/`leave`/
+//! `endfinally`/call-finally terminators and the catch-handler entry
+//! store to their LIR forms and carries the region table through.
+//! Everything else — switches — fails with
 //! [`CompileError::Unsupported`].
 
 mod dsl;
@@ -108,9 +111,6 @@ impl<'a> Cx<'a> {
 /// [`lir::Operand`], calls only as top-level `StmtKind::Call`, branches
 /// folded to `BranchCond`, temps defined exactly once before use.
 pub fn lower(method: hir::Method, target: &dyn Target) -> CompileResult<lir::Method> {
-    if !method.eh_regions.is_empty() {
-        return Err(CompileError::Unsupported("EH regions: not yet supported"));
-    }
     for local in &method.locals {
         if target.class_of(local.ty, &method.struct_layouts).is_none() {
             return Err(CompileError::Unsupported(
@@ -195,6 +195,22 @@ impl Flatten<'_> {
         for stmt in &block.stmts {
             match &stmt.kind {
                 hir::StmtKind::Store { dst, value } => {
+                    // The catch-handler entry store (step_10.6): the
+                    // funclet's incoming throwable lands in `dst`; there
+                    // is no tree to flatten.
+                    if let hir::Expr::CatchArg = value {
+                        if self.locals[dst.0 as usize].ty != Type::Ref {
+                            return Err(CompileError::Internal(
+                                "CatchArg store to a non-Ref local",
+                            ));
+                        }
+                        Self::push(
+                            &mut stmts,
+                            stmt.il_offset,
+                            lir::StmtKind::CatchArg { dst: *dst },
+                        );
+                        continue;
+                    }
                     let src = self.flatten_expr(value, &mut stmts, stmt.il_offset)?;
                     // A struct store is a block copy into the destination's
                     // frame slot (struct values are addresses, step_10.9);
@@ -335,6 +351,11 @@ impl Flatten<'_> {
             hir::Expr::Const(k) => Ok(lir::Operand::Const(*k)),
             hir::Expr::Local(id) => Ok(lir::Operand::Local(*id)),
             hir::Expr::LocalAddr(id) => Ok(lir::Operand::AddrOf(*id)),
+            // The importer builds CatchArg only as the value of a catch
+            // handler's synthesized entry store, handled in `lower_block`.
+            hir::Expr::CatchArg => Err(CompileError::Internal(
+                "CatchArg outside a catch handler's entry store",
+            )),
             hir::Expr::Binary { op, lhs, rhs } => {
                 let lhs = self.flatten_expr(lhs, out, il)?;
                 let rhs = self.flatten_expr(rhs, out, il)?;
@@ -597,12 +618,35 @@ impl Flatten<'_> {
             hir::Terminator::Switch { .. } => {
                 return Err(CompileError::Unsupported("switch: not yet supported"));
             }
-            hir::Terminator::Throw { .. }
-            | hir::Terminator::Leave { .. }
-            | hir::Terminator::EndFinally => {
-                return Err(CompileError::Unsupported(
-                    "EH control flow: not yet supported",
-                ));
+            hir::Terminator::Throw { exception } => {
+                // The exception tree flattens like a branch condition
+                // (its calls/traps evaluate first); the Throw consumes
+                // the operand.
+                let exception = self.flatten_expr(exception, out, IL_OFFSET_NONE)?;
+                Self::push(out, IL_OFFSET_NONE, lir::StmtKind::Throw { exception });
+            }
+            hir::Terminator::Leave { target } => {
+                Self::push(
+                    out,
+                    IL_OFFSET_NONE,
+                    lir::StmtKind::Leave { target: *target },
+                );
+            }
+            hir::Terminator::CallFinally {
+                funclet,
+                continuation,
+            } => {
+                Self::push(
+                    out,
+                    IL_OFFSET_NONE,
+                    lir::StmtKind::CallFinally {
+                        funclet: *funclet,
+                        continuation: *continuation,
+                    },
+                );
+            }
+            hir::Terminator::EndFinally => {
+                Self::push(out, IL_OFFSET_NONE, lir::StmtKind::EndFinally);
             }
         }
         Ok(())
@@ -1401,6 +1445,101 @@ mod tests {
         ));
         // One arg + five temps.
         assert_eq!(m.locals.len(), 6);
+    }
+
+    // --- step_10.6: EH lowering ---
+
+    #[test]
+    fn throw_flattens_its_exception_tree() {
+        // Throw of (arg0 + 1): the tree flattens to a Binary statement
+        // feeding the Throw, exactly like a branch condition.
+        let m = lower_ok(method_with(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Throw {
+                exception: hir::Expr::Binary {
+                    op: BinaryOp::Add,
+                    lhs: Box::new(hir::Expr::Local(LocalId(0))),
+                    rhs: Box::new(hir::Expr::Const(Const::Int32(1))),
+                },
+            },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2);
+        assert!(matches!(stmts[0].kind, lir::StmtKind::Binary { .. }));
+        assert!(matches!(
+            stmts[1].kind,
+            lir::StmtKind::Throw {
+                exception: lir::Operand::Temp(LocalId(1))
+            }
+        ));
+    }
+
+    #[test]
+    fn leave_callfinally_endfinally_lower_and_regions_carry_through() {
+        let mut m = method_with(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Leave { target: BlockId(2) },
+        ));
+        m.blocks.push(block(
+            1,
+            Vec::new(),
+            hir::Terminator::CallFinally {
+                funclet: BlockId(3),
+                continuation: BlockId(2),
+            },
+        ));
+        m.blocks.push(block(
+            2,
+            Vec::new(),
+            hir::Terminator::Return { value: None },
+        ));
+        m.blocks
+            .push(block(3, Vec::new(), hir::Terminator::EndFinally));
+        m.eh_regions.push(hir::EhRegion {
+            kind: hir::EhRegionKind::Finally,
+            try_start: BlockId(0),
+            try_end: BlockId(1),
+            handler_start: BlockId(3),
+            handler_end: BlockId(4),
+        });
+        let m = lower_ok(m);
+        assert_eq!(m.eh_regions.len(), 1, "the region table carries over");
+        assert!(matches!(
+            m.blocks[0].stmts[0].kind,
+            lir::StmtKind::Leave { target: BlockId(2) }
+        ));
+        assert!(matches!(
+            m.blocks[1].stmts[0].kind,
+            lir::StmtKind::CallFinally {
+                funclet: BlockId(3),
+                continuation: BlockId(2)
+            }
+        ));
+        assert!(matches!(
+            m.blocks[3].stmts[0].kind,
+            lir::StmtKind::EndFinally
+        ));
+    }
+
+    #[test]
+    fn catch_arg_store_lowers_to_the_lir_form() {
+        // Store { dst, CatchArg } → lir CatchArg { dst } — no tree walk.
+        let mut m = method_with(block(
+            0,
+            vec![hstmt(hir::StmtKind::Store {
+                dst: LocalId(0),
+                value: hir::Expr::CatchArg,
+            })],
+            hir::Terminator::Return { value: None },
+        ));
+        m.locals[0] = local(Type::Ref, hir::LocalKind::Temp);
+        let m = lower_ok(m);
+        assert!(matches!(
+            m.blocks[0].stmts[0].kind,
+            lir::StmtKind::CatchArg { dst: LocalId(0) }
+        ));
     }
 
     #[test]

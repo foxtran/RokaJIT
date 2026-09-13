@@ -410,9 +410,12 @@ PANIC_RE = re.compile(r"rokajit: panic in compileMethod")
 # messages evolve with the importer. step_10.9 landed value types: the
 # "value types in signatures" gate, the lowering "structs:" reject and the
 # tier-0 struct/stack-arg messages are gone; the bucket keeps the residual
-# struct rejects.)
+# struct rejects. step_10.6 landed EH: the "EH regions"/"EH control flow"
+# gate messages are gone; the residual EH rejects are the out-of-scope
+# filter/fault clauses, endfilter and rethrow.)
 BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"EH regions|EH control flow|EH clauses|draining EH clauses"), "EH (try/catch/finally)"),
+    (re.compile(r"EH filter clauses|EH fault clauses"), "EH filters/faults (out of 10.6 scope)"),
+    (re.compile(r"^rethrow$"), "rethrow (out of 10.6 scope)"),
     (re.compile(r"generic methods"), "generics"),
     (re.compile(r"non-class receiver \(value types\)|initobj/ldobj/stobj/cpobj of a non-value class|struct alignment above 16|SysV descriptor"), "structs & value types"),
     (re.compile(r"newobj of a value class"), "newobj of a value class"),
