@@ -456,6 +456,18 @@ pub enum Inst {
     /// Always explicit: the offset-vs-page-size folding RyuJIT does is a
     /// later optimization.
     NullCheck { addr: Src },
+    /// The array bounds check (step_10.8): the 32-bit length load at
+    /// `[array + 8]` doubles as the null check (a null array faults — the
+    /// trap model), then `index < length` unsigned decides between
+    /// fallthrough and a call to the EE's RNGCHKFAIL helper
+    /// (`IndexOutOfRangeException`). `index_wide` selects the 64-bit
+    /// compare for a native-int index (the length load zero-extends, so
+    /// the wide compare is exact).
+    BoundsCheck {
+        index: Src,
+        index_wide: bool,
+        array: Src,
+    },
     /// `jcc target` — reads the flags `Cmp` (or a future flag-setting
     /// instruction) left. Flag materialization is by adjacency: lowering
     /// emits the producer immediately before the consumer, and codegen
@@ -649,6 +661,11 @@ impl Inst {
                     defs: CALL_DEFS,
                 }
             }
+            // A failed bounds check calls RNGCHKFAIL (conditionally).
+            Inst::BoundsCheck { .. } => FixedRegs {
+                uses: &[],
+                defs: CALL_DEFS,
+            },
             _ => NO_FIXED,
         }
     }

@@ -518,6 +518,24 @@ rokajit::lower_rules! {
         if let Some(a) = operand_src(*arg)
         => |_| vec![Inst::NullCheck { addr: a }];
 
+    /// The array bounds check (step_10.8): the only array-aware
+    /// descriptor — the length load, the unsigned compare, and the
+    /// conditional RNGCHKFAIL helper call. Element addressing never
+    /// reaches here (the flattener already expanded it to plain
+    /// address arithmetic). The compare widens to 64 bits for a
+    /// native-int index (RyuJIT widens to TYP_I_IMPL, morph.cpp:3022).
+    rule bounds_check: BoundsCheck { array, index }
+        if let (Some(a), Some(i), Some(w)) = (
+            operand_src(*array),
+            operand_src(*index),
+            operand_width(cx, *index),
+        )
+        => |_| vec![Inst::BoundsCheck {
+            index: i,
+            index_wide: matches!(w, Width::W64),
+            array: a,
+        }];
+
     /// `t := a + b`, `a - b`, `a * b` — one three-operand descriptor;
     /// codegen emits the destructive two-operand pair. Constants ride
     /// along as immediates (`Src::Imm`); the encoder picks the imm form.
@@ -2086,6 +2104,195 @@ mod tests {
             lower_obj(&s),
             Some(vec![Inst::NullCheck { addr: Src::Imm(0) }])
         );
+    }
+
+    // --- step_10.8: the array pack ---
+
+    #[test]
+    fn bounds_check_lowers_to_the_descriptor() {
+        // An Int32 index compares 32-bit; a native-int index 64-bit (the
+        // length load zero-extends, so the wide compare is exact).
+        let mut ls = locals_obj();
+        ls.push(hir::Local {
+            ty: Type::NativeInt,
+            kind: hir::LocalKind::Temp,
+            pinned: false,
+        });
+        let s = stmt(StmtKind::BoundsCheck {
+            array: Operand::Local(LocalId(0)),
+            index: Operand::Local(LocalId(1)),
+        });
+        assert_eq!(
+            lower_with(&ls, &s),
+            Some(vec![Inst::BoundsCheck {
+                index: vsrc(1),
+                index_wide: false,
+                array: vsrc(0),
+            }])
+        );
+        let s = stmt(StmtKind::BoundsCheck {
+            array: Operand::Local(LocalId(0)),
+            index: Operand::Local(LocalId(5)),
+        });
+        assert_eq!(
+            lower_with(&ls, &s),
+            Some(vec![Inst::BoundsCheck {
+                index: vsrc(5),
+                index_wide: true,
+                array: vsrc(0),
+            }])
+        );
+    }
+
+    /// The step_10.8 element-access matrix, exercised through the plain
+    /// typed-memory rules with a ByRef-temp address at offset 0 — exactly
+    /// the operands the flattener's ArrElemAddr expansion produces, with
+    /// zero array knowledge in the rules (the 10.13 ldind/stind
+    /// contract). Locals: Int32 0, Int64 1, NativeInt 2, Float 3,
+    /// Double 4, Ref 5, ByRef 6 (the address temp).
+    fn locals_matrix() -> Vec<hir::Local> {
+        let l = |ty: Type, i: u32| hir::Local {
+            ty,
+            kind: hir::LocalKind::IlLocal(i),
+            pinned: false,
+        };
+        vec![
+            l(Type::Int32, 0),
+            l(Type::Int64, 1),
+            l(Type::NativeInt, 2),
+            l(Type::Float, 3),
+            l(Type::Double, 4),
+            l(Type::Ref, 5),
+            l(Type::ByRef, 6),
+        ]
+    }
+
+    #[test]
+    fn element_matrix_loads_cover_every_kind() {
+        let addr = Operand::Temp(LocalId(6));
+        let load = |dst: u32, ty: Type, access: MemAccess| {
+            stmt(StmtKind::Load {
+                dst: LocalId(dst),
+                addr,
+                offset: 0,
+                ty,
+                access,
+            })
+        };
+        // Sub-Int32 loads: movsx/movzx by cell size and signedness
+        // (ECMA-335 §III.1.1.1: I1/I2 sign-extend, U1/U2 zero-extend).
+        for (access, size, signed) in [
+            (MemAccess::I8, 1, true),
+            (MemAccess::U8, 1, false),
+            (MemAccess::I16, 2, true),
+            (MemAccess::U16, 2, false),
+        ] {
+            assert_eq!(
+                lower_with(&locals_matrix(), &load(0, Type::Int32, access)),
+                Some(vec![Inst::LoadMemNarrow {
+                    size,
+                    signed,
+                    dst: val(0),
+                    addr: vsrc(6),
+                    disp: 0,
+                }]),
+                "{access:?}"
+            );
+        }
+        // Natural GPR loads (i4/u4, i8, i, ref): width from the type.
+        for (dst, ty, w) in [
+            (0, Type::Int32, Width::W32),
+            (1, Type::Int64, Width::W64),
+            (2, Type::NativeInt, Width::W64),
+            (5, Type::Ref, Width::W64),
+        ] {
+            assert_eq!(
+                lower_with(&locals_matrix(), &load(dst, ty, MemAccess::Natural)),
+                Some(vec![Inst::LoadMem {
+                    width: w,
+                    dst: val(dst),
+                    addr: vsrc(6),
+                    disp: 0,
+                }]),
+                "{ty:?}"
+            );
+        }
+        // Float loads (r4/r8): movss/movsd.
+        for (dst, ty, w) in [(3, Type::Float, FWidth::S), (4, Type::Double, FWidth::D)] {
+            assert_eq!(
+                lower_with(&locals_matrix(), &load(dst, ty, MemAccess::Natural)),
+                Some(vec![Inst::LoadMemF {
+                    width: w,
+                    dst: xval(dst),
+                    addr: vsrc(6),
+                    disp: 0,
+                }]),
+                "{ty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn element_matrix_stores_cover_every_kind() {
+        let addr = Operand::Temp(LocalId(6));
+        let store = |src: u32, access: MemAccess| {
+            stmt(StmtKind::Store {
+                addr,
+                offset: 0,
+                src: Operand::Temp(LocalId(src)),
+                access,
+            })
+        };
+        // Sub-Int32 stores: only the low bytes write (extension is a
+        // store-time no-op).
+        for (access, size) in [
+            (MemAccess::I8, 1),
+            (MemAccess::U8, 1),
+            (MemAccess::I16, 2),
+            (MemAccess::U16, 2),
+        ] {
+            assert_eq!(
+                lower_with(&locals_matrix(), &store(0, access)),
+                Some(vec![Inst::StoreMemNarrow {
+                    size,
+                    addr: vsrc(6),
+                    disp: 0,
+                    src: vsrc(0),
+                }]),
+                "{access:?}"
+            );
+        }
+        // Natural GPR stores (i4, i8, i, ref): width from the source.
+        for (src, w) in [
+            (0, Width::W32),
+            (1, Width::W64),
+            (2, Width::W64),
+            (5, Width::W64),
+        ] {
+            assert_eq!(
+                lower_with(&locals_matrix(), &store(src, MemAccess::Natural)),
+                Some(vec![Inst::StoreMem {
+                    width: w,
+                    addr: vsrc(6),
+                    disp: 0,
+                    src: vsrc(src),
+                }]),
+                "src local {src}"
+            );
+        }
+        // Float stores (r4/r8): movss/movsd.
+        for (src, w) in [(3, FWidth::S), (4, FWidth::D)] {
+            assert_eq!(
+                lower_with(&locals_matrix(), &store(src, MemAccess::Natural)),
+                Some(vec![Inst::StoreMemF {
+                    width: w,
+                    addr: vsrc(6),
+                    disp: 0,
+                    src: xsrc(src),
+                }]),
+                "src local {src}"
+            );
+        }
     }
 
     #[test]

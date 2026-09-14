@@ -182,10 +182,18 @@ impl ClassQueries for MockEe {
 
     fn init_class(
         &self,
-        _field: Option<FieldHandle>,
-        _method: Option<MethodHandle>,
+        field: Option<FieldHandle>,
+        method: Option<MethodHandle>,
         _context: ContextHandle,
     ) -> CorInfoInitClassResult {
+        // The method-prolog query (no field, no method — the 10.8
+        // entry-cctor fix) has its own canned verdict, NOT_REQUIRED by
+        // default; field/newobj-triggered queries keep the shared one.
+        if field.is_none() && method.is_none() {
+            return self
+                .prolog_init_class
+                .unwrap_or(CorInfoInitClassResult::EMPTY);
+        }
         // The canned verdict; `CorInfoInitClassResult::EMPTY` is
         // NOT_REQUIRED (bit value 0) — the default.
         self.init_class_result
@@ -249,8 +257,10 @@ impl ClassQueries for MockEe {
         (CorInfoType::Undef, None)
     }
 
-    fn is_sd_array(&self, _cls: ClassHandle) -> bool {
-        false
+    fn is_sd_array(&self, cls: ClassHandle) -> bool {
+        // The canned happy path is an SZ array; designated handles can
+        // the gate's false answer.
+        !self.non_sd_arrays.contains(&(cls.as_raw() as usize))
     }
 
     fn get_array_rank(&self, _cls: ClassHandle) -> u32 {

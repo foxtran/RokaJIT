@@ -134,9 +134,20 @@ pub struct MockEe {
     /// The canned `get_new_helper` verdict's helper; `None` cans
     /// `CORINFO_HELP_NEWFAST` (step_10.4).
     pub new_helper: Option<CorInfoHelpFunc>,
+    /// The canned `get_new_arr_helper` verdict (step_10.8); `None` cans
+    /// `CORINFO_HELP_NEWARR_1_PTR`.
+    pub new_arr_helper: Option<CorInfoHelpFunc>,
+    /// Class handles (raw values) for which `is_sd_array` cans `false`
+    /// (step_10.8's non-SZ-array gate); the default answers the happy
+    /// path — every class is an SZ array.
+    pub non_sd_arrays: std::collections::HashSet<usize>,
     /// The canned `init_class` verdict (step_10.4). `EMPTY` is
     /// `CORINFO_INITCLASS_NOT_REQUIRED` (bit value 0) — the default.
     pub init_class_result: CorInfoInitClassResult,
+    /// The canned verdict for the method-prolog query
+    /// (`init_class(None, None, context)` — the 10.8 entry-cctor fix);
+    /// `None` answers NOT_REQUIRED, keeping the prolog inert by default.
+    pub prolog_init_class: Option<CorInfoInitClassResult>,
     /// Canned `get_box_helper`/`get_un_box_helper` verdicts (step_10.5);
     /// `None` cans `CORINFO_HELP_BOX`/`CORINFO_HELP_UNBOX`.
     pub box_helper: Option<CorInfoHelpFunc>,

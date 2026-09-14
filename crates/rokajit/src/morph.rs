@@ -47,6 +47,10 @@ pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
                     certify_expr(value)?;
                 }
                 hir::StmtKind::BlockZero { addr, .. } => certify_expr(addr)?,
+                hir::StmtKind::BoundsCheck { array, index } => {
+                    certify_expr(array)?;
+                    certify_expr(index)?;
+                }
                 hir::StmtKind::Eval(expr) => certify_expr(expr)?,
             }
         }
@@ -392,6 +396,45 @@ mod tests {
             struct_layouts: StructLayouts::new(),
         };
         morph(method).expect("the EH shapes certify");
+    }
+
+    #[test]
+    fn array_nodes_certify() {
+        // The step_10.8 shapes: a BoundsCheck statement, and ArrLen /
+        // ArrElemAddr (with its baked element size) trees.
+        let method = hir::Method {
+            blocks: vec![hir::Block {
+                id: BlockId(0),
+                stmts: vec![hir::Stmt {
+                    il_offset: crate::ir::IlOffset(0),
+                    kind: hir::StmtKind::BoundsCheck {
+                        array: hir::Expr::Local(LocalId(0)),
+                        index: hir::Expr::Const(Const::Int32(0)),
+                    },
+                }],
+                terminator: hir::Terminator::Return {
+                    value: Some(hir::Expr::ArrLen {
+                        array: Box::new(hir::Expr::Load {
+                            addr: Box::new(hir::Expr::ArrElemAddr {
+                                array: Box::new(hir::Expr::Local(LocalId(0))),
+                                index: Box::new(hir::Expr::Const(Const::Int32(1))),
+                                elem: Type::Int32,
+                                elem_size: 4,
+                            }),
+                            offset: 0,
+                            ty: Type::Int32,
+                            access: crate::ir::MemAccess::Natural,
+                        }),
+                    }),
+                },
+            }],
+            locals: Vec::new(),
+            eh_regions: Vec::new(),
+            num_args: 0,
+            num_il_locals: 0,
+            struct_layouts: StructLayouts::new(),
+        };
+        morph(method).expect("the array shapes certify");
     }
 
     #[test]

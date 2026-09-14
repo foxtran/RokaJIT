@@ -59,7 +59,7 @@ impl Helpers for MockEe {
     }
 
     fn get_new_arr_helper(&self, _array_cls: ClassHandle) -> CorInfoHelpFunc {
-        CorInfoHelpFunc::NEWARR_1_PTR
+        self.new_arr_helper.unwrap_or(CorInfoHelpFunc::NEWARR_1_PTR)
     }
 
     fn get_shared_cctor_helper(&self, _cls: ClassHandle) -> CorInfoHelpFunc {

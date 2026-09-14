@@ -52,7 +52,15 @@
 //! — IAT_VALUE only — and converted to the RuntimeTypeHandle/
 //! RuntimeMethodHandle/RuntimeFieldHandle struct through the
 //! TYPEHANDLE_TO_*/METHODDESC_TO_*/FIELDDESC_TO_* helper family) and
-//! `sizeof` (a JIT-time constant fold of `get_class_size`). Anything else
+//! `sizeof` (a JIT-time constant fold of `get_class_size`). The
+//! step_10.8 array pack adds `newarr` (the EE's `getNewArrHelper`
+//! allocation), `ldlen` (a length load at offset 8 that doubles as the
+//! null check), and `ldelem.*`/`stelem.*`/`ldelem`/`stelem`/`ldelema`
+//! (an explicit `BoundsCheck` statement — the RNGCHKFAIL helper throws
+//! `IndexOutOfRangeException` — plus the typed load/store through the
+//! computed element address; `stelem.ref` and `ldelema` of a reference
+//! element go through the `ARRADDR_ST`/`LDELEMA_REF` helpers, which
+//! check bounds, covariance, and barriers internally). Anything else
 //! is
 //! [`CompileError::Unsupported`]; malformed IL is
 //! [`CompileError::BadIl`]. The importer never panics: every operand read
@@ -77,7 +85,8 @@
 //! `get_field_info` for the statics),
 //! `embed_class_handle`, `init_class`, and `get_new_helper` (the object
 //! pack), `embed_generic_handle`/`get_token_type_as_handle` (ldtoken) and
-//! `get_class_size` (sizeof), and
+//! `get_class_size` (sizeof), `get_new_arr_helper`/`is_sd_array`/
+//! `as_cor_info_type` (the array pack), and
 //! signature walking (`get_arg_type`/`get_arg_next`,
 //! bounded by `numArgs` — the real EE's `getArgNext` never returns null, so
 //! stepping past `numArgs` walks off the signature blob). The entry
@@ -229,7 +238,7 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
     // blocks in IL order with the `leave` chains' step blocks spliced in,
     // then each clause's handler blocks grouped at the tail; ids and the
     // region table follow the new order.
-    let (blocks, eh_regions) = if importer.clauses.is_empty() {
+    let (mut blocks, eh_regions) = if importer.clauses.is_empty() {
         (blocks, Vec::new())
     } else {
         let ranges: Vec<(u32, u32)> = (0..leaders.len())
@@ -248,6 +257,40 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
             &importer.block_of,
         )?
     };
+    // The per-method class-init trigger (RyuJIT's morph.cpp:50
+    // fgMorphMainInit): a method whose OWN class has a precise
+    // (non-beforefieldinit) cctor not yet run starts with the INITCLASS
+    // helper call. The field-access/newobj triggers alone miss the
+    // same-class and entry-point cases — a static method that never
+    // touches its class's fields would run with the cctor unrun (found
+    // by JIT/opt/Cloning/loops_with_eh.cs in the 10.8 triage). The query
+    // is `initClass(NULL, NULL, method-context)`: with no field, the EE
+    // answers for the context's own class, and its same-class
+    // NOT_REQUIRED optimization requires a non-null method — so the
+    // prolog trigger fires exactly when the cctor genuinely must run
+    // (jitinterface.cpp initClass).
+    let prolog_init = importer
+        .ee
+        .init_class(None, None, ContextHandle::from_method(info.ftn));
+    if prolog_init.contains(CorInfoInitClassResult::USE_HELPER) {
+        let class = importer.ee.get_method_class(info.ftn);
+        let mt = importer.embed_class_const(class)?;
+        blocks[0].stmts.insert(
+            0,
+            hir::Stmt {
+                il_offset: IlOffset(0),
+                kind: hir::StmtKind::Eval(hir::Expr::Call {
+                    target: CallTarget::Helper(CorInfoHelpFunc::INITCLASS),
+                    sig: CallSig {
+                        ret: Type::Void,
+                        args: vec![Type::NativeInt],
+                        has_this: false,
+                    },
+                    args: vec![mt],
+                }),
+            },
+        );
+    }
     Ok(hir::Method {
         blocks,
         locals,
@@ -332,6 +375,25 @@ fn corinfo_mem_type(ty: CorInfoType) -> CompileResult<(Type, MemAccess)> {
             ));
         }
     })
+}
+
+/// The natural cell size of a full-width IR type (array element sizes;
+/// step_10.8): 4 for Int32/Float, 8 for the 64-bit types.
+fn natural_cell_size(ty: Type) -> u32 {
+    match ty {
+        Type::Int32 | Type::Float => 4,
+        Type::Int64 | Type::NativeInt | Type::Ref | Type::ByRef | Type::Double => 8,
+        Type::Struct(_) | Type::Void => unreachable!("no natural cell size"),
+    }
+}
+
+/// A resolved array element kind (step_10.8): either a typed cell (stack
+/// type, memory shape, element size in bytes) or a struct element whose
+/// layout sits in the side table.
+#[derive(Copy, Clone)]
+enum ElemKind {
+    Cell(Type, MemAccess, u32),
+    Struct(ClassHandle),
 }
 
 fn check_call_conv(call_conv: ffi::CorInfoCallConv) -> CompileResult<()> {
@@ -494,6 +556,25 @@ enum Op {
     /// `unbox.any` — boxed value to the value itself: `unbox` + `ldobj`
     /// for a value class, `castclass` for anything else (type token).
     UnboxAny(u32),
+    /// `newarr` — 1-D zero-based array allocation through the EE's
+    /// `getNewArrHelper` (array class token; step_10.8).
+    NewArr(u32),
+    /// `ldlen` — the array's element count (step_10.8).
+    LdLen,
+    /// `ldelema` — the element's address, an interior `ByRef` (element
+    /// class token; step_10.8).
+    LdElemA(u32),
+    /// `ldelem.*` — the fixed element kinds (0x90..=0x9A), each carrying
+    /// its (stack type, cell shape, element size) from
+    /// [`LDELEM_FIXED_KINDS`] (step_10.8).
+    LdElemK(Type, MemAccess, u32),
+    /// `ldelem` — the element load with the element class token (0xA3).
+    LdElem(u32),
+    /// `stelem.*` — the fixed element kinds (0x9B..=0xA2), from
+    /// [`STELEM_FIXED_KINDS`] (step_10.8).
+    StElemK(Type, MemAccess, u32),
+    /// `stelem` — the element store with the element class token (0xA4).
+    StElem(u32),
     /// `throw` — raise the stack-top exception reference.
     Throw,
     /// `leave`/`leave.s` — exit the enclosing protected region(s) for
@@ -543,6 +624,38 @@ const BR_CMP_OPS: [BinaryOp; 10] = [
     BinaryOp::UGt,
     BinaryOp::ULe,
     BinaryOp::ULt,
+];
+
+/// The fixed `ldelem.*` element kinds in opcode order (0x90..=0x9A: i1,
+/// u1, i2, u2, i4, u4, i8, i, r4, r8, ref) as (stack type, cell shape,
+/// element size). Sub-Int32 elements normalize to Int32 on the stack but
+/// keep their cell width (the field rule, [`corinfo_mem_type`]).
+const LDELEM_FIXED_KINDS: [(Type, MemAccess, u32); 11] = [
+    (Type::Int32, MemAccess::I8, 1),
+    (Type::Int32, MemAccess::U8, 1),
+    (Type::Int32, MemAccess::I16, 2),
+    (Type::Int32, MemAccess::U16, 2),
+    (Type::Int32, MemAccess::Natural, 4),     // i4
+    (Type::Int32, MemAccess::Natural, 4),     // u4
+    (Type::Int64, MemAccess::Natural, 8),     // i8
+    (Type::NativeInt, MemAccess::Natural, 8), // i
+    (Type::Float, MemAccess::Natural, 4),     // r4
+    (Type::Double, MemAccess::Natural, 8),    // r8
+    (Type::Ref, MemAccess::Natural, 8),       // ref
+];
+
+/// The fixed `stelem.*` element kinds in opcode order (0x9B..=0xA2: i,
+/// i1, i2, i4, i8, r4, r8, ref). Stores write only the low bytes, so the
+/// signedness distinction of the load forms doesn't exist here.
+const STELEM_FIXED_KINDS: [(Type, MemAccess, u32); 8] = [
+    (Type::NativeInt, MemAccess::Natural, 8), // i
+    (Type::Int32, MemAccess::I8, 1),          // i1
+    (Type::Int32, MemAccess::I16, 2),         // i2
+    (Type::Int32, MemAccess::Natural, 4),     // i4
+    (Type::Int64, MemAccess::Natural, 8),     // i8
+    (Type::Float, MemAccess::Natural, 4),     // r4
+    (Type::Double, MemAccess::Natural, 8),    // r8
+    (Type::Ref, MemAccess::Natural, 8),       // ref
 ];
 
 /// Bounds-checked cursor over the IL stream.
@@ -721,6 +834,19 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x80 => Op::StSFld(r.u32()?),
             0x81 => Op::StObj(r.u32()?),
             0x8C => Op::Box(r.u32()?),
+            0x8D => Op::NewArr(r.u32()?),
+            0x8E => Op::LdLen,
+            0x8F => Op::LdElemA(r.u32()?),
+            0x90..=0x9A => {
+                let (ty, access, size) = LDELEM_FIXED_KINDS[usize::from(opcode - 0x90)];
+                Op::LdElemK(ty, access, size)
+            }
+            0x9B..=0xA2 => {
+                let (ty, access, size) = STELEM_FIXED_KINDS[usize::from(opcode - 0x9B)];
+                Op::StElemK(ty, access, size)
+            }
+            0xA3 => Op::LdElem(r.u32()?),
+            0xA4 => Op::StElem(r.u32()?),
             0xA5 => Op::UnboxAny(r.u32()?),
             0xD0 => Op::LdToken(r.u32()?),
             0xD1 => Op::Conv(ConvKind::U2),
@@ -3319,6 +3445,365 @@ impl BlockImport<'_> {
         }
     }
 
+    // --- step_10.8: arrays ---
+
+    /// `newarr` (0x8D): allocate a 1-D zero-based array through the EE's
+    /// `getNewArrHelper` — the two-argument `(MethodTable*, INT_PTR
+    /// element_count) -> Object*` forms. The class handle embeds as a raw
+    /// `NativeInt` constant (the newobj rule: a MethodTable* is never
+    /// GC-rooted as a reference). The helper zero-initializes; a negative
+    /// length zero-extends to a huge count and the helper throws
+    /// `OverflowException` (RyuJIT's answer to the same shape).
+    fn newarr(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+            t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+            t.tokenScope = self.info.args.scope;
+            t.token = token;
+            t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Newarr;
+        });
+        self.ee.resolve_token(&mut resolved);
+        let Some(class) = ClassHandle::from_raw(resolved.hClass) else {
+            return Err(CompileError::BadIl(
+                "newarr token did not resolve to a class",
+            ));
+        };
+        // `newarr` always builds an SZ (single-dimension, zero-based)
+        // array; the gate is defensive.
+        if !self.ee.is_sd_array(class) {
+            return Err(CompileError::Unsupported("newarr of a non-SZ array"));
+        }
+        let helper = self.ee.get_new_arr_helper(class);
+        if !matches!(
+            helper,
+            CorInfoHelpFunc::NEWARR_1_DIRECT
+                | CorInfoHelpFunc::NEWARR_1_MAYBEFROZEN
+                | CorInfoHelpFunc::NEWARR_1_PTR
+                | CorInfoHelpFunc::NEWARR_1_VC
+                | CorInfoHelpFunc::NEWARR_1_ALIGN8
+        ) {
+            return Err(CompileError::Unsupported(
+                "newarr allocation helper outside the accepted set",
+            ));
+        }
+        let (lt, len) = self.pop()?;
+        if !matches!(lt, Type::Int32 | Type::NativeInt) {
+            return Err(CompileError::BadIl(
+                "newarr length must be int32 or native int",
+            ));
+        }
+        let mt = self.embed_class_const(class)?;
+        self.spill_stack(stmts, il_offset)?;
+        let len = self.index_native(lt, len);
+        self.push(
+            Type::Ref,
+            hir::Expr::Call {
+                target: CallTarget::Helper(helper),
+                sig: CallSig {
+                    ret: Type::Ref,
+                    args: vec![Type::NativeInt, Type::NativeInt],
+                    has_this: false,
+                },
+                args: vec![mt, len],
+            },
+        )
+    }
+
+    /// `ldlen` (0x8E): the element count — an [`hir::Expr::ArrLen`] tree,
+    /// Int32 on the stack. The load it lowers to doubles as the null
+    /// check (step_10.4's trap model).
+    fn ldlen(&mut self) -> CompileResult<()> {
+        let array = self.pop_array()?;
+        self.push(
+            Type::Int32,
+            hir::Expr::ArrLen {
+                array: Box::new(array),
+            },
+        )
+    }
+
+    /// `ldelem.*` (0x90..=0x9A) / `ldelem` (0xA3): the bounds check
+    /// statement, then the typed load through the computed element
+    /// address. A struct element yields the address as a `StructVal`
+    /// (step_10.9); a reference element is a natural-width `Ref` load
+    /// whose temp is automatically a GC root.
+    fn ldelem(
+        &mut self,
+        elem: ElemKind,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        match elem {
+            ElemKind::Cell(ty, access, elem_size) => {
+                let addr = self.bounds_checked_addr(ty, elem_size, stmts, il_offset)?;
+                self.push(
+                    ty,
+                    hir::Expr::Load {
+                        addr: Box::new(addr),
+                        offset: 0,
+                        ty,
+                        access,
+                    },
+                )
+            }
+            ElemKind::Struct(class) => {
+                let elem_size = self.struct_layouts[&class].size;
+                let addr =
+                    self.bounds_checked_addr(Type::Struct(class), elem_size, stmts, il_offset)?;
+                self.push(
+                    Type::Struct(class),
+                    hir::Expr::StructVal {
+                        addr: Box::new(addr),
+                        class,
+                    },
+                )
+            }
+        }
+    }
+
+    /// `stelem.*` (0x9B..=0xA2) / `stelem` (0xA4): the bounds check
+    /// statement, then the store through the computed element address.
+    /// A reference store goes through the `CORINFO_HELP_ARRADDR_ST`
+    /// helper instead (`CastHelpers.StelemRef`: the null check, bounds
+    /// check, covariance type check, and write barrier are all the
+    /// helper's — jithelpers.h:139), and a struct store is the block
+    /// copy / bulk-write-barrier path of `stobj`.
+    fn stelem(
+        &mut self,
+        elem: ElemKind,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        match elem {
+            ElemKind::Cell(Type::Ref, _, _) => {
+                let (vt, value) = self.pop()?;
+                if vt != Type::Ref {
+                    return Err(CompileError::BadIl("stelem value type mismatch"));
+                }
+                let (it, index) = self.pop_index()?;
+                let array = self.pop_array()?;
+                self.spill_stack(stmts, il_offset)?;
+                let index = self.index_native(it, index);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Eval(hir::Expr::Call {
+                        target: CallTarget::Helper(CorInfoHelpFunc::ARRADDR_ST),
+                        sig: CallSig {
+                            ret: Type::Void,
+                            args: vec![Type::Ref, Type::NativeInt, Type::Ref],
+                            has_this: false,
+                        },
+                        args: vec![array, index, value],
+                    }),
+                });
+                Ok(())
+            }
+            ElemKind::Cell(ty, access, elem_size) => {
+                let (vt, value) = self.pop()?;
+                if vt != ty {
+                    return Err(CompileError::BadIl("stelem value type mismatch"));
+                }
+                let addr = self.bounds_checked_addr(ty, elem_size, stmts, il_offset)?;
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::StoreInd {
+                        addr,
+                        offset: 0,
+                        value,
+                        access,
+                    },
+                });
+                Ok(())
+            }
+            ElemKind::Struct(class) => {
+                let (vt, value) = self.pop()?;
+                if vt != Type::Struct(class) {
+                    return Err(CompileError::BadIl("stelem value type mismatch"));
+                }
+                let elem_size = self.struct_layouts[&class].size;
+                let addr =
+                    self.bounds_checked_addr(Type::Struct(class), elem_size, stmts, il_offset)?;
+                self.store_struct_through(addr, class, value, stmts, il_offset)
+            }
+        }
+    }
+
+    /// `ldelema` (0x8F): the element's address, an interior `ByRef` (the
+    /// temp it lands in is an interior-pointer GC root, the `unbox`
+    /// discipline). A reference element takes the
+    /// `CORINFO_HELP_LDELEMA_REF` helper (`CastHelpers.LdelemaRef`): a
+    /// byref into a covariant array would bypass `stelem.ref`'s
+    /// covariance check, so the helper null-checks, bounds-checks, and
+    /// exact-element-type-checks itself — no separate BoundsCheck.
+    fn ldelema(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let elem = self.elem_kind_of(token)?;
+        match elem {
+            ElemKind::Cell(Type::Ref, _, _) => {
+                let (it, index) = self.pop_index()?;
+                let array = self.pop_array()?;
+                self.spill_stack(stmts, il_offset)?;
+                let index = self.index_native(it, index);
+                self.push(
+                    Type::ByRef,
+                    hir::Expr::Call {
+                        target: CallTarget::Helper(CorInfoHelpFunc::LDELEMA_REF),
+                        sig: CallSig {
+                            ret: Type::ByRef,
+                            args: vec![Type::Ref, Type::NativeInt],
+                            has_this: false,
+                        },
+                        args: vec![array, index],
+                    },
+                )
+            }
+            ElemKind::Cell(ty, _, elem_size) => {
+                let addr = self.bounds_checked_addr(ty, elem_size, stmts, il_offset)?;
+                self.push(Type::ByRef, addr)
+            }
+            ElemKind::Struct(class) => {
+                let elem_size = self.struct_layouts[&class].size;
+                let addr =
+                    self.bounds_checked_addr(Type::Struct(class), elem_size, stmts, il_offset)?;
+                self.push(Type::ByRef, addr)
+            }
+        }
+    }
+
+    /// The element kind of a token form (`ldelema`/`ldelem`/`stelem`):
+    /// the element class resolved with the Class hint (importer.cpp's
+    /// `impResolveToken` for these opcodes), its storage type from
+    /// `asCorInfoType`. A value class is a struct element (the layout
+    /// registers into the side table); a reference type is exactly the
+    /// `*.ref` fixed form (RyuJIT does the same); anything else maps
+    /// through the stored-cell table.
+    fn elem_kind_of(&mut self, token: u32) -> CompileResult<ElemKind> {
+        let (_resolved, class) =
+            self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
+        let raw = self.ee.as_cor_info_type(class);
+        if raw == CorInfoType::ValueClass {
+            let ty = sig_elem_type(Some(raw), Some(class), self.ee, &mut self.struct_layouts)?;
+            let Type::Struct(class) = ty else {
+                return Err(CompileError::Internal(
+                    "a value-class element is always a struct",
+                ));
+            };
+            return Ok(ElemKind::Struct(class));
+        }
+        let (ty, access) = corinfo_mem_type(raw)
+            .map_err(|_| CompileError::Unsupported("array element type outside the array pack"))?;
+        let elem_size = match access.narrow_bytes() {
+            Some(n) => u32::from(n),
+            None => natural_cell_size(ty),
+        };
+        Ok(ElemKind::Cell(ty, access, elem_size))
+    }
+
+    /// The shared core of the bounds-checked element accesses: pops the
+    /// index, then the array (IL pop order), spills the pending stack,
+    /// and emits the [`hir::StmtKind::BoundsCheck`] statement. Both
+    /// operands feed the check AND the returned `ArrElemAddr` tree, so a
+    /// non-trivial tree (one containing a call) materializes into a temp
+    /// first — it must evaluate exactly once, array before index (the IL
+    /// push order).
+    fn bounds_checked_addr(
+        &mut self,
+        elem: Type,
+        elem_size: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<hir::Expr> {
+        let (it, index) = self.pop_index()?;
+        let array = self.pop_array()?;
+        self.spill_stack(stmts, il_offset)?;
+        let (array, check_array) = self.duplicate(Type::Ref, array, stmts, il_offset);
+        let (index, check_index) = self.duplicate(it, index, stmts, il_offset);
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::BoundsCheck {
+                array: check_array,
+                index: check_index,
+            },
+        });
+        Ok(hir::Expr::ArrElemAddr {
+            array: Box::new(array),
+            index: Box::new(index),
+            elem,
+            elem_size,
+        })
+    }
+
+    /// Pops the array operand of an element access: a reference (null
+    /// included — the bounds check's length load faults on it).
+    fn pop_array(&mut self) -> CompileResult<hir::Expr> {
+        let (ty, array) = self.pop()?;
+        if ty != Type::Ref {
+            return Err(CompileError::BadIl("array operand must be a reference"));
+        }
+        Ok(array)
+    }
+
+    /// Pops the index operand of an element access (int32 or native int).
+    fn pop_index(&mut self) -> CompileResult<(Type, hir::Expr)> {
+        let (ty, index) = self.pop()?;
+        if !matches!(ty, Type::Int32 | Type::NativeInt) {
+            return Err(CompileError::BadIl(
+                "array index must be int32 or native int",
+            ));
+        }
+        Ok((ty, index))
+    }
+
+    /// An array index/count widened to native int for a helper signature:
+    /// a zero-extending `conv.u` (the bounds check proves 0 <= index).
+    fn index_native(&mut self, ty: Type, index: hir::Expr) -> hir::Expr {
+        if ty == Type::NativeInt {
+            index
+        } else {
+            hir::Expr::Conv {
+                to: Type::NativeInt,
+                overflow: false,
+                unsigned: true,
+                arg: Box::new(index),
+            }
+        }
+    }
+
+    /// Duplicates a popped operand tree for a two-consumer shape (the
+    /// bounds-check statement and the element address both read the array
+    /// and the index). A trivial tree (a constant, a local read/address)
+    /// copies outright; anything else spills to a temp first so its
+    /// effects — a call — evaluate exactly once.
+    fn duplicate(
+        &mut self,
+        ty: Type,
+        value: hir::Expr,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> (hir::Expr, hir::Expr) {
+        match value {
+            hir::Expr::Const(k) => (hir::Expr::Const(k), hir::Expr::Const(k)),
+            hir::Expr::Local(id) => (hir::Expr::Local(id), hir::Expr::Local(id)),
+            hir::Expr::LocalAddr(id) => (hir::Expr::LocalAddr(id), hir::Expr::LocalAddr(id)),
+            value => {
+                let t = self.temp(ty);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store { dst: t, value },
+                });
+                (hir::Expr::Local(t), hir::Expr::Local(t))
+            }
+        }
+    }
+
     /// Imports the instructions of block `b` (leader `leaders[b]`). The
     /// stack starts empty — the entry check below rejects leaders a
     /// predecessor already entered non-empty, and a later pass over
@@ -3460,6 +3945,23 @@ impl BlockImport<'_> {
                 Op::Unbox(token) => self.unbox(token)?,
                 Op::Box(token) => self.box_(token, &mut stmts, il_offset)?,
                 Op::UnboxAny(token) => self.unbox_any(token)?,
+                Op::NewArr(token) => self.newarr(token, &mut stmts, il_offset)?,
+                Op::LdLen => self.ldlen()?,
+                Op::LdElemA(token) => self.ldelema(token, &mut stmts, il_offset)?,
+                Op::LdElemK(ty, access, size) => {
+                    self.ldelem(ElemKind::Cell(ty, access, size), &mut stmts, il_offset)?
+                }
+                Op::LdElem(token) => {
+                    let elem = self.elem_kind_of(token)?;
+                    self.ldelem(elem, &mut stmts, il_offset)?
+                }
+                Op::StElemK(ty, access, size) => {
+                    self.stelem(ElemKind::Cell(ty, access, size), &mut stmts, il_offset)?
+                }
+                Op::StElem(token) => {
+                    let elem = self.elem_kind_of(token)?;
+                    self.stelem(elem, &mut stmts, il_offset)?
+                }
                 Op::Br { target } => {
                     self.note_depth(target, self.stack.len())?;
                     terminator = Some(hir::Terminator::Jump {
@@ -7225,5 +7727,569 @@ mod tests {
             matches!(&err, CompileError::Unsupported(m) if m.contains("casting helper")),
             "{err:?}"
         );
+    }
+
+    // --- step_10.8: arrays ---
+
+    const ARR_TOKEN: u32 = 0x0200_0042;
+    const ELEM_TOKEN: u32 = 0x0200_0043;
+
+    /// A MockEe resolving ARR_TOKEN to a canned array class; the mock's
+    /// defaults answer the happy path (an SZ array, the NEWARR_1_PTR
+    /// helper).
+    fn array_fixture(il: &[u8], entry: &MockSig, locals: &[CorInfoType]) -> (MockEe, MethodInfo) {
+        let (mut ee, info) = fixture(il, entry, locals);
+        let arr = ClassHandle::from_raw(0xA550usize as ffi::CORINFO_CLASS_HANDLE).unwrap();
+        ee.class_tokens.insert(ARR_TOKEN, arr);
+        (ee, info)
+    }
+
+    /// A canned element class resolved from ELEM_TOKEN, with
+    /// `as_cor_info_type` answering `cor` (a registered value class for a
+    /// struct element; a bare handle with a `class_cor_info_types`
+    /// override otherwise).
+    fn with_elem(ee: &mut MockEe, elem: ClassHandle, cor: CorInfoType) {
+        ee.class_tokens.insert(ELEM_TOKEN, elem);
+        ee.class_cor_info_types.insert(elem.as_raw() as usize, cor);
+    }
+
+    fn as_bounds_check(stmt: &hir::Stmt) -> (&hir::Expr, &hir::Expr) {
+        match &stmt.kind {
+            hir::StmtKind::BoundsCheck { array, index } => (array, index),
+            _ => panic!("expected StmtKind::BoundsCheck"),
+        }
+    }
+
+    fn as_arr_elem_addr(e: &hir::Expr) -> (&hir::Expr, &hir::Expr, Type, u32) {
+        match e {
+            hir::Expr::ArrElemAddr {
+                array,
+                index,
+                elem,
+                elem_size,
+            } => (array, index, *elem, *elem_size),
+            _ => panic!("expected Expr::ArrElemAddr"),
+        }
+    }
+
+    #[test]
+    fn newarr_imports_as_the_allocation_helper_call() {
+        // ldc.i4.3; newarr T; stloc.0; ldc.i4.0; ret — a Ref local holds
+        // the fresh array.
+        let t = tok(ARR_TOKEN);
+        let il = [0x19, 0x8D, t[0], t[1], t[2], t[3], 0x0A, 0x16, 0x2A];
+        let (ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::Class]);
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(0));
+        assert_eq!(m.locals[0].ty, Type::Ref);
+        let (helper, csig, args) = as_helper_call(value);
+        assert_eq!(helper, CorInfoHelpFunc::NEWARR_1_PTR);
+        assert_eq!(
+            csig,
+            &CallSig {
+                ret: Type::Ref,
+                args: vec![Type::NativeInt, Type::NativeInt],
+                has_this: false,
+            }
+        );
+        assert!(
+            matches!(args[0], hir::Expr::Const(Const::NativeInt(_))),
+            "the array class embeds as a raw pointer constant, never a Ref"
+        );
+        // The Int32 length zero-extends to native int.
+        let (to, overflow, unsigned, arg) = as_conv(&args[1]);
+        assert_eq!(to, Type::NativeInt);
+        assert!(!overflow && unsigned);
+        assert_eq!(as_i32(arg), 3);
+
+        // A native-int length rides through unchanged.
+        let il = [0x02, 0x8D, t[0], t[1], t[2], t[3], 0x0A, 0x16, 0x2A];
+        let (ee, info) = array_fixture(
+            &il,
+            &sig(CorInfoType::Int, &[CorInfoType::NativeInt]),
+            &[CorInfoType::Class],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (_, value) = store(&m.blocks[0].stmts[0]);
+        let (_, _, args) = as_helper_call(value);
+        assert_eq!(as_local(&args[1]), LocalId(0), "no widening node");
+    }
+
+    #[test]
+    fn newarr_gates() {
+        let t = tok(ARR_TOKEN);
+        let il = [0x17, 0x8D, t[0], t[1], t[2], t[3], 0x26, 0x16, 0x2A];
+        // A non-SZ array class (the defensive gate) is Unsupported.
+        let (mut ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let arr = ee.class_tokens[&ARR_TOKEN];
+        ee.non_sd_arrays.insert(arr.as_raw() as usize);
+        let err = import(&info, &ee).err().expect("a non-SZ array is out");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("non-SZ")),
+            "{err:?}"
+        );
+        // An allocation helper outside the accepted set is Unsupported.
+        let (mut ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.new_arr_helper = Some(CorInfoHelpFunc::NEWFAST);
+        let err = import(&info, &ee).err().expect("helper outside the set");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("allocation helper")),
+            "{err:?}"
+        );
+        // A float length is BadIl.
+        let il = [
+            0x23, 0, 0, 0, 0, 0, 0, 0, 0, 0x8D, t[0], t[1], t[2], t[3], 0x26, 0x16, 0x2A,
+        ];
+        let (ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let err = import(&info, &ee).err().expect("a float length is bad IL");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("newarr length")),
+            "{err:?}"
+        );
+        // An unresolvable token is BadIl.
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let err = import(&info, &ee).err().expect("unresolvable token");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("did not resolve")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn ldlen_pushes_the_arr_len_tree() {
+        // ldarg.0; ldlen; ret — the length read, Int32.
+        let il = [0x02, 0x8E, 0x2A];
+        let (ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::ArrLen { array } => assert_eq!(as_local(array), LocalId(0)),
+            _ => panic!("expected Expr::ArrLen"),
+        }
+
+        // ldlen of a non-reference is BadIl.
+        let (ee, info) = fixture(
+            &[0x02, 0x8E, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Int]),
+            &[],
+        );
+        let err = import(&info, &ee).err().expect("ldlen of an int");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("must be a reference")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn ldelem_fixed_kinds_import_as_bounds_check_plus_typed_load() {
+        for (i, &(ty, access, size)) in LDELEM_FIXED_KINDS.iter().enumerate() {
+            // ldarg.0; ldc.i4.1; ldelem.X; pop; ldc.i4.0; ret
+            let il = [0x02, 0x17, 0x90 + i as u8, 0x26, 0x16, 0x2A];
+            let (ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+            let m = import(&info, &ee).expect("imports");
+            let stmts = &m.blocks[0].stmts;
+            assert_eq!(
+                stmts.len(),
+                2,
+                "opcode {:#04x}: the bounds check, then the popped load's Eval",
+                0x90 + i as u8
+            );
+            let (array, index) = as_bounds_check(&stmts[0]);
+            assert_eq!(as_local(array), LocalId(0));
+            assert_eq!(as_i32(index), 1);
+            match &stmts[1].kind {
+                hir::StmtKind::Eval(hir::Expr::Load {
+                    addr,
+                    offset,
+                    ty: lty,
+                    access: lacc,
+                }) => {
+                    assert_eq!(*offset, 0);
+                    assert_eq!(*lty, ty, "opcode {:#04x}", 0x90 + i as u8);
+                    assert_eq!(*lacc, access);
+                    let (a, idx, elem, elem_size) = as_arr_elem_addr(addr);
+                    assert_eq!(as_local(a), LocalId(0));
+                    assert_eq!(as_i32(idx), 1);
+                    assert_eq!(elem, ty);
+                    assert_eq!(elem_size, size);
+                }
+                _ => panic!("expected the Eval of the element load"),
+            }
+        }
+    }
+
+    #[test]
+    fn stelem_fixed_kinds_import_as_bounds_check_plus_store_ind() {
+        // The value IL matching each element kind's stack type (stelem.ref
+        // — the ARRADDR_ST helper form — has its own test).
+        let value_ils: [&[u8]; 7] = [
+            &[0x16, 0xE0],                         // native int: ldc.i4.0; conv.u
+            &[0x1F, 0x2A],                         // i1: ldc.i4.s 42
+            &[0x1F, 0x2A],                         // i2
+            &[0x1F, 0x2A],                         // i4
+            &[0x21, 0, 0, 0, 0, 0, 0, 0, 0],       // i8: ldc.i8 0
+            &[0x22, 0, 0, 0x80, 0x3F],             // r4: ldc.r4 1.0
+            &[0x23, 0, 0, 0, 0, 0, 0, 0xF0, 0x3F], // r8: ldc.r8 1.0
+        ];
+        for (i, (&(ty, access, size), value_il)) in
+            STELEM_FIXED_KINDS[..7].iter().zip(&value_ils).enumerate()
+        {
+            // ldarg.0; ldc.i4.1; <value>; stelem.X; ldc.i4.0; ret
+            let mut il = vec![0x02, 0x17];
+            il.extend_from_slice(value_il);
+            il.extend_from_slice(&[0x9B + i as u8, 0x16, 0x2A]);
+            let (ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+            let m = import(&info, &ee).expect("imports");
+            let stmts = &m.blocks[0].stmts;
+            assert_eq!(
+                stmts.len(),
+                2,
+                "opcode {:#04x}: the bounds check, then the store",
+                0x9B + i as u8
+            );
+            let (array, index) = as_bounds_check(&stmts[0]);
+            assert_eq!(as_local(array), LocalId(0));
+            assert_eq!(as_i32(index), 1);
+            match &stmts[1].kind {
+                hir::StmtKind::StoreInd {
+                    addr,
+                    offset,
+                    access: sacc,
+                    ..
+                } => {
+                    assert_eq!(*offset, 0);
+                    assert_eq!(*sacc, access);
+                    let (a, idx, elem, elem_size) = as_arr_elem_addr(addr);
+                    assert_eq!(as_local(a), LocalId(0));
+                    assert_eq!(as_i32(idx), 1);
+                    assert_eq!(elem, ty);
+                    assert_eq!(elem_size, size);
+                }
+                _ => panic!("expected StmtKind::StoreInd"),
+            }
+        }
+    }
+
+    #[test]
+    fn stelem_ref_is_the_arraddr_st_helper_call() {
+        // ldarg.0; ldc.i4.1; ldnull; stelem.ref; ldc.i4.0; ret — the
+        // helper checks null, bounds, covariance, and applies the write
+        // barrier; NO BoundsCheck statement.
+        let il = [0x02, 0x17, 0x14, 0xA2, 0x16, 0x2A];
+        let (ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "the helper call only — no bounds check");
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::ARRADDR_ST),
+                    "CastHelpers.StelemRef"
+                );
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::Void,
+                        args: vec![Type::Ref, Type::NativeInt, Type::Ref],
+                        has_this: false,
+                    }
+                );
+                assert_eq!(as_local(&args[0]), LocalId(0));
+                // The Int32 index zero-extends to native int.
+                let (to, _, unsigned, arg) = as_conv(&args[1]);
+                assert_eq!(to, Type::NativeInt);
+                assert!(unsigned);
+                assert_eq!(as_i32(arg), 1);
+                assert!(matches!(args[2], hir::Expr::Const(Const::NullRef)));
+            }
+            _ => panic!("expected the ARRADDR_ST helper Eval"),
+        }
+    }
+
+    #[test]
+    fn ldelema_of_a_primitive_is_a_bounds_checked_byref() {
+        // ldarg.0; ldc.i4.0; ldelema <int>; stloc.0 (ByRef); ldc.i4.0; ret.
+        let t = tok(ELEM_TOKEN);
+        let il = [0x02, 0x16, 0x8F, t[0], t[1], t[2], t[3], 0x0A, 0x16, 0x2A];
+        let (mut ee, info) = array_fixture(
+            &il,
+            &sig(CorInfoType::Int, &[CorInfoType::Class]),
+            &[CorInfoType::ByRef],
+        );
+        let elem = ClassHandle::from_raw(0xE1E4usize as ffi::CORINFO_CLASS_HANDLE).unwrap();
+        with_elem(&mut ee, elem, CorInfoType::Int);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the bounds check, then the stloc");
+        let (array, _) = as_bounds_check(&stmts[0]);
+        assert_eq!(as_local(array), LocalId(0));
+        let (dst, value) = store(&stmts[1]);
+        assert_eq!(dst, LocalId(1), "the ByRef IL local");
+        let (_, _, elem_ty, elem_size) = as_arr_elem_addr(value);
+        assert_eq!(elem_ty, Type::Int32);
+        assert_eq!(elem_size, 4);
+        assert_eq!(m.locals[1].ty, Type::ByRef);
+    }
+
+    #[test]
+    fn ldelema_of_a_reference_element_is_the_ldelema_ref_helper() {
+        // A reference element: the LDELEMA_REF helper (it null-checks,
+        // bounds-checks, and exact-type-checks itself) — no BoundsCheck.
+        let t = tok(ELEM_TOKEN);
+        let il = [0x02, 0x16, 0x8F, t[0], t[1], t[2], t[3], 0x0A, 0x16, 0x2A];
+        let (mut ee, info) = array_fixture(
+            &il,
+            &sig(CorInfoType::Int, &[CorInfoType::Class]),
+            &[CorInfoType::ByRef],
+        );
+        let elem = ClassHandle::from_raw(0xE1EFusize as ffi::CORINFO_CLASS_HANDLE).unwrap();
+        ee.class_tokens.insert(ELEM_TOKEN, elem); // a reference type (the default)
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "the stloc only — no bounds check");
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(1));
+        let (helper, sig, args) = as_helper_call(value);
+        assert_eq!(helper, CorInfoHelpFunc::LDELEMA_REF);
+        assert_eq!(
+            sig,
+            &CallSig {
+                ret: Type::ByRef,
+                args: vec![Type::Ref, Type::NativeInt],
+                has_this: false,
+            }
+        );
+        assert_eq!(as_local(&args[0]), LocalId(0));
+        let (to, _, unsigned, _) = as_conv(&args[1]);
+        assert_eq!(to, Type::NativeInt);
+        assert!(unsigned);
+    }
+
+    #[test]
+    fn ldelem_stelem_token_forms_follow_the_element_type() {
+        let t = tok(ELEM_TOKEN);
+        // ldelem <int> ≡ ldelem.i4 (0x94): BoundsCheck + Int32 load.
+        let il = [0x02, 0x17, 0xA3, t[0], t[1], t[2], t[3], 0x26, 0x16, 0x2A];
+        let (mut ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+        let elem = ClassHandle::from_raw(0xE1E4usize as ffi::CORINFO_CLASS_HANDLE).unwrap();
+        with_elem(&mut ee, elem, CorInfoType::Int);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2);
+        let _ = as_bounds_check(&stmts[0]);
+        match &stmts[1].kind {
+            hir::StmtKind::Eval(hir::Expr::Load {
+                ty, access, addr, ..
+            }) => {
+                assert_eq!(*ty, Type::Int32);
+                assert_eq!(*access, MemAccess::Natural);
+                assert_eq!(as_arr_elem_addr(addr).3, 4);
+            }
+            _ => panic!("expected the Eval of the element load"),
+        }
+
+        // ldelem <a reference type> ≡ ldelem.ref (0x9A).
+        let (mut ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+        let elem = ClassHandle::from_raw(0xE1EFusize as ffi::CORINFO_CLASS_HANDLE).unwrap();
+        ee.class_tokens.insert(ELEM_TOKEN, elem);
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[1].kind {
+            hir::StmtKind::Eval(hir::Expr::Load { ty, addr, .. }) => {
+                assert_eq!(*ty, Type::Ref);
+                assert_eq!(as_arr_elem_addr(addr).3, 8);
+            }
+            _ => panic!("expected the Eval of the element load"),
+        }
+
+        // stelem <a reference type> ≡ stelem.ref: the ARRADDR_ST helper.
+        let il = [0x02, 0x17, 0x14, 0xA4, t[0], t[1], t[2], t[3], 0x16, 0x2A];
+        let (mut ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+        ee.class_tokens.insert(ELEM_TOKEN, elem);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "the helper call only — no bounds check");
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, .. }) => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::ARRADDR_ST)
+                );
+            }
+            _ => panic!("expected the ARRADDR_ST helper Eval"),
+        }
+    }
+
+    #[test]
+    fn ldelem_of_a_struct_yields_a_struct_val_over_the_element_address() {
+        // ldarg.0; ldc.i4.0; ldelem S; stloc.0 (a struct local); ret.
+        let (mut ee, c) = struct_ee(12, &[], None);
+        ee.class_tokens.insert(ELEM_TOKEN, c);
+        let entry = sig(CorInfoType::Void, &[CorInfoType::Class]);
+        let t = tok(ELEM_TOKEN);
+        let info = struct_info(
+            &mut ee,
+            &[0x02, 0x16, 0xA3, t[0], t[1], t[2], t[3], 0x0A, 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass],
+            &[Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the bounds check, then the stloc");
+        let _ = as_bounds_check(&stmts[0]);
+        let (dst, value) = store(&stmts[1]);
+        assert_eq!(dst, LocalId(1));
+        let (addr, class) = as_struct_val(value);
+        assert_eq!(class, c);
+        let (_, _, elem, elem_size) = as_arr_elem_addr(addr);
+        assert_eq!(elem, Type::Struct(c));
+        assert_eq!(elem_size, 12, "the layout size is the element size");
+    }
+
+    #[test]
+    fn stelem_of_a_struct_is_the_block_copy_shape() {
+        // ldarg.0; ldc.i4.0; ldloc.0; stelem S; ret — BoundsCheck, then
+        // StoreInd of the StructVal (the flattener's BlockCopy path).
+        let (mut ee, c) = struct_ee(12, &[], None);
+        ee.class_tokens.insert(ELEM_TOKEN, c);
+        let entry = sig(CorInfoType::Void, &[CorInfoType::Class]);
+        let t = tok(ELEM_TOKEN);
+        let info = struct_info(
+            &mut ee,
+            &[0x02, 0x16, 0x06, 0xA4, t[0], t[1], t[2], t[3], 0x2A],
+            &entry,
+            &[CorInfoType::ValueClass],
+            &[Some(c)],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the bounds check, then the store");
+        let _ = as_bounds_check(&stmts[0]);
+        match &stmts[1].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset,
+                value,
+                access,
+            } => {
+                assert_eq!(*offset, 0);
+                assert_eq!(*access, MemAccess::Natural);
+                assert_eq!(as_arr_elem_addr(addr).3, 12);
+                let (src, class) = as_struct_val(value);
+                assert_eq!(class, c);
+                assert_eq!(as_local_addr(src), LocalId(1), "the struct local's address");
+            }
+            _ => panic!("expected StmtKind::StoreInd"),
+        }
+    }
+
+    #[test]
+    fn a_call_shaped_array_evaluates_exactly_once() {
+        // ldc.i4.3; newarr T; ldc.i4.0; ldelem.i4; pop; ldc.i4.0; ret —
+        // the array is a call tree: it materializes into a temp, and both
+        // the bounds check and the element address read the temp.
+        let t = tok(ARR_TOKEN);
+        let il = [
+            0x19, 0x8D, t[0], t[1], t[2], t[3], 0x16, 0x94, 0x26, 0x16, 0x2A,
+        ];
+        let (ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(
+            stmts.len(),
+            3,
+            "the array temp store, the bounds check, the popped load's Eval"
+        );
+        let (tmp, value) = store(&stmts[0]);
+        assert_eq!(m.locals[tmp.0 as usize].ty, Type::Ref);
+        assert!(matches!(value, hir::Expr::Call { .. }), "the newarr call");
+        let (array, _) = as_bounds_check(&stmts[1]);
+        assert_eq!(as_local(array), tmp);
+        match &stmts[2].kind {
+            hir::StmtKind::Eval(hir::Expr::Load { addr, .. }) => {
+                let (a, _, _, _) = as_arr_elem_addr(addr);
+                assert_eq!(as_local(a), tmp, "the address reads the same temp");
+            }
+            _ => panic!("expected the Eval of the element load"),
+        }
+    }
+
+    #[test]
+    fn element_access_type_gates_are_bad_il() {
+        // An index of a reference type.
+        let il = [0x02, 0x02, 0x94, 0x26, 0x16, 0x2A];
+        let (ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+        let err = import(&info, &ee).err().expect("a ref index is bad IL");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("array index")),
+            "{err:?}"
+        );
+        // A non-reference array operand.
+        let il = [0x16, 0x16, 0x94, 0x26, 0x16, 0x2A];
+        let (ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let err = import(&info, &ee)
+            .err()
+            .expect("an int array operand is bad IL");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("array operand")),
+            "{err:?}"
+        );
+        // A stelem value of the wrong stack type.
+        let il = [0x02, 0x16, 0x14, 0x9E, 0x16, 0x2A]; // stelem.i4 of null
+        let (ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+        let err = import(&info, &ee).err().expect("a ref value for stelem.i4");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("stelem value type mismatch")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_pack_element_type_is_unsupported() {
+        // ldelem <a byref-typed class>: no such array storage exists.
+        let t = tok(ELEM_TOKEN);
+        let il = [0x02, 0x17, 0xA3, t[0], t[1], t[2], t[3], 0x26, 0x16, 0x2A];
+        let (mut ee, info) = array_fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
+        let elem = ClassHandle::from_raw(0xE1E5usize as ffi::CORINFO_CLASS_HANDLE).unwrap();
+        with_elem(&mut ee, elem, CorInfoType::ByRef);
+        let err = import(&info, &ee).err().expect("a byref element is out");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("array element type")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn method_prolog_class_init_trigger() {
+        // RyuJIT's morph.cpp:50 fgMorphMainInit shape: a method whose own
+        // class's precise cctor has not run starts with the INITCLASS
+        // helper call (the 10.8 entry-cctor fix — loops_with_eh.cs).
+        let il = [0x16, 0x2A]; // ldc.i4.0; ret
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.prolog_init_class = Some(CorInfoInitClassResult::USE_HELPER);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "just the prolog trigger");
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(matches!(
+                    target,
+                    CallTarget::Helper(h) if *h == CorInfoHelpFunc::INITCLASS
+                ));
+                assert_eq!(sig.ret, Type::Void);
+                assert_eq!(args.len(), 1);
+                assert!(
+                    matches!(args[0], hir::Expr::Const(Const::NativeInt(_))),
+                    "the method's own class embeds as a raw pointer"
+                );
+            }
+            _ => panic!("expected the prolog INITCLASS call"),
+        }
+        assert_eq!(stmts[0].il_offset, IlOffset(0));
+
+        // The default verdict (NOT_REQUIRED — a beforefieldinit class)
+        // emits nothing.
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(m.blocks[0].stmts.is_empty());
     }
 }

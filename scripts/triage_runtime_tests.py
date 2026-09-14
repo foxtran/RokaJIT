@@ -412,14 +412,16 @@ PANIC_RE = re.compile(r"rokajit: panic in compileMethod")
 # tier-0 struct/stack-arg messages are gone; the bucket keeps the residual
 # struct rejects. step_10.6 landed EH: the "EH regions"/"EH control flow"
 # gate messages are gone; the residual EH rejects are the out-of-scope
-# filter/fault clauses, endfilter and rethrow.)
+# filter/fault clauses, endfilter and rethrow. step_10.8 landed arrays:
+# the "arrays:" reject is gone; the bucket keeps the residual array-pack
+# gates.)
 BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"EH filter clauses|EH fault clauses"), "EH filters/faults (out of 10.6 scope)"),
     (re.compile(r"^rethrow$"), "rethrow (out of 10.6 scope)"),
     (re.compile(r"generic methods"), "generics"),
     (re.compile(r"non-class receiver \(value types\)|initobj/ldobj/stobj/cpobj of a non-value class|struct alignment above 16|SysV descriptor"), "structs & value types"),
     (re.compile(r"newobj of a value class"), "newobj of a value class"),
-    (re.compile(r"arrays:"), "arrays"),
+    (re.compile(r"newarr of a non-SZ array|newarr allocation helper|array element type outside"), "array pack gates (10.8: non-SZ/helper/element)"),
     (re.compile(r"thread-local statics|static field of a shared-generic|static field through an address helper|static field accessor outside|static field needing an access callout|static field address through an indirection cell"), "statics pack gates (10.7: TLS/generic/R2R/accessors)"),
     (re.compile(r"static fields"), "static fields"),
     (re.compile(r"field type outside the 10\.4 object pack"), "field types outside the object pack"),

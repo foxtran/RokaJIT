@@ -108,6 +108,13 @@ pub struct IlOffset(pub u32);
 
 pub const IL_OFFSET_NONE: IlOffset = IlOffset(u32::MAX);
 
+/// The array object layout (corinfo.h:2071-2076's
+/// `OFFSETOF__CORINFO_Array__length`/`data`, x64): the element count is a
+/// 32-bit field at offset 8, the data starts at offset 16. Compile-time
+/// constants — no EE query exists for them.
+pub const ARRAY_LENGTH_OFFSET: u32 = 8;
+pub const ARRAY_DATA_OFFSET: u32 = 16;
+
 /// An IL literal.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum Const {
@@ -249,6 +256,11 @@ pub mod hir {
         /// Zero a block of memory (`initobj`): `size_of(class)` bytes at
         /// `addr` (step_10.9).
         BlockZero { addr: Expr, class: ClassHandle },
+        /// The array bounds check (step_10.8: `ldelem`/`stelem`/`ldelema`):
+        /// throws `IndexOutOfRangeException` unless `0 <= index < len`
+        /// (unsigned — a negative index is huge); a null array faults on
+        /// the length load, the 10.4 trap model's NRE.
+        BoundsCheck { array: Expr, index: Expr },
         /// Evaluate and discard (expression statements: `pop` of a call
         /// result, etc.).
         Eval(Expr),
@@ -355,11 +367,16 @@ pub mod hir {
         ArrLen {
             array: Box<Expr>,
         },
-        /// `ldelema`-style element address.
+        /// `ldelema`-style element address (step_10.8): `array + data
+        /// offset + index * elem_size`, a managed byref. `elem_size` is
+        /// baked at import (the element's cell width; `elem` can't
+        /// express the sub-Int32 sizes). The bounds check is the separate
+        /// [`StmtKind::BoundsCheck`] statement.
         ArrElemAddr {
             array: Box<Expr>,
             index: Box<Expr>,
             elem: Type,
+            elem_size: u32,
         },
         /// `isinst`/`castclass`.
         Cast {
@@ -511,15 +528,29 @@ pub mod lir {
             sig: CallSig,
             args: Vec<Operand>,
         },
+        /// Seeded but never produced: the flattener expands HIR `ArrLen`
+        /// directly into a [`StmtKind::Load`] at
+        /// [`ARRAY_LENGTH_OFFSET`](crate::ir::ARRAY_LENGTH_OFFSET)
+        /// (step_10.8; the x64 ruleset's missing rule is the guard).
         ArrLen {
             dst: LocalId,
             array: Operand,
         },
+        /// Seeded but never produced (step_10.8): the flattener expands
+        /// HIR `ArrElemAddr` into the `mul`/`add` chain over plain
+        /// [`StmtKind::Binary`] statements.
         ArrElemAddr {
             dst: LocalId,
             array: Operand,
             index: Operand,
             elem: Type,
+        },
+        /// The array bounds check (step_10.8): the length load doubles as
+        /// the null check; on failure the RNGCHKFAIL helper throws
+        /// `IndexOutOfRangeException`. A statement (no result value).
+        BoundsCheck {
+            array: Operand,
+            index: Operand,
         },
         Cast {
             dst: LocalId,

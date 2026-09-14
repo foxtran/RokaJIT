@@ -36,8 +36,12 @@
 //! check (flattened to [`lir::StmtKind::NullCheck`], yielding the checked
 //! value unchanged). The step_10.6 EH pack lowers `throw`/`leave`/
 //! `endfinally`/call-finally terminators and the catch-handler entry
-//! store to their LIR forms and carries the region table through.
-//! Everything else — switches — fails with
+//! store to their LIR forms and carries the region table through. The
+//! step_10.8 array pack expands `ArrLen` to the length load (offset 8,
+//! doubling as the null check) and `ArrElemAddr` to the
+//! index-scale-plus-header `mul`/`add` chain ending in a ByRef temp, and
+//! passes `BoundsCheck` statements through to LIR. Everything else —
+//! switches — fails with
 //! [`CompileError::Unsupported`].
 
 mod dsl;
@@ -286,6 +290,17 @@ impl Flatten<'_> {
                         },
                     );
                 }
+                hir::StmtKind::BoundsCheck { array, index } => {
+                    // The bounds check (step_10.8): a statement consuming
+                    // the array and index operands (IL order: array first).
+                    let array = self.flatten_expr(array, &mut stmts, stmt.il_offset)?;
+                    let index = self.flatten_expr(index, &mut stmts, stmt.il_offset)?;
+                    Self::push(
+                        &mut stmts,
+                        stmt.il_offset,
+                        lir::StmtKind::BoundsCheck { array, index },
+                    );
+                }
                 hir::StmtKind::Eval(expr) => {
                     self.flatten_eval(expr, &mut stmts, stmt.il_offset)?;
                 }
@@ -508,8 +523,95 @@ impl Flatten<'_> {
                 Self::push(out, il, lir::StmtKind::NullCheck { arg });
                 Ok(arg)
             }
-            hir::Expr::ArrLen { .. } | hir::Expr::ArrElemAddr { .. } => {
-                Err(CompileError::Unsupported("arrays: not yet supported"))
+            hir::Expr::ArrLen { array } => {
+                // The length sits at offset 8 (corinfo.h's CORINFO_Array
+                // layout); the load doubles as the null check — a null
+                // array faults here, the hardware fault translated to the
+                // NRE (step_10.4's trap model).
+                let array = self.flatten_expr(array, out, il)?;
+                let array = self.addr_value(array, out, il);
+                let dst = self.temp(Type::Int32);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::Load {
+                        dst,
+                        addr: array,
+                        offset: crate::ir::ARRAY_LENGTH_OFFSET,
+                        ty: Type::Int32,
+                        access: crate::ir::MemAccess::Natural,
+                    },
+                );
+                Ok(lir::Operand::Temp(dst))
+            }
+            hir::Expr::ArrElemAddr {
+                array,
+                index,
+                elem_size,
+                ..
+            } => {
+                // Element address: `array + 16 + index * elem_size`
+                // (corinfo.h's CORINFO_Array layout) — the FieldAddr
+                // shape: the address temp is ByRef-typed, so it is
+                // automatically an interior-pointer GC root.
+                let array = self.flatten_expr(array, out, il)?;
+                let array = self.addr_value(array, out, il);
+                let index = self.flatten_expr(index, out, il)?;
+                // A 32-bit index zero-extends to native width (the bounds
+                // check already proved 0 <= index < len).
+                let index = if self.operand_ty(&index)? == Type::Int32 {
+                    let dst = self.temp(Type::NativeInt);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::Conv {
+                            dst,
+                            to: Type::NativeInt,
+                            overflow: false,
+                            unsigned: true,
+                            src: index,
+                        },
+                    );
+                    lir::Operand::Temp(dst)
+                } else {
+                    index
+                };
+                let scaled = self.temp(Type::NativeInt);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::Binary {
+                        dst: scaled,
+                        op: BinaryOp::Mul,
+                        lhs: index,
+                        rhs: lir::Operand::Const(Const::NativeInt(*elem_size as isize)),
+                    },
+                );
+                let offset = self.temp(Type::NativeInt);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::Binary {
+                        dst: offset,
+                        op: BinaryOp::Add,
+                        lhs: lir::Operand::Temp(scaled),
+                        rhs: lir::Operand::Const(Const::NativeInt(
+                            crate::ir::ARRAY_DATA_OFFSET as isize,
+                        )),
+                    },
+                );
+                let dst = self.temp(Type::ByRef);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::Binary {
+                        dst,
+                        op: BinaryOp::Add,
+                        lhs: array,
+                        rhs: lir::Operand::Temp(offset),
+                    },
+                );
+                Ok(lir::Operand::Temp(dst))
             }
             hir::Expr::Cast { .. } | hir::Expr::Box { .. } => {
                 Err(CompileError::Unsupported("cast/box: not yet supported"))
@@ -1815,5 +1917,194 @@ mod tests {
             }
             _ => panic!("expected Unary"),
         }
+    }
+
+    // --- step_10.8: array flattening ---
+
+    #[test]
+    fn arr_len_lowers_to_the_length_load() {
+        // return ldlen(this) — a natural Int32 load at offset 8 through
+        // the array; the load doubles as the null check.
+        let m = lower_ok(method_with_ref_arg(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::ArrLen {
+                    array: Box::new(hir::Expr::Local(LocalId(0))),
+                }),
+            },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the load, the return");
+        match &stmts[0].kind {
+            lir::StmtKind::Load {
+                dst,
+                addr,
+                offset,
+                ty,
+                access,
+            } => {
+                assert_eq!(*dst, LocalId(1), "fresh temp after the one arg");
+                assert_eq!(*addr, lir::Operand::Local(LocalId(0)));
+                assert_eq!(*offset, 8, "corinfo.h's CORINFO_Array length offset");
+                assert_eq!(*ty, Type::Int32);
+                assert_eq!(*access, crate::ir::MemAccess::Natural);
+                assert_eq!(m.locals[1].ty, Type::Int32);
+            }
+            _ => panic!("expected the length Load"),
+        }
+    }
+
+    #[test]
+    fn arr_elem_addr_lowers_to_the_mul_add_chain() {
+        // return this[i] for an i4 element: the address is
+        // array + 16 + zero-extended index * 4, ending in a ByRef temp
+        // (the FieldAddr shape — an interior-pointer GC root), and the
+        // load reads through it at offset 0.
+        let m = lower_ok(method_with_ref_arg(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Load {
+                    addr: Box::new(hir::Expr::ArrElemAddr {
+                        array: Box::new(hir::Expr::Local(LocalId(0))),
+                        index: Box::new(hir::Expr::Const(Const::Int32(2))),
+                        elem: Type::Int32,
+                        elem_size: 4,
+                    }),
+                    offset: 0,
+                    ty: Type::Int32,
+                    access: crate::ir::MemAccess::Natural,
+                }),
+            },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 6, "conv, mul, add, add, load, return");
+        // The Int32 index zero-extends to native width first.
+        match &stmts[0].kind {
+            lir::StmtKind::Conv {
+                dst,
+                to,
+                unsigned,
+                src,
+                ..
+            } => {
+                assert_eq!(*to, Type::NativeInt);
+                assert!(unsigned);
+                assert_eq!(*src, lir::Operand::Const(Const::Int32(2)));
+                assert_eq!(*dst, LocalId(1));
+            }
+            _ => panic!("expected the widening Conv"),
+        }
+        match &stmts[1].kind {
+            lir::StmtKind::Binary { dst, op, lhs, rhs } => {
+                assert_eq!(*op, BinaryOp::Mul);
+                assert_eq!(*lhs, lir::Operand::Temp(LocalId(1)));
+                assert_eq!(*rhs, lir::Operand::Const(Const::NativeInt(4)));
+                assert_eq!(*dst, LocalId(2));
+                assert_eq!(m.locals[2].ty, Type::NativeInt);
+            }
+            _ => panic!("expected the scaling Mul"),
+        }
+        match &stmts[2].kind {
+            lir::StmtKind::Binary { dst, op, lhs, rhs } => {
+                assert_eq!(*op, BinaryOp::Add);
+                assert_eq!(*lhs, lir::Operand::Temp(LocalId(2)));
+                assert_eq!(
+                    *rhs,
+                    lir::Operand::Const(Const::NativeInt(16)),
+                    "the data offset"
+                );
+                assert_eq!(*dst, LocalId(3));
+            }
+            _ => panic!("expected the header Add"),
+        }
+        match &stmts[3].kind {
+            lir::StmtKind::Binary { dst, op, lhs, rhs } => {
+                assert_eq!(*op, BinaryOp::Add);
+                assert_eq!(*lhs, lir::Operand::Local(LocalId(0)), "the array");
+                assert_eq!(*rhs, lir::Operand::Temp(LocalId(3)));
+                assert_eq!(*dst, LocalId(4));
+                assert_eq!(
+                    m.locals[4].ty,
+                    Type::ByRef,
+                    "the address temp is a byref root"
+                );
+            }
+            _ => panic!("expected the address Add"),
+        }
+        match &stmts[4].kind {
+            lir::StmtKind::Load {
+                addr,
+                offset,
+                ty,
+                access,
+                ..
+            } => {
+                assert_eq!(*addr, lir::Operand::Temp(LocalId(4)));
+                assert_eq!(*offset, 0);
+                assert_eq!(*ty, Type::Int32);
+                assert_eq!(*access, crate::ir::MemAccess::Natural);
+            }
+            _ => panic!("expected the element Load"),
+        }
+    }
+
+    #[test]
+    fn arr_elem_addr_of_a_native_index_skips_the_conv() {
+        // A NativeInt index needs no widening: mul, add, add.
+        let mut m = method_with_ref_arg(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Load {
+                    addr: Box::new(hir::Expr::ArrElemAddr {
+                        array: Box::new(hir::Expr::Local(LocalId(0))),
+                        index: Box::new(hir::Expr::Local(LocalId(1))),
+                        elem: Type::Ref,
+                        elem_size: 8,
+                    }),
+                    offset: 0,
+                    ty: Type::Ref,
+                    access: crate::ir::MemAccess::Natural,
+                }),
+            },
+        ));
+        m.locals
+            .push(local(Type::NativeInt, hir::LocalKind::IlLocal(0)));
+        m.num_il_locals = 1;
+        let m = lower_ok(m);
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 5, "mul, add, add, load, return");
+        match &stmts[0].kind {
+            lir::StmtKind::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::Mul);
+                assert_eq!(*lhs, lir::Operand::Local(LocalId(1)));
+                assert_eq!(*rhs, lir::Operand::Const(Const::NativeInt(8)));
+            }
+            _ => panic!("expected the scaling Mul"),
+        }
+    }
+
+    #[test]
+    fn bounds_check_flattens_to_the_lir_statement() {
+        let m = lower_ok(method_with_ref_arg(block(
+            0,
+            vec![hstmt(hir::StmtKind::BoundsCheck {
+                array: hir::Expr::Local(LocalId(0)),
+                index: hir::Expr::Const(Const::Int32(0)),
+            })],
+            hir::Terminator::Return { value: None },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the check, the return");
+        match &stmts[0].kind {
+            lir::StmtKind::BoundsCheck { array, index } => {
+                assert_eq!(*array, lir::Operand::Local(LocalId(0)));
+                assert_eq!(*index, lir::Operand::Const(Const::Int32(0)));
+            }
+            _ => panic!("expected BoundsCheck"),
+        }
+        assert_eq!(stmts[0].il_offset, IlOffset(3), "the IL offset propagates");
     }
 }

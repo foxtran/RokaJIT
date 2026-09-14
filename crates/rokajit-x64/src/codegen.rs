@@ -148,7 +148,8 @@ const SCRATCH_XMM_A: Xmm = Xmm::Xmm15;
 const SCRATCH_XMM_B: Xmm = Xmm::Xmm14;
 
 /// First synthetic label id (for the float-compare branch expansions'
-/// internal skip labels). Block labels are small integers; synthetics
+/// internal skip labels and the bounds check's in-bounds skip). Block
+/// labels are small integers; synthetics
 /// count down from here so the two spaces never meet.
 const FIRST_SYNTHETIC_LABEL: u32 = 0x8000_0000;
 
@@ -804,8 +805,9 @@ struct Emitter<'a> {
     call_sig: Option<CallSig>,
     call_sites: Vec<CallSite>,
     relocations: Vec<Relocation>,
-    /// Synthetic-label supply for the float-compare branch expansions
-    /// (counts down from [`FIRST_SYNTHETIC_LABEL`]).
+    /// Synthetic-label supply for the float-compare branch expansions and
+    /// the bounds check's in-bounds skip (counts down from
+    /// [`FIRST_SYNTHETIC_LABEL`]).
     next_synthetic: u32,
     /// ABI-pinned registers currently holding live values (step_10.9):
     /// argument registers already written during a call's setup, return
@@ -1004,7 +1006,8 @@ impl<'a> Emitter<'a> {
 
     // ---- float emission (step_10.2): values are always frame-resident ----
 
-    /// A fresh synthetic label (float-compare branch expansions only).
+    /// A fresh synthetic label (the float-compare branch expansions and
+    /// the bounds check's in-bounds skip).
     fn synthetic_label(&mut self) -> Label {
         self.next_synthetic += 1;
         Label(rokajit::ir::BlockId(self.next_synthetic - 1))
@@ -1972,6 +1975,11 @@ impl<'a> Emitter<'a> {
                 src,
             } => self.emit_store_mem_f(width, addr, disp, src),
             Inst::NullCheck { addr } => self.emit_null_check(addr),
+            Inst::BoundsCheck {
+                index,
+                index_wide,
+                array,
+            } => self.emit_bounds_check(index, index_wide, array),
             Inst::LoadEightbyte {
                 addr,
                 disp,
@@ -2617,6 +2625,43 @@ impl<'a> Emitter<'a> {
         let gd = gpr_of(p)?;
         self.asm
             .mov(Width::W32, Rm::Reg(gd), Rmi::Mem(Mem::base(g)));
+        Ok(())
+    }
+
+    /// The array bounds check (step_10.8): a 32-bit load of the length at
+    /// `[array + 8]` (corinfo.h's CORINFO_Array layout — a null array
+    /// faults here, the 10.4 trap model's NRE; 32-bit so a native index
+    /// compares against the zero-extended length), then `index < length`
+    /// unsigned — a negative index is huge unsigned and fails, as does
+    /// index == length. In bounds, `jb` skips the never-returning
+    /// RNGCHKFAIL helper call (IndexOutOfRangeException), emitted through
+    /// the standard helper-call path (spills, call-site record,
+    /// relocation); the trailing NOP keeps the call's return address a
+    /// valid in-region byte (the Throw shape).
+    fn emit_bounds_check(&mut self, index: Src, index_wide: bool, array: Src) -> CompileResult<()> {
+        // Every register-resident value spills BEFORE the compare: the
+        // bounds check is a conditional throw edge, and the helper-call
+        // path (which spills inside `emit_call_lookup`) must not leave the
+        // value machine claiming slot residency the in-bounds path never
+        // wrote.
+        let moves = self.vs.spill_registers();
+        self.apply(moves)?;
+        let g = self.addr_into(array)?;
+        let (p, moves) = self.vs.take_scratch(&[g.phys()]);
+        self.apply(moves)?;
+        let gd = gpr_of(p)?;
+        self.asm.mov(
+            Width::W32,
+            Rm::Reg(gd),
+            Rmi::Mem(Mem::base_disp(g, rokajit::ir::ARRAY_LENGTH_OFFSET as i32)),
+        );
+        let width = if index_wide { Width::W64 } else { Width::W32 };
+        self.emit_cmp(width, index, Src::Reg(gd))?;
+        let in_bounds = self.synthetic_label();
+        self.asm.jcc(CondCode::ULt, in_bounds);
+        self.emit_helper_call(CorInfoHelpFunc::RNGCHKFAIL)?;
+        self.asm.nop();
+        self.asm.bind(in_bounds);
         Ok(())
     }
 
@@ -5657,6 +5702,139 @@ mod tests {
         assert_eq!(out.relocations.len(), 1);
         assert!(out.interruptible_ranges.is_empty(), "no EH regions");
         assert!(out.funclets.is_empty() && out.eh_clauses.is_empty());
+    }
+
+    /// `void bounds(int[] arr, int i)` shape — the step_10.8 bounds
+    /// check: the 32-bit length load doubles as the null check, the
+    /// unsigned compare skips the never-returning RNGCHKFAIL helper call
+    /// when in bounds.
+    #[test]
+    fn bounds_check_method_bytes() {
+        let m = method(
+            vec![ref_arg(0), int_arg(1)],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BoundsCheck {
+                        array: Operand::Local(LocalId(0)),
+                        index: Operand::Local(LocalId(1)),
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg arr
+            0x89, 0x75, 0xF4, // movl %esi, -12(%rbp) — arg i
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax — the array
+            0x8B, 0x48, 0x08, // movl 8(%rax), %ecx   — the length (faults on null)
+            0x39, 0x4D, 0xF4, // cmpl -12(%rbp), %ecx — i < len, unsigned
+            0x0F, 0x82, 0x06, 0, 0, 0, // jb over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_RNGCHKFAIL
+            0x90, // nop — the return address stays inside the region
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].offset, 31, "the RNGCHKFAIL call site");
+        assert_eq!(out.call_sites[0].method, None, "a helper call");
+        assert_eq!(out.relocations.len(), 1);
+        assert_eq!(out.relocations[0].offset, 32, "the rel32 field");
+    }
+
+    /// A register-resident index temp spills BEFORE the compare: the
+    /// helper call's own spill (on the throw path only) must not leave
+    /// the value machine claiming slot residency the in-bounds path never
+    /// wrote.
+    #[test]
+    fn bounds_check_spills_a_register_resident_index_first() {
+        let m = method(
+            vec![ref_arg(0), int_arg(1), int_temp()],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Binary {
+                        dst: LocalId(2),
+                        op: BinaryOp::Add,
+                        lhs: Operand::Local(LocalId(1)),
+                        rhs: Operand::Const(Const::Int32(1)),
+                    }),
+                    stmt(StmtKind::BoundsCheck {
+                        array: Operand::Local(LocalId(0)),
+                        index: Operand::Temp(LocalId(2)),
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg arr
+            0x89, 0x75, 0xF4, // movl %esi, -12(%rbp) — arg i
+            0x8B, 0x45, 0xF4, // movl -12(%rbp), %eax
+            0x83, 0xC0, 0x01, // addl $1, %eax        — t2 = i + 1 (reg-resident)
+            0x89, 0x45, 0xF0, // movl %eax, -16(%rbp) — the pre-check spill
+            0x48, 0x8B, 0x4D, 0xF8, // movq -8(%rbp), %rcx — the array
+            0x8B, 0x51, 0x08, // movl 8(%rcx), %edx   — the length
+            0x39, 0x55, 0xF0, // cmpl -16(%rbp), %edx — t2 < len, from the slot
+            0x0F, 0x82, 0x06, 0, 0, 0, // jb over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_RNGCHKFAIL
+            0x90, // nop
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// The native-int index form: the compare widens to 64 bits against
+    /// the zero-extended length (the 32-bit length load's upper half is
+    /// clear).
+    #[test]
+    fn bounds_check_native_index_method_bytes() {
+        let m = method(
+            vec![ref_arg(0), local(Type::NativeInt, LocalKind::IlArg(1))],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BoundsCheck {
+                        array: Operand::Local(LocalId(0)),
+                        index: Operand::Local(LocalId(1)),
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg arr
+            0x48, 0x89, 0x75, 0xF0, // movq %rsi, -16(%rbp) — arg i (native int)
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax — the array
+            0x8B, 0x48, 0x08, // movl 8(%rax), %ecx   — the length, zero-extended
+            0x48, 0x39, 0x4D, 0xF0, // cmpq -16(%rbp), %rcx — i < len, unsigned
+            0x0F, 0x82, 0x06, 0, 0, 0, // jb over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_RNGCHKFAIL
+            0x90, // nop
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
     }
 
     /// The EH clause ordering (genReportEH): innermost first (nested try
