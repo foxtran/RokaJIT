@@ -190,6 +190,199 @@ impl Flatten<'_> {
         out.push(lir::Stmt { il_offset, kind });
     }
 
+    /// float → unsigned integer (step_10.11), the saturating semantics
+    /// RyuJIT implements since .NET 9 (measured against the reference
+    /// JIT): NaN and negatives → 0, in-range values truncate toward zero,
+    /// values at/above 2^N saturate to the target's maximum. The sequence
+    /// is lowerxarch.cpp's pre-AVX512 lowering:
+    ///
+    /// ```text
+    /// f = maxs(src, 0.0)               // negatives *and* NaN → +0 (the
+    ///                                  // second operand wins on NaN)
+    /// r = cvtt(f)                      // signed 64-bit; INT64_MIN on
+    ///                                  // overflow (f ≥ 2^63)
+    /// // 64-bit targets only:
+    /// n = cvtt(f - 2^64)               // the wrapped (negative-domain)
+    ///                                  // value; the subtraction is exact
+    ///                                  // whenever f ≥ 2^63
+    /// c = r | (n & (r >> 63))          // wrapped bits iff r overflowed
+    /// // both widths:
+    /// mask = clt.un(f, 2^N) - 1        // all-ones iff f ≥ 2^N; f is
+    ///                                  // never NaN, so clt.un is a plain
+    ///                                  // ordered compare here
+    /// result = c | mask                // saturate at the target's max
+    /// ```
+    fn lower_conv_f_to_uint(
+        &mut self,
+        to: Type,
+        fty: Type,
+        src: lir::Operand,
+        out: &mut Vec<lir::Stmt>,
+        il: IlOffset,
+    ) -> CompileResult<lir::Operand> {
+        let fconst = |v: f64| {
+            lir::Operand::Const(match fty {
+                Type::Float => Const::Float(v as f32),
+                _ => Const::Double(v),
+            })
+        };
+        let wide = !matches!(to, Type::Int32);
+        let f = self.temp(fty);
+        Self::push(
+            out,
+            il,
+            lir::StmtKind::Binary {
+                dst: f,
+                op: BinaryOp::MaxF,
+                lhs: src,
+                rhs: fconst(0.0),
+            },
+        );
+        let r = self.temp(Type::Int64);
+        Self::push(
+            out,
+            il,
+            lir::StmtKind::Conv {
+                dst: r,
+                to: Type::Int64,
+                overflow: false,
+                unsigned: false,
+                src: lir::Operand::Temp(f),
+            },
+        );
+        let limit = fconst(if wide {
+            18446744073709551616.0 // 2^64
+        } else {
+            4294967296.0 // 2^32
+        });
+        let c = if wide {
+            let w = self.temp(fty);
+            Self::push(
+                out,
+                il,
+                lir::StmtKind::Binary {
+                    dst: w,
+                    op: BinaryOp::Sub,
+                    lhs: lir::Operand::Temp(f),
+                    rhs: limit,
+                },
+            );
+            let n = self.temp(Type::Int64);
+            Self::push(
+                out,
+                il,
+                lir::StmtKind::Conv {
+                    dst: n,
+                    to: Type::Int64,
+                    overflow: false,
+                    unsigned: false,
+                    src: lir::Operand::Temp(w),
+                },
+            );
+            let s = self.temp(Type::Int64);
+            Self::push(
+                out,
+                il,
+                lir::StmtKind::Binary {
+                    dst: s,
+                    op: BinaryOp::Shr,
+                    lhs: lir::Operand::Temp(r),
+                    rhs: lir::Operand::Const(Const::Int32(63)),
+                },
+            );
+            let a = self.temp(Type::Int64);
+            Self::push(
+                out,
+                il,
+                lir::StmtKind::Binary {
+                    dst: a,
+                    op: BinaryOp::And,
+                    lhs: lir::Operand::Temp(n),
+                    rhs: lir::Operand::Temp(s),
+                },
+            );
+            let c = self.temp(Type::Int64);
+            Self::push(
+                out,
+                il,
+                lir::StmtKind::Binary {
+                    dst: c,
+                    op: BinaryOp::Or,
+                    lhs: lir::Operand::Temp(r),
+                    rhs: lir::Operand::Temp(a),
+                },
+            );
+            c
+        } else {
+            // A 32-bit target keeps the low half of the 64-bit conversion
+            // (exact for f < 2^32).
+            let c = self.temp(Type::Int32);
+            Self::push(
+                out,
+                il,
+                lir::StmtKind::Conv {
+                    dst: c,
+                    to: Type::Int32,
+                    overflow: false,
+                    unsigned: false,
+                    src: lir::Operand::Temp(r),
+                },
+            );
+            c
+        };
+        let lt = self.temp(Type::Int32);
+        Self::push(
+            out,
+            il,
+            lir::StmtKind::Binary {
+                dst: lt,
+                op: BinaryOp::ULt,
+                lhs: lir::Operand::Temp(f),
+                rhs: limit,
+            },
+        );
+        let m32 = self.temp(Type::Int32);
+        Self::push(
+            out,
+            il,
+            lir::StmtKind::Binary {
+                dst: m32,
+                op: BinaryOp::Sub,
+                lhs: lir::Operand::Temp(lt),
+                rhs: lir::Operand::Const(Const::Int32(1)),
+            },
+        );
+        let dst = self.temp(to);
+        let mask = if wide {
+            let m64 = self.temp(Type::Int64);
+            Self::push(
+                out,
+                il,
+                lir::StmtKind::Conv {
+                    dst: m64,
+                    to: Type::Int64,
+                    overflow: false,
+                    unsigned: false,
+                    src: lir::Operand::Temp(m32),
+                },
+            );
+            m64
+        } else {
+            m32
+        };
+        Self::push(
+            out,
+            il,
+            lir::StmtKind::Binary {
+                dst,
+                op: BinaryOp::Or,
+                lhs: lir::Operand::Temp(c),
+                rhs: lir::Operand::Temp(mask),
+            },
+        );
+        Ok(lir::Operand::Temp(dst))
+    }
+
     fn lower_block(
         &mut self,
         block: &hir::Block,
@@ -501,6 +694,16 @@ impl Flatten<'_> {
                     return Err(CompileError::Unsupported("checked (ovf) conversion"));
                 }
                 let src = self.flatten_expr(arg, out, il)?;
+                // A float source with an unsigned integer target is the
+                // saturating conversion (step_10.11) — expanded to a
+                // statement sequence, not a single Conv.
+                let src_ty = self.operand_ty(&src)?;
+                if *unsigned
+                    && matches!(src_ty, Type::Float | Type::Double)
+                    && matches!(*to, Type::Int32 | Type::Int64 | Type::NativeInt)
+                {
+                    return self.lower_conv_f_to_uint(*to, src_ty, src, out, il);
+                }
                 let dst = self.temp(*to);
                 Self::push(
                     out,
@@ -2106,5 +2309,221 @@ mod tests {
             _ => panic!("expected BoundsCheck"),
         }
         assert_eq!(stmts[0].il_offset, IlOffset(3), "the IL offset propagates");
+    }
+
+    // --- step_10.11: float -> unsigned integer (saturating) ---
+
+    /// `double f(double d)` shape: one Double arg, no IL locals.
+    fn method_with_double_arg(block: hir::Block) -> hir::Method {
+        let mut m = method_with(block);
+        m.locals[0] = local(Type::Double, hir::LocalKind::IlArg(0));
+        m
+    }
+
+    #[test]
+    fn conv_u8_from_float_expands_to_the_saturating_sequence() {
+        // return (ulong)arg0 — the lowerxarch.cpp sequence: maxs clamp,
+        // the signed cvtt of both the clamped and the 2^64-wrapped value,
+        // the overflow blend, and the saturation mask.
+        let m = lower_ok(method_with_double_arg(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Conv {
+                    to: Type::Int64,
+                    overflow: false,
+                    unsigned: true,
+                    arg: Box::new(hir::Expr::Local(LocalId(0))),
+                }),
+            },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 12, "the expansion, then the return");
+        match &stmts[0].kind {
+            lir::StmtKind::Binary { dst, op, lhs, rhs } => {
+                assert_eq!(*op, BinaryOp::MaxF);
+                assert_eq!(*dst, LocalId(1));
+                assert_eq!(*lhs, lir::Operand::Local(LocalId(0)));
+                assert_eq!(*rhs, lir::Operand::Const(Const::Double(0.0)));
+            }
+            _ => panic!("expected the maxs clamp"),
+        }
+        // r = cvtt(f): a SIGNED Conv node, the 64-bit form.
+        match &stmts[1].kind {
+            lir::StmtKind::Conv {
+                dst,
+                to,
+                unsigned,
+                src,
+                ..
+            } => {
+                assert_eq!(*to, Type::Int64);
+                assert!(!unsigned);
+                assert_eq!(*dst, LocalId(2));
+                assert_eq!(*src, lir::Operand::Temp(LocalId(1)));
+            }
+            _ => panic!("expected the signed cvtt"),
+        }
+        // w = f - 2^64, then n = cvtt(w).
+        match &stmts[2].kind {
+            lir::StmtKind::Binary { op, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::Sub);
+                assert_eq!(
+                    *rhs,
+                    lir::Operand::Const(Const::Double(18446744073709551616.0))
+                );
+            }
+            _ => panic!("expected the 2^64 wrap subtract"),
+        }
+        assert!(matches!(
+            stmts[3].kind,
+            lir::StmtKind::Conv {
+                to: Type::Int64,
+                unsigned: false,
+                ..
+            }
+        ));
+        // The overflow blend: s = r >> 63 (arithmetic), a = n & s,
+        // c = r | a.
+        match &stmts[4].kind {
+            lir::StmtKind::Binary { op, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::Shr);
+                assert_eq!(*rhs, lir::Operand::Const(Const::Int32(63)));
+            }
+            _ => panic!("expected the sign-mask shift"),
+        }
+        assert!(matches!(
+            stmts[5].kind,
+            lir::StmtKind::Binary {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
+        assert!(matches!(
+            stmts[6].kind,
+            lir::StmtKind::Binary {
+                op: BinaryOp::Or,
+                ..
+            }
+        ));
+        // The saturation mask: clt.un against 2^64, minus one.
+        match &stmts[7].kind {
+            lir::StmtKind::Binary { dst, op, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::ULt);
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Int32);
+                assert_eq!(
+                    *rhs,
+                    lir::Operand::Const(Const::Double(18446744073709551616.0))
+                );
+            }
+            _ => panic!("expected the limit compare"),
+        }
+        match &stmts[8].kind {
+            lir::StmtKind::Binary { op, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::Sub);
+                assert_eq!(*rhs, lir::Operand::Const(Const::Int32(1)));
+            }
+            _ => panic!("expected the mask bias"),
+        }
+        // The mask widens to 64 bits and ORs into the result.
+        assert!(matches!(
+            stmts[9].kind,
+            lir::StmtKind::Conv {
+                to: Type::Int64,
+                unsigned: false,
+                ..
+            }
+        ));
+        match &stmts[10].kind {
+            lir::StmtKind::Binary { dst, op, .. } => {
+                assert_eq!(*op, BinaryOp::Or);
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Int64);
+            }
+            _ => panic!("expected the result Or"),
+        }
+        assert!(matches!(
+            stmts[11].kind,
+            lir::StmtKind::Return {
+                value: Some(lir::Operand::Temp(LocalId(10)))
+            }
+        ));
+    }
+
+    #[test]
+    fn conv_u4_from_float_saturates_at_2_to_the_32() {
+        // return (uint)arg0 — the 32-bit target keeps the low half of the
+        // 64-bit conversion and saturates at 2^32: no wrap subtract.
+        let m = lower_ok(method_with_double_arg(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Conv {
+                    to: Type::Int32,
+                    overflow: false,
+                    unsigned: true,
+                    arg: Box::new(hir::Expr::Local(LocalId(0))),
+                }),
+            },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(
+            stmts.len(),
+            7,
+            "clamp, cvtt64, low half, compare, mask, or, return"
+        );
+        match &stmts[2].kind {
+            lir::StmtKind::Conv { to, src, .. } => {
+                assert_eq!(*to, Type::Int32);
+                assert_eq!(*src, lir::Operand::Temp(LocalId(2)));
+            }
+            _ => panic!("expected the low-half truncation"),
+        }
+        match &stmts[3].kind {
+            lir::StmtKind::Binary { op, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::ULt);
+                assert_eq!(*rhs, lir::Operand::Const(Const::Double(4294967296.0)));
+            }
+            _ => panic!("expected the 2^32 compare"),
+        }
+        assert!(matches!(
+            stmts[5].kind,
+            lir::StmtKind::Binary {
+                op: BinaryOp::Or,
+                ..
+            }
+        ));
+        // No Int64 mask widening on the 32-bit path.
+        assert_eq!(m.locals[6].ty, Type::Int32);
+    }
+
+    #[test]
+    fn conv_u1_from_int_keeps_the_shift_pair() {
+        // A non-float unsigned narrow is untouched by step_10.11:
+        // truncate to 32 bits, shl/ushr pair (conv_narrow at import).
+        let m = lower_ret(hir::Expr::Binary {
+            op: BinaryOp::UShr,
+            lhs: Box::new(hir::Expr::Binary {
+                op: BinaryOp::Shl,
+                lhs: Box::new(hir::Expr::Local(LocalId(0))),
+                rhs: Box::new(hir::Expr::Const(Const::Int32(24))),
+            }),
+            rhs: Box::new(hir::Expr::Const(Const::Int32(24))),
+        });
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 3, "shl, ushr, return");
+        assert!(matches!(
+            stmts[0].kind,
+            lir::StmtKind::Binary {
+                op: BinaryOp::Shl,
+                ..
+            }
+        ));
+        assert!(matches!(
+            stmts[1].kind,
+            lir::StmtKind::Binary {
+                op: BinaryOp::UShr,
+                ..
+            }
+        ));
     }
 }

@@ -109,14 +109,17 @@ pub enum XmmSrc {
 }
 
 /// The scalar SSE arithmetic instructions lowering emits (`add`/`sub`/
-/// `mul`/`div`; `rem` on floats is an EE helper call, not an instruction
-/// — see `decisions/` for step_10.2).
+/// `mul`/`div`, and `min`/`max` for the saturating float→unsigned-int
+/// conversions of step_10.11; `rem` on floats is an EE helper call, not
+/// an instruction — see `decisions/` for step_10.2).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ArithFOp {
     Add,
     Sub,
     Mul,
     Div,
+    Min,
+    Max,
 }
 
 impl ArithFOp {
@@ -129,6 +132,8 @@ impl ArithFOp {
             B::Sub => Some(ArithFOp::Sub),
             B::Mul => Some(ArithFOp::Mul),
             B::Div => Some(ArithFOp::Div),
+            B::MinF => Some(ArithFOp::Min),
+            B::MaxF => Some(ArithFOp::Max),
             _ => None,
         }
     }

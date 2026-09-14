@@ -10,8 +10,9 @@
 //! `neg`/`not` (`neg` accepts floats), the shifts `shl`/`shr`/`shr.un`,
 //! compare-as-value `ceq`/`cgt`/`cgt.un`/`clt`/`clt.un` (integers,
 //! floats, and the reference forms), the integer conversions
-//! `conv.i1`/`i2`/`i4`/`i8`/`u1`/`u2`/`u4`/`u8`/`u` (float sources
-//! truncate toward zero; `conv.u8`/`conv.u` from a float is out) plus
+//! `conv.i1`/`i2`/`i4`/`i8`/`u1`/`u2`/`u4`/`u8`/`u`/`i` (float sources
+//! truncate toward zero, saturating for the unsigned targets —
+//! step_10.11) plus
 //! `conv.r4`/`conv.r8`,
 //! `dup`/`pop`, `ldloca`/`ldarga`/`starg` (short and wide forms),
 //! `ldnull`, `ldstr` (resolved through the EE's `constructStringLiteral`
@@ -603,6 +604,9 @@ enum ConvKind {
     U2,
     U4,
     U8,
+    /// `conv.i` — to native int: sign-extension from Int32, the identity
+    /// on a 64-bit operand (step_10.11; integer sources only).
+    I,
     /// `conv.u` — to native uint: zero-extension from Int32, the identity
     /// on a 64-bit operand.
     U,
@@ -851,6 +855,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0xD0 => Op::LdToken(r.u32()?),
             0xD1 => Op::Conv(ConvKind::U2),
             0xD2 => Op::Conv(ConvKind::U1),
+            0xD3 => Op::Conv(ConvKind::I),
             0xDC => Op::EndFinally,
             0xDD => {
                 let d = r.i32()?;
@@ -1822,12 +1827,11 @@ impl BlockImport<'_> {
                 }
             }
             // conv.i8/u8: extend to 64 bits (identity on a 64-bit
-            // operand). conv.u8 from a float needs the unsigned-overflow
-            // fixup sequence — outside the pack.
+            // operand). From a float, conv.u8 is the saturating
+            // unsigned conversion — the `unsigned` flag rides the Conv
+            // node and the HIR→LIR lowering expands the sequence
+            // (step_10.11; `decisions/` entry for the choice).
             ConvKind::I8 | ConvKind::U8 => {
-                if fp && matches!(kind, ConvKind::U8) {
-                    return Err(CompileError::Unsupported("conv.u8 from a float operand"));
-                }
                 if ty == Type::Int64 || ty == Type::NativeInt {
                     // A 64-bit operand is the identity; the IL stack type
                     // still becomes int64 (a NativeInt source re-types).
@@ -1845,14 +1849,33 @@ impl BlockImport<'_> {
                     )
                 }
             }
+            // conv.i: to native int (step_10.11) — sign-extend from
+            // Int32, the identity on a 64-bit operand. From a float the
+            // saturating signed conversion is the still-open 10.2 follow-
+            // up (see the conv_narrow comment), so it stays unsupported.
+            ConvKind::I => {
+                if fp {
+                    return Err(CompileError::Unsupported("conv.i from a float operand"));
+                }
+                if ty == Type::Int64 || ty == Type::NativeInt {
+                    self.push(Type::NativeInt, value)
+                } else {
+                    self.push(
+                        Type::NativeInt,
+                        hir::Expr::Conv {
+                            to: Type::NativeInt,
+                            overflow: false,
+                            unsigned: false,
+                            arg: Box::new(value),
+                        },
+                    )
+                }
+            }
             // conv.u: to native uint (step_10.7's rider) — zero-extend
             // from Int32, the identity on a 64-bit operand. From a float
-            // it is the same unsigned 64-bit truncation as conv.u8 —
-            // outside the pack for the same reason.
+            // it is the same saturating unsigned 64-bit truncation as
+            // conv.u8 (step_10.11).
             ConvKind::U => {
-                if fp {
-                    return Err(CompileError::Unsupported("conv.u from a float operand"));
-                }
                 if ty == Type::Int64 || ty == Type::NativeInt {
                     self.push(Type::NativeInt, value)
                 } else {
@@ -1901,6 +1924,15 @@ impl BlockImport<'_> {
     /// expansion is exact. A non-Int32 operand converts to Int32 first —
     /// for a float source that is the truncating `cvtt*` conversion,
     /// after which the low `bits` behave as for integers.
+    ///
+    /// Float source, unsigned narrow (step_10.11): RyuJIT's .NET 9+
+    /// semantics saturate to the small type's range (measured against the
+    /// reference JIT: NaN/negative → 0, above the max → the max), so the
+    /// operand is clamped in the float domain first — `maxs(v, 0)` maps
+    /// negatives *and* NaN to +0 (the second operand wins on NaN), then
+    /// `mins(…, MAX)`. The signed narrows from a float keep the plain
+    /// `cvtt*` pre-conversion: matching RyuJIT's signed clamp is the
+    /// still-open 10.2 follow-up (`convfloat` mismatch).
     fn conv_narrow(
         &mut self,
         bits: u32,
@@ -1908,11 +1940,24 @@ impl BlockImport<'_> {
         ty: Type,
         value: hir::Expr,
     ) -> CompileResult<()> {
+        let fp = matches!(ty, Type::Float | Type::Double);
+        let value = if fp && unsigned {
+            let max = ((1u64 << bits) - 1) as f64;
+            let (zero, limit) = if ty == Type::Float {
+                (Const::Float(0.0), Const::Float(max as f32))
+            } else {
+                (Const::Double(0.0), Const::Double(max))
+            };
+            let above_zero = binary(BinaryOp::MaxF, value, hir::Expr::Const(zero));
+            binary(BinaryOp::MinF, above_zero, hir::Expr::Const(limit))
+        } else {
+            value
+        };
         let value = if ty == Type::Int32 {
             value
         } else {
             // A wider operand narrows to 32 bits first; the low `bits`
-            // survive either way.
+            // survive either way. A clamped float converts exactly.
             hir::Expr::Conv {
                 to: Type::Int32,
                 overflow: false,
@@ -5679,16 +5724,19 @@ mod tests {
         let m = import(&info, &ee).expect("imports");
         assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
 
-        // From a float it is the conv.u8-shaped gap (the 2^63 fixup).
+        // From a float it is the saturating unsigned conversion
+        // (step_10.11): the Conv node keeps the unsigned flag; the
+        // HIR→LIR lowering expands the sequence.
         let (ee, info) = fixture(
             &[0x02, 0xE0, 0x2A],
             &sig(CorInfoType::NativeInt, &[CorInfoType::Double]),
             &[],
         );
-        assert!(matches!(
-            import(&info, &ee),
-            Err(CompileError::Unsupported(_))
-        ));
+        let m = import(&info, &ee).expect("conv.u of a double imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::NativeInt);
+        assert!(!overflow && unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
 
         // conv.u8 of a native-int operand: the identity, but the IL stack
         // type becomes Int64 (a NativeInt source re-types) — otherwise
@@ -5700,6 +5748,113 @@ mod tests {
         );
         let m = import(&info, &ee).expect("conv.u8 of native int imports");
         assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+    }
+
+    #[test]
+    fn conv_u8_from_a_float_is_the_unsigned_conv_node() {
+        // conv.u8 of a double: no longer rejected (step_10.11) — the
+        // saturating expansion happens at the HIR→LIR lowering.
+        let (ee, info) = fixture(
+            &[0x02, 0x6E, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int64);
+        assert!(!overflow && unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // Same from a float32.
+        let (ee, info) = fixture(
+            &[0x02, 0x6E, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Float]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (_, _, unsigned, _) = as_conv(return_value(&m, 0));
+        assert!(unsigned);
+    }
+
+    #[test]
+    fn conv_u1_u2_from_a_float_clamp_in_the_float_domain() {
+        // conv.u1 of a double (step_10.11): the saturating small-type
+        // semantics clamp the float source to [0, 255] BEFORE the
+        // conversion — maxs(v, 0) then mins(…, 255) — then the usual
+        // shift pair narrows the (in-range) Int32.
+        let (ee, info) = fixture(
+            &[0x02, 0xD2, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (op, shl, count) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::UShr);
+        assert_eq!(as_i32(count), 24);
+        let (op, value, _) = as_binary(shl);
+        assert_eq!(op, BinaryOp::Shl);
+        let (to, _, _, arg) = as_conv(value);
+        assert_eq!(to, Type::Int32);
+        // The Conv's operand is mins(maxs(d, 0.0), 255.0).
+        let (op, clamped, limit) = as_binary(arg);
+        assert_eq!(op, BinaryOp::MinF);
+        assert!(matches!(limit, hir::Expr::Const(Const::Double(v)) if *v == 255.0));
+        let (op, value, zero) = as_binary(clamped);
+        assert_eq!(op, BinaryOp::MaxF);
+        assert_eq!(as_local(value), LocalId(0));
+        assert!(matches!(zero, hir::Expr::Const(Const::Double(v)) if *v == 0.0));
+
+        // conv.u2 of a float32: the constants take the source's width.
+        let (ee, info) = fixture(
+            &[0x02, 0xD1, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Float]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (_, shl, count) = as_binary(return_value(&m, 0));
+        assert_eq!(as_i32(count), 16);
+        let (_, value, _) = as_binary(shl);
+        let (_, _, _, arg) = as_conv(value);
+        let (op, _, limit) = as_binary(arg);
+        assert_eq!(op, BinaryOp::MinF);
+        assert!(matches!(limit, hir::Expr::Const(Const::Float(v)) if *v == 65535.0));
+    }
+
+    #[test]
+    fn conv_i_sign_extends_to_native_int() {
+        // conv.i of an i32 arg (step_10.11): a SIGNED Conv node to
+        // NativeInt — the conv.u twin zero-extends.
+        let (ee, info) = fixture(
+            &[0x02, 0xD3, 0x2A],
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Int]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::NativeInt);
+        assert!(!overflow && !unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // A 64-bit operand is the identity, re-typed NativeInt.
+        let (ee, info) = fixture(
+            &[0x02, 0xD3, 0x2A],
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+
+        // From a float the saturating signed conversion is the still-open
+        // 10.2 follow-up — stays unsupported.
+        let (ee, info) = fixture(
+            &[0x02, 0xD3, 0x2A],
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Double]),
+            &[],
+        );
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -6139,16 +6294,17 @@ mod tests {
         assert_eq!(to, Type::Int32);
         assert!(unsigned);
 
-        // conv.u8 from a float is outside the pack.
+        // conv.u8 from a float: the unsigned Conv node (step_10.11 — the
+        // saturating expansion happens at the HIR→LIR lowering).
         let (ee, info) = fixture(
             &[0x02, 0x6E, 0x2A],
             &sig(CorInfoType::Long, &[CorInfoType::Double]),
             &[],
         );
-        assert!(matches!(
-            import(&info, &ee),
-            Err(CompileError::Unsupported(_))
-        ));
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, unsigned, _) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int64);
+        assert!(unsigned);
     }
 
     // --- step_10.4: the object pack ---

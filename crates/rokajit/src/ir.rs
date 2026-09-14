@@ -142,7 +142,11 @@ pub struct CallSig {
 
 /// Integer/Float arithmetic and comparison operators. Comparison results
 /// are `Int32` 0/1 (ECMA-335 `ceq`/`clt`/…). `U*` are the unsigned forms
-/// (`un.` prefix in IL).
+/// (`un.` prefix in IL). `MinF`/`MaxF` are the float-domain minimum/
+/// maximum (SSE `mins*`/`maxs*` semantics: the *second* operand wins on
+/// NaN) — no IL opcode maps to them; the importer and the HIR→LIR
+/// lowering build them for the saturating float→unsigned-int conversion
+/// sequences (step_10.11).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum BinaryOp {
     Add,
@@ -168,6 +172,8 @@ pub enum BinaryOp {
     UGt,
     Ge,
     UGe,
+    MinF,
+    MaxF,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]

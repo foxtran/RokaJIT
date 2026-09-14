@@ -110,6 +110,7 @@ SUPPORTED = {
     0xD0,                    # ldtoken (step_10.10)
     0xD1,                    # conv.u2 (step_10.7)
     0xD2,                    # conv.u1 (step_10.7)
+    0xD3,                    # conv.i (step_10.11, integer sources)
     0xDC,                    # endfinally (step_10.6)
     0xDD,                    # leave (step_10.6)
     0xDE,                    # leave.s (step_10.6)

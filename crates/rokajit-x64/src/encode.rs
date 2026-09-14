@@ -642,14 +642,18 @@ impl Asm {
         self.emit_sse(sse_prefix(width), false, src as u8, RmX::Mem(dst), 0x11);
     }
 
-    /// `add`/`sub`/`mul`/`div ss|sd dst, src` (`0F 58/5C/59/5E /r`).
-    /// Destructive two-operand: `dst` is both source and destination.
+    /// `add`/`sub`/`mul`/`div`/`min`/`max ss|sd dst, src`
+    /// (`0F 58/5C/59/5E/5D/5F /r`). Destructive two-operand: `dst` is both
+    /// source and destination. `min`/`max` return the *second* operand on
+    /// NaN — the property the float→unsigned conversions clamp with.
     pub fn arith_f(&mut self, op: ArithFOp, width: FWidth, dst: Xmm, src: RmX) {
         let opcode = match op {
             ArithFOp::Add => 0x58,
             ArithFOp::Sub => 0x5C,
             ArithFOp::Mul => 0x59,
             ArithFOp::Div => 0x5E,
+            ArithFOp::Min => 0x5D,
+            ArithFOp::Max => 0x5F,
         };
         self.emit_sse(sse_prefix(width), false, dst as u8, src, opcode);
     }
@@ -1959,6 +1963,25 @@ mod tests {
         assert_eq!(
             finish(|a| a.arith_f(ArithFOp::Div, D, Xmm7, RmX::Reg(Xmm6))),
             [0xF2, 0x0F, 0x5E, 0xFE]
+        );
+        // minsd %xmm1, %xmm0 / maxsd %xmm2, %xmm3 — the float->unsigned
+        // conversion clamp forms (step_10.11).
+        assert_eq!(
+            finish(|a| a.arith_f(ArithFOp::Min, D, Xmm0, RmX::Reg(Xmm1))),
+            [0xF2, 0x0F, 0x5D, 0xC1]
+        );
+        assert_eq!(
+            finish(|a| a.arith_f(ArithFOp::Max, D, Xmm3, RmX::Reg(Xmm2))),
+            [0xF2, 0x0F, 0x5F, 0xDA]
+        );
+        // minss %xmm5, %xmm4 / maxss -8(%rbp), %xmm6
+        assert_eq!(
+            finish(|a| a.arith_f(ArithFOp::Min, S, Xmm4, RmX::Reg(Xmm5))),
+            [0xF3, 0x0F, 0x5D, 0xE5]
+        );
+        assert_eq!(
+            finish(|a| a.arith_f(ArithFOp::Max, S, Xmm6, RmX::Mem(Mem::base_disp(Rbp, -8)))),
+            [0xF3, 0x0F, 0x5F, 0x75, 0xF8]
         );
     }
 
