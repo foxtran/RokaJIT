@@ -123,6 +123,25 @@ fn compile_method(
         max_stack: info.maxStack,
         eh_count: info.EHcount,
         init_locals: info.options & rokajit_ffi::CorInfoOptions_CORINFO_OPT_INIT_LOCALS != 0,
+        // The CorInfoOptions generics bits (corinfo.h:709-715) — the same
+        // `options` word as init_locals.
+        generics_context: match info.options
+            & rokajit_ffi::CorInfoOptions_CORINFO_GENERICS_CTXT_MASK
+        {
+            rokajit_ffi::CorInfoOptions_CORINFO_GENERICS_CTXT_FROM_THIS => {
+                Some(rokajit::ir::GenericsContext::This)
+            }
+            rokajit_ffi::CorInfoOptions_CORINFO_GENERICS_CTXT_FROM_METHODDESC => {
+                Some(rokajit::ir::GenericsContext::MethodDesc)
+            }
+            rokajit_ffi::CorInfoOptions_CORINFO_GENERICS_CTXT_FROM_METHODTABLE => {
+                Some(rokajit::ir::GenericsContext::MethodTable)
+            }
+            _ => None,
+        },
+        generics_context_keep_alive: info.options
+            & rokajit_ffi::CorInfoOptions_CORINFO_GENERICS_CTXT_KEEP_ALIVE
+            != 0,
         args: info.args,
         locals: info.locals,
     };

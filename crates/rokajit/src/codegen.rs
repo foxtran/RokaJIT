@@ -859,6 +859,7 @@ mod tests {
                     frame_size: 16,
                     outgoing_bytes: 0,
                     gc_roots: Vec::new(),
+                    generics_context: None,
                 },
                 funclets: Vec::new(),
                 eh_clauses: Vec::new(),
@@ -878,6 +879,7 @@ mod tests {
             num_args: 0,
             num_il_locals: 0,
             struct_layouts: StructLayouts::new(),
+            generics_context: None,
         }
     }
 

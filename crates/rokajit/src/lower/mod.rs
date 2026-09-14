@@ -138,6 +138,7 @@ pub fn lower(method: hir::Method, target: &dyn Target) -> CompileResult<lir::Met
         num_args: method.num_args,
         num_il_locals: method.num_il_locals,
         struct_layouts: method.struct_layouts,
+        generics_context: method.generics_context,
     })
 }
 
@@ -1088,6 +1089,7 @@ mod tests {
             num_args: 1,
             num_il_locals: 0,
             struct_layouts: StructLayouts::new(),
+            generics_context: None,
         }
     }
 
@@ -1522,6 +1524,7 @@ mod tests {
             num_args: 0,
             num_il_locals: 2,
             struct_layouts: layouts,
+            generics_context: None,
         }
     }
 
@@ -1737,6 +1740,8 @@ mod tests {
             max_stack: 8,
             eh_count: 0,
             init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
             args: ee.make_method_sig(&fib_sig),
             locals: ee.make_locals_sig(&[]),
         };

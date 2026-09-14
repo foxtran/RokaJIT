@@ -35,7 +35,7 @@ use crate::artifact::{
     CallSite, CodeChunks, CompilationArtifact, DataChunk, EhClause, Relocation, UnwindBlob,
 };
 use crate::error::CompileResult;
-use crate::ir::{hir, lir};
+use crate::ir::{hir, lir, GenericsContext};
 use crate::target::Target;
 
 /// What the pipeline compiles: an owned snapshot of the EE's
@@ -61,6 +61,17 @@ pub struct MethodInfo {
     /// `CORINFO_OPT_INIT_LOCALS`: IL locals must be zero-initialized on
     /// entry.
     pub init_locals: bool,
+    /// The CorInfoOptions generics bits (corinfo.h:709-715): how a shared
+    /// generic body receives its instantiation context — through `this`
+    /// (FROM_THIS), or through the hidden context argument as a
+    /// MethodDesc* (FROM_METHODDESC) or MethodTable* (FROM_METHODTABLE).
+    /// `None` when no CORINFO_GENERICS_CTXT_* bit is set (non-shared
+    /// code; step_11.3B).
+    pub generics_context: Option<GenericsContext>,
+    /// `CORINFO_GENERICS_CTXT_KEEP_ALIVE` (corinfo.h:715): the context
+    /// must stay reported (and, for FROM_THIS, alive) for the method's
+    /// whole extent.
+    pub generics_context_keep_alive: bool,
     /// The argument signature (`CORINFO_METHOD_INFO::args`).
     pub args: CORINFO_SIG_INFO,
     /// The locals signature (`CORINFO_METHOD_INFO::locals`) — the only
@@ -144,6 +155,26 @@ pub struct FrameInfo {
     /// the root set at *every* safepoint; per-safepoint liveness arrives
     /// with tier 1 as a contract extension.
     pub gc_roots: Vec<GcRootSlot>,
+    /// The generics-context slot the GC info reports (step_11.3B), when
+    /// the method carries one — its presence forces the fat header.
+    pub generics_context: Option<GenericsContextGcInfo>,
+}
+
+/// The GC-info encoding facts for a method's generics context
+/// (step_11.3B; gcinfoencoder.cpp:936-1046).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct GenericsContextGcInfo {
+    /// The context slot's frame offset: the negative of its
+    /// bytes-below-rbp — the same convention as the untracked slot
+    /// table's `GcStackSlot.SpOffset`.
+    pub slot_offset: i32,
+    /// Which context it is (the fat header's 2-bit contextParamType:
+    /// MT=1, MD=2, THIS=3 — gcinfodecoder.h:241-245).
+    pub kind: GenericsContext,
+    /// Native code offset after the incoming-argument homing stores: the
+    /// point the context slot becomes reportable, encoded as the fat
+    /// header's prolog size (`varl_u(normPrologSize - 1)`).
+    pub prolog_end: u32,
 }
 
 /// One frame slot holding a GC pointer.

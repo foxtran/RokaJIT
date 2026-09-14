@@ -196,6 +196,29 @@ pub enum CallTarget<A> {
     Helper(CorInfoHelpFunc),
 }
 
+/// How a shared-generic method receives its instantiation context
+/// (corinfo.h:709-715's CORINFO_GENERICS_CTXT_* options bits): through
+/// `this` (instance methods on shared generic types), or through the
+/// hidden context argument as an InstantiatedMethodDesc* (generic
+/// methods) or a MethodTable* (statics on shared generic types).
+/// Step_11.3B.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum GenericsContext {
+    This,
+    MethodDesc,
+    MethodTable,
+}
+
+/// The frame slot holding a method's generics context, reported in the
+/// GC info's fat header (gcinfoencoder.cpp:936-1046): the hidden context
+/// argument (a PARAMTYPE entry signature), or `this` when the EE asks
+/// for it (FROM_THIS + CORINFO_GENERICS_CTXT_KEEP_ALIVE).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct GenericsContextSlot {
+    pub local: LocalId,
+    pub kind: GenericsContext,
+}
+
 /// HIR: the importer's output. Expression trees rooted at statements.
 pub mod hir {
     use super::*;
@@ -214,6 +237,9 @@ pub mod hir {
         /// Layout facts of every value class the method mentions
         /// (step_10.9; populated at import, one EE query set per class).
         pub struct_layouts: StructLayouts,
+        /// The generics context to report in the GC info (step_11.3B);
+        /// `None` for ordinary (non-shared) methods.
+        pub generics_context: Option<GenericsContextSlot>,
     }
 
     /// One local/arg/temp slot.
@@ -313,6 +339,7 @@ pub mod hir {
     /// HIR expression: a typed tree. Children evaluate depth-first in
     /// operand (field) order — i.e. IL push order — and every
     /// exception-point/call in the tree observes that order.
+    #[derive(Clone)]
     pub enum Expr {
         Const(Const),
         /// Read a local/arg/temp (`ldloc`, `ldarg`).
@@ -457,6 +484,9 @@ pub mod lir {
         /// Carried over from HIR (step_10.9): frame layout, call
         /// classification, and GC roots consult it.
         pub struct_layouts: StructLayouts,
+        /// Carried over from HIR (step_11.3B): the generics-context slot
+        /// to report in the GC info.
+        pub generics_context: Option<GenericsContextSlot>,
     }
 
     pub struct Block {

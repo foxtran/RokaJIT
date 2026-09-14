@@ -45,8 +45,10 @@ impl ClassQueries for MockEe {
         None
     }
 
-    fn get_class_name_from_metadata(&self, _cls: ClassHandle) -> Option<(String, Option<String>)> {
-        None
+    fn get_class_name_from_metadata(&self, cls: ClassHandle) -> Option<(String, Option<String>)> {
+        // Canned (name, namespace) answers, keyed by the class handle's
+        // raw value; absent handles answer "no metadata name".
+        self.class_names.get(&(cls.as_raw() as usize)).cloned()
     }
 
     fn get_type_instantiation_argument(
@@ -199,7 +201,11 @@ impl ClassQueries for MockEe {
         self.init_class_result
     }
 
-    fn class_must_be_loaded_before_code_is_run(&self, _cls: ClassHandle) {}
+    fn class_must_be_loaded_before_code_is_run(&self, cls: ClassHandle) {
+        self.sink_log
+            .borrow_mut()
+            .push(format!("class_must_be_loaded_before_code_is_run({cls:?})"));
+    }
 
     fn get_builtin_class(&self, _class_id: CorInfoClassId) -> Option<ClassHandle> {
         None

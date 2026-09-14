@@ -76,6 +76,11 @@ impl FieldQueries for MockEe {
             .value_class
             .map_or(std::ptr::null_mut(), |c| c.as_raw());
         info.accessAllowed = ffi::CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ALLOWED;
+        // The helper/offset pair drives the GENERICS_STATIC_HELPER
+        // accessor (step_11.3D): the base helper id and the field's
+        // offset into the statics block.
+        info.helper = field.statics_helper.map_or(0, |h| h.to_raw());
+        info.offset = field.offset;
         info.fieldLookup.accessType = ffi::InfoAccessType_IAT_VALUE;
         info.fieldLookup.__bindgen_anon_1.addr =
             (0x57A7_0000usize + field.handle.as_raw() as usize * 8) as *mut std::ffi::c_void;

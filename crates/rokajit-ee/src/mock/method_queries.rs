@@ -47,14 +47,20 @@ impl MethodQueries for MockEe {
         0
     }
 
-    fn method_must_be_loaded_before_code_is_run(&self, _ftn: MethodHandle) {}
+    fn method_must_be_loaded_before_code_is_run(&self, ftn: MethodHandle) {
+        self.sink_log
+            .borrow_mut()
+            .push(format!("method_must_be_loaded_before_code_is_run({ftn:?})"));
+    }
 
     fn get_method_name_from_metadata(&self, _ftn: MethodHandle) -> Option<String> {
         self.method_name.clone()
     }
 
-    fn is_intrinsic(&self, _ftn: MethodHandle) -> bool {
-        false
+    fn is_intrinsic(&self, ftn: MethodHandle) -> bool {
+        // Canned [Intrinsic] methods (the GetMethodTable fixtures),
+        // keyed by the method handle's raw value; default false.
+        self.intrinsic_methods.contains(&(ftn.as_raw() as usize))
     }
 
     fn can_value_class_instance_pointer_escape(&self, _ftn: MethodHandle) -> bool {

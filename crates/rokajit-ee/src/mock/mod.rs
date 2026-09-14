@@ -87,6 +87,10 @@ pub struct MockMethod {
     /// The fake handle `resolve_token`/`get_call_info` hand back.
     pub handle: MethodHandle,
     pub sig: MockSig,
+    /// Extra callconv bits OR'd into the sig mirrors (step_11.3B:
+    /// `CORINFO_CALLCONV_GENERIC`/`CORINFO_CALLCONV_PARAMTYPE`) — the
+    /// MockSig surface itself has no callconv flags.
+    pub call_conv_flags: ffi::CorInfoCallConv,
     /// Index into the mock's arg-list table (drives sig-cursor walking).
     arg_list: usize,
 }
@@ -110,6 +114,10 @@ pub struct MockField {
     pub init_class: bool,
     pub in_heap: bool,
     pub accessor: Option<ffi::CORINFO_FIELD_ACCESSOR>,
+    /// The canned `CORINFO_FIELD_INFO.helper` for the
+    /// `GENERICS_STATIC_HELPER` accessor (step_11.3D) — e.g.
+    /// `GET_GCSTATIC_BASE`; absent cans a zeroed (rejected) helper.
+    pub statics_helper: Option<CorInfoHelpFunc>,
 }
 
 /// Canned EE. Every query returns the stored/default value; output sinks
@@ -207,6 +215,32 @@ pub struct MockEe {
     /// default is a direct, token-deterministic IAT_VALUE handle.
     pub embed_runtime_lookup: bool,
     pub embed_indirection: bool,
+    /// A canned `CORINFO_LOOKUP` answer for `embed_generic_handle`
+    /// (step_11.3B: the runtime-lookup emitter's fixture) — returned
+    /// verbatim, ahead of the `embed_*` rejection flags.
+    pub embed_lookup: Option<ffi::CORINFO_LOOKUP>,
+    /// Canned `get_call_info` generics-context answers (step_11.3B),
+    /// keyed by metadata token: the (tagged) `contextHandle` and
+    /// `exactContextNeedsRuntimeLookup`.
+    pub call_contexts: HashMap<u32, (usize, bool)>,
+    /// Canned `entryPointLookup` answers for a
+    /// `CORINFO_CALL_CODE_POINTER` verdict (step_11.3B), keyed by
+    /// metadata token — copied into the call-info union verbatim.
+    pub call_code_pointer_lookups: HashMap<u32, ffi::CORINFO_LOOKUP>,
+    /// Canned `thisTransform` answers for a `constrained.` callvirt
+    /// (step_11.3C), keyed by the call's method metadata token; absent
+    /// tokens answer CORINFO_NO_THIS_TRANSFORM (the zeroed default).
+    pub this_transforms: HashMap<u32, ffi::CORINFO_THIS_TRANSFORM>,
+    /// Canned [Intrinsic] methods (the GetMethodTable fixtures), keyed by
+    /// the method handle's raw value; `is_intrinsic` answers true for them.
+    pub intrinsic_methods: std::collections::HashSet<usize>,
+    /// Canned `get_class_name_from_metadata` answers — (name, namespace) —
+    /// keyed by the class handle's raw value; absent handles answer `None`.
+    pub class_names: HashMap<usize, (String, Option<String>)>,
+    /// The constrained-token operand each `get_call_info` call arrived
+    /// with (its metadata token; 0 when the call had no `constrained.`
+    /// prefix), in order (step_11.3C).
+    pub constrained_seen: RefCell<Vec<u32>>,
     /// Sink calls observed, newest last, as "(kind, detail)" strings.
     pub sink_log: RefCell<Vec<String>>,
     /// Buffers handed out by the fake `alloc_mem`/`alloc_gc_info`, kept
@@ -263,7 +297,7 @@ impl MockEe {
             ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS
         } else {
             ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT
-        };
+        } | method.call_conv_flags;
         self.build_sig_info(
             call_conv,
             method.sig.ret,
@@ -298,6 +332,7 @@ impl MockEe {
             MockMethod {
                 handle,
                 sig,
+                call_conv_flags: ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT,
                 arg_list,
             },
         );
@@ -353,6 +388,7 @@ impl MockEe {
                 init_class: false,
                 in_heap: false,
                 accessor: None,
+                statics_helper: None,
             },
         );
         handle
@@ -384,6 +420,7 @@ impl MockEe {
             handle: MethodHandle::from_raw(1usize as ffi::CORINFO_METHOD_HANDLE)
                 .expect("fake handle is non-null"),
             sig: sig.clone(),
+            call_conv_flags: ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT,
             arg_list,
         };
         self.method_sig_info(&method)

@@ -105,7 +105,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use rokajit_ee::ee_info::{zeroed_out, EeInfo};
 use rokajit_ee::enums::{
-    CallInfoFlags, CorInfoHelpFunc, CorInfoInitClassResult, CorInfoType, InfoAccessType,
+    CallInfoFlags, ClassAttribs, CorInfoHelpFunc, CorInfoInitClassResult, CorInfoType,
+    InfoAccessType,
 };
 use rokajit_ee::handles::{
     ArgListHandle, ClassHandle, ContextHandle, FieldHandle, MethodHandle, ModuleHandle,
@@ -114,7 +115,8 @@ use rokajit_ffi as ffi;
 
 use crate::error::{CompileError, CompileResult};
 use crate::ir::{
-    hir, BinaryOp, BlockId, CallSig, CallTarget, Const, IlOffset, LocalId, MemAccess, Type, UnaryOp,
+    hir, BinaryOp, BlockId, CallSig, CallTarget, Const, GenericsContext, GenericsContextSlot,
+    IlOffset, LocalId, MemAccess, Type, UnaryOp,
 };
 use crate::pipeline::MethodInfo;
 use crate::structs::{layout_of, StructLayouts};
@@ -164,6 +166,32 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         }
         _ => None,
     };
+    // The hidden generics-context argument (step_11.3B;
+    // decisions/2026-09-14-generics-context-arg.md): a PARAMTYPE entry
+    // signature is shared generic code whose body takes one extra
+    // argument of native-int size at position (has_this + has_retbuf)
+    // — the JitDisasm-verified SysV order is [this] [retbuf] [context]
+    // [user args…]. IL arg indices shift past it exactly like the retbuf
+    // (`il_arg_id`). GENERIC without PARAMTYPE is an unshared
+    // instantiation: no context argument, ordinary code.
+    let context_arg = if info.args.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE != 0 {
+        // The CorInfoOptions word names the context kind (MethodDesc* for
+        // generic methods, MethodTable* for statics on shared generic
+        // types); PARAMTYPE without either is an EE contract violation.
+        if !matches!(
+            info.generics_context,
+            Some(GenericsContext::MethodDesc) | Some(GenericsContext::MethodTable)
+        ) {
+            return Err(CompileError::Internal(
+                "PARAMTYPE entry signature without a method/table context kind",
+            ));
+        }
+        let id = LocalId(local_types.len() as u32);
+        local_types.push(Type::NativeInt);
+        Some(id)
+    } else {
+        None
+    };
     local_types.extend(sig_arg_types(&info.args, ee, &mut struct_layouts)?);
     let num_args = local_types.len() as u32;
     local_types.extend(sig_arg_types(&info.locals, ee, &mut struct_layouts)?);
@@ -191,6 +219,7 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         num_il_locals,
         ret_ty,
         retbuf,
+        context_arg,
         struct_layouts,
         block_of,
         expected_depth: HashMap::new(),
@@ -280,6 +309,18 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         .ee
         .init_class(None, None, ContextHandle::from_method(info.ftn));
     if prolog_init.contains(CorInfoInitClassResult::USE_HELPER) {
+        // Shared generic code (the method's own class is inexact — a
+        // precise cctor on a shared generic class): RyuJIT's
+        // fgInitThisClass runtime-lookup branch (morph.cpp:14663) goes
+        // through INITINSTCLASS / the generic statics base machinery;
+        // embedding the canonical MethodTable* here would init the wrong
+        // class. Named Unsupported until that lands (step_11.3D audit).
+        let own_kind = importer.ee.get_location_of_this_type(info.ftn);
+        if own_kind.needsRuntimeLookup {
+            return Err(CompileError::Unsupported(
+                "prolog class-init trigger in shared generic code (INITINSTCLASS)",
+            ));
+        }
         let class = importer.ee.get_method_class(info.ftn);
         let mt = importer.embed_class_const(class)?;
         blocks[0].stmts.insert(
@@ -305,6 +346,29 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         num_args,
         num_il_locals,
         struct_layouts: importer.struct_layouts,
+        // The GC-info context report (step_11.3B): the hidden context
+        // arg's slot for PARAMTYPE entries (kind from the options word),
+        // or `this` for FROM_THIS + KEEP_ALIVE — the unconditional
+        // analogue of RyuJIT's lvaReportParamTypeArg (compiler.hpp:2689);
+        // reporting is always safe, the VM only reads it when needed.
+        // The MD/MT context is not a GC root (its NativeInt local keeps
+        // it out of gc_roots); `this` is already an ordinary root, the
+        // header field is additional.
+        generics_context: match (context_arg, info.generics_context) {
+            (Some(id), Some(kind)) => Some(GenericsContextSlot { local: id, kind }),
+            (None, Some(GenericsContext::This)) if info.generics_context_keep_alive => {
+                if !has_this {
+                    return Err(CompileError::Internal(
+                        "FROM_THIS keep-alive context on a static method",
+                    ));
+                }
+                Some(GenericsContextSlot {
+                    local: LocalId(0),
+                    kind: GenericsContext::This,
+                })
+            }
+            _ => None,
+        },
     })
 }
 
@@ -403,26 +467,36 @@ enum ElemKind {
     Struct(ClassHandle),
 }
 
+/// The calling-convention gate (entry sig and `call`/`callvirt` callee
+/// sigs). Step_11.3B lifted the generics rejection:
+/// `CORINFO_CALLCONV_GENERIC` without `CORINFO_CALLCONV_PARAMTYPE` is an
+/// unshared instantiation (value-type type args) — ordinary code, every
+/// EE answer exact. PARAMTYPE marks shared generic code taking the
+/// hidden context argument (corinfo.h:666): the entry path inserts it
+/// into the arg-local list ([`import`]) and call sites pass it
+/// ([`BlockImport::call`]). `calli`/`ldftn`/`newobj` keep their own
+/// PARAMTYPE rejection (phase C feedback if it ever appears there).
 fn check_call_conv(call_conv: ffi::CorInfoCallConv) -> CompileResult<()> {
-    if call_conv & ffi::CorInfoCallConv_CORINFO_CALLCONV_GENERIC != 0 {
-        return Err(CompileError::Unsupported("generic methods"));
-    }
-    // CORINFO_CALLCONV_PARAMTYPE (corinfo.h:666): the method is shared
-    // generic code and takes a hidden instantiation argument after its
-    // declared parameters — e.g. a static method on a generic type
-    // (`MyG<T,U>.foo()`). The flag sits above the 4-bit convention mask,
-    // so the mask check alone lets it through; without it the compiled
-    // body would run with no generic context at all — a silent
-    // wrong-result, not a crash.
-    if call_conv & ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE != 0 {
-        return Err(CompileError::Unsupported(
-            "generic methods (shared code needs the hidden context argument)",
-        ));
-    }
     if call_conv & ffi::CorInfoCallConv_CORINFO_CALLCONV_MASK
         != ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT
     {
         return Err(CompileError::Unsupported("non-default calling convention"));
+    }
+    Ok(())
+}
+
+/// `calli`/`newobj` (and `ldftn`) never take the hidden context argument
+/// in phase B: reject the generics callconv bits there
+/// (`check_call_conv` itself accepts them now — see above).
+fn check_no_generics_call_conv(call_conv: ffi::CorInfoCallConv) -> CompileResult<()> {
+    if call_conv
+        & (ffi::CorInfoCallConv_CORINFO_CALLCONV_GENERIC
+            | ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE)
+        != 0
+    {
+        return Err(CompileError::Unsupported(
+            "generic callconv on a calli/ldftn/newobj site (shared generics)",
+        ));
     }
     Ok(())
 }
@@ -515,11 +589,24 @@ enum Op {
         op: BinaryOp,
         target: u32,
     },
-    Call(u32),
+    /// `call` — exact-target call; `constrained` carries the
+    /// `constrained.` prefix's type-token operand (0xFE 16), which RyuJIT
+    /// tolerates before `call` as well as `callvirt` (importer.cpp:8962)
+    /// — the EE's `getCallInfo` answers the verdict for both.
+    Call {
+        token: u32,
+        constrained: Option<u32>,
+    },
     /// `callvirt` — same resolution as `call`, but the receiver is
     /// null-checked (ECMA-335 §III.4.2: NullReferenceException on a null
     /// `this` even when the EE devirtualizes to a direct call).
-    CallVirt(u32),
+    /// `constrained` carries the `constrained.` prefix's type-token
+    /// operand (0xFE 16, step_11.3C): the receiver is then a byref the
+    /// EE's thisTransform verdict rewrites.
+    CallVirt {
+        token: u32,
+        constrained: Option<u32>,
+    },
     /// `calli` — indirect call through a function pointer with a
     /// callsite-signature token (0x11000000, the StandAloneSig heap).
     CallI(u32),
@@ -791,6 +878,9 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
     // reordering optimizations.
     let mut unaligned: Option<u8> = None;
     let mut volatile = false;
+    // A pending `constrained.` prefix (step_11.3C): the type token, merged
+    // into the following callvirt's operand.
+    let mut constrained: Option<u32> = None;
     let mut prefix_start: Option<u32> = None;
     while r.ip < il.len() {
         let offset = r.ip as u32;
@@ -815,7 +905,10 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x23 => Op::LdcR8(f64::from_bits(r.u64()?)),
             0x25 => Op::Dup,
             0x26 => Op::Pop,
-            0x28 => Op::Call(r.u32()?),
+            0x28 => Op::Call {
+                token: r.u32()?,
+                constrained: None,
+            },
             0x2A => Op::Ret,
             0x2B => {
                 let d = r.i8()?;
@@ -897,7 +990,10 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x6C => Op::Conv(ConvKind::R8),
             0x6D => Op::Conv(ConvKind::U4),
             0x6E => Op::Conv(ConvKind::U8),
-            0x6F => Op::CallVirt(r.u32()?),
+            0x6F => Op::CallVirt {
+                token: r.u32()?,
+                constrained: None,
+            },
             0x29 => Op::CallI(r.u32()?),
             0x70 => Op::CpObj(r.u32()?),
             0x71 => Op::LdObj(r.u32()?),
@@ -987,6 +1083,19 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                     continue;
                 }
                 0x15 => Op::InitObj(r.u32()?),
+                0x16 => {
+                    // `constrained.` (step_11.3C/D): the following call's
+                    // `this` is a byref into a value of the operand type
+                    // (ECMA-335 §III.2.1; RyuJIT accepts callvirt, call,
+                    // and ldftn — importer.cpp:8962; ldftn's generic
+                    // verdicts stay gated, see the merge below).
+                    if constrained.is_some() {
+                        return Err(CompileError::BadIl("nested constrained. prefix"));
+                    }
+                    constrained = Some(r.u32()?);
+                    prefix_start = Some(prefix_start.unwrap_or(offset));
+                    continue;
+                }
                 0x1A => return Err(CompileError::Unsupported("rethrow")),
                 0x1C => Op::SizeOf(r.u32()?),
                 _ => {
@@ -1002,6 +1111,39 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             }
         };
         let start = prefix_start.unwrap_or(offset);
+        let mut op = op;
+        if let Some(ctoken) = constrained.take() {
+            // `constrained.` merges into a following callvirt's or call's
+            // operand (RyuJIT accepts both, importer.cpp:8962 — plus
+            // ldftn, whose generic verdicts stay gated here, and nothing
+            // else: newobj/calli/… are BadIl).
+            match op {
+                Op::CallVirt { token, .. } => {
+                    op = Op::CallVirt {
+                        token,
+                        constrained: Some(ctoken),
+                    };
+                    prefix_start = None;
+                }
+                Op::Call { token, .. } => {
+                    op = Op::Call {
+                        token,
+                        constrained: Some(ctoken),
+                    };
+                    prefix_start = None;
+                }
+                Op::LdFtn(_) => {
+                    return Err(CompileError::Unsupported(
+                        "constrained. prefix before ldftn",
+                    ));
+                }
+                _ => {
+                    return Err(CompileError::BadIl(
+                        "constrained. prefix before a non-call instruction",
+                    ));
+                }
+            }
+        }
         if unaligned.is_some() || volatile {
             // RyuJIT's `impValidateMemoryAccessOpcode` set
             // (importer.cpp:5317): the ldind/stind family (incl. stind.i),
@@ -1525,6 +1667,10 @@ struct BlockImport<'a> {
     /// `this`), present when the method's own return type is a
     /// non-register-passed struct (step_10.9).
     retbuf: Option<LocalId>,
+    /// The hidden generics-context arg-local (a NativeInt at position
+    /// has_this + has_retbuf — step_11.3B), present when the entry
+    /// signature carries `CORINFO_CALLCONV_PARAMTYPE`.
+    context_arg: Option<LocalId>,
     /// Layout facts of every value class mentioned, queried once per class.
     struct_layouts: StructLayouts,
     /// Leader offset → block index in layout order.
@@ -1637,6 +1783,54 @@ fn virtual_func_ptr_call(
     }
 }
 
+/// The `!needsRuntimeLookup` half of a `CORINFO_LOOKUP`
+/// (corinfo.h:1143-1178): the handle as a constant (IAT_VALUE) or a load
+/// through the EE's cell (IAT_PVALUE); deeper indirection is out (the
+/// step_07 embedding policy). Shared by [`BlockImport::embed_handle_expr`]
+/// and the runtime-lookup emitter (step_11.3B).
+fn const_lookup_expr(const_lookup: &ffi::CORINFO_CONST_LOOKUP) -> CompileResult<hir::Expr> {
+    match const_lookup.accessType {
+        ffi::InfoAccessType_IAT_VALUE => {
+            // SAFETY: accessType selects the union member.
+            let handle = unsafe { const_lookup.__bindgen_anon_1.handle };
+            Ok(hir::Expr::Const(Const::NativeInt(handle as isize)))
+        }
+        ffi::InfoAccessType_IAT_PVALUE => {
+            // SAFETY: accessType selects the union member.
+            let cell = unsafe { const_lookup.__bindgen_anon_1.addr };
+            Ok(hir::Expr::Load {
+                addr: Box::new(hir::Expr::Const(Const::NativeInt(cell as isize))),
+                offset: 0,
+                ty: Type::NativeInt,
+                access: MemAccess::Natural,
+            })
+        }
+        _ => Err(CompileError::Unsupported(
+            "handle through multiple indirections (IAT_PPVALUE/IAT_RELPVALUE)",
+        )),
+    }
+}
+
+/// The runtime-lookup helper call `helper(ctx, signature)` (step_11.3B):
+/// the fallback for `testForNull` lookups and the only path for
+/// CORINFO_USEHELPER ones (e.g. CORINFO_HELP_RUNTIMEHANDLE_METHOD /
+/// _CLASS). The helper id comes from the lookup itself; codegen resolves
+/// its address through `get_helper_ftn` as for any helper call.
+fn runtime_lookup_helper_call(ctx: hir::Expr, rl: &ffi::CORINFO_RUNTIME_LOOKUP) -> hir::Expr {
+    hir::Expr::Call {
+        target: CallTarget::Helper(CorInfoHelpFunc::from_raw(rl.helper)),
+        sig: CallSig {
+            ret: Type::NativeInt,
+            args: vec![Type::NativeInt, Type::NativeInt],
+            has_this: false,
+        },
+        args: vec![
+            ctx,
+            hir::Expr::Const(Const::NativeInt(rl.signature as isize)),
+        ],
+    }
+}
+
 impl BlockImport<'_> {
     fn push(&mut self, ty: Type, expr: hir::Expr) -> CompileResult<()> {
         if self.stack.len() >= self.info.max_stack as usize {
@@ -1732,18 +1926,19 @@ impl BlockImport<'_> {
     }
 
     /// Maps an IL argument index (`ldarg`/`ldarga`/`starg`) to its local
-    /// slot. The hidden retbuf arg-local (step_10.9) sits between `this`
-    /// and the user arguments in the flat namespace but is NOT an IL
-    /// argument, so user-arg indices shift past it.
+    /// slot. The hidden retbuf and generics-context arg-locals
+    /// (step_10.9/step_11.3B) sit between `this` and the user arguments
+    /// in the flat namespace but are NOT IL arguments, so user-arg
+    /// indices shift past them.
     fn il_arg_id(&self, index: u32) -> CompileResult<LocalId> {
         let this_count =
             u32::from(self.info.args.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0);
-        let retbuf_count = u32::from(self.retbuf.is_some());
-        if index >= self.num_args - retbuf_count {
+        let hidden_count = u32::from(self.retbuf.is_some()) + u32::from(self.context_arg.is_some());
+        if index >= self.num_args - hidden_count {
             return Err(CompileError::BadIl("argument index out of range"));
         }
         Ok(LocalId(
-            index + if index >= this_count { retbuf_count } else { 0 },
+            index + if index >= this_count { hidden_count } else { 0 },
         ))
     }
 
@@ -2298,10 +2493,10 @@ impl BlockImport<'_> {
     /// through the TYPEHANDLE_TO_*/METHODDESC_TO_*/FIELDDESC_TO_* helper
     /// (jithelpers.h:238-240 — CoreCLR's handle structs wrap a managed
     /// object, so the helper call is where the RuntimeType comes from),
-    /// returned in `rax` like any one-eightbyte struct. A generic-context
-    /// runtime lookup is the shared-generics step; an indirection cell
-    /// needs load/reloc plumbing tier 0 doesn't have (the ldstr/newobj
-    /// policy — the EE decides, we follow).
+    /// returned in `rax` like any one-eightbyte struct. The embed goes
+    /// through the [`Self::runtime_lookup_expr`] emitter (step_11.3D): in
+    /// shared generic code the answer is the runtime lookup seeded from
+    /// our own context, not the inexact representative handle.
     fn ldtoken(&mut self, token: u32) -> CompileResult<()> {
         let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
             t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
@@ -2320,42 +2515,39 @@ impl BlockImport<'_> {
         let result = self
             .ee
             .embed_generic_handle(&mut resolved, false, self.info.ftn);
-        if result.lookup.lookupKind.needsRuntimeLookup {
-            return Err(CompileError::Unsupported(
-                "ldtoken with a generic-context runtime lookup",
-            ));
-        }
-        // !needsRuntimeLookup ⇒ the constLookup union member is live
-        // (corinfo.h's CORINFO_LOOKUP contract).
-        let const_lookup = unsafe { result.lookup.__bindgen_anon_1.constLookup };
-        if const_lookup.accessType != ffi::InfoAccessType_IAT_VALUE {
-            return Err(CompileError::Unsupported(
-                "ldtoken handle through an indirection cell (IAT_PVALUE/PPVALUE)",
-            ));
-        }
-        let handle = unsafe { const_lookup.__bindgen_anon_1.handle };
+        let handle_expr = self.runtime_lookup_expr(&result.lookup)?;
 
-        // RyuJIT's impTokenToHandle mustRestoreHandle bookkeeping: record
-        // the load dependency with the EE (for a field, its owning
-        // class's). Notifications only — no codegen effect in-process.
-        match result.handleType {
-            ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_CLASS => {
-                if let Some(c) = ClassHandle::from_raw(handle as ffi::CORINFO_CLASS_HANDLE) {
-                    self.ee.class_must_be_loaded_before_code_is_run(c);
+        // RyuJIT's impTokenToHandle mustRestoreHandle bookkeeping (CEE_
+        // LDTOKEN passes it, importer.cpp:10625): record the load
+        // dependency with the EE (for a field, its owning class's) — only
+        // meaningful for a compile-time handle. Notifications only — no
+        // codegen effect in-process.
+        if !result.lookup.lookupKind.needsRuntimeLookup {
+            match result.handleType {
+                ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_CLASS => {
+                    if let Some(c) =
+                        ClassHandle::from_raw(result.compileTimeHandle as ffi::CORINFO_CLASS_HANDLE)
+                    {
+                        self.ee.class_must_be_loaded_before_code_is_run(c);
+                    }
                 }
-            }
-            ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_METHOD => {
-                if let Some(m) = MethodHandle::from_raw(handle as ffi::CORINFO_METHOD_HANDLE) {
-                    self.ee.method_must_be_loaded_before_code_is_run(m);
+                ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_METHOD => {
+                    if let Some(m) = MethodHandle::from_raw(
+                        result.compileTimeHandle as ffi::CORINFO_METHOD_HANDLE,
+                    ) {
+                        self.ee.method_must_be_loaded_before_code_is_run(m);
+                    }
                 }
-            }
-            ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_FIELD => {
-                if let Some(f) = FieldHandle::from_raw(handle as ffi::CORINFO_FIELD_HANDLE) {
-                    self.ee
-                        .class_must_be_loaded_before_code_is_run(self.ee.get_field_class(f));
+                ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_FIELD => {
+                    if let Some(f) =
+                        FieldHandle::from_raw(result.compileTimeHandle as ffi::CORINFO_FIELD_HANDLE)
+                    {
+                        self.ee
+                            .class_must_be_loaded_before_code_is_run(self.ee.get_field_class(f));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
 
         // The raw-handle → handle-struct conversion helper, by the
@@ -2379,7 +2571,7 @@ impl BlockImport<'_> {
                     args: vec![Type::NativeInt],
                     has_this: false,
                 },
-                args: vec![hir::Expr::Const(Const::NativeInt(handle as isize))],
+                args: vec![handle_expr],
             },
         )
     }
@@ -2388,10 +2580,23 @@ impl BlockImport<'_> {
     /// to a constant at JIT time — the EE's `getClassSize` is the query
     /// (RyuJIT's CEE_SIZEOF, importer.cpp:10953: no value-type gate;
     /// CoreCLR answers for any type, and C# emits the opcode for unmanaged
-    /// types only). The IL stack type is unsigned int32.
+    /// types only). A type parameter (`sizeof(T)` under an unmanaged
+    /// constraint) resolves to a type-variable handle whose "size" is the
+    /// canonical representative's — meaningless — and the EE is under no
+    /// obligation to answer it: named Unsupported (step_11.3D). The IL
+    /// stack type is unsigned int32.
     fn sizeof_(&mut self, token: u32) -> CompileResult<()> {
         let (_resolved, class) =
             self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
+        if self
+            .ee
+            .get_class_attribs(class)
+            .contains(ClassAttribs::GENERIC_TYPE_VARIABLE)
+        {
+            return Err(CompileError::Unsupported(
+                "sizeof over a generic type parameter",
+            ));
+        }
         let size = self.ee.get_class_size(class);
         self.push(Type::Int32, hir::Expr::Const(Const::Int32(size as i32)))
     }
@@ -2414,14 +2619,21 @@ impl BlockImport<'_> {
     /// the header-sanctioned fallback (corinfo.h:1355: the JIT "is
     /// allowed to implement the call as if it were
     /// CORINFO_VIRTUALCALL_LDVIRTFTN"), the `VIRTUAL_FUNC_PTR` helper +
-    /// indirect call. `CORINFO_CALL_CODE_POINTER` and any dispatch
-    /// needing a generic-context runtime lookup stay Unsupported (the
-    /// shared-generics step).
+    /// indirect call. `CORINFO_CALL_CODE_POINTER` (shared generic code,
+    /// corinfo.h:1340) is an indirect call through the
+    /// `codePointerLookup`'s runtime-computed code pointer; handle
+    /// embeddings needing a generic-context runtime lookup go through
+    /// [`Self::runtime_lookup_expr`] (step_11.3C). `constrained` carries
+    /// the `constrained.` prefix's type-token operand (step_11.3C): it
+    /// resolves as its own token (RyuJIT importer.cpp:8949-8952) and goes
+    /// to `getCallInfo` (importer.cpp:8841), whose `thisTransform` answer
+    /// rewrites the byref `this` (corinfo.h:1388-1396).
     fn call(
         &mut self,
         token: u32,
         flags: CallInfoFlags,
         null_check_this: bool,
+        constrained: Option<u32>,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
@@ -2435,12 +2647,34 @@ impl BlockImport<'_> {
             t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Method;
         });
         self.ee.resolve_token(&mut resolved);
-        let call = self
-            .ee
-            .get_call_info(&mut resolved, None, self.info.ftn, flags);
+        // The `constrained.` prefix's type token (step_11.3C): its own
+        // CORINFO_RESOLVED_TOKEN with the Constrained kind hint
+        // (importer.cpp:8952), resolved before the getCallInfo query.
+        let mut constrained_resolved = constrained.map(|ctoken| {
+            let mut cr = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+                t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+                t.tokenScope = self.info.args.scope;
+                t.token = ctoken;
+                t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Constrained;
+            });
+            self.ee.resolve_token(&mut cr);
+            cr
+        });
+        let call = self.ee.get_call_info(
+            &mut resolved,
+            constrained_resolved.as_ref(),
+            self.info.ftn,
+            flags,
+        );
         // A dispatch kind is only legal for `callvirt` — a plain `call`
         // always resolves to the exact method (corinfo.h:1331). The
         // newobj constructor gate below keeps its own direct-only check.
+        // CORINFO_CALL_CODE_POINTER (shared generic code, corinfo.h:1340)
+        // is neither: an indirect call through the entryPointLookup's
+        // runtime-computed code pointer — the target is an instantiating
+        // stub following the UNIFORM calling convention (no hidden
+        // context param; RyuJIT's assert, importercalls.cpp:757).
+        let mut code_pointer = false;
         let virtual_kind = match call.kind {
             ffi::CORINFO_CALL_KIND_CORINFO_CALL => None,
             kind @ (ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_VTABLE
@@ -2450,6 +2684,15 @@ impl BlockImport<'_> {
                     return Err(CompileError::BadIl("dispatch kind on a non-callvirt call"));
                 }
                 Some(kind)
+            }
+            ffi::CORINFO_CALL_KIND_CORINFO_CALL_CODE_POINTER => {
+                if call.sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE != 0 {
+                    return Err(CompileError::Internal(
+                        "CORINFO_CALL_CODE_POINTER with a PARAMTYPE signature",
+                    ));
+                }
+                code_pointer = true;
+                None
             }
             _ => {
                 return Err(CompileError::Unsupported(
@@ -2468,7 +2711,7 @@ impl BlockImport<'_> {
             self.ee,
             &mut self.struct_layouts,
         )?;
-        let arg_types = sig_arg_types(&call.sig, self.ee, &mut self.struct_layouts)?;
+        let mut arg_types = sig_arg_types(&call.sig, self.ee, &mut self.struct_layouts)?;
 
         let mut args = Vec::with_capacity(arg_types.len() + usize::from(has_this));
         for &expected in arg_types.iter().rev() {
@@ -2479,25 +2722,115 @@ impl BlockImport<'_> {
             args.push(value);
         }
         args.reverse();
+        // Whether the receiver evaluation carries the callvirt null check
+        // (set inside the `this` rewrite below) — drives the argument-
+        // before-check ordering spill (Runtime_121711).
+        let mut receiver_null_checked = false;
         if has_this {
             let (ty, this) = self.pop()?;
             if !matches!(ty, Type::Ref | Type::ByRef) {
                 return Err(CompileError::BadIl("`this` must be a reference"));
             }
-            let this = if null_check_this {
-                hir::Expr::NullCheck {
-                    arg: Box::new(this),
+            // The receiver's null check, when one is owed: plain callvirt
+            // (ECMA-335 §III.4.2), or a constrained DEREF_THIS under
+            // callvirt (the EE reports nullInstanceCheck for the dispatch
+            // verdicts, jitinterface.cpp:5397-5408). `constrained_this`'s
+            // deref itself never checks — impTransformThis builds only the
+            // load (importercalls.cpp:7467-7477).
+            let this = match constrained_resolved.as_mut() {
+                // The `constrained.` this-rewrite (corinfo.h:1388-1396):
+                // the IL `this` is a byref into a value of the constraint
+                // type; the EE's thisTransform says how to make it the
+                // callee's receiver. The byref itself is never null
+                // checked (a stack/value address — the EE reports
+                // nullInstanceCheck=false on the resolved path,
+                // jitinterface.cpp:5389).
+                Some(cr) => {
+                    let deref =
+                        call.thisTransform == ffi::CORINFO_THIS_TRANSFORM_CORINFO_DEREF_THIS;
+                    let this =
+                        self.constrained_this(ty, this, cr, call.thisTransform, stmts, il_offset)?;
+                    if deref && null_check_this {
+                        receiver_null_checked = true;
+                        hir::Expr::NullCheck {
+                            arg: Box::new(this),
+                        }
+                    } else {
+                        this
+                    }
                 }
-            } else {
-                this
+                None if null_check_this => {
+                    receiver_null_checked = true;
+                    hir::Expr::NullCheck {
+                        arg: Box::new(this),
+                    }
+                }
+                None => this,
             };
             args.insert(0, this);
+        }
+        if receiver_null_checked {
+            // ECMA-335 §III.4.2: the callvirt null check fires when the
+            // call executes — after EVERY argument has evaluated
+            // (Runtime_121711: `b.Foo<T>(Bar())` runs Bar() before the
+            // NullReferenceException). Spill the side-effecting user args
+            // to temps in IL order, then evaluate the receiver (null
+            // check included) into its own temp; the call then reads
+            // temps only.
+            self.spill_args_before_receiver_check(&mut args, &arg_types, stmts, il_offset)?;
+        }
+        // CORINFO_CALL_CODE_POINTER: hMethod is not valid
+        // (corinfo.h:1343) — the indirect target comes from the
+        // entryPointLookup through the runtime-lookup emitter.
+        if code_pointer {
+            // SAFETY: kind == CORINFO_CALL_CODE_POINTER ⇒ the
+            // codePointerLookup union member is live (corinfo.h:1541).
+            let lookup = unsafe { &call.__bindgen_anon_1.codePointerLookup };
+            let target = self.runtime_lookup_expr(lookup)?;
+            return self.finish_call(
+                CallTarget::Indirect(Box::new(target)),
+                CallSig {
+                    ret,
+                    args: arg_types,
+                    has_this,
+                },
+                args,
+                stmts,
+                il_offset,
+            );
         }
         let Some(method) = MethodHandle::from_raw(call.hMethod) else {
             return Err(CompileError::BadIl(
                 "get_call_info returned a null method handle",
             ));
         };
+        // The one named intrinsic tier 0 expands (RyuJIT's impIntrinsic,
+        // importercalls.cpp:3930, name-matched at importercalls.cpp:12212):
+        // `RuntimeHelpers.GetMethodTable(obj)`. Its CoreLib IL body is
+        // deliberately self-recursive — the [Intrinsic] marker is the real
+        // implementation — so compiling it literally recurses until the
+        // stack overflows (enumerablecloning.cs: the managed helper behind
+        // CORINFO_HELP_VIRTUAL_FUNC_PTR calls it, and a tier-1 re-JIT of
+        // that helper lands the IL body here). Emit the MethodTable lookup
+        // directly: the faulting `[obj+0]` load (gtNewMethodTableLookup).
+        if virtual_kind.is_none()
+            && constrained_resolved.is_none()
+            && !has_this
+            && ret == Type::NativeInt
+            && arg_types == [Type::Ref]
+            && self.is_get_method_table_intrinsic(method)
+        {
+            let obj = args.pop().expect("the intrinsic's one argument");
+            return self.push(
+                Type::NativeInt,
+                hir::Expr::Load {
+                    addr: Box::new(obj),
+                    offset: 0,
+                    ty: Type::NativeInt,
+                    access: MemAccess::Natural,
+                },
+            );
+        }
         let target = match virtual_kind {
             None => CallTarget::Direct(method),
             Some(ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_VTABLE) => {
@@ -2519,6 +2852,19 @@ impl BlockImport<'_> {
                 )))
             }
         };
+        // The hidden generics-context argument (step_11.3B): a callee
+        // whose sig carries PARAMTYPE is shared code, and the context
+        // rides at position (has_this + has_retbuf) — BEFORE the user
+        // args, which is also where `finish_call`'s retbuf insertion
+        // lands relative to it (sig.args excludes `this` but includes
+        // the retbuf, so the NativeInt goes in at the retbuf position).
+        if call.sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE != 0 {
+            let context = self.generics_context_arg(&mut resolved, &call)?;
+            let has_retbuf = matches!(ret,
+                Type::Struct(class) if !self.struct_layouts[&class].sysv.passed_in_registers);
+            arg_types.insert(usize::from(has_retbuf), Type::NativeInt);
+            args.insert(usize::from(has_this) + usize::from(has_retbuf), context);
+        }
         self.finish_call(
             target,
             CallSig {
@@ -2532,11 +2878,151 @@ impl BlockImport<'_> {
         )
     }
 
+    /// The `this` rewrite of a `constrained.` callvirt (step_11.3C):
+    /// RyuJIT's `impTransformThis` (importercalls.cpp:7462-7517). The IL
+    /// `this` is a byref into a value of the constraint type
+    /// (corinfo.h:1388), and the EE's `thisTransform` (corinfo.h:1418)
+    /// says how to turn it into the resolved callee's receiver:
+    ///
+    /// - `NO_THIS_TRANSFORM`: the byref IS the receiver — the constraint
+    ///   resolved at compile time to the value type's own method, called
+    ///   in place. No null check: the byref is a stack/value address, and
+    ///   the EE reports nullInstanceCheck=false on the resolved path
+    ///   (jitinterface.cpp:5389).
+    /// - `DEREF_THIS`: the constraint is a reference type — the byref
+    ///   points at the object reference; load it (a managed-pointer
+    ///   deref), then the ordinary callvirt receiver path, explicit null
+    ///   check included (the EE reports nullInstanceCheck=true for the
+    ///   dispatch verdicts, jitinterface.cpp:5397-5408).
+    /// - `BOX_THIS`: the value type's target method has no unboxed entry
+    ///   point (inherited from System.Object/ValueType,
+    ///   importercalls.cpp:7484-7489) — box through the EE's `BOX`
+    ///   helper; the constrained class handle embeds through the
+    ///   generic-handle path (`embedGenericHandle` on the constrained
+    ///   token — RyuJIT's impImportAndPushBox → impTokenToHandle), which
+    ///   is where shared generic code's runtime lookup enters. The fresh
+    ///   box is never null, so no null check (the newobj rule).
+    fn constrained_this(
+        &mut self,
+        ty: Type,
+        this: hir::Expr,
+        constrained: &mut ffi::CORINFO_RESOLVED_TOKEN,
+        transform: ffi::CORINFO_THIS_TRANSFORM,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<hir::Expr> {
+        if ty != Type::ByRef {
+            return Err(CompileError::BadIl(
+                "constrained. callvirt `this` must be a byref",
+            ));
+        }
+        match transform {
+            ffi::CORINFO_THIS_TRANSFORM_CORINFO_NO_THIS_TRANSFORM => Ok(this),
+            // The plain load (impTransformThis, importercalls.cpp:7467);
+            // the caller adds the null check when the opcode owes one
+            // (callvirt only — a `constrained. … call` never checks).
+            ffi::CORINFO_THIS_TRANSFORM_CORINFO_DEREF_THIS => Ok(hir::Expr::Load {
+                addr: Box::new(this),
+                offset: 0,
+                ty: Type::Ref,
+                access: MemAccess::Natural,
+            }),
+            ffi::CORINFO_THIS_TRANSFORM_CORINFO_BOX_THIS => {
+                let Some(class) = ClassHandle::from_raw(constrained.hClass) else {
+                    return Err(CompileError::BadIl(
+                        "constrained. token did not resolve to a class",
+                    ));
+                };
+                match self.ee.get_box_helper(class) {
+                    CorInfoHelpFunc::BOX => {}
+                    CorInfoHelpFunc::BOX_NULLABLE => {
+                        return Err(CompileError::Unsupported("box of Nullable<T>"));
+                    }
+                    _ => {
+                        return Err(CompileError::Unsupported("box helper outside the box set"));
+                    }
+                }
+                let mt = self.embed_handle_expr(constrained, false)?;
+                // The box rides in a Ref temp — a GC root across the
+                // safepoints of the dispatch-target computation (the
+                // VIRTUAL_FUNC_PTR helper / runtime-lookup helpers).
+                self.spill_stack(stmts, il_offset)?;
+                let t = self.temp(Type::Ref);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store {
+                        dst: t,
+                        value: hir::Expr::Call {
+                            target: CallTarget::Helper(CorInfoHelpFunc::BOX),
+                            sig: CallSig {
+                                ret: Type::Ref,
+                                args: vec![Type::NativeInt, Type::ByRef],
+                                has_this: false,
+                            },
+                            args: vec![mt, this],
+                        },
+                    },
+                });
+                Ok(hir::Expr::Local(t))
+            }
+            _ => Err(CompileError::Internal("unknown CORINFO_THIS_TRANSFORM")),
+        }
+    }
+
+    /// The callvirt argument/null-check ordering spill (Runtime_121711):
+    /// ECMA-335 §III.4.2 fires the receiver's null check at call
+    /// execution — after ALL arguments evaluated. Every user argument
+    /// whose tree could fault or observe (the `spill_stack` predicate:
+    /// constants and local addresses are exempt) spills to a temp in IL
+    /// order; only then does the receiver — null check included — store
+    /// to its own temp. `args[0]` is the receiver, `arg_types` the call
+    /// signature's user-argument types.
+    fn spill_args_before_receiver_check(
+        &mut self,
+        args: &mut [hir::Expr],
+        arg_types: &[Type],
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        if args.len() != arg_types.len() + 1 {
+            return Err(CompileError::Internal(
+                "receiver check ordering: argument list does not match its signature",
+            ));
+        }
+        self.spill_stack(stmts, il_offset)?;
+        for (arg, &ty) in args[1..].iter_mut().zip(arg_types.iter()) {
+            let value = std::mem::replace(arg, hir::Expr::Const(Const::Int32(0)));
+            if matches!(value, hir::Expr::LocalAddr(_) | hir::Expr::Const(_)) {
+                *arg = value;
+                continue;
+            }
+            let tmp = self.temp(ty);
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Store { dst: tmp, value },
+            });
+            let (_, expr) = self.local_value_expr(tmp);
+            *arg = expr;
+        }
+        let t = self.temp(Type::Ref);
+        let receiver = std::mem::replace(&mut args[0], hir::Expr::Local(t));
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Store {
+                dst: t,
+                value: receiver,
+            },
+        });
+        Ok(())
+    }
+
     /// Spills a call's (already null-checked) receiver argument into a
     /// Ref temp, replacing `args[0]` with a read of the temp: a virtual
     /// dispatch references the receiver twice — as argument and inside
     /// the target computation — and the temp pins the single evaluation
-    /// (the null check included) before both. Returns the temp.
+    /// (the null check included) before both. A receiver the ordering
+    /// spill already materialized (a plain `Local`) is reused as-is.
+    /// Returns the temp.
     fn spill_receiver(
         &mut self,
         args: &mut [hir::Expr],
@@ -2547,6 +3033,9 @@ impl BlockImport<'_> {
             return Err(CompileError::BadIl("virtual dispatch without a receiver"));
         }
         self.spill_stack(stmts, il_offset)?;
+        if let hir::Expr::Local(t) = args[0] {
+            return Ok(t);
+        }
         let t = self.temp(Type::Ref);
         let receiver = std::mem::replace(&mut args[0], hir::Expr::Local(t));
         stmts.push(hir::Stmt {
@@ -2557,6 +3046,26 @@ impl BlockImport<'_> {
             },
         });
         Ok(t)
+    }
+
+    /// Whether `method` is the `RuntimeHelpers.GetMethodTable` intrinsic:
+    /// the EE's [Intrinsic] bit plus the name match (RyuJIT name-matches
+    /// it the same way, importercalls.cpp:12212) on the declaring class
+    /// `System.Runtime.CompilerServices.RuntimeHelpers`.
+    fn is_get_method_table_intrinsic(&self, method: MethodHandle) -> bool {
+        if !self.ee.is_intrinsic(method) {
+            return false;
+        }
+        if self.ee.get_method_name_from_metadata(method).as_deref() != Some("GetMethodTable") {
+            return false;
+        }
+        let class = self.ee.get_method_class(method);
+        match self.ee.get_class_name_from_metadata(class) {
+            Some((name, ns)) => {
+                name == "RuntimeHelpers" && ns.as_deref() == Some("System.Runtime.CompilerServices")
+            }
+            None => false,
+        }
     }
 
     /// The dispatch target of a `CORINFO_VIRTUALCALL_VTABLE` verdict: the
@@ -2592,8 +3101,11 @@ impl BlockImport<'_> {
     /// `embedGenericHandle` → a NativeInt expr for the handle constants
     /// the `VIRTUAL_FUNC_PTR` helper takes (RyuJIT's impTokenToHandle,
     /// importer.cpp:1276: `embed_parent` selects method vs. parent type
-    /// handle). A generic-context runtime lookup is the shared-generics
-    /// step; an indirection cell reads through the EE's frozen slot.
+    /// handle). A generic-context runtime lookup answer (shared generic
+    /// code — step_11.3C) goes through the [`Self::runtime_lookup_expr`]
+    /// emitter, seeded from our own context, exactly impTokenToHandle's
+    /// mustRestoreHandle path; a compile-time answer is the ordinary
+    /// const-lookup consumption.
     fn embed_handle_expr(
         &mut self,
         resolved: &mut ffi::CORINFO_RESOLVED_TOKEN,
@@ -2602,32 +3114,212 @@ impl BlockImport<'_> {
         let result = self
             .ee
             .embed_generic_handle(resolved, embed_parent, self.info.ftn);
-        if result.lookup.lookupKind.needsRuntimeLookup {
-            return Err(CompileError::Unsupported(
-                "non-direct call kind: generic-context runtime lookup (shared generics)",
+        self.runtime_lookup_expr(&result.lookup)
+    }
+
+    /// The class-handle query of the type-operand opcodes (step_11.3D):
+    /// RyuJIT's `impTokenToHandle`/`impParentClassTokenToHandle` pair
+    /// (importer.cpp:1276 — `embed_parent` selects the token's own class
+    /// vs. the resolved method/field's parent class). In a possibly-shared
+    /// context `resolve_token`'s `hClass` is the REPRESENTATIVE (canonical
+    /// / type-variable) handle — embedding it directly gives the wrong
+    /// runtime type identity (the Enum/shared.cs silent wrong answers);
+    /// `embed_generic_handle` is where the EE substitutes the runtime
+    /// lookup instead. The EE must answer a class handle for a class
+    /// operand (anything else is a contract violation). `must_restore`
+    /// issues the `classMustBeLoadedBeforeCodeIsRun` notification on a
+    /// compile-time answer, exactly impTokenToHandle's mustRestoreHandle
+    /// switch (importer.cpp:1293-1312).
+    fn class_handle_result(
+        &mut self,
+        resolved: &mut ffi::CORINFO_RESOLVED_TOKEN,
+        embed_parent: bool,
+        must_restore: bool,
+    ) -> CompileResult<ffi::CORINFO_GENERICHANDLE_RESULT> {
+        let result = self
+            .ee
+            .embed_generic_handle(resolved, embed_parent, self.info.ftn);
+        if result.handleType != ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_CLASS {
+            return Err(CompileError::Internal(
+                "embed_generic_handle answered a non-class handle for a class operand",
             ));
         }
-        // !needsRuntimeLookup ⇒ the constLookup union member is live
-        // (corinfo.h's CORINFO_LOOKUP contract).
-        let const_lookup = unsafe { result.lookup.__bindgen_anon_1.constLookup };
-        match const_lookup.accessType {
-            ffi::InfoAccessType_IAT_VALUE => {
-                let handle = unsafe { const_lookup.__bindgen_anon_1.handle };
-                Ok(hir::Expr::Const(Const::NativeInt(handle as isize)))
+        if must_restore && !result.lookup.lookupKind.needsRuntimeLookup {
+            if let Some(class) =
+                ClassHandle::from_raw(result.compileTimeHandle as ffi::CORINFO_CLASS_HANDLE)
+            {
+                self.ee.class_must_be_loaded_before_code_is_run(class);
             }
-            ffi::InfoAccessType_IAT_PVALUE => {
-                let cell = unsafe { const_lookup.__bindgen_anon_1.addr };
-                Ok(hir::Expr::Load {
-                    addr: Box::new(hir::Expr::Const(Const::NativeInt(cell as isize))),
+        }
+        Ok(result)
+    }
+
+    /// The [`Self::class_handle_result`] query consumed as an HIR expr:
+    /// a constant for an exact answer, the runtime-lookup sequence seeded
+    /// from our own context for a shared one.
+    fn class_handle_expr(
+        &mut self,
+        resolved: &mut ffi::CORINFO_RESOLVED_TOKEN,
+        embed_parent: bool,
+        must_restore: bool,
+    ) -> CompileResult<hir::Expr> {
+        let result = self.class_handle_result(resolved, embed_parent, must_restore)?;
+        self.runtime_lookup_expr(&result.lookup)
+    }
+
+    /// The hidden generics-context argument for a call to a
+    /// PARAMTYPE-signature callee (step_11.3B): RyuJIT's
+    /// `impGetInstParamArg` (importercalls.cpp:30-130).
+    /// `getCallInfo`'s `contextHandle` is tagged
+    /// (corinfo.h:1024-1031: CORINFO_CONTEXTFLAGS_MASK=0x01; METHOD=0x00
+    /// — an InstantiatedMethodDesc*, CLASS=0x01 — a MethodTable*). An
+    /// exact (non-runtime-lookup) context embeds as a constant with the
+    /// matching mustBeLoaded notification; a runtime-lookup context goes
+    /// through `embed_generic_handle` — `embed_parent` iff the tag is
+    /// CLASS (the impTokenToHandle vs impParentClassTokenToHandle
+    /// choice, importercalls.cpp:60-120) — and the
+    /// [`Self::runtime_lookup_expr`] emitter. `instParamLookup` is
+    /// AOT-only and never consulted.
+    fn generics_context_arg(
+        &mut self,
+        resolved: &mut ffi::CORINFO_RESOLVED_TOKEN,
+        call: &ffi::CORINFO_CALL_INFO,
+    ) -> CompileResult<hir::Expr> {
+        let raw = call.contextHandle as usize;
+        let is_class = raw & ffi::CorInfoContextFlags_CORINFO_CONTEXTFLAGS_MASK as usize
+            == ffi::CorInfoContextFlags_CORINFO_CONTEXTFLAGS_CLASS as usize;
+        if !call.exactContextNeedsRuntimeLookup {
+            let handle = raw & !(ffi::CorInfoContextFlags_CORINFO_CONTEXTFLAGS_MASK as usize);
+            if is_class {
+                let class = ClassHandle::from_raw(handle as ffi::CORINFO_CLASS_HANDLE).ok_or(
+                    CompileError::BadIl("null exact class context for a shared generic call"),
+                )?;
+                self.ee.class_must_be_loaded_before_code_is_run(class);
+            } else {
+                let method = MethodHandle::from_raw(handle as ffi::CORINFO_METHOD_HANDLE).ok_or(
+                    CompileError::BadIl("null exact method context for a shared generic call"),
+                )?;
+                self.ee.method_must_be_loaded_before_code_is_run(method);
+            }
+            return Ok(hir::Expr::Const(Const::NativeInt(handle as isize)));
+        }
+        let result = self
+            .ee
+            .embed_generic_handle(resolved, is_class, self.info.ftn);
+        self.runtime_lookup_expr(&result.lookup)
+    }
+
+    /// A `CORINFO_LOOKUP` as an HIR expr (step_11.3B): RyuJIT's
+    /// `impRuntimeLookupToTree` (importer.cpp:1599-1690). The seed is
+    /// `this` for CORINFO_LOOKUP_THISOBJ, our own hidden context
+    /// argument for METHODPARAM/CLASSPARAM (a method with neither is an
+    /// EE contract violation — the lookup cannot be seeded).
+    /// `!needsRuntimeLookup` answers take the ordinary const-lookup
+    /// consumption ([`const_lookup_expr`]).
+    ///
+    /// `testForNull` (and `CORINFO_USEHELPER`) emit ONLY the helper call
+    /// — `helper(ctx, signature)`. This is deliberate correct-if-slower:
+    /// the helper IS RyuJIT's fallback, and the importer has no
+    /// internal-branch machinery for the inline-cache-with-null-check
+    /// sequence (a later optimization).
+    fn runtime_lookup_expr(&mut self, lookup: &ffi::CORINFO_LOOKUP) -> CompileResult<hir::Expr> {
+        if !lookup.lookupKind.needsRuntimeLookup {
+            // SAFETY: !needsRuntimeLookup ⇒ the constLookup union member
+            // is live (corinfo.h's CORINFO_LOOKUP contract).
+            return const_lookup_expr(unsafe { &lookup.__bindgen_anon_1.constLookup });
+        }
+        // SAFETY: needsRuntimeLookup ⇒ the runtimeLookup union member is
+        // live (same contract).
+        let rl = unsafe { lookup.__bindgen_anon_1.runtimeLookup };
+        let ctx = match lookup.lookupKind.runtimeLookupKind {
+            ffi::CORINFO_RUNTIME_LOOKUP_KIND_CORINFO_LOOKUP_THISOBJ => {
+                if self.info.args.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS == 0 {
+                    return Err(CompileError::Internal(
+                        "THISOBJ runtime lookup in a method without `this`",
+                    ));
+                }
+                hir::Expr::Local(LocalId(0))
+            }
+            ffi::CORINFO_RUNTIME_LOOKUP_KIND_CORINFO_LOOKUP_METHODPARAM
+            | ffi::CORINFO_RUNTIME_LOOKUP_KIND_CORINFO_LOOKUP_CLASSPARAM => {
+                hir::Expr::Local(self.context_arg.ok_or(CompileError::Internal(
+                    "generic-context runtime lookup in a method without a context argument",
+                ))?)
+            }
+            _ => {
+                return Err(CompileError::Unsupported(
+                    "runtime lookup kind NOT_SUPPORTED (or unknown)",
+                ));
+            }
+        };
+        // CORINFO_USEHELPER (corinfo.h:1180): the answer only exists via
+        // the runtime helper.
+        if rl.indirections == 0xFFFF {
+            return Ok(runtime_lookup_helper_call(ctx, &rl));
+        }
+        // CORINFO_USENULL is R2R-only (the JIT never sees it).
+        if rl.indirections == 0xFFFE {
+            return Err(CompileError::Unsupported(
+                "CORINFO_USENULL runtime lookup (R2R-only)",
+            ));
+        }
+        if rl.testForNull {
+            // See the doc comment: the helper call IS the semantics.
+            return Ok(runtime_lookup_helper_call(ctx, &rl));
+        }
+        // A size check without testForNull means dynamic dictionary
+        // expansion — RyuJIT tier-0 doesn't do size checks either
+        // (importer.cpp:1624's assert).
+        if rl.sizeOffset != 0xFFFF {
+            return Err(CompileError::Unsupported(
+                "runtime lookup with dynamic dictionary expansion (sizeOffset)",
+            ));
+        }
+        // The offsets array is fixed at four (corinfo.h's
+        // CORINFO_RUNTIME_LOOKUP); more indirections is an EE contract
+        // violation.
+        if rl.indirections > 4 {
+            return Err(CompileError::Internal(
+                "runtime lookup with more than four indirections",
+            ));
+        }
+        // The slot-pointer chain (importer.cpp:1628-1664): p = ctx; per
+        // indirection a nonfaulting load and the offset add, with the
+        // indirect-first/second-offset base saved pre-deref.
+        let mut p = ctx;
+        for i in 0..rl.indirections {
+            let indirect =
+                (i == 1 && rl.indirectFirstOffset) || (i == 2 && rl.indirectSecondOffset);
+            let base = indirect.then(|| p.clone());
+            if i != 0 {
+                p = hir::Expr::Load {
+                    addr: Box::new(p),
                     offset: 0,
                     ty: Type::NativeInt,
                     access: MemAccess::Natural,
-                })
+                };
             }
-            _ => Err(CompileError::Unsupported(
-                "non-direct call kind: handle through multiple indirections",
-            )),
+            if let Some(base) = base {
+                p = binary(BinaryOp::Add, base, p);
+            }
+            if rl.offsets[i as usize] != 0 {
+                p = binary(
+                    BinaryOp::Add,
+                    p,
+                    hir::Expr::Const(Const::NativeInt(rl.offsets[i as usize] as isize)),
+                );
+            }
         }
+        if rl.indirections == 0 {
+            return Ok(p);
+        }
+        // The final dereference yields the handle itself.
+        Ok(hir::Expr::Load {
+            addr: Box::new(p),
+            offset: 0,
+            ty: Type::NativeInt,
+            access: MemAccess::Natural,
+        })
     }
 
     /// The call tail shared by `call`/`callvirt`/`calli`: the hidden
@@ -2711,6 +3403,9 @@ impl BlockImport<'_> {
             Some(ContextHandle::from_method(self.info.ftn)),
         );
         check_call_conv(sig.callConv)?;
+        // A callsite sig never carries the generics bits for a supported
+        // calli; PARAMTYPE would need the hidden context argument.
+        check_no_generics_call_conv(sig.callConv)?;
         let has_this = sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0;
         let ret = sig_elem_type(
             CorInfoType::from_raw(sig.retType()),
@@ -2777,6 +3472,9 @@ impl BlockImport<'_> {
                 "ldftn with a non-direct call kind (shared generics)",
             ));
         }
+        // The entry point of shared generic code is meaningless without
+        // the hidden context argument its body expects.
+        check_no_generics_call_conv(call.sig.callConv)?;
         let Some(method) = MethodHandle::from_raw(call.hMethod) else {
             return Err(CompileError::BadIl("ldftn token did not resolve"));
         };
@@ -2848,6 +3546,8 @@ impl BlockImport<'_> {
             ffi::CORINFO_CALL_KIND_CORINFO_CALL => {
                 // Not actually virtual: evaluate the object for its
                 // effects (the IL pushed it), then the ldftn constant.
+                // Shared generic code (PARAMTYPE) is the ldftn rule.
+                check_no_generics_call_conv(call.sig.callConv)?;
                 let Some(method) = MethodHandle::from_raw(call.hMethod) else {
                     return Err(CompileError::BadIl("ldvirtftn token did not resolve"));
                 };
@@ -3138,18 +3838,25 @@ impl BlockImport<'_> {
     /// A value-class static the EE boxes (`STATIC_IN_HEAP`) instead
     /// answers the address of the cell holding the frozen box object —
     /// the field data is one indirection plus the object header away
-    /// (importer.cpp:4417). Thread statics, shared-generic/collectible
-    /// helper accessors, indirection cells, and access callouts are all
+    /// (importer.cpp:4417). A shared-generic class's static
+    /// (`CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER`, step_11.3D)
+    /// computes its address as `helper(parent-class handle) + offset`
+    /// (importer.cpp:4199-4223), the parent handle coming through the
+    /// generic-handle path — embedding the resolved hClass directly would
+    /// name the canonical representative's statics, the same silent-wrong
+    /// family as the cast/box operands. Thread statics, the collectible
+    /// shared-static helper, indirection cells, and access callouts stay
     /// named `Unsupported` (the gates RyuJIT's `CORINFO_FLG_FIELD_STATIC`
     /// check and R2R paths also take).
     ///
-    /// Returns the field, the field's address expression, and whether the
-    /// class-init trigger fired (see [`BlockImport::maybe_init_class`]).
+    /// Returns the field, the field's address expression, and the
+    /// INITCLASS argument when the class-init trigger fired (see
+    /// [`BlockImport::maybe_init_class`]).
     fn resolve_static_field(
         &mut self,
         token: u32,
         flags: u32,
-    ) -> CompileResult<(FieldHandle, hir::Expr, bool)> {
+    ) -> CompileResult<(FieldHandle, hir::Expr, Option<hir::Expr>)> {
         let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
             t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
             t.tokenScope = self.info.args.scope;
@@ -3166,19 +3873,46 @@ impl BlockImport<'_> {
             // BADCODEs this too (importer.cpp CEE_LDSFLD).
             return Err(CompileError::BadIl("static access on an instance field"));
         }
-        match info.fieldAccessor {
+        // The GENERICS_STATIC_HELPER accessor (step_11.3D) carries its
+        // statics-base helper id; every other accepted accessor is the
+        // const-address shape.
+        let generics_base_helper = match info.fieldAccessor {
             ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_ADDRESS
-            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_RVA_ADDRESS => {}
+            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_RVA_ADDRESS => None,
             ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS
             | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS_MANAGED => {
                 return Err(CompileError::Unsupported(
                     "thread-local statics ([ThreadStatic])",
                 ));
             }
-            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_SHARED_STATIC_HELPER
-            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER => {
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER => {
+                // RyuJIT's impImportStaticFieldAddress case
+                // (importer.cpp:4199): the statics base is
+                // `helper(runtime-looked-up parent class handle)`, the
+                // field at `pFieldInfo->offset` past it. The thread-
+                // static bases are valid EE answers (importer.cpp:4207)
+                // but stay out of step-11's scope.
+                let helper = CorInfoHelpFunc::from_raw(info.helper);
+                match helper {
+                    CorInfoHelpFunc::GET_GCSTATIC_BASE | CorInfoHelpFunc::GET_NONGCSTATIC_BASE => {
+                        Some(helper)
+                    }
+                    CorInfoHelpFunc::GET_GCTHREADSTATIC_BASE
+                    | CorInfoHelpFunc::GET_NONGCTHREADSTATIC_BASE => {
+                        return Err(CompileError::Unsupported(
+                            "thread-local statics of a shared-generic class",
+                        ));
+                    }
+                    _ => {
+                        return Err(CompileError::Unsupported(
+                            "generic statics helper outside the statics-base set",
+                        ));
+                    }
+                }
+            }
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_SHARED_STATIC_HELPER => {
                 return Err(CompileError::Unsupported(
-                    "static field of a shared-generic or collectible class (helper accessor)",
+                    "static field of a collectible class (shared static helper)",
                 ));
             }
             ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_ADDR_HELPER
@@ -3192,45 +3926,75 @@ impl BlockImport<'_> {
                     "static field accessor outside the statics pack",
                 ));
             }
-        }
+        };
         if info.accessAllowed != ffi::CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ALLOWED {
             return Err(CompileError::Unsupported(
                 "static field needing an access callout",
             ));
         }
-        if info.fieldLookup.accessType != ffi::InfoAccessType_IAT_VALUE {
-            // The indirection-cell answer is the R2R shape — the
-            // ldstr/newobj policy: load+relocation plumbing tier 0
-            // doesn't have.
-            return Err(CompileError::Unsupported(
-                "static field address through an indirection cell (IAT_PVALUE/PPVALUE)",
-            ));
-        }
-        // SAFETY: IAT_VALUE's live union member is `addr`
-        // (corinfo.h's CORINFO_CONST_LOOKUP contract).
-        let addr = unsafe { info.fieldLookup.__bindgen_anon_1.addr };
-        let mut addr_expr = hir::Expr::Const(Const::NativeInt(addr as isize));
-        if info.fieldFlags & ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_STATIC_IN_HEAP != 0 {
-            // A boxed value-class static: the cell holds the frozen box
-            // object; the field data sits past the object header.
-            addr_expr = hir::Expr::FieldAddr {
-                obj: Box::new(hir::Expr::Load {
-                    addr: Box::new(addr_expr),
-                    offset: 0,
-                    ty: Type::Ref,
-                    access: MemAccess::Natural,
-                }),
-                field,
-                offset: 8, // TARGET_POINTER_SIZE
-            };
-        }
+        // The field's address expression, plus — for the generics-helper
+        // shape — the parent class handle (which doubles as the INITCLASS
+        // argument if the cctor trigger fires: impInitClass's
+        // impParentClassTokenToHandle, importer.cpp:3908).
+        let (addr_expr, init_handle) = match generics_base_helper {
+            Some(helper) => {
+                let parent = self.class_handle_expr(&mut resolved, true, true)?;
+                let base = hir::Expr::Call {
+                    target: CallTarget::Helper(helper),
+                    sig: CallSig {
+                        ret: Type::ByRef,
+                        args: vec![Type::NativeInt],
+                        has_this: false,
+                    },
+                    args: vec![parent.clone()],
+                };
+                (
+                    binary(
+                        BinaryOp::Add,
+                        base,
+                        hir::Expr::Const(Const::NativeInt(info.offset as isize)),
+                    ),
+                    Some(parent),
+                )
+            }
+            None => {
+                if info.fieldLookup.accessType != ffi::InfoAccessType_IAT_VALUE {
+                    // The indirection-cell answer is the R2R shape — the
+                    // ldstr/newobj policy: load+relocation plumbing tier 0
+                    // doesn't have.
+                    return Err(CompileError::Unsupported(
+                        "static field address through an indirection cell (IAT_PVALUE/PPVALUE)",
+                    ));
+                }
+                // SAFETY: IAT_VALUE's live union member is `addr`
+                // (corinfo.h's CORINFO_CONST_LOOKUP contract).
+                let addr = unsafe { info.fieldLookup.__bindgen_anon_1.addr };
+                let mut addr_expr = hir::Expr::Const(Const::NativeInt(addr as isize));
+                if info.fieldFlags & ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_STATIC_IN_HEAP != 0
+                {
+                    // A boxed value-class static: the cell holds the frozen box
+                    // object; the field data sits past the object header.
+                    addr_expr = hir::Expr::FieldAddr {
+                        obj: Box::new(hir::Expr::Load {
+                            addr: Box::new(addr_expr),
+                            offset: 0,
+                            ty: Type::Ref,
+                            access: MemAccess::Natural,
+                        }),
+                        field,
+                        offset: 8, // TARGET_POINTER_SIZE
+                    };
+                }
+                (addr_expr, None)
+            }
+        };
         // The class-init trigger (the semantic core of the pack):
         // getFieldInfo's INITCLASS flag says the class is not yet inited;
         // initClass then decides — queried exactly as RyuJIT's
         // impInitClass does (importer.cpp:3897): the field, the method
         // being compiled, and the *method* context (an untagged or
         // class-tagged context here would crash the EE).
-        let mut needs_init = false;
+        let mut init_arg = None;
         if info.fieldFlags & ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_INITCLASS != 0 {
             let init = self.ee.init_class(
                 Some(field),
@@ -3238,26 +4002,32 @@ impl BlockImport<'_> {
                 ContextHandle::from_method(self.info.ftn),
             );
             // DONT_INLINE is an inlining hint; we never inline.
-            needs_init = init.contains(CorInfoInitClassResult::USE_HELPER);
+            if init.contains(CorInfoInitClassResult::USE_HELPER) {
+                init_arg = Some(match init_handle {
+                    // Shared-generic class: the runtime-looked-up parent
+                    // handle (impInitClass's runtimeLookup branch).
+                    Some(parent) => parent,
+                    // Exact class: the owning class's raw MethodTable*
+                    // constant (the newobj embedding rule).
+                    None => self.embed_class_const(self.ee.get_field_class(field))?,
+                });
+            }
         }
-        Ok((field, addr_expr, needs_init))
+        Ok((field, addr_expr, init_arg))
     }
 
     /// Emits the static-constructor trigger (`CORINFO_HELP_INITCLASS` of
-    /// the field's owning class, embedded as a raw `NativeInt` constant —
-    /// the newobj emission's exact shape) when the `init_class` verdict
-    /// asked for a helper.
+    /// the field's owning class — a raw `NativeInt` constant for an exact
+    /// class, the runtime-looked-up parent handle for a shared-generic
+    /// one) when the `init_class` verdict asked for a helper (the
+    /// `Some` form of [`BlockImport::resolve_static_field`]'s answer).
     fn maybe_init_class(
         &mut self,
-        field: FieldHandle,
-        needs_init: bool,
+        init_arg: Option<hir::Expr>,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
-    ) -> CompileResult<()> {
-        if !needs_init {
-            return Ok(());
-        }
-        let owner = self.ee.get_field_class(field);
+    ) {
+        let Some(arg) = init_arg else { return };
         stmts.push(hir::Stmt {
             il_offset,
             kind: hir::StmtKind::Eval(hir::Expr::Call {
@@ -3267,10 +4037,9 @@ impl BlockImport<'_> {
                     args: vec![Type::NativeInt],
                     has_this: false,
                 },
-                args: vec![self.embed_class_const(owner)?],
+                args: vec![arg],
             }),
         });
-        Ok(())
     }
 
     /// `ldsfld` (0x7E): a load through the field's static address. Pending
@@ -3285,11 +4054,11 @@ impl BlockImport<'_> {
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let (field, addr, needs_init) =
+        let (field, addr, init_arg) =
             self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_GET)?;
         let (ty, access) = self.field_mem_type(field)?;
         self.spill_stack(stmts, il_offset)?;
-        self.maybe_init_class(field, needs_init, stmts, il_offset)?;
+        self.maybe_init_class(init_arg, stmts, il_offset);
         if let Type::Struct(class) = ty {
             return self.push(
                 ty,
@@ -3318,10 +4087,10 @@ impl BlockImport<'_> {
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let (field, addr, needs_init) =
+        let (_field, addr, init_arg) =
             self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_ADDRESS)?;
         self.spill_stack(stmts, il_offset)?;
-        self.maybe_init_class(field, needs_init, stmts, il_offset)?;
+        self.maybe_init_class(init_arg, stmts, il_offset);
         self.push(Type::ByRef, addr)
     }
 
@@ -3340,7 +4109,7 @@ impl BlockImport<'_> {
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let (field, addr, needs_init) =
+        let (field, addr, init_arg) =
             self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_SET)?;
         let (ty, access) = self.field_mem_type(field)?;
         let (vt, value) = self.pop()?;
@@ -3348,7 +4117,7 @@ impl BlockImport<'_> {
             return Err(CompileError::BadIl("stsfld value type mismatch"));
         }
         self.spill_stack(stmts, il_offset)?;
-        let value = if needs_init {
+        let value = if init_arg.is_some() {
             let t = self.temp(ty);
             stmts.push(hir::Stmt {
                 il_offset,
@@ -3358,7 +4127,7 @@ impl BlockImport<'_> {
         } else {
             value
         };
-        self.maybe_init_class(field, needs_init, stmts, il_offset)?;
+        self.maybe_init_class(init_arg, stmts, il_offset);
         if let Type::Struct(class) = ty {
             return self.store_struct_through(addr, class, value, stmts, il_offset);
         }
@@ -3557,10 +4326,37 @@ impl BlockImport<'_> {
         Ok(())
     }
 
-    /// `ldobj` (0x71): the struct value at the address.
+    /// The scalar cell shape of a value class whose CorInfoType is a
+    /// primitive rather than VALUECLASS — IntPtr/UIntPtr and enums
+    /// (RyuJIT's `TypeHandleToVarType` maps them to the scalar type, so
+    /// `ldobj`/`stobj`/`initobj`/`cpobj` over them are the plain typed
+    /// memory ops, importer.cpp:11098's `lclTyp != TYP_STRUCT` tail). This
+    /// is the same normalization the field pack applies in
+    /// `field_mem_type`; without it `stobj !!T` over `T = IntPtr` mismatches
+    /// the NativeInt an `ldfld` of the field produced (found by
+    /// GenericCache's TryGet re-JIT in enumerablecloning.cs). `None` for
+    /// a true struct (VALUECLASS, or a type corinfo_mem_type doesn't
+    /// map — e.g. RefAny, which keeps the struct path).
+    fn scalar_value_class_cell(&mut self, class: ClassHandle) -> Option<(Type, MemAccess)> {
+        corinfo_mem_type(self.ee.as_cor_info_type(class)).ok()
+    }
+
+    /// `ldobj` (0x71): the struct value at the address — or, for a
+    /// primitive-typed value class, the scalar cell load.
     fn ldobj(&mut self, token: u32) -> CompileResult<()> {
         let class = self.resolve_value_class(token)?;
         let addr = self.pop_struct_addr()?;
+        if let Some((ty, access)) = self.scalar_value_class_cell(class) {
+            return self.push(
+                ty,
+                hir::Expr::Load {
+                    addr: Box::new(addr),
+                    offset: 0,
+                    ty,
+                    access,
+                },
+            );
+        }
         self.push(
             Type::Struct(class),
             hir::Expr::StructVal {
@@ -3570,7 +4366,8 @@ impl BlockImport<'_> {
         )
     }
 
-    /// `stobj` (0x81): the struct value stores through the address.
+    /// `stobj` (0x81): the struct value stores through the address — or,
+    /// for a primitive-typed value class, the scalar cell store.
     fn stobj(
         &mut self,
         token: u32,
@@ -3578,6 +4375,24 @@ impl BlockImport<'_> {
         il_offset: IlOffset,
     ) -> CompileResult<()> {
         let class = self.resolve_value_class(token)?;
+        if let Some((ty, access)) = self.scalar_value_class_cell(class) {
+            let (vt, value) = self.pop()?;
+            if vt != ty {
+                return Err(CompileError::BadIl("stobj value type mismatch"));
+            }
+            let addr = self.pop_struct_addr()?;
+            self.spill_stack(stmts, il_offset)?;
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::StoreInd {
+                    addr,
+                    offset: 0,
+                    value,
+                    access,
+                },
+            });
+            return Ok(());
+        }
         let (vt, value) = self.pop()?;
         if vt != Type::Struct(class) {
             return Err(CompileError::BadIl("stobj value type mismatch"));
@@ -3588,7 +4403,8 @@ impl BlockImport<'_> {
     }
 
     /// `cpobj` (0x70): struct copy from the source address to the
-    /// destination address.
+    /// destination address — a scalar load+store for a primitive-typed
+    /// value class (the same `TypeHandleToVarType` normalization).
     fn cpobj(
         &mut self,
         token: u32,
@@ -3599,6 +4415,23 @@ impl BlockImport<'_> {
         let src = self.pop_struct_addr()?;
         let dst = self.pop_struct_addr()?;
         self.spill_stack(stmts, il_offset)?;
+        if let Some((ty, access)) = self.scalar_value_class_cell(class) {
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::StoreInd {
+                    addr: dst,
+                    offset: 0,
+                    value: hir::Expr::Load {
+                        addr: Box::new(src),
+                        offset: 0,
+                        ty,
+                        access,
+                    },
+                    access,
+                },
+            });
+            return Ok(());
+        }
         self.store_struct_through(
             dst,
             class,
@@ -3611,7 +4444,9 @@ impl BlockImport<'_> {
         )
     }
 
-    /// `initobj` (0xFE 15): zero-init the slot at the address.
+    /// `initobj` (0xFE 15): zero-init the slot at the address — a block
+    /// zero for a true struct, the scalar zero store for a primitive-typed
+    /// value class (importer.cpp:11098's `lclTyp != TYP_STRUCT` tail).
     fn initobj(
         &mut self,
         token: u32,
@@ -3621,6 +4456,26 @@ impl BlockImport<'_> {
         let class = self.resolve_value_class(token)?;
         let addr = self.pop_struct_addr()?;
         self.spill_stack(stmts, il_offset)?;
+        if let Some((ty, access)) = self.scalar_value_class_cell(class) {
+            let zero = match ty {
+                Type::Int32 => Const::Int32(0),
+                Type::Int64 => Const::Int64(0),
+                Type::NativeInt => Const::NativeInt(0),
+                Type::Float => Const::Float(0.0),
+                Type::Double => Const::Double(0.0),
+                _ => return Err(CompileError::Unsupported("initobj of a reference cell")),
+            };
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::StoreInd {
+                    addr,
+                    offset: 0,
+                    value: hir::Expr::Const(zero),
+                    access,
+                },
+            });
+            return Ok(());
+        }
         stmts.push(hir::Stmt {
             il_offset,
             kind: hir::StmtKind::BlockZero { addr, class },
@@ -3632,9 +4487,10 @@ impl BlockImport<'_> {
     /// (the `CORINFO_HELP_NEWFAST`/`NEWSFAST` families — the
     /// single-argument `(MethodTable*) -> Object*` forms), then run the
     /// constructor as a direct call on the fresh object, and push the
-    /// object. The class
-    /// handle is embedded as a raw `NativeInt` constant: a MethodTable* is
-    /// not an object reference and must never be GC-rooted as one.
+    /// object. The class handle embeds through the generic-handle path
+    /// (a MethodTable* is not an object reference and must never be
+    /// GC-rooted as one; in shared generic code it is the runtime lookup,
+    /// not a constant).
     fn newobj(
         &mut self,
         token: u32,
@@ -3672,17 +4528,27 @@ impl BlockImport<'_> {
         let context = ContextHandle::from_class(class);
         let init = self.ee.init_class(None, Some(self.info.ftn), context);
 
-        // The class's MethodTable* operand, embedded directly; an
-        // indirection cell (R2R-style) needs load/reloc plumbing tier 0
-        // doesn't have. The reference path passes it to the allocation
-        // helper; both paths pass it to INITCLASS when a cctor runs.
-        let (embedded, indirection) = self.ee.embed_class_handle(class);
-        let (Some(embedded), None) = (embedded, indirection) else {
+        // The class's MethodTable* operand: the parent-handle embed of
+        // the (constructor-method) resolved token — gtNewAllocObjNode's
+        // `useParent = true` shape (importer.cpp:9176) — through the
+        // generic-handle path, so a `new MyGen<T>()` in shared generic
+        // code allocates the runtime-looked-up type, not the canonical
+        // representative the raw `resolved.hClass` would name
+        // (step_11.3D — the same silent-wrong family as the cast fix).
+        // The reference path passes it to the allocation helper; both
+        // paths pass it to INITCLASS when a cctor runs.
+        let class_handle = self.class_handle_result(&mut resolved, true, true)?;
+        if is_value_class && class_handle.lookup.lookupKind.needsRuntimeLookup {
+            // A shared-generic VALUE class: the in-place construction
+            // below needs the exact layout, which the canonical
+            // representative doesn't carry. (Reference-type layout is
+            // uniform across the instantiations a shared body serves.)
             return Err(CompileError::Unsupported(
-                "class handle through an indirection cell",
+                "newobj of a shared-generic value class",
             ));
-        };
-        let class_const = || hir::Expr::Const(Const::NativeInt(embedded.as_raw() as isize));
+        }
+        let class_expr = self.runtime_lookup_expr(&class_handle.lookup)?;
+        let class_const = || class_expr.clone();
 
         // Pending stack trees (the constructor arguments included) must
         // evaluate before the allocation side effects.
@@ -3776,6 +4642,9 @@ impl BlockImport<'_> {
             return Err(CompileError::Unsupported("non-direct call kind"));
         }
         check_call_conv(call.sig.callConv)?;
+        // A generic-type ctor is an instance method (the context arrives
+        // via `this`); PARAMTYPE here would mean phase-C material.
+        check_no_generics_call_conv(call.sig.callConv)?;
         if call.sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS == 0 {
             return Err(CompileError::BadIl("newobj on a static method"));
         }
@@ -3883,17 +4752,21 @@ impl BlockImport<'_> {
     /// the type test. `castclass` failure raises `InvalidCastException`
     /// from the helper's own throwing path; nothing is open-coded.
     fn cast(&mut self, token: u32, throwing: bool) -> CompileResult<()> {
-        let (resolved, class) =
+        let (mut resolved, _class) =
             self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Casting)?;
-        self.cast_from_resolved(&resolved, class, throwing)
+        self.cast_from_resolved(&mut resolved, throwing)
     }
 
     /// The cast helper call on an already-resolved token; also the
-    /// non-value-class tail of `unbox.any` (the throwing form).
+    /// non-value-class tail of `unbox.any` (the throwing form). The class
+    /// handle comes from the generic-handle path (importer.cpp:11024's
+    /// `impTokenToHandle`, embed_parent=false, no mustRestoreHandle) — in
+    /// shared generic code the resolved hClass is the inexact
+    /// representative and only the runtime lookup names the real type
+    /// (step_11.3D; Enum/shared.cs's silent wrong answer).
     fn cast_from_resolved(
         &mut self,
-        resolved: &ffi::CORINFO_RESOLVED_TOKEN,
-        class: ClassHandle,
+        resolved: &mut ffi::CORINFO_RESOLVED_TOKEN,
         throwing: bool,
     ) -> CompileResult<()> {
         let helper = self.ee.get_casting_helper(resolved, throwing);
@@ -3912,7 +4785,7 @@ impl BlockImport<'_> {
                 "casting helper outside the isinst/castclass set",
             ));
         }
-        let mt = self.embed_class_const(class)?;
+        let mt = self.class_handle_expr(resolved, false, false)?;
         let obj = self.pop_object()?;
         self.push(
             Type::Ref,
@@ -3932,19 +4805,26 @@ impl BlockImport<'_> {
     /// `BOX` helper — `CastHelpers.Box(MethodTable*, ref byte)` —
     /// never an inline allocate/copy sequence (tier 0: correct helper
     /// selection, not reimplemented boxing). Boxing a non-value class is
-    /// the ECMA-335 no-op form (the reference passes through). The class
-    /// passed to the helper is `getTypeForBox`'s answer (boxing
-    /// `Nullable<T>` produces a boxed `T`).
+    /// the ECMA-335 no-op form (the reference passes through) — and a
+    /// generic type parameter resolves to a type-variable handle, which
+    /// the EE answers `isValueClass == false` for (importer.cpp:10907's
+    /// `eeIsValueClass` NOP: the shared body only serves reference-type
+    /// instantiations). The MethodTable* operand comes from the
+    /// generic-handle path (impImportAndPushBox's helper form,
+    /// importer.cpp:3782's `impTokenToHandle` with mustRestoreHandle) —
+    /// `getTypeForBox` differs from the resolved class only for
+    /// `Nullable<T>`, which is gated below.
     fn box_(
         &mut self,
         token: u32,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let (_resolved, class) =
+        let (mut resolved, class) =
             self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Box)?;
         if !self.ee.is_value_class(class) {
-            // `box` of a reference type is a NOP (importer.cpp CEE_BOX).
+            // `box` of a reference type or type parameter is a NOP
+            // (importer.cpp CEE_BOX).
             let (ty, value) = self.pop()?;
             if ty != Type::Ref {
                 return Err(CompileError::BadIl("box operand type mismatch"));
@@ -3961,8 +4841,7 @@ impl BlockImport<'_> {
                 return Err(CompileError::Unsupported("box helper outside the box set"));
             }
         }
-        let boxed = self.ee.get_type_for_box(class);
-        let mt = self.embed_class_const(boxed)?;
+        let mt = self.class_handle_expr(&mut resolved, false, true)?;
 
         // The box operand pops first; the remaining pending stack trees
         // then spill (IL order: they were produced before the operand),
@@ -4016,8 +4895,15 @@ impl BlockImport<'_> {
     /// helper both checks the type (NullReferenceException /
     /// InvalidCastException from its own throwing paths) and computes the
     /// payload address, so the boxed-value layout offset is never
-    /// materialized JIT-side.
-    fn unbox_payload_call(&mut self, class: ClassHandle) -> CompileResult<hir::Expr> {
+    /// materialized JIT-side. The MethodTable* operand goes through the
+    /// generic-handle path (importer.cpp:10669's `impTokenToHandle`,
+    /// mustRestoreHandle): in shared generic code the resolved hClass is
+    /// the inexact representative (step_11.3D).
+    fn unbox_payload_call(
+        &mut self,
+        resolved: &mut ffi::CORINFO_RESOLVED_TOKEN,
+        class: ClassHandle,
+    ) -> CompileResult<hir::Expr> {
         let helper = self.ee.get_un_box_helper(class);
         match helper {
             CorInfoHelpFunc::UNBOX => {}
@@ -4030,7 +4916,7 @@ impl BlockImport<'_> {
                 ));
             }
         }
-        let mt = self.embed_class_const(class)?;
+        let mt = self.class_handle_expr(resolved, false, true)?;
         let obj = self.pop_object()?;
         Ok(hir::Expr::Call {
             target: CallTarget::Helper(CorInfoHelpFunc::UNBOX),
@@ -4048,29 +4934,34 @@ impl BlockImport<'_> {
     /// slot — reported in the GC slot table with the interior flag
     /// (step_10.3/10.4's untracked-root mechanism), which both keeps the
     /// box alive and re-bases the pointer if the GC moves it.
+    ///
+    /// A type-parameter operand (ECMA-335 §III.4.32 allows one) resolves
+    /// to a type-variable handle: not a value class, and RyuJIT takes no
+    /// special path either — the UNBOX helper with the runtime-looked-up
+    /// handle answers it (a reference-type payload address IS the object
+    /// reference).
     fn unbox(&mut self, token: u32) -> CompileResult<()> {
-        let (_resolved, class) =
+        let (mut resolved, class) =
             self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
-        if !self.ee.is_value_class(class) {
-            return Err(CompileError::BadIl("unbox of a non-value class"));
-        }
-        let payload = self.unbox_payload_call(class)?;
+        let payload = self.unbox_payload_call(&mut resolved, class)?;
         self.push(Type::ByRef, payload)
     }
 
     /// `unbox.any` (0xA5): for a value class, `unbox` followed by the
     /// `ldobj` read of the payload (the struct copy semantics of
     /// step_10.9 apply through `StructVal`); for anything else it is
-    /// exactly `castclass` (importer.cpp CEE_UNBOX_ANY).
+    /// exactly `castclass` (importer.cpp CEE_UNBOX_ANY's goto CASTCLASS)
+    /// — including a type parameter, whose shared body only serves
+    /// reference-type instantiations.
     fn unbox_any(&mut self, token: u32) -> CompileResult<()> {
-        let (resolved, class) =
+        let (mut resolved, class) =
             self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
         if !self.ee.is_value_class(class) {
-            return self.cast_from_resolved(&resolved, class, true);
+            return self.cast_from_resolved(&mut resolved, true);
         }
         let raw = self.ee.as_cor_info_type(class);
         let ty = sig_elem_type(Some(raw), Some(class), self.ee, &mut self.struct_layouts)?;
-        let payload = self.unbox_payload_call(class)?;
+        let payload = self.unbox_payload_call(&mut resolved, class)?;
         if let Type::Struct(class) = ty {
             self.push(
                 ty,
@@ -4099,10 +4990,12 @@ impl BlockImport<'_> {
 
     /// `newarr` (0x8D): allocate a 1-D zero-based array through the EE's
     /// `getNewArrHelper` — the two-argument `(MethodTable*, INT_PTR
-    /// element_count) -> Object*` forms. The class handle embeds as a raw
-    /// `NativeInt` constant (the newobj rule: a MethodTable* is never
-    /// GC-rooted as a reference). The helper zero-initializes; a negative
-    /// length zero-extends to a huge count and the helper throws
+    /// element_count) -> Object*` forms. The array class handle comes from
+    /// the generic-handle path (importer.cpp:10143's `impTokenToHandle`
+    /// with mustRestoreHandle): a `newarr T[]` over a type parameter in
+    /// shared code gets the runtime-looked-up array MethodTable, not the
+    /// inexact representative (step_11.3D). The helper zero-initializes; a
+    /// negative length zero-extends to a huge count and the helper throws
     /// `OverflowException` (RyuJIT's answer to the same shape).
     fn newarr(
         &mut self,
@@ -4146,7 +5039,7 @@ impl BlockImport<'_> {
                 "newarr length must be int32 or native int",
             ));
         }
-        let mt = self.embed_class_const(class)?;
+        let mt = self.class_handle_expr(&mut resolved, false, true)?;
         self.spill_stack(stmts, il_offset)?;
         let len = self.index_native(lt, len);
         self.push(
@@ -4298,14 +5191,14 @@ impl BlockImport<'_> {
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let (elem, elem_class) = self.elem_kind_of(token)?;
+        let (elem, _elem_class, mut resolved) = self.elem_kind_of(token)?;
         match elem {
             ElemKind::Cell(Type::Ref, _, _) => {
                 let (it, index) = self.pop_index()?;
                 let array = self.pop_array()?;
                 self.spill_stack(stmts, il_offset)?;
                 let index = self.index_native(it, index);
-                let elem_ty = self.embed_class_const(elem_class)?;
+                let elem_ty = self.class_handle_expr(&mut resolved, false, true)?;
                 self.push(
                     Type::ByRef,
                     hir::Expr::Call {
@@ -4338,10 +5231,16 @@ impl BlockImport<'_> {
     /// `asCorInfoType`. A value class is a struct element (the layout
     /// registers into the side table); a reference type is exactly the
     /// `*.ref` fixed form (RyuJIT does the same); anything else maps
-    /// through the stored-cell table. The class handle comes along:
-    /// `ldelema`-of-ref passes it to the LDELEMA_REF helper.
-    fn elem_kind_of(&mut self, token: u32) -> CompileResult<(ElemKind, ClassHandle)> {
-        let (_resolved, class) =
+    /// through the stored-cell table. The resolved token comes along:
+    /// `ldelema`-of-ref's LDELEMA_REF helper takes the element class
+    /// handle through the generic-handle path (step_11.3D — `ldelema T`
+    /// over a type parameter in shared code needs the runtime lookup,
+    /// not the inexact representative).
+    fn elem_kind_of(
+        &mut self,
+        token: u32,
+    ) -> CompileResult<(ElemKind, ClassHandle, ffi::CORINFO_RESOLVED_TOKEN)> {
+        let (resolved, class) =
             self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
         let raw = self.ee.as_cor_info_type(class);
         if raw == CorInfoType::ValueClass {
@@ -4351,7 +5250,7 @@ impl BlockImport<'_> {
                     "a value-class element is always a struct",
                 ));
             };
-            return Ok((ElemKind::Struct(struct_class), class));
+            return Ok((ElemKind::Struct(struct_class), class, resolved));
         }
         let (ty, access) = corinfo_mem_type(raw)
             .map_err(|_| CompileError::Unsupported("array element type outside the array pack"))?;
@@ -4359,7 +5258,7 @@ impl BlockImport<'_> {
             Some(n) => u32::from(n),
             None => natural_cell_size(ty),
         };
-        Ok((ElemKind::Cell(ty, access, elem_size), class))
+        Ok((ElemKind::Cell(ty, access, elem_size), class, resolved))
     }
 
     /// The shared core of the bounds-checked element accesses: pops the
@@ -4578,12 +5477,22 @@ impl BlockImport<'_> {
                     )?;
                 }
                 Op::Conv(kind) => self.conv(kind)?,
-                Op::Call(token) => {
-                    self.call(token, CallInfoFlags::EMPTY, false, &mut stmts, il_offset)?
-                }
-                Op::CallVirt(token) => {
-                    self.call(token, CallInfoFlags::CALLVIRT, true, &mut stmts, il_offset)?
-                }
+                Op::Call { token, constrained } => self.call(
+                    token,
+                    CallInfoFlags::EMPTY,
+                    false,
+                    constrained,
+                    &mut stmts,
+                    il_offset,
+                )?,
+                Op::CallVirt { token, constrained } => self.call(
+                    token,
+                    CallInfoFlags::CALLVIRT,
+                    true,
+                    constrained,
+                    &mut stmts,
+                    il_offset,
+                )?,
                 Op::CallI(token) => self.calli(token, &mut stmts, il_offset)?,
                 Op::LdFtn(token) => self.ldftn(token)?,
                 Op::LdVirtFtn(token) => self.ldvirtftn(token, &mut stmts, il_offset)?,
@@ -4610,14 +5519,14 @@ impl BlockImport<'_> {
                     self.ldelem(ElemKind::Cell(ty, access, size), &mut stmts, il_offset)?
                 }
                 Op::LdElem(token) => {
-                    let (elem, _) = self.elem_kind_of(token)?;
+                    let (elem, ..) = self.elem_kind_of(token)?;
                     self.ldelem(elem, &mut stmts, il_offset)?
                 }
                 Op::StElemK(ty, access, size) => {
                     self.stelem(ElemKind::Cell(ty, access, size), &mut stmts, il_offset)?
                 }
                 Op::StElem(token) => {
-                    let (elem, _) = self.elem_kind_of(token)?;
+                    let (elem, ..) = self.elem_kind_of(token)?;
                     self.stelem(elem, &mut stmts, il_offset)?
                 }
                 Op::LdInd(ty, access) => self.ldind(ty, access)?,
@@ -4755,6 +5664,8 @@ mod tests {
             max_stack,
             eh_count,
             init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
             args: ee.make_method_sig(entry),
             locals: ee.make_locals_sig(locals),
         };
@@ -6629,27 +7540,35 @@ mod tests {
     }
 
     #[test]
-    fn ldtoken_rejection_forms_are_named_unsupported() {
+    fn ldtoken_indirection_cell_loads_through_the_cell() {
+        // IAT_PVALUE: the handle is a load through the EE's cell (the
+        // const-lookup consumption, step_07's embedding policy); the
+        // conversion helper wraps it as usual.
         let il = [0xD0, 0x07, 0x00, 0x00, 0x02, 0x26, 0x16, 0x2A];
-        // A generic-context runtime lookup is the shared-generics step.
-        let (mut ee, info) = ldtoken_fixture(&il);
-        let cls = ee.add_class(16, 8, &[], None);
-        ee.class_tokens.insert(LDTYPE_TOKEN, cls);
-        ee.embed_runtime_lookup = true;
-        let err = import(&info, &ee).err().expect("rejected");
-        assert!(
-            matches!(err, CompileError::Unsupported(m) if m.contains("generic-context runtime lookup"))
-        );
-
-        // An indirection cell needs load/reloc plumbing tier 0 lacks.
         let (mut ee, info) = ldtoken_fixture(&il);
         let cls = ee.add_class(16, 8, &[], None);
         ee.class_tokens.insert(LDTYPE_TOKEN, cls);
         ee.embed_indirection = true;
-        let err = import(&info, &ee).err().expect("rejected");
-        assert!(matches!(err, CompileError::Unsupported(m) if m.contains("indirection cell")));
+        let m = import(&info, &ee).expect("imports");
+        let (_, _, args) = ldtoken_eval(&m);
+        let hir::Expr::Load {
+            addr,
+            offset: 0,
+            ty: Type::NativeInt,
+            ..
+        } = &args[0]
+        else {
+            panic!("expected the load through the handle cell")
+        };
+        assert!(
+            matches!(&**addr, hir::Expr::Const(Const::NativeInt(v)) if *v == (0x7A7A_0000usize + LDTYPE_TOKEN as usize) as isize)
+        );
+    }
 
+    #[test]
+    fn ldtoken_of_an_unresolvable_token_is_bad_il() {
         // No resolved handles at all is bad IL.
+        let il = [0xD0, 0x07, 0x00, 0x00, 0x02, 0x26, 0x16, 0x2A];
         let (mut ee, info) = ldtoken_fixture(&il);
         ee.token_type_class = None;
         let err = import(&info, &ee).err().expect("rejected");
@@ -6954,15 +7873,24 @@ mod tests {
 
     #[test]
     fn callvirt_null_checks_this_and_passes_callvirt() {
-        // ldarg.0 (this); ldarg.1; callvirt int inst(int); ret.
+        // ldarg.0 (this); ldarg.1; callvirt int inst(int); ret. The
+        // ordering spill (Runtime_121711): the user arg's temp store runs
+        // BEFORE the receiver's null-checked temp store; the call reads
+        // the two temps.
         let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
         let (ee, info) = object_fixture(&il);
         let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "arg spill, then the receiver store");
+        let (arg_t, arg_v) = store(&stmts[0]);
+        assert_eq!(as_local(arg_v), LocalId(1));
+        let (this_t, this_v) = store(&stmts[1]);
+        assert_eq!(as_local(as_null_check(this_v)), LocalId(0));
         let (sig, args) = as_call(return_value(&m, 0));
         assert!(sig.has_this);
         assert_eq!(args.len(), 2);
-        assert_eq!(as_local(as_null_check(&args[0])), LocalId(0));
-        assert_eq!(as_local(&args[1]), LocalId(1));
+        assert_eq!(as_local(&args[0]), this_t);
+        assert_eq!(as_local(&args[1]), arg_t);
         assert_eq!(
             ee.call_info_flags.borrow().as_slice(),
             [CallInfoFlags::CALLVIRT]
@@ -6988,26 +7916,56 @@ mod tests {
         let (ee, info) = object_fixture(&il);
         assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
 
-        // A code-pointer verdict (shared generics) stays out (step_10.12:
-        // the vtable and helper verdicts are handled below).
+        // A code-pointer verdict (shared generics, step_11.3B): an
+        // indirect call through the entryPointLookup — the target is an
+        // instantiating stub with the uniform calling convention (no
+        // hidden context param; importercalls.cpp:757's assert), the
+        // receiver still null-checked for callvirt.
         let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
         let (mut ee, info) = object_fixture(&il);
         ee.call_kinds
             .insert(INST_TOKEN, ffi::CORINFO_CALL_KIND_CORINFO_CALL_CODE_POINTER);
-        assert!(matches!(
-            import(&info, &ee),
-            Err(CompileError::Unsupported(_))
-        ));
+        let mut lookup: ffi::CORINFO_LOOKUP = unsafe { std::mem::zeroed() };
+        let mut const_lookup: ffi::CORINFO_CONST_LOOKUP = unsafe { std::mem::zeroed() };
+        const_lookup.accessType = ffi::InfoAccessType_IAT_VALUE;
+        const_lookup.__bindgen_anon_1.handle = 0x1C0DE as ffi::CORINFO_GENERIC_HANDLE;
+        lookup.__bindgen_anon_1.constLookup = const_lookup;
+        ee.call_code_pointer_lookups.insert(INST_TOKEN, lookup);
+        let m = import(&info, &ee).expect("a code-pointer verdict imports");
+        let t_this = spilled_receiver(&m);
+        match return_value(&m, 0) {
+            hir::Expr::Call { target, args, .. } => {
+                match target {
+                    CallTarget::Indirect(addr) => {
+                        assert_eq!(as_isize(addr), 0x1C0DE, "the entryPointLookup constant")
+                    }
+                    _ => panic!("expected an indirect call through the code pointer"),
+                }
+                assert_eq!(as_local(&args[0]), t_this);
+            }
+            _ => panic!("expected the call as the return value"),
+        }
     }
 
     // --- step_10.12: vtable/interface dispatch, ldftn/ldvirtftn, calli ---
 
-    /// The receiver temp a virtual call spills: asserts the store of the
-    /// null-checked `ldarg.0` and returns the temp.
+    /// The receiver temp a virtual call spills: finds the store of the
+    /// null-checked `ldarg.0` (after the ordering spill's arg temp stores,
+    /// Runtime_121711) and returns the temp.
     fn spilled_receiver(m: &hir::Method) -> LocalId {
-        let (dst, value) = store(&m.blocks[0].stmts[0]);
-        assert_eq!(as_local(as_null_check(value)), LocalId(0));
-        dst
+        m.blocks[0]
+            .stmts
+            .iter()
+            .find_map(|s| match &s.kind {
+                hir::StmtKind::Store { dst, value }
+                    if matches!(value, hir::Expr::NullCheck { .. }) =>
+                {
+                    assert_eq!(as_local(as_null_check(value)), LocalId(0));
+                    Some(*dst)
+                }
+                _ => None,
+            })
+            .expect("the null-checked receiver store")
     }
 
     #[test]
@@ -7023,7 +7981,10 @@ mod tests {
             panic!("expected Expr::Call")
         };
         assert_eq!(as_local(&args[0]), t_this);
-        assert_eq!(as_local(&args[1]), LocalId(1));
+        // The user arg reads its spilled temp (the Runtime_121711
+        // ordering spill), not the IL arg directly.
+        let (arg_t, _) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(as_local(&args[1]), arg_t);
         let CallTarget::Indirect(target) = target else {
             panic!("expected an indirect target")
         };
@@ -7147,17 +8108,51 @@ mod tests {
         }
     }
 
+    /// The post-11.3C form of the stub-fallback runtime-lookup gate: the
+    /// VIRTUAL_FUNC_PTR fallback's handle embeddings take the
+    /// runtime-lookup emitter (impTokenToHandle's mustRestoreHandle path)
+    /// instead of rejecting — generic interface/virtual calls in shared
+    /// code import. (The pre-C pin asserted Unsupported.)
     #[test]
-    fn callvirt_stub_kind_with_a_runtime_lookup_is_generics() {
+    fn callvirt_stub_kind_with_a_runtime_lookup_uses_the_lookup_emitter() {
         let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
         let (mut ee, info) = object_fixture(&il);
         ee.call_kinds
             .insert(INST_TOKEN, ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_STUB);
-        ee.embed_runtime_lookup = true;
-        assert!(matches!(
-            import(&info, &ee),
-            Err(CompileError::Unsupported(_))
-        ));
+        // A THISOBJ-seeded deref chain (offsets {0x18, 0x10}, two
+        // indirections): the handles come out of the dictionary on `this`.
+        let mut lookup = canned_lookup(false);
+        lookup.lookupKind.runtimeLookupKind =
+            ffi::CORINFO_RUNTIME_LOOKUP_KIND_CORINFO_LOOKUP_THISOBJ;
+        ee.embed_lookup = Some(lookup);
+        let m = import(&info, &ee).expect("imports");
+        let t_this = spilled_receiver(&m);
+        let hir::Expr::Call { target, .. } = return_value(&m, 0) else {
+            panic!("expected Expr::Call")
+        };
+        let CallTarget::Indirect(target) = target else {
+            panic!("expected an indirect target")
+        };
+        let hir::Expr::Call {
+            target: CallTarget::Helper(CorInfoHelpFunc::VIRTUAL_FUNC_PTR),
+            args: helper_args,
+            ..
+        } = &**target
+        else {
+            panic!("expected the VIRTUAL_FUNC_PTR helper call")
+        };
+        assert_eq!(as_local(&helper_args[0]), t_this);
+        // Both handles are the lookup chain off `this` (LocalId(0)):
+        // Load(Add(Load(Add(this, 0x18)), 0x10)).
+        for handle in &helper_args[1..] {
+            let (op1, base1, off1) = as_binary(as_load(handle));
+            assert_eq!(op1, BinaryOp::Add);
+            assert_eq!(as_isize(off1), 0x10);
+            let (op0, base0, off0) = as_binary(as_load(base1));
+            assert_eq!(op0, BinaryOp::Add);
+            assert_eq!(as_local(base0), LocalId(0));
+            assert_eq!(as_isize(off0), 0x18);
+        }
     }
 
     #[test]
@@ -7973,21 +8968,977 @@ mod tests {
         }
     }
 
+    // --- step_11.3B: the hidden generics-context argument ---
+
+    const GENERIC_FN_TOKEN: u32 = 0x0600_0020;
+
+    /// A shared-generic entry fixture: GENERIC|PARAMTYPE on the entry
+    /// sig mirror, the context kind on the (options-derived) field.
+    fn shared_fixture(il: &[u8], entry: &MockSig, kind: GenericsContext) -> (MockEe, MethodInfo) {
+        let (ee, mut info) = fixture(il, entry, &[]);
+        info.args.callConv |= ffi::CorInfoCallConv_CORINFO_CALLCONV_GENERIC
+            | ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE;
+        info.generics_context = Some(kind);
+        (ee, info)
+    }
+
+    /// The post-11.3B form of the 2026-09-13 gate regression pin: a
+    /// PARAMTYPE entry signature is shared generic code taking the hidden
+    /// context argument — accepted now, with the arg local in place. (The
+    /// pre-B pin asserted rejection; rejecting became the bug once the
+    /// context plumbing landed.)
     #[test]
-    fn shared_generic_methods_are_rejected_by_the_callconv_gate() {
-        // Regression for the post-10.6 triage MISMATCH JIT/opt/Enum/shared:
-        // a static method on a generic type carries
-        // CORINFO_CALLCONV_PARAMTYPE (a hidden instantiation argument) —
-        // above the 4-bit convention mask, so the generic gate missed it
-        // and the method compiled with no generic context, silently
-        // producing the wrong answer.
+    fn shared_generic_entry_takes_the_hidden_context_arg() {
+        // static T Id<T>(T x) => x: no this, no retbuf — the context
+        // rides first; ldarg.0 is the first USER arg.
+        let (ee, info) = shared_fixture(
+            &[0x02, 0x2A],
+            &sig(CorInfoType::Class, &[CorInfoType::Class]),
+            GenericsContext::MethodDesc,
+        );
+        let m = import(&info, &ee).expect("a shared generic body imports");
+        assert_eq!(m.num_args, 2, "context + one user arg");
+        assert_eq!(m.locals[0].ty, Type::NativeInt, "the hidden context arg");
+        assert_eq!(m.locals[1].ty, Type::Ref, "the user arg");
+        assert_eq!(
+            as_local(return_value(&m, 0)),
+            LocalId(1),
+            "ldarg.0 is the user arg"
+        );
+        assert_eq!(
+            m.generics_context,
+            Some(GenericsContextSlot {
+                local: LocalId(0),
+                kind: GenericsContext::MethodDesc,
+            }),
+        );
+    }
+
+    /// An instance shared-generic entry: [this, context, user] — the
+    /// SysV order the decision doc verified against RyuJIT disassembly.
+    #[test]
+    fn shared_generic_instance_entry_orders_context_after_this() {
+        let (ee, info) = shared_fixture(
+            &[0x03, 0x2A],
+            &MockSig {
+                ret: CorInfoType::Class,
+                args: vec![CorInfoType::Class],
+                has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
+            },
+            GenericsContext::MethodTable,
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.num_args, 3);
+        assert_eq!(m.locals[0].ty, Type::Ref, "this");
+        assert_eq!(m.locals[1].ty, Type::NativeInt, "the context");
+        assert_eq!(m.locals[2].ty, Type::Ref, "the user arg");
+        // ldarg.1 (the first user arg) reads past this AND the context.
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(2));
+        assert_eq!(
+            m.generics_context,
+            Some(GenericsContextSlot {
+                local: LocalId(1),
+                kind: GenericsContext::MethodTable,
+            }),
+        );
+    }
+
+    /// GENERIC without PARAMTYPE is an unshared instantiation (value-type
+    /// type args): no context argument, ordinary code.
+    #[test]
+    fn unshared_generic_instantiation_has_no_hidden_arg() {
+        let (ee, mut info) = fixture(
+            &[0x02, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Int]),
+            &[],
+        );
+        info.args.callConv |= ffi::CorInfoCallConv_CORINFO_CALLCONV_GENERIC;
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.num_args, 1);
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+        assert_eq!(m.generics_context, None);
+    }
+
+    /// PARAMTYPE without a method/table context kind in the options word
+    /// is an EE contract violation, not a fallback.
+    #[test]
+    fn paramtype_without_a_context_kind_is_an_ee_contract_violation() {
         let (ee, mut info) = fixture(&[0x2A], &sig(CorInfoType::Void, &[]), &[]);
         info.args.callConv |= ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE;
-        let err = import(&info, &ee).err().expect("PARAMTYPE is generic");
+        let err = import(&info, &ee).err().expect("rejected");
+        assert!(matches!(err, CompileError::Internal(_)), "{err:?}");
+    }
+
+    /// A call to a PARAMTYPE callee with `exactContextNeedsRuntimeLookup
+    /// == false`: the untagged context handle goes in as a constant at
+    /// position (has_this + has_retbuf) = 0, ahead of the user args, with
+    /// the mustBeLoaded notification (RyuJIT importercalls.cpp:53-103).
+    #[test]
+    fn call_to_a_shared_generic_passes_the_exact_context_constant() {
+        // ldc.i4.1; call G; ret.
+        let (mut ee, info) = fixture(
+            &[0x17, 0x28, 0x20, 0x00, 0x00, 0x06, 0x2A],
+            &sig(CorInfoType::Int, &[]),
+            &[],
+        );
+        let callee = ee.add_method(GENERIC_FN_TOKEN, sig(CorInfoType::Int, &[CorInfoType::Int]));
+        ee.methods
+            .get_mut(&GENERIC_FN_TOKEN)
+            .unwrap()
+            .call_conv_flags = ffi::CorInfoCallConv_CORINFO_CALLCONV_GENERIC
+            | ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE;
+        // METHOD tag (0): the fake handle doubles as the
+        // InstantiatedMethodDesc*.
+        let raw = callee.as_raw() as usize;
+        ee.call_contexts.insert(GENERIC_FN_TOKEN, (raw, false));
+        let m = import(&info, &ee).expect("imports");
+        let (csig, args) = as_call(return_value(&m, 0));
+        assert_eq!(csig.args, vec![Type::NativeInt, Type::Int32]);
+        assert_eq!(args.len(), 2);
+        match &args[0] {
+            hir::Expr::Const(Const::NativeInt(v)) => {
+                assert_eq!(*v as usize, raw, "the untagged context constant")
+            }
+            _ => panic!("expected the context constant"),
+        }
+        assert_eq!(as_i32(&args[1]), 1, "the user arg");
+        let log = ee.sink_log.borrow();
         assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("generic")),
+            log.iter()
+                .any(|e| e.starts_with("method_must_be_loaded_before_code_is_run")),
+            "the load notification fired: {log:?}"
+        );
+    }
+
+    /// A CLASS-tagged exact context embeds the MethodTable* and notifies
+    /// classMustBeLoadedBeforeCodeIsRun instead.
+    #[test]
+    fn class_tagged_context_notifies_the_class_load() {
+        // call G; ret (void static callee, no args).
+        let (mut ee, info) = fixture(
+            &[0x28, 0x20, 0x00, 0x00, 0x06, 0x2A],
+            &sig(CorInfoType::Void, &[]),
+            &[],
+        );
+        let _ = ee.add_method(GENERIC_FN_TOKEN, sig(CorInfoType::Void, &[]));
+        ee.methods
+            .get_mut(&GENERIC_FN_TOKEN)
+            .unwrap()
+            .call_conv_flags = ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE;
+        let raw = 0xCAFE_0000usize | ffi::CorInfoContextFlags_CORINFO_CONTEXTFLAGS_CLASS as usize;
+        ee.call_contexts.insert(GENERIC_FN_TOKEN, (raw, false));
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { sig, args, .. }) => {
+                assert_eq!(sig.args, vec![Type::NativeInt]);
+                match &args[0] {
+                    hir::Expr::Const(Const::NativeInt(v)) => {
+                        assert_eq!(*v as usize, 0xCAFE_0000, "untagged")
+                    }
+                    _ => panic!("expected the context constant"),
+                }
+            }
+            _ => panic!("expected the call"),
+        }
+        let log = ee.sink_log.borrow();
+        assert!(
+            log.iter()
+                .any(|e| e.starts_with("class_must_be_loaded_before_code_is_run")),
+            "the class load notification fired: {log:?}"
+        );
+    }
+
+    /// A canned runtime-lookup answer for the callee context (offsets
+    /// {0x18, 0x10}, two indirections — the shape the decision doc
+    /// disasm-verified for `MakeArray<System.__Canon>`).
+    fn canned_lookup(test_for_null: bool) -> ffi::CORINFO_LOOKUP {
+        let mut lookup: ffi::CORINFO_LOOKUP = unsafe { std::mem::zeroed() };
+        lookup.lookupKind.needsRuntimeLookup = true;
+        lookup.lookupKind.runtimeLookupKind =
+            ffi::CORINFO_RUNTIME_LOOKUP_KIND_CORINFO_LOOKUP_METHODPARAM;
+        // SAFETY: the runtimeLookup member is being initialized here and
+        // is the live member for needsRuntimeLookup answers.
+        let rl = unsafe { &mut lookup.__bindgen_anon_1.runtimeLookup };
+        rl.signature = 0x5EED as *mut std::ffi::c_void;
+        rl.helper = ffi::CorInfoHelpFunc_CORINFO_HELP_RUNTIMEHANDLE_METHOD;
+        rl.indirections = 2;
+        rl.testForNull = test_for_null;
+        rl.sizeOffset = 0xFFFF; // CORINFO_NO_SIZE_CHECK
+        rl.offsets = [0x18, 0x10, 0, 0];
+        lookup
+    }
+
+    fn as_isize(e: &hir::Expr) -> isize {
+        match e {
+            hir::Expr::Const(Const::NativeInt(v)) => *v,
+            _ => panic!("expected Expr::Const(NativeInt)"),
+        }
+    }
+
+    fn as_load(e: &hir::Expr) -> &hir::Expr {
+        match e {
+            hir::Expr::Load { addr, ty, .. } => {
+                assert_eq!(*ty, Type::NativeInt);
+                addr
+            }
+            _ => panic!("expected Expr::Load"),
+        }
+    }
+
+    /// The runtime-lookup emitter end to end through the call path: the
+    /// caller is itself shared (its own PARAMTYPE entry), so the lookup
+    /// seeds from the hidden context arg.
+    #[test]
+    fn runtime_lookup_context_emits_the_deref_chain() {
+        // ldarg.0; call G; ret — inside `static T Chain<T>(T x)`'s body.
+        let (mut ee, info) = shared_fixture(
+            &[0x02, 0x28, 0x20, 0x00, 0x00, 0x06, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Int]),
+            GenericsContext::MethodDesc,
+        );
+        let _ = ee.add_method(GENERIC_FN_TOKEN, sig(CorInfoType::Int, &[CorInfoType::Int]));
+        ee.methods
+            .get_mut(&GENERIC_FN_TOKEN)
+            .unwrap()
+            .call_conv_flags = ffi::CorInfoCallConv_CORINFO_CALLCONV_GENERIC
+            | ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE;
+        ee.call_contexts.insert(GENERIC_FN_TOKEN, (0, true));
+        ee.embed_lookup = Some(canned_lookup(false));
+        let m = import(&info, &ee).expect("imports");
+        let (csig, args) = as_call(return_value(&m, 0));
+        assert_eq!(csig.args, vec![Type::NativeInt, Type::Int32]);
+        assert_eq!(args.len(), 2);
+        // The documented chain: rax = [[ctx+0x18]+0x10] —
+        // Load(Add(Load(Add(ctx, 0x18)), 0x10)).
+        let (op1, base1, off1) = as_binary(as_load(&args[0]));
+        assert_eq!(op1, BinaryOp::Add);
+        assert_eq!(as_isize(off1), 0x10);
+        let (op0, base0, off0) = as_binary(as_load(base1));
+        assert_eq!(op0, BinaryOp::Add);
+        assert_eq!(as_local(base0), LocalId(0), "our own hidden context arg");
+        assert_eq!(as_isize(off0), 0x18);
+        assert_eq!(as_local(&args[1]), LocalId(1), "the user arg");
+    }
+
+    /// testForNull (and CORINFO_USEHELPER): always the helper call —
+    /// `helper(ctx, signature)`; the inline cache is a later
+    /// optimization (the importer has no internal-branch machinery).
+    #[test]
+    fn runtime_lookup_with_test_for_null_is_always_the_helper_call() {
+        for test_for_null in [true, false] {
+            let (mut ee, info) = shared_fixture(
+                &[0x02, 0x28, 0x20, 0x00, 0x00, 0x06, 0x2A],
+                &sig(CorInfoType::Int, &[CorInfoType::Int]),
+                GenericsContext::MethodDesc,
+            );
+            let _ = ee.add_method(GENERIC_FN_TOKEN, sig(CorInfoType::Int, &[CorInfoType::Int]));
+            ee.methods
+                .get_mut(&GENERIC_FN_TOKEN)
+                .unwrap()
+                .call_conv_flags = ffi::CorInfoCallConv_CORINFO_CALLCONV_GENERIC
+                | ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE;
+            ee.call_contexts.insert(GENERIC_FN_TOKEN, (0, true));
+            let mut lookup = canned_lookup(test_for_null);
+            if !test_for_null {
+                // The CORINFO_USEHELPER form: no inline answer at all.
+                lookup.__bindgen_anon_1.runtimeLookup.indirections = 0xFFFF;
+            }
+            ee.embed_lookup = Some(lookup);
+            let m = import(&info, &ee).expect("imports");
+            let (_, args) = as_call(return_value(&m, 0));
+            match &args[0] {
+                hir::Expr::Call { target, sig, args } => {
+                    assert!(
+                        matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::RUNTIMEHANDLE_METHOD),
+                    );
+                    assert_eq!(sig.args, vec![Type::NativeInt, Type::NativeInt]);
+                    assert_eq!(as_local(&args[0]), LocalId(0), "the context");
+                    assert_eq!(as_isize(&args[1]), 0x5EED, "the lookup signature");
+                }
+                _ => panic!("expected the runtime-handle helper call"),
+            }
+        }
+    }
+
+    /// The lookup shapes phase B does not consume keep their named
+    /// rejections: R2R's USENULL, dynamic dictionary expansion, and the
+    /// NOT_SUPPORTED kind.
+    #[test]
+    fn runtime_lookup_rejection_forms_are_named() {
+        for (name, mutate) in [("USENULL", 0xFFFEu16), ("size check", 1u16)] {
+            let (mut ee, info) = shared_fixture(
+                &[0x02, 0x28, 0x20, 0x00, 0x00, 0x06, 0x2A],
+                &sig(CorInfoType::Int, &[CorInfoType::Int]),
+                GenericsContext::MethodDesc,
+            );
+            let _ = ee.add_method(GENERIC_FN_TOKEN, sig(CorInfoType::Int, &[CorInfoType::Int]));
+            ee.methods
+                .get_mut(&GENERIC_FN_TOKEN)
+                .unwrap()
+                .call_conv_flags = ffi::CorInfoCallConv_CORINFO_CALLCONV_GENERIC
+                | ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE;
+            ee.call_contexts.insert(GENERIC_FN_TOKEN, (0, true));
+            let mut lookup = canned_lookup(false);
+            let rl = unsafe { &mut lookup.__bindgen_anon_1.runtimeLookup };
+            if name == "USENULL" {
+                rl.indirections = 0xFFFE;
+            } else {
+                rl.sizeOffset = mutate;
+            }
+            ee.embed_lookup = Some(lookup);
+            let err = import(&info, &ee)
+                .err()
+                .unwrap_or_else(|| panic!("{name} rejected"));
+            assert!(
+                matches!(err, CompileError::Unsupported(_)),
+                "{name}: {err:?}"
+            );
+        }
+        // NOT_SUPPORTED kind: no seed at all.
+        let (mut ee, info) = shared_fixture(
+            &[0x02, 0x28, 0x20, 0x00, 0x00, 0x06, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Int]),
+            GenericsContext::MethodDesc,
+        );
+        let _ = ee.add_method(GENERIC_FN_TOKEN, sig(CorInfoType::Int, &[CorInfoType::Int]));
+        ee.methods
+            .get_mut(&GENERIC_FN_TOKEN)
+            .unwrap()
+            .call_conv_flags = ffi::CorInfoCallConv_CORINFO_CALLCONV_GENERIC
+            | ffi::CorInfoCallConv_CORINFO_CALLCONV_PARAMTYPE;
+        ee.call_contexts.insert(GENERIC_FN_TOKEN, (0, true));
+        let mut lookup = canned_lookup(false);
+        lookup.lookupKind.runtimeLookupKind =
+            ffi::CORINFO_RUNTIME_LOOKUP_KIND_CORINFO_LOOKUP_NOT_SUPPORTED;
+        ee.embed_lookup = Some(lookup);
+        let err = import(&info, &ee).err().expect("NOT_SUPPORTED rejected");
+        assert!(matches!(err, CompileError::Unsupported(_)), "{err:?}");
+    }
+
+    // --- step_11.3C: the `constrained.` prefix ---
+
+    /// The constrained-callvirt fixture: `ldarga.s 0; ldc.i4 7;
+    /// constrained. CTYPE; callvirt inst; ret` — entry takes one
+    /// byref-able argument, CTYPE is the constrained-class token,
+    /// INST_TOKEN is the canned `int inst(int)` instance method. The mock
+    /// cans the thisTransform per method token.
+    const CTYPE_TOKEN: u32 = 0x1B00_0001;
+
+    fn constrained_fixture(transform: ffi::CORINFO_THIS_TRANSFORM) -> (MockEe, MethodInfo) {
+        let il = [
+            0x0F, 0x00, // ldarga.s 0
+            0x1F, 0x07, // ldc.i4.s 7
+            0xFE, 0x16, 0x01, 0x00, 0x00, 0x1B, // constrained. CTYPE
+            0x6F, 0x03, 0x00, 0x00, 0x06, // callvirt inst
+            0x2A, // ret
+        ];
+        let entry = sig(CorInfoType::Int, &[CorInfoType::Int]);
+        let (mut ee, info) = fixture(&il, &entry, &[]);
+        // The constrained class: a registered value class (BOX_THIS's
+        // helper query and embedding need it; the other transforms never
+        // touch it).
+        let class = ee.add_class(8, 8, &[], None);
+        ee.class_tokens.insert(CTYPE_TOKEN, class);
+        ee.this_transforms.insert(INST_TOKEN, transform);
+        (ee, info)
+    }
+
+    /// DEREF_THIS (the reference-type constraint): the byref's pointee
+    /// loads as a Ref and takes the ordinary callvirt null check (in the
+    /// receiver temp store — the Runtime_121711 ordering spill); the
+    /// constrained token went to get_call_info.
+    #[test]
+    fn constrained_deref_this_loads_and_null_checks() {
+        let (ee, info) = constrained_fixture(ffi::CORINFO_THIS_TRANSFORM_CORINFO_DEREF_THIS);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(
+            ee.constrained_seen.borrow().as_slice(),
+            [CTYPE_TOKEN],
+            "the constrained token reached get_call_info"
+        );
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        let hir::Expr::Load {
+            addr,
+            offset: 0,
+            ty: Type::Ref,
+            ..
+        } = as_null_check(value)
+        else {
+            panic!("expected the null-checked deref load")
+        };
+        assert_eq!(as_local_addr(addr), LocalId(0), "ldarga.s 0");
+        let (_, args) = as_call(return_value(&m, 0));
+        assert_eq!(args.len(), 2);
+        assert_eq!(as_local(&args[0]), dst, "the receiver temp");
+        assert_eq!(as_i32(&args[1]), 7, "the user arg");
+    }
+
+    /// NO_THIS_TRANSFORM (the value type's own method, resolved in place):
+    /// the byref flows to the direct call untouched, no null check.
+    #[test]
+    fn constrained_no_transform_passes_the_byref_unchecked() {
+        let (ee, info) = constrained_fixture(ffi::CORINFO_THIS_TRANSFORM_CORINFO_NO_THIS_TRANSFORM);
+        let m = import(&info, &ee).expect("imports");
+        let (_, args) = as_call(return_value(&m, 0));
+        assert_eq!(args.len(), 2);
+        assert_eq!(as_local_addr(&args[0]), LocalId(0), "the raw byref");
+        assert!(
+            !matches!(&args[0], hir::Expr::NullCheck { .. }),
+            "no null check on the byref"
+        );
+        assert_eq!(as_i32(&args[1]), 7);
+    }
+
+    /// BOX_THIS (a value-type method inherited from Object/ValueType):
+    /// the BOX helper call wraps the byref in a Ref temp; the temp is the
+    /// receiver.
+    #[test]
+    fn constrained_box_this_calls_the_box_helper() {
+        let (ee, info) = constrained_fixture(ffi::CORINFO_THIS_TRANSFORM_CORINFO_BOX_THIS);
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        let hir::Expr::Call {
+            target: CallTarget::Helper(CorInfoHelpFunc::BOX),
+            sig,
+            args,
+        } = value
+        else {
+            panic!("expected the BOX helper call")
+        };
+        assert_eq!(sig.args, [Type::NativeInt, Type::ByRef]);
+        // The embedded constrained-class handle (the mock cans a
+        // token-deterministic IAT_VALUE constant) and the byref.
+        assert_eq!(
+            as_isize(&args[0]),
+            (0x7A7A_0000usize + CTYPE_TOKEN as usize) as isize
+        );
+        assert_eq!(as_local_addr(&args[1]), LocalId(0));
+        let (_, call_args) = as_call(return_value(&m, 0));
+        assert_eq!(as_local(&call_args[0]), dst, "the box temp is the receiver");
+        assert_eq!(as_i32(&call_args[1]), 7);
+    }
+
+    /// `constrained.` before `call` merges exactly like callvirt
+    /// (RyuJIT's tolerance, importer.cpp:8962 — Runtime_94467's static-
+    /// abstract-interface shape); before `ldftn` it is a named
+    /// Unsupported (valid IL, unimplemented feature); before anything
+    /// else BadIl (ECMA-335 §III.2.1). A trailing prefix is BadIl too.
+    #[test]
+    fn constrained_before_call_merges_and_other_followers_are_rejected() {
+        // ldc.i4.1; constrained. CTYPE; call fib; pop; ret — a plain
+        // `call` follower imports, and the constrained token reaches
+        // get_call_info.
+        let entry = sig(CorInfoType::Void, &[]);
+        let (mut ee, info) = fixture(
+            &[
+                0x17, 0xFE, 0x16, 0x01, 0x00, 0x00, 0x1B, 0x28, 0x01, 0x00, 0x00, 0x06, 0x26, 0x2A,
+            ],
+            &entry,
+            &[],
+        );
+        let class = ee.add_class(8, 8, &[], None);
+        ee.class_tokens.insert(CTYPE_TOKEN, class);
+        let m = import(&info, &ee).expect("constrained. call imports");
+        assert_eq!(ee.constrained_seen.borrow().as_slice(), [CTYPE_TOKEN]);
+        assert_eq!(
+            ee.call_info_flags.borrow().as_slice(),
+            [CallInfoFlags::EMPTY],
+            "a call, not a callvirt"
+        );
+        let _ = m;
+
+        // constrained. CTYPE; ldftn fib — valid IL (importer.cpp:8962),
+        // gated here.
+        let (mut ee, info) = fixture(
+            &[
+                0xFE, 0x16, 0x01, 0x00, 0x00, 0x1B, 0xFE, 0x06, 0x01, 0x00, 0x00, 0x06, 0x26, 0x2A,
+            ],
+            &sig(CorInfoType::Void, &[]),
+            &[],
+        );
+        let class = ee.add_class(8, 8, &[], None);
+        ee.class_tokens.insert(CTYPE_TOKEN, class);
+        let err = import(&info, &ee)
+            .err()
+            .expect("constrained. ldftn is gated");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("ldftn")),
             "{err:?}"
         );
+
+        // constrained. CTYPE; newobj ...; and a trailing prefix.
+        let (ee, info) = fixture(
+            &[
+                0xFE, 0x16, 0x01, 0x00, 0x00, 0x1B, 0x73, 0x01, 0x00, 0x00, 0x06, 0x2A,
+            ],
+            &entry,
+            &[],
+        );
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+        let (ee, info) = fixture(&[0xFE, 0x16, 0x01, 0x00, 0x00, 0x1B], &entry, &[]);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+        // Nested constrained. is BadIl too.
+        let (ee, info) = fixture(
+            &[
+                0xFE, 0x16, 0x01, 0x00, 0x00, 0x1B, 0xFE, 0x16, 0x01, 0x00, 0x00, 0x1B, 0x6F, 0x03,
+                0x00, 0x00, 0x06, 0x2A,
+            ],
+            &entry,
+            &[],
+        );
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    // --- step_11.3D: generic operands over type parameters ---
+
+    /// A type-operand token standing in for `!!T`: resolves to a plain
+    /// (reference) class handle — the mock's is_value_class answers false,
+    /// exactly the EE's answer for a type-variable handle.
+    const TYPEVAR_TOKEN: u32 = 0x1B00_0002;
+
+    /// Registers TYPEVAR_TOKEN as a reference-type class token and cans
+    /// the runtime-lookup embed answer (METHODPARAM-seeded, offsets
+    /// {0x18, 0x10} — the shared-fixture entry's context is LocalId(0)).
+    fn typevar_class(ee: &mut MockEe) {
+        let class = ClassHandle::from_raw(0x7E55usize as ffi::CORINFO_CLASS_HANDLE).unwrap();
+        ee.class_tokens.insert(TYPEVAR_TOKEN, class);
+        ee.embed_lookup = Some(canned_lookup(false));
+    }
+
+    /// Asserts `e` is the canned lookup's deref chain seeded from the
+    /// hidden context arg: Load(Add(Load(Add(Local(0), 0x18)), 0x10)).
+    fn assert_context_chain(e: &hir::Expr) {
+        let (op1, base1, off1) = as_binary(as_load(e));
+        assert_eq!(op1, BinaryOp::Add);
+        assert_eq!(as_isize(off1), 0x10);
+        let (op0, base0, off0) = as_binary(as_load(base1));
+        assert_eq!(op0, BinaryOp::Add);
+        assert_eq!(as_local(base0), LocalId(0), "our own hidden context arg");
+        assert_eq!(as_isize(off0), 0x18);
+    }
+
+    /// (a) `castclass !!T` in a shared body: the casting helper's class
+    /// operand is the runtime lookup seeded from our context, not a raw
+    /// constant naming the canonical representative (Enum/shared.cs).
+    #[test]
+    fn castclass_over_a_type_variable_uses_the_runtime_lookup() {
+        // ldarg.0; castclass TK; ret — `static T Cast<T>(object o)`.
+        let (mut ee, info) = shared_fixture(
+            &[0x02, 0x74, 0x02, 0x00, 0x00, 0x1B, 0x2A],
+            &sig(CorInfoType::Class, &[CorInfoType::Class]),
+            GenericsContext::MethodDesc,
+        );
+        typevar_class(&mut ee);
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Call { target, args, .. } = return_value(&m, 0) else {
+            panic!("expected the casting helper call")
+        };
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::CHKCASTANY),
+            "the throwing cast helper"
+        );
+        assert_context_chain(&args[0]);
+        assert_eq!(as_local(&args[1]), LocalId(1), "the object operand");
+    }
+
+    /// (b) `box !!T` in a shared body is a NOP (importer.cpp:10907's
+    /// eeIsValueClass NOP): the reference passes through untouched.
+    #[test]
+    fn box_over_a_type_variable_is_a_nop() {
+        // ldarg.0; box TK; ret.
+        let (mut ee, info) = shared_fixture(
+            &[0x02, 0x8C, 0x02, 0x00, 0x00, 0x1B, 0x2A],
+            &sig(CorInfoType::Class, &[CorInfoType::Class]),
+            GenericsContext::MethodDesc,
+        );
+        typevar_class(&mut ee);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(
+            as_local(return_value(&m, 0)),
+            LocalId(1),
+            "the reference passes through"
+        );
+    }
+
+    /// (c) `newarr !!T` in a shared body: NEWARR_1_PTR with the
+    /// runtime-looked-up array MethodTable (the phase-B disasm's shape).
+    #[test]
+    fn newarr_over_a_type_variable_uses_the_runtime_lookup() {
+        // ldc.i4.3; newarr TK; ret — `static T[] MakeArray<T>()`.
+        let (mut ee, info) = shared_fixture(
+            &[0x19, 0x8D, 0x02, 0x00, 0x00, 0x1B, 0x2A],
+            &sig(CorInfoType::Class, &[]),
+            GenericsContext::MethodDesc,
+        );
+        typevar_class(&mut ee);
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Call { target, args, .. } = return_value(&m, 0) else {
+            panic!("expected the allocation helper call")
+        };
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::NEWARR_1_PTR),
+            "the SZ-array allocation helper"
+        );
+        assert_context_chain(&args[0]);
+    }
+
+    /// (d) `ldtoken !!T` in a shared body: the runtime lookup feeds the
+    /// TYPEHANDLE_TO_RUNTIMETYPEHANDLE conversion helper.
+    #[test]
+    fn ldtoken_over_a_type_variable_uses_the_runtime_lookup() {
+        // ldtoken TK; pop; ldc.i4.0; ret.
+        let (mut ee, info) = shared_fixture(
+            &[0xD0, 0x02, 0x00, 0x00, 0x1B, 0x26, 0x16, 0x2A],
+            &sig(CorInfoType::Int, &[]),
+            GenericsContext::MethodDesc,
+        );
+        typevar_class(&mut ee);
+        let handle_class = ee.add_class(
+            8,
+            8,
+            &[(0, false)],
+            Some(sysv_descriptor(&[(
+                ffi::SystemVClassificationType_SystemVClassificationTypeInteger,
+                8,
+            )])),
+        );
+        ee.token_type_class = Some(handle_class);
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, args, .. }) => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::TYPEHANDLE_TO_RUNTIMETYPEHANDLE)
+                );
+                assert_context_chain(&args[0]);
+            }
+            _ => panic!("expected the Eval of the conversion helper call"),
+        }
+    }
+
+    /// (e) a static field of a shared-generic class
+    /// (CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER): the address is
+    /// `GET_GCSTATIC_BASE(runtime-looked-up parent handle) + offset`,
+    /// and an INITCLASS verdict takes the same looked-up handle.
+    #[test]
+    fn generic_statics_use_the_base_helper_and_offset() {
+        // ldsfld F; ret — a static int field on a shared generic class
+        // (the MethodTable context kind: statics on shared generic types).
+        let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = shared_fixture(
+            &il,
+            &sig(CorInfoType::Int, &[]),
+            GenericsContext::MethodTable,
+        );
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let field = &mut ee.fields.get_mut(&FIELD_TOKEN).unwrap();
+        field.accessor =
+            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER);
+        field.statics_helper = Some(CorInfoHelpFunc::GET_GCSTATIC_BASE);
+        field.offset = 16;
+        ee.embed_lookup = Some(canned_lookup(false));
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Load {
+            addr, offset, ty, ..
+        } = return_value(&m, 0)
+        else {
+            panic!("expected the field load")
+        };
+        assert_eq!(*offset, 0);
+        assert_eq!(*ty, Type::Int32);
+        let (op, base, off) = as_binary(addr);
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(
+            as_isize(off),
+            16,
+            "the field's offset into the statics block"
+        );
+        let hir::Expr::Call { target, args, .. } = base else {
+            panic!("expected the statics-base helper call")
+        };
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::GET_GCSTATIC_BASE)
+        );
+        assert_context_chain(&args[0]);
+
+        // With the INITCLASS flag and a USE_HELPER verdict: the trigger
+        // runs first, on the same looked-up handle (impInitClass's
+        // impParentClassTokenToHandle, importer.cpp:3908).
+        let (mut ee, info) = shared_fixture(
+            &il,
+            &sig(CorInfoType::Int, &[]),
+            GenericsContext::MethodTable,
+        );
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let field = &mut ee.fields.get_mut(&FIELD_TOKEN).unwrap();
+        field.accessor =
+            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER);
+        field.statics_helper = Some(CorInfoHelpFunc::GET_GCSTATIC_BASE);
+        field.offset = 16;
+        field.init_class = true;
+        ee.init_class_result = CorInfoInitClassResult::USE_HELPER;
+        ee.embed_lookup = Some(canned_lookup(false));
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "the INITCLASS trigger only");
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, args, .. }) => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::INITCLASS)
+                );
+                assert_context_chain(&args[0]);
+            }
+            _ => panic!("expected the INITCLASS helper call"),
+        }
+
+        // The thread-static base helpers stay gated (step-11 scope).
+        let (mut ee, info) = shared_fixture(
+            &il,
+            &sig(CorInfoType::Int, &[]),
+            GenericsContext::MethodTable,
+        );
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let field = &mut ee.fields.get_mut(&FIELD_TOKEN).unwrap();
+        field.accessor =
+            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER);
+        field.statics_helper = Some(CorInfoHelpFunc::GET_GCTHREADSTATIC_BASE);
+        let err = import(&info, &ee).err().expect("thread statics are out");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("thread-local")),
+            "{err:?}"
+        );
+    }
+
+    /// (f) Runtime_121711's ordering: a callvirt with a side-effecting
+    /// argument evaluates the argument BEFORE the receiver's null check
+    /// (ECMA-335 §III.4.2: the check fires at call execution).
+    #[test]
+    fn callvirt_evaluates_args_before_the_null_check() {
+        // ldarg.0 (this); ldarg.1; call fib; callvirt inst; ret — the
+        // argument is a call (observable), the receiver null-checked.
+        let il = [
+            0x02, 0x03, 0x28, 0x01, 0x00, 0x00, 0x06, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A,
+        ];
+        let (mut ee, info) = object_fixture(&il);
+        ee.non_direct_calls.insert(INST_TOKEN); // the VTABLE verdict
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the arg spill, then the receiver store");
+        let (arg_t, arg_v) = store(&stmts[0]);
+        assert!(
+            matches!(
+                arg_v,
+                hir::Expr::Call {
+                    target: CallTarget::Direct(_),
+                    ..
+                }
+            ),
+            "the side-effecting argument evaluates first"
+        );
+        let (this_t, this_v) = store(&stmts[1]);
+        assert_eq!(
+            as_local(as_null_check(this_v)),
+            LocalId(0),
+            "the null check faults only after the argument ran"
+        );
+        let hir::Expr::Call { args, .. } = return_value(&m, 0) else {
+            panic!("expected the dispatch call")
+        };
+        assert_eq!(as_local(&args[0]), this_t);
+        assert_eq!(as_local(&args[1]), arg_t);
+    }
+
+    // --- enumerablecloning.cs follow-ups: the GetMethodTable intrinsic
+    // --- and primitive-typed value classes in the struct-memory opcodes ---
+
+    const GMT_TOKEN: u32 = 0x0600_0030;
+
+    /// Cans `RuntimeHelpers.GetMethodTable`: sig `(Class) -> Ptr`, the
+    /// [Intrinsic] bit, the name, and the declaring class (the mock's
+    /// declaring-class stand-in is the method handle itself).
+    fn gmt_fixture(ee: &mut MockEe) {
+        let handle = ee.add_method(GMT_TOKEN, sig(CorInfoType::Ptr, &[CorInfoType::Class]));
+        ee.method_name = Some("GetMethodTable".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            (
+                "RuntimeHelpers".into(),
+                Some("System.Runtime.CompilerServices".into()),
+            ),
+        );
+    }
+
+    /// The self-recursive [Intrinsic] IL body must never compile: the
+    /// importer expands the call to the faulting `[obj+0]` MethodTable
+    /// load (RyuJIT's gtNewMethodTableLookup, importercalls.cpp:3930).
+    #[test]
+    fn get_method_table_intrinsic_expands_to_the_mt_load() {
+        // ldarg.0; call GMT; ret.
+        let il = [0x02, 0x28, 0x30, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Class]),
+            &[],
+        );
+        gmt_fixture(&mut ee);
+        ee.intrinsic_methods
+            .insert(ee.methods[&GMT_TOKEN].handle.as_raw() as usize);
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Load {
+            addr,
+            offset: 0,
+            ty: Type::NativeInt,
+            access: MemAccess::Natural,
+        } = return_value(&m, 0)
+        else {
+            panic!("expected the [obj+0] MethodTable load")
+        };
+        assert_eq!(as_local(addr), LocalId(0), "the object argument");
+    }
+
+    /// The name+shape match alone is not enough: without the EE's
+    /// [Intrinsic] bit the same call is an ordinary direct call.
+    #[test]
+    fn get_method_table_shape_without_the_intrinsic_bit_is_a_plain_call() {
+        let il = [0x02, 0x28, 0x30, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Class]),
+            &[],
+        );
+        gmt_fixture(&mut ee);
+        let m = import(&info, &ee).expect("imports");
+        let (_, args) = as_call(return_value(&m, 0));
+        assert_eq!(as_local(&args[0]), LocalId(0));
+    }
+
+    /// A value class with a primitive CorInfoType (the IntPtr stand-in):
+    /// registered as a class (is_value_class answers true) with the
+    /// NativeInt override.
+    fn intptr_ee() -> MockEe {
+        let (mut ee, class) = struct_ee(8, &[], None);
+        ee.class_cor_info_types
+            .insert(class.as_raw() as usize, CorInfoType::NativeInt);
+        ee
+    }
+
+    /// `ldobj`/`stobj`/`cpobj`/`initobj` over a primitive-typed value
+    /// class are the scalar cell ops (RyuJIT's TypeHandleToVarType
+    /// normalization — importer.cpp:11098) — GenericCache's TryGet hits
+    /// this with `TValue = IntPtr` (`stobj !!1` against an ldfld-loaded
+    /// NativeInt).
+    #[test]
+    fn struct_memory_ops_of_a_primitive_value_class_are_scalar_cells() {
+        // ldobj: ldarga.s 0; ldobj C; ret — a NativeInt cell load.
+        let mut ee = intptr_ee();
+        let entry = sig(CorInfoType::NativeInt, &[CorInfoType::Int]);
+        let info = struct_info(
+            &mut ee,
+            &[0x0F, 0x00, 0x71, 0x01, 0x00, 0x00, 0x02, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("ldobj imports");
+        let hir::Expr::Load {
+            addr,
+            offset: 0,
+            ty: Type::NativeInt,
+            access: MemAccess::Natural,
+        } = return_value(&m, 0)
+        else {
+            panic!("expected the scalar cell load")
+        };
+        assert_eq!(as_local_addr(addr), LocalId(0));
+
+        // stobj: ldarga.s 0; ldarg.1; stobj C; ret — the scalar store;
+        // the NativeInt value (NOT a Struct) type-checks.
+        let mut ee = intptr_ee();
+        let entry = sig(
+            CorInfoType::Void,
+            &[CorInfoType::Int, CorInfoType::NativeInt],
+        );
+        let info = struct_info(
+            &mut ee,
+            &[0x0F, 0x00, 0x03, 0x81, 0x01, 0x00, 0x00, 0x02, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("stobj imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset: 0,
+                value,
+                access: MemAccess::Natural,
+            } => {
+                assert_eq!(as_local_addr(addr), LocalId(0));
+                assert_eq!(as_local(value), LocalId(1));
+            }
+            _ => panic!("expected the scalar cell store"),
+        }
+
+        // cpobj: ldarga.s 0; ldarga.s 1; cpobj C; ret — scalar load+store.
+        let mut ee = intptr_ee();
+        let entry = sig(CorInfoType::Void, &[CorInfoType::Int, CorInfoType::Int]);
+        let info = struct_info(
+            &mut ee,
+            &[0x0F, 0x00, 0x0F, 0x01, 0x70, 0x01, 0x00, 0x00, 0x02, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("cpobj imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset: 0,
+                value,
+                access: MemAccess::Natural,
+            } => {
+                assert_eq!(as_local_addr(addr), LocalId(0));
+                let hir::Expr::Load {
+                    addr: src,
+                    offset: 0,
+                    ty: Type::NativeInt,
+                    ..
+                } = value
+                else {
+                    panic!("expected the scalar load as the stored value")
+                };
+                assert_eq!(as_local_addr(src), LocalId(1));
+            }
+            _ => panic!("expected the scalar cell store"),
+        }
+
+        // initobj: ldarga.s 0; initobj C; ret — the scalar zero store.
+        let mut ee = intptr_ee();
+        let entry = sig(CorInfoType::Void, &[CorInfoType::Int]);
+        let info = struct_info(
+            &mut ee,
+            &[0x0F, 0x00, 0xFE, 0x15, 0x01, 0x00, 0x00, 0x02, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("initobj imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset: 0,
+                value,
+                access: MemAccess::Natural,
+            } => {
+                assert_eq!(as_local_addr(addr), LocalId(0));
+                assert!(
+                    matches!(value, hir::Expr::Const(Const::NativeInt(0))),
+                    "the zero constant"
+                );
+            }
+            _ => panic!("expected the scalar zero store"),
+        }
     }
 
     // --- step_10.9: value types ---
@@ -8028,6 +9979,8 @@ mod tests {
             max_stack: 8,
             eh_count: 0,
             init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
             args: ee.make_method_sig(entry),
             locals: ee.make_locals_sig_with_classes(locals, local_classes),
         }
@@ -9155,11 +11108,12 @@ mod tests {
         let (to, _, unsigned, _) = as_conv(&args[1]);
         assert_eq!(to, Type::NativeInt);
         assert!(unsigned);
-        // The third argument is the element class handle, embedded as a
-        // raw pointer constant (the helper's exact-type check input).
+        // The third argument is the element class handle through the
+        // generic-handle path (the helper's exact-type check input): the
+        // mock cans 0x7A7A_0000 + token for an exact answer.
         assert!(
-            matches!(&args[2], hir::Expr::Const(Const::NativeInt(v)) if *v == 0xE1EF),
-            "the element class handle embeds raw"
+            matches!(&args[2], hir::Expr::Const(Const::NativeInt(v)) if *v == (0x7A7A_0000usize + ELEM_TOKEN as usize) as isize),
+            "the element class handle embeds through embed_generic_handle"
         );
     }
 

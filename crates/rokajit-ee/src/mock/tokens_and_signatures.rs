@@ -153,21 +153,32 @@ impl TokensAndSignatures for MockEe {
     fn embed_generic_handle(
         &self,
         token: &mut ffi::CORINFO_RESOLVED_TOKEN,
-        _embed_parent: bool,
+        embed_parent: bool,
         _caller: MethodHandle,
     ) -> ffi::CORINFO_GENERICHANDLE_RESULT {
         // A canned direct embedding (step_10.10): token-deterministic
         // handle constant, no runtime lookup, handle kind from the
-        // resolved token's handles. The `embed_*` flags switch to the
-        // rejection forms (runtime lookup / indirection cell).
+        // resolved token's handles — or CLASS when the caller asked for
+        // the parent (embed_parent: the resolved method/field's owning
+        // class, corinfo.h's embedGenericHandle contract). The `embed_*`
+        // flags switch to the rejection forms (runtime lookup /
+        // indirection cell).
         let mut result: ffi::CORINFO_GENERICHANDLE_RESULT = unsafe { std::mem::zeroed() };
-        result.handleType = if !token.hMethod.is_null() {
+        result.handleType = if embed_parent {
+            ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_CLASS
+        } else if !token.hMethod.is_null() {
             ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_METHOD
         } else if !token.hField.is_null() {
             ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_FIELD
         } else {
             ffi::CorInfoGenericHandleType_CORINFO_HANDLETYPE_CLASS
         };
+        // A canned full lookup answer (step_11.3B's runtime-lookup
+        // fixtures) wins over the flag-driven rejection forms.
+        if let Some(lookup) = &self.embed_lookup {
+            result.lookup = *lookup;
+            return result;
+        }
         let handle = (0x7A7A_0000usize + token.token as usize) as ffi::CORINFO_GENERIC_HANDLE;
         result.compileTimeHandle = handle;
         result.lookup.lookupKind.needsRuntimeLookup = self.embed_runtime_lookup;
@@ -198,11 +209,14 @@ impl TokensAndSignatures for MockEe {
     fn get_call_info(
         &self,
         token: &mut ffi::CORINFO_RESOLVED_TOKEN,
-        _constrained: Option<&ffi::CORINFO_RESOLVED_TOKEN>,
+        constrained: Option<&ffi::CORINFO_RESOLVED_TOKEN>,
         _caller: MethodHandle,
         flags: CallInfoFlags,
     ) -> ffi::CORINFO_CALL_INFO {
         self.call_info_flags.borrow_mut().push(flags);
+        self.constrained_seen
+            .borrow_mut()
+            .push(constrained.map_or(0, |t| t.token));
         let mut info: ffi::CORINFO_CALL_INFO = unsafe { std::mem::zeroed() };
         if let Some(method) = self.methods.get(&token.token) {
             info.hMethod = method.handle.as_raw();
@@ -216,6 +230,18 @@ impl TokensAndSignatures for MockEe {
                 ffi::CORINFO_CALL_KIND_CORINFO_CALL
             };
             info.sig = self.method_sig_info(method);
+        }
+        // Canned constrained-call this transforms (step_11.3C).
+        if let Some(&transform) = self.this_transforms.get(&token.token) {
+            info.thisTransform = transform;
+        }
+        // Canned generics-context answers (step_11.3B).
+        if let Some(&(context, needs_lookup)) = self.call_contexts.get(&token.token) {
+            info.contextHandle = context as ffi::CORINFO_CONTEXT_HANDLE;
+            info.exactContextNeedsRuntimeLookup = needs_lookup;
+        }
+        if let Some(lookup) = self.call_code_pointer_lookups.get(&token.token) {
+            info.__bindgen_anon_1.codePointerLookup = *lookup;
         }
         info
     }

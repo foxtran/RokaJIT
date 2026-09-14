@@ -17,7 +17,9 @@
 use crate::artifact::{EhClause, IlMapEntry};
 use crate::error::{CompileError, CompileResult};
 use crate::ir::lir;
-use crate::pipeline::{CodegenOutput, FuncletInfo, GcRootSlot, MetadataOutput};
+use crate::pipeline::{
+    CodegenOutput, FuncletInfo, GcRootSlot, GenericsContextGcInfo, MetadataOutput,
+};
 use crate::target::Target;
 
 /// The GC-info encoder's input, in target-generic vocabulary. The target
@@ -53,6 +55,9 @@ pub struct GcInfoInput {
     /// (`SizeOfStackOutgoingAndScratchArea`; written only in the fat
     /// header). Codegen's frame layout supplies it.
     pub outgoing_area_size: u32,
+    /// The generics-context slot to report (step_11.3B); its presence
+    /// forces the fat header.
+    pub generics_context: Option<GenericsContextGcInfo>,
 }
 
 /// The unwind encoder's input, in target-generic vocabulary. The target
@@ -87,6 +92,7 @@ pub struct MetadataBuilder {
     funclets: Vec<FuncletInfo>,
     interruptible_ranges: Vec<(u32, u32)>,
     outgoing_area_size: u32,
+    generics_context: Option<GenericsContextGcInfo>,
 }
 
 impl MetadataBuilder {
@@ -102,6 +108,7 @@ impl MetadataBuilder {
             funclets: Vec::new(),
             interruptible_ranges: Vec::new(),
             outgoing_area_size: 0,
+            generics_context: None,
         }
     }
 
@@ -143,6 +150,12 @@ impl MetadataBuilder {
         });
     }
 
+    /// Record the generics-context slot the GC-info fat header reports
+    /// (step_11.3B).
+    pub fn record_generics_context(&mut self, context: Option<GenericsContextGcInfo>) {
+        self.generics_context = context;
+    }
+
     /// Render every section: GC info and unwind through the target's
     /// encoders (the EE-facing formats are target-owned), EH clauses and
     /// the IL-offset map target-independently.
@@ -156,6 +169,7 @@ impl MetadataBuilder {
             safepoints: self.safepoints,
             interruptible_ranges: self.interruptible_ranges,
             outgoing_area_size: self.outgoing_area_size,
+            generics_context: self.generics_context,
         })?;
         // The root fragment covers the main body only: funclets follow it
         // in emission order, so the first funclet's start is the main
@@ -211,6 +225,7 @@ pub fn build_metadata(
         output.interruptible_ranges.clone(),
         output.frame.outgoing_bytes,
     );
+    builder.record_generics_context(output.frame.generics_context);
     builder.finish(target)
 }
 
@@ -320,6 +335,7 @@ mod tests {
                 frame_size: 32,
                 outgoing_bytes: 0,
                 gc_roots: Vec::new(),
+                generics_context: None,
             },
             funclets: Vec::new(),
             eh_clauses: Vec::new(),
@@ -337,6 +353,7 @@ mod tests {
             num_args: 0,
             num_il_locals: 0,
             struct_layouts: StructLayouts::new(),
+            generics_context: None,
         }
     }
 

@@ -741,6 +741,9 @@ flag_set!(
     // Shared prefix with MethodAttribs (both are CorInfoFlag); value classes
     // are the one bit every class consumer tests.
     VALUECLASS => CorInfoFlag_CORINFO_FLG_VALUECLASS,
+    // The class is a generic type parameter (!!T/!T — corinfo.h:780);
+    // answers about it describe the canonical representative.
+    GENERIC_TYPE_VARIABLE => CorInfoFlag_CORINFO_FLG_GENERIC_TYPE_VARIABLE,
 );
 
 flag_set!(

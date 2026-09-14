@@ -1978,6 +1978,7 @@ mod tests {
             num_args: 0,
             num_il_locals: 3,
             struct_layouts: StructLayouts::new(),
+            generics_context: None,
         };
         assert!(matches!(
             lower_method(&method),
@@ -2509,6 +2510,8 @@ mod tests {
             max_stack: 8,
             eh_count: 0,
             init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
             args: ee.make_method_sig(&fib_sig),
             locals: ee.make_locals_sig(&[]),
         };

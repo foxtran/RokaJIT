@@ -167,6 +167,8 @@ mod tests {
             max_stack: 8,
             eh_count: 0,
             init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
             args: ee.make_method_sig(entry),
             locals: ee.make_locals_sig(&[]),
         };
@@ -337,6 +339,7 @@ mod tests {
             num_args: 0,
             num_il_locals: 0,
             struct_layouts: StructLayouts::new(),
+            generics_context: None,
         };
         assert!(matches!(morph(method), Err(CompileError::Internal(_))));
     }
@@ -394,6 +397,7 @@ mod tests {
             num_args: 0,
             num_il_locals: 0,
             struct_layouts: StructLayouts::new(),
+            generics_context: None,
         };
         morph(method).expect("the EH shapes certify");
     }
@@ -433,6 +437,7 @@ mod tests {
             num_args: 0,
             num_il_locals: 0,
             struct_layouts: StructLayouts::new(),
+            generics_context: None,
         };
         morph(method).expect("the array shapes certify");
     }
@@ -451,6 +456,7 @@ mod tests {
             num_args: 0,
             num_il_locals: 0,
             struct_layouts: StructLayouts::new(),
+            generics_context: None,
         });
         assert!(m.is_ok());
     }

@@ -617,6 +617,11 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
     // rbp-relative and safe to include).
     em.range_reopen();
     em.spill_incoming_args()?;
+    // The reported prolog end for a generics context (step_11.3B): the
+    // offset after the incoming-argument homing stores is where the
+    // context slot becomes reportable (clr-abi.md:92); the homing store
+    // is inside [0, prolog_end) by construction.
+    let arg_homing_end = em.asm.offset();
     em.zero_init_slots()?;
 
     let mut block_offsets = Vec::with_capacity(method.blocks.len());
@@ -783,6 +788,17 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
                 &em.layout.slots,
                 &method.struct_layouts,
             ),
+            // The generics-context slot (step_11.3B): the same
+            // bytes-below-rbp frame offset convention as the root set,
+            // negated (the GC-info slot convention). The slot is a
+            // NativeInt local, so it never appears in `gc_roots`.
+            generics_context: method.generics_context.map(|ctx| {
+                rokajit::pipeline::GenericsContextGcInfo {
+                    slot_offset: -(em.layout.slots[ctx.local.0 as usize] as i32),
+                    kind: ctx.kind,
+                    prolog_end: arg_homing_end,
+                }
+            }),
         },
         funclets,
         eh_clauses,
@@ -2843,6 +2859,7 @@ mod tests {
             num_args,
             num_il_locals,
             struct_layouts: StructLayouts::new(),
+            generics_context: None,
         }
     }
 
@@ -4406,6 +4423,8 @@ mod tests {
             max_stack: 8,
             eh_count: 0,
             init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
             args: ee.make_method_sig(&fib_sig),
             locals: ee.make_locals_sig(&[]),
         };
@@ -5366,6 +5385,8 @@ mod tests {
             max_stack: 8,
             eh_count: 0,
             init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
             args: ee.make_method_sig(&entry),
             locals: ee.make_locals_sig(&[]),
         };

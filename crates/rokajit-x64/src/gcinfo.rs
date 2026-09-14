@@ -14,8 +14,7 @@
 //!   tier-0 frame is rbp-based, and `NORMALIZE_STACK_BASE_REGISTER(rbp) =
 //!   rbp ^ 5 = 0` (`gcinfotypes.h:583`), so the header stays slim with the
 //!   SBR bit set. The decoder (`gcinfodecoder.cpp:294-320`) reads exactly
-//!   two bits here.
-//! - **Code length** as `varl_u(code_len, CODE_LENGTH_ENCBASE=8)`;
+//!   two bits here.//! - **Code length** as `varl_u(code_len, CODE_LENGTH_ENCBASE=8)`;
 //!   `NORMALIZE_CODE_LENGTH` is the identity on AMD64.
 //! - **Safepoints** (`NUM_SAFE_POINTS_ENCBASE=2`): the managed calls'
 //!   return addresses, as recorded by codegen (the encoder's
@@ -81,9 +80,24 @@
 //!   `numUsedSlots == 0` early exit (gcinfoencoder.cpp:1448) skips even
 //!   that when the slot table is empty.
 //!
+//! ## The generics context (step_11.3B)
+//!
+//! A reported context ([`GcInfoInput::generics_context`]) also forces the
+//! fat header — with or without EH (gcinfoencoder.cpp:940's
+//! `hasContextParamType`): the 2-bit `contextParamType` flag field
+//! (MT/MD/THIS), then after the code-length varl `varl_u(normPrologSize -
+//! 1, NORM_PROLOG_SIZE_ENCBASE=5)` (the context slot becomes reportable at
+//! the end of the incoming-argument homing — clr-abi.md:92) and
+//! `varl_s(NORMALIZE_STACK_SLOT(slot),
+//! GENERICS_INST_CONTEXT_STACK_SLOT_ENCBASE=6)`, then the stack-base
+//! register, the stack area, and the rest of the fat/slim tail unchanged.
+//! A context WITHOUT EH keeps the partially-interruptible tail (safepoint
+//! count, then the zero ranges count, then the fixed-width offsets — the
+//! Build order, gcinfoencoder.cpp:1117-1148).
+//!
 //! Not yet encoded (named causes, later steps): tracked GC-root slots
 //! (per-safepoint liveness — a tier-1 contract extension), GS cookie,
-//! generics context, reverse-pinvoke frame, EnC.
+//! reverse-pinvoke frame, EnC.
 
 use rokajit::error::{CompileError, CompileResult};
 use rokajit::metadata::GcInfoInput;
@@ -117,39 +131,101 @@ const INTERRUPTIBLE_RANGE_DELTA1_ENCBASE: u32 = 6;
 const INTERRUPTIBLE_RANGE_DELTA2_ENCBASE: u32 = 6;
 /// `AMD64GcInfoEncoding::POINTER_SIZE_ENCBASE` (gcinfotypes.h:617).
 const POINTER_SIZE_ENCBASE: u32 = 3;
-/// The fat-header flags word (`GC_INFO_FLAGS_BIT_SIZE = 10`,
-/// gcinfodecoder.h:257): `GC_INFO_HAS_STACK_BASE_REGISTER` (0x40) |
-/// `GC_INFO_WANTS_REPORT_ONLY_LEAF` (0x80).
-const FAT_FLAGS_EH: u64 = 0xC0;
+/// `AMD64GcInfoEncoding::NORM_PROLOG_SIZE_ENCBASE` (gcinfotypes.h:605).
+const NORM_PROLOG_SIZE_ENCBASE: u32 = 5;
+/// `AMD64GcInfoEncoding::GENERICS_INST_CONTEXT_STACK_SLOT_ENCBASE`
+/// (gcinfotypes.h:592).
+const GENERICS_INST_CONTEXT_STACK_SLOT_ENCBASE: u32 = 6;
+
+/// The 2-bit `contextParamType` field of the fat-flags word
+/// (gcinfodecoder.h:241-245: MT=0x10, MD=0x20, THIS=0x30 — field values
+/// 1/2/3 in bits 4-5).
+fn context_param_type_bits(kind: rokajit::ir::GenericsContext) -> u64 {
+    match kind {
+        rokajit::ir::GenericsContext::MethodTable => 0x10,
+        rokajit::ir::GenericsContext::MethodDesc => 0x20,
+        rokajit::ir::GenericsContext::This => 0x30,
+    }
+}
 
 /// The `Target::encode_gc_info` body for x64.
 pub fn encode(input: &GcInfoInput) -> CompileResult<Vec<u8>> {
     let mut w = BitWriter::new();
-    // Non-empty interruptible ranges ⇒ an EH method: the fat
-    // fully-interruptible header (see the module docs). The slim path is
+    // Non-empty interruptible ranges ⇒ an EH method; a reported generics
+    // context (step_11.3B) also forces the fat header
+    // (gcinfoencoder.cpp:940-952's slimHeader condition). The slim path is
     // byte-identical to pre-EH output.
     let fully_interruptible = !input.interruptible_ranges.is_empty();
-    if fully_interruptible {
+    let fat = fully_interruptible || input.generics_context.is_some();
+    if fat {
+        // GC_INFO_HAS_STACK_BASE_REGISTER (0x40): rbp normalizes to 0.
+        let mut flags = 0x40u64;
+        if fully_interruptible {
+            // RyuJIT sets WANTS_REPORT_ONLY_LEAF for any method with
+            // funclets (gcencode.cpp:3998-4004) — no double-reporting of
+            // the parent frame.
+            flags |= 0x80;
+        }
+        if let Some(ctx) = &input.generics_context {
+            flags |= context_param_type_bits(ctx.kind);
+        }
         w.write(1, 1);
-        w.write(FAT_FLAGS_EH, 10);
+        w.write(flags, 10);
         w.write_varl_u(input.code_len, CODE_LENGTH_ENCBASE);
+        if let Some(ctx) = &input.generics_context {
+            // The prolog size bounds where the context slot may be
+            // reported (gcinfoencoder.cpp:1004-1017; the slot's homing
+            // store lies inside the prolog by construction).
+            // NORMALIZE_CODE_OFFSET is the identity on AMD64.
+            if ctx.prolog_end == 0 || ctx.prolog_end >= input.code_len {
+                return Err(CompileError::Internal(
+                    "generics-context prolog end outside the method body",
+                ));
+            }
+            w.write_varl_u(ctx.prolog_end - 1, NORM_PROLOG_SIZE_ENCBASE);
+            if ctx.slot_offset % 8 != 0 {
+                return Err(CompileError::Internal(
+                    "generics-context slot not 8-aligned",
+                ));
+            }
+            // NORMALIZE_STACK_SLOT(x) = x >> 3 (gcinfotypes.h).
+            w.write_varl_s(
+                i64::from(ctx.slot_offset / 8),
+                GENERICS_INST_CONTEXT_STACK_SLOT_ENCBASE,
+            );
+        }
         // rbp: NORMALIZE_STACK_BASE_REGISTER(5) = 5 ^ 5 = 0.
         w.write_varl_u(0, STACK_BASE_REGISTER_ENCBASE);
-        // NORMALIZE_SIZE_OF_STACK_AREA(x) = x >> 3.
+        // NORMALIZE_SIZE_OF_STACK_AREA(x) = x >> 3. The fat header always
+        // carries it on AMD64 (HAS_FIXED_STACK_PARAMETER_SCRATCH_AREA,
+        // gcinfotypes.h:620).
         if !input.outgoing_area_size.is_multiple_of(8) {
             return Err(CompileError::Internal(
                 "outgoing argument area not 8-aligned",
             ));
         }
         w.write_varl_u(input.outgoing_area_size >> 3, SIZE_OF_STACK_AREA_ENCBASE);
-        // Fully interruptible: zero safepoints, then the ranges,
-        // delta-encoded (start delta from the previous range's stop, then
-        // the length minus one — gcinfoencoder.cpp:1143-1162).
-        w.write_varl_u(0, NUM_SAFE_POINTS_ENCBASE);
+        // NUM_SAFE_POINTS, then NUM_INTERRUPTIBLE_RANGES, then the
+        // safepoint offsets, then the ranges — the encoder's Build order
+        // (gcinfoencoder.cpp:1117-1162). Fully interruptible: zero
+        // safepoints.
+        let mut safepoints = input.safepoints.clone();
+        safepoints.sort_unstable();
+        if fully_interruptible {
+            w.write_varl_u(0, NUM_SAFE_POINTS_ENCBASE);
+        } else {
+            w.write_varl_u(safepoints.len() as u32, NUM_SAFE_POINTS_ENCBASE);
+        }
         w.write_varl_u(
             input.interruptible_ranges.len() as u32,
             NUM_INTERRUPTIBLE_RANGES_ENCBASE,
         );
+        if !fully_interruptible {
+            let offset_bits = ceil_log2(input.code_len);
+            for safepoint in safepoints {
+                w.write(u64::from(safepoint), offset_bits);
+            }
+        }
         let mut last_stop = 0u32;
         for &(start, end) in &input.interruptible_ranges {
             if start < last_stop || end <= start {
@@ -331,6 +407,7 @@ mod tests {
             safepoints: safepoints.to_vec(),
             interruptible_ranges: Vec::new(),
             outgoing_area_size: 0,
+            generics_context: None,
         }
     }
 
@@ -810,5 +887,146 @@ mod tests {
         let mut i = eh_input();
         i.outgoing_area_size = 12;
         assert!(matches!(encode(&i), Err(CompileError::Internal(_))));
+    }
+
+    /// A reported context (step_11.3B), hand-computed bit stream
+    /// (LSB-first; gcinfoencoder.cpp:936-1046's Build order):
+    ///   [0] fat=1
+    ///   [1..10]  flags 0x60 (SBR | contextParamType=MD)
+    ///   [11..19] varl8(73): the code length
+    ///   [20..25] varl5(7): normPrologSize - 1 = prolog_end 8 - 1
+    ///   [26..32] varl_s(-2, base 6): the context slot (rbp - 16)
+    ///   [33..36] varl3(0): the stack base register
+    ///   [37..40] varl3(0): the outgoing area
+    ///   [41..43] varl2(2): two safepoints
+    ///   [44..45] varl1(0): no interruptible ranges
+    ///   [46..59] the two safepoint offsets (CeilOfLog2(73) = 7 bits)
+    ///   [60..61] no register slots, no stack slots
+    #[test]
+    fn generics_context_forces_the_fat_header() {
+        let mut i = input(73, &[37, 56]);
+        i.generics_context = Some(rokajit::pipeline::GenericsContextGcInfo {
+            slot_offset: -16,
+            kind: rokajit::ir::GenericsContext::MethodDesc,
+            prolog_end: 8,
+        });
+        let blob = encode(&i).expect("encodes");
+        let mut r = Reader {
+            bytes: &blob,
+            bit: 0,
+        };
+        assert_eq!(r.read(1), 1, "fat header");
+        assert_eq!(
+            r.read(10),
+            0x60,
+            "HAS_STACK_BASE_REGISTER | contextParamType=MD (0x20)"
+        );
+        assert_eq!(r.read_varl_u(CODE_LENGTH_ENCBASE), 73);
+        assert_eq!(
+            r.read_varl_u(NORM_PROLOG_SIZE_ENCBASE),
+            7,
+            "normPrologSize - 1"
+        );
+        assert_eq!(
+            r.read_varl_s(GENERICS_INST_CONTEXT_STACK_SLOT_ENCBASE),
+            -2,
+            "the context slot at rbp - 16"
+        );
+        assert_eq!(r.read_varl_u(STACK_BASE_REGISTER_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(SIZE_OF_STACK_AREA_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(NUM_SAFE_POINTS_ENCBASE), 2);
+        assert_eq!(
+            r.read_varl_u(NUM_INTERRUPTIBLE_RANGES_ENCBASE),
+            0,
+            "partially interruptible: no ranges"
+        );
+        // The safepoint offsets follow the ranges count (Build order).
+        assert_eq!(r.read(7), 37);
+        assert_eq!(r.read(7), 56);
+        assert_eq!(r.read(1), 0, "no register slots");
+        assert_eq!(r.read(1), 0, "no stack/untracked slots");
+        assert!(blob.len() * 8 - r.bit < 8, "only padding remains");
+    }
+
+    /// Context AND a call safepoint (step_11.3C's "GC-info context
+    /// reporting under stub dispatch" shape): the fat header carries
+    /// contextParamType=MT and the safepoint table rides behind the
+    /// context fields.
+    #[test]
+    fn generics_context_and_a_safepoint_encode_together() {
+        let mut i = input(40, &[22]);
+        i.generics_context = Some(rokajit::pipeline::GenericsContextGcInfo {
+            slot_offset: -16,
+            kind: rokajit::ir::GenericsContext::MethodTable,
+            prolog_end: 8,
+        });
+        let blob = encode(&i).expect("encodes");
+        let mut r = Reader {
+            bytes: &blob,
+            bit: 0,
+        };
+        assert_eq!(r.read(1), 1, "fat header");
+        assert_eq!(
+            r.read(10),
+            0x50,
+            "HAS_STACK_BASE_REGISTER | contextParamType=MT (0x10)"
+        );
+        assert_eq!(r.read_varl_u(CODE_LENGTH_ENCBASE), 40);
+        assert_eq!(r.read_varl_u(NORM_PROLOG_SIZE_ENCBASE), 7);
+        assert_eq!(
+            r.read_varl_s(GENERICS_INST_CONTEXT_STACK_SLOT_ENCBASE),
+            -2,
+            "the context slot at rbp - 16"
+        );
+        assert_eq!(r.read_varl_u(STACK_BASE_REGISTER_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(SIZE_OF_STACK_AREA_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(NUM_SAFE_POINTS_ENCBASE), 1);
+        assert_eq!(r.read_varl_u(NUM_INTERRUPTIBLE_RANGES_ENCBASE), 0);
+        assert_eq!(r.read(6), 22, "the safepoint (CeilOfLog2(40) = 6 bits)");
+        assert_eq!(r.read(1), 0, "no register slots");
+        assert_eq!(r.read(1), 0, "no stack/untracked slots");
+        assert!(blob.len() * 8 - r.bit < 8, "only padding remains");
+    }
+
+    /// Context AND EH (a shared generic method with funclets): both flag
+    /// sets, the prolog varl and context slot before the stack base
+    /// register, then the EH tail (zero safepoints, the ranges).
+    #[test]
+    fn generics_context_composes_with_the_eh_fat_path() {
+        let mut i = eh_input();
+        i.generics_context = Some(rokajit::pipeline::GenericsContextGcInfo {
+            slot_offset: -8,
+            kind: rokajit::ir::GenericsContext::This,
+            prolog_end: 6,
+        });
+        let blob = encode(&i).expect("encodes");
+        let mut r = Reader {
+            bytes: &blob,
+            bit: 0,
+        };
+        assert_eq!(r.read(1), 1, "fat header");
+        assert_eq!(
+            r.read(10),
+            0xF0,
+            "SBR | WANTS_REPORT_ONLY_LEAF | contextParamType=THIS (0x30)"
+        );
+        assert_eq!(r.read_varl_u(CODE_LENGTH_ENCBASE), 100);
+        assert_eq!(r.read_varl_u(NORM_PROLOG_SIZE_ENCBASE), 5);
+        assert_eq!(
+            r.read_varl_s(GENERICS_INST_CONTEXT_STACK_SLOT_ENCBASE),
+            -1,
+            "the context slot at rbp - 8"
+        );
+        assert_eq!(r.read_varl_u(STACK_BASE_REGISTER_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(SIZE_OF_STACK_AREA_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(NUM_SAFE_POINTS_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(NUM_INTERRUPTIBLE_RANGES_ENCBASE), 2);
+        let first = read_range(&mut r, 0);
+        assert_eq!(first, (8, 73));
+        let second = read_range(&mut r, first.1);
+        assert_eq!(second, (84, 96));
+        assert_eq!(r.read(1), 0, "no register slots");
+        assert_eq!(r.read(1), 0, "no stack/untracked slots");
+        assert!(blob.len() * 8 - r.bit < 8, "only padding remains");
     }
 }
