@@ -31,13 +31,13 @@ under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 132 |
+| MATCH | 149 |
 | MISMATCH | 2 |
-| CRASH | 411 |
+| CRASH | 394 |
 | TIMEOUT | 2 |
 | COMPILE_FAIL | 2734 |
 
-Of the MATCHes, 131 exit 100 (the CoreCLR pass
+Of the MATCHes, 148 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -52,13 +52,13 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| non-direct calls (callvirt/calli) | 224 | `JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>`JIT/CodeGenBringUpTests/DblArea.cs`<br>`JIT/CodeGenBringUpTests/DblArray.cs`<br>… and 219 more |
-| unsupported IL opcode (importer) | 112 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD1.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD2.cs`<br>`JIT/CodeGenBringUpTests/BinaryRMW.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>… and 107 more |
-| generics | 48 | `JIT/CodeGenBringUpTests/RecursiveTailCall.cs`<br>`JIT/HardwareIntrinsics/General/ConstantFolding/StaticReadonlySimd.cs`<br>`JIT/Intrinsics/TypeEquality.cs`<br>`JIT/Regression_2/Runtime_118143/Runtime_118143.cs`<br>`JIT/Regression_2/Runtime_131285/Runtime_131285.cs`<br>… and 43 more |
-| eval-stack values across block boundaries | 13 | `JIT/CodeGenBringUpTests/Rotate.cs`<br>`JIT/CodeGenBringUpTests/StaticCalls.cs`<br>`JIT/Regression_2/Runtime_120792/Runtime_120792.cs`<br>`JIT/Regression_2/Runtime_71611/Runtime_71611.cs`<br>`JIT/Regression_3/GitHub_18362/GitHub_18362.cs`<br>… and 8 more |
+| generics | 236 | `JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>`JIT/CodeGenBringUpTests/DblArea.cs`<br>`JIT/CodeGenBringUpTests/DblArray.cs`<br>… and 231 more |
+| unsupported IL opcode (importer) | 99 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD1.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD2.cs`<br>`JIT/CodeGenBringUpTests/BinaryRMW.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>… and 94 more |
+| eval-stack values across block boundaries | 32 | `JIT/CodeGenBringUpTests/Rotate.cs`<br>`JIT/CodeGenBringUpTests/StaticCalls.cs`<br>`JIT/Intrinsics/TypeEqualitySealed.cs`<br>`JIT/Methodical/delegate/DelegateToDelegate.cs`<br>`JIT/Methodical/delegate/GSDelegate.cs`<br>… and 27 more |
 | unsupported (unmapped): conv from a non-numeric operand (pointers) | 5 | `JIT/Regression_3/GitHub_11408/GitHub_11408.cs`<br>`JIT/opt/Cloning/Runtime_61040_5.cs`<br>`JIT/opt/Loops/LoopSideEffectsForHwiStores.cs`<br>`JIT/opt/OSR/livelocaladdress.cs`<br>`JIT/opt/OSR/tailrecursetry2.cs` |
+| ldtoken handle embedding (10.10 gates) | 4 | `JIT/opt/Devirtualization/exact1.cs`<br>`JIT/opt/Devirtualization/exact2.cs`<br>`JIT/opt/Devirtualization/generic.cs`<br>`JIT/opt/Devirtualization/sharedoverride.cs` |
+| statics pack gates (10.7: TLS/generic/R2R/accessors) | 4 | `JIT/Directed/tls/StaticTlsResolver.cs`<br>`JIT/opt/Devirtualization/GitHub_51918.cs`<br>`JIT/opt/OptimizeBools/optboolsreturn.cs`<br>`JIT/opt/ValueNumbering/ConstIndexRVA.cs` |
 | bad IL rejected by importer | 3 | `JIT/Regression_2/Runtime_110958/Runtime_110985.cs`<br>`JIT/jit64/gc/regress/vswhidbey/143837.cs`<br>`JIT/jit64/regress/vsw/524070/test1.cs` |
-| statics pack gates (10.7: TLS/generic/R2R/accessors) | 2 | `JIT/Directed/tls/StaticTlsResolver.cs`<br>`JIT/opt/OptimizeBools/optboolsreturn.cs` |
 | EH filters/faults (out of 10.6 scope) | 1 | `JIT/opt/Cloning/loops_with_eh.cs` |
 | rethrow (out of 10.6 scope) | 1 | `JIT/jit64/opt/cprop/cprop001.cs` |
 | structs & value types | 1 | `JIT/Regression_2/Runtime_72506/Runtime_72506.cs` |
@@ -100,4 +100,11 @@ error model didn't classify. Each carries its stderr signature.
 | --- | --- | --- | --- |
 | `JIT/Methodical/delegate/VirtualDelegate.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/Regression_2/Runtime_124749/Runtime_124749.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Regression_2/Runtime_70790/Runtime_70790.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_2/Runtime_72775/Runtime_72775.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/AssertionPropagation/ArrBoundUnsigned.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/opt/Enum/hasflag.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Inline/tests/DelegInstanceFtn.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Inline/tests/DelegStaticFtn.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Inline/tests/Inline_DelegateStruct.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/ValueNumbering/StaticReadonlyStructWithGC.cs` | CRASH | SIGSEGV | (no stderr output) |

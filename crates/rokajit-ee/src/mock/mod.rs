@@ -128,6 +128,19 @@ pub struct MockEe {
     /// Method tokens for which `get_call_info` cans a non-`CORINFO_CALL`
     /// kind (the importer's "non-direct call kind" path; step_10.4).
     pub non_direct_calls: std::collections::HashSet<u32>,
+    /// Per-token `get_call_info` kind overrides (step_10.12: can STUB or
+    /// LDVIRTFTN verdicts for the interface/generic-virtual helper
+    /// fallback). Consulted before `non_direct_calls`.
+    pub call_kinds: HashMap<u32, ffi::CORINFO_CALL_KIND>,
+    /// Canned `get_method_vtable_offset` verdicts (step_10.12), keyed by
+    /// the method handle's raw value; absent handles answer the default —
+    /// no chunk indirection, slot offset 0x28 (an ordinary mid-table
+    /// slot).
+    pub vtable_offsets: HashMap<usize, (u32, u32, bool)>,
+    /// Canned `find_sig` answers for `calli`'s StandAloneSig tokens
+    /// (step_10.12), registered via [`MockEe::add_calli_sig`]: the
+    /// signature body and its arg-list table index.
+    calli_sigs: HashMap<u32, (MockSig, usize)>,
     /// The flags each `get_call_info` call arrived with, in order
     /// (step_10.4 tests: `call` passes EMPTY, `callvirt` CALLVIRT).
     pub call_info_flags: RefCell<Vec<CallInfoFlags>>,
@@ -291,7 +304,13 @@ impl MockEe {
         handle
     }
 
-    /// Registers a canned value class (step_10.9); returns its fake handle.
+    /// Registers a canned `calli` callsite signature under a
+    /// StandAloneSig `token` (step_10.12); `find_sig` answers it.
+    pub fn add_calli_sig(&mut self, token: u32, sig: MockSig) {
+        let arg_list = self.push_arg_list(&sig.args, &sig.arg_classes);
+        self.calli_sigs.insert(token, (sig, arg_list));
+    }
+
     pub fn add_class(
         &mut self,
         size: u32,

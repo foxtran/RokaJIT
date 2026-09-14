@@ -721,7 +721,10 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
             for (i, inst) in insts.iter().enumerate() {
                 if matches!(
                     inst,
-                    Inst::CallDirect { .. } | Inst::CallHelper { .. } | Inst::CallLabel { .. }
+                    Inst::CallDirect { .. }
+                        | Inst::CallHelper { .. }
+                        | Inst::CallLabel { .. }
+                        | Inst::CallReg { .. }
                 ) {
                     em.fixed_dests = fixed_gprs(&insts[i + 1..], false);
                 }
@@ -2022,6 +2025,7 @@ impl<'a> Emitter<'a> {
             }
             Inst::CallDirect { method } => self.emit_call(method),
             Inst::CallHelper { id } => self.emit_helper_call(id),
+            Inst::CallReg { target } => self.emit_call_reg(target),
             Inst::Push { reg } => {
                 self.asm.push(reg);
                 Ok(())
@@ -2694,6 +2698,40 @@ impl<'a> Emitter<'a> {
         let addr = const_lookup_addr(&lookup);
         let slot = const_lookup_slot(&lookup);
         self.emit_call_lookup(None, addr, slot)
+    }
+
+    /// A computed-target call (step_10.12: `calli`, vtable dispatch):
+    /// spill the pool like any call, materialize the target operand into
+    /// r11 — the fixed scratch that is never an argument register, so the
+    /// argument setup already emitted stays intact — then `call r11`. The
+    /// call site is a GC safepoint like a direct call's, but records no
+    /// relocation (the target is a runtime value) and no method handle —
+    /// the CallSite contract's indirect form; the statement's signature
+    /// still records.
+    fn emit_call_reg(&mut self, target: Src) -> CompileResult<()> {
+        let moves = self.vs.spill_registers();
+        self.apply(moves)?;
+        let g = Gpr::R11;
+        match self.wide_imm(Width::W64, target, &[g.phys()])? {
+            Rmi::Reg(r) => {
+                if r != g {
+                    self.asm.mov(Width::W64, Rm::Reg(g), Rmi::Reg(r));
+                }
+            }
+            Rmi::Mem(m) => self.asm.mov(Width::W64, Rm::Reg(g), Rmi::Mem(m)),
+            Rmi::Imm(i) => self.asm.mov(Width::W64, Rm::Reg(g), Rmi::Imm(i)),
+        }
+        let instr_offset = self.asm.offset();
+        self.asm.call_reg(g);
+        // `call r11` is REX.B + FF /2: three bytes.
+        self.call_sites.push(CallSite {
+            chunk: ChunkRef::HotCode,
+            offset: instr_offset,
+            size: 3,
+            sig: self.call_sig.clone(),
+            method: None,
+        });
+        Ok(())
     }
 
     /// The shared call-emission tail behind [`Emitter::emit_call`] and
@@ -3456,6 +3494,70 @@ mod tests {
         assert_eq!(out.relocations[0].offset, 24, "the disp32 field");
         assert_eq!(out.relocations[0].target, 0x9000, "the slot, not the entry");
         assert_eq!(out.relocations[0].reloc_type, RelocType::RELATIVE32);
+    }
+
+    /// The step_10.12 computed-target call (`calli` / vtable dispatch):
+    /// `int g(int n, native int f) { return f(n); }` — the argument move,
+    /// the pointer materialized into r11 (never an argument register),
+    /// `call r11`, the result. The call site is a GC safepoint with NO
+    /// relocation and no method handle.
+    #[test]
+    fn call_reg_method_bytes() {
+        let sig = rokajit::ir::CallSig {
+            ret: Type::Int32,
+            args: vec![Type::Int32],
+            has_this: false,
+        };
+        let m = method(
+            vec![
+                int_arg(0),
+                local(Type::NativeInt, LocalKind::IlArg(1)),
+                int_temp(),
+            ],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Call {
+                        dst: Some(LocalId(2)),
+                        target: rokajit::ir::CallTarget::Indirect(Box::new(Operand::Local(
+                            LocalId(1),
+                        ))),
+                        sig: sig.clone(),
+                        args: vec![Operand::Local(LocalId(0))],
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(2))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)   — arg n
+            0x48, 0x89, 0x75, 0xF0, // movq %rsi, -16(%rbp) — arg f
+            0x8B, 0x7D, 0xFC, // movl -4(%rbp), %edi  — arg setup
+            0x4C, 0x8B, 0x5D, 0xF0, // movq -16(%rbp), %r11 — the target
+            0x41, 0xFF, 0xD3, // call r11
+            0x89, 0x45, 0xEC, // movl %eax, -20(%rbp) — t2 defined
+            0x8B, 0x45, 0xEC, // movl -20(%rbp), %eax — return value
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+
+        // A GC safepoint (size 3: REX.B + FF /2), no relocation, no method.
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].offset, 22, "the REX.B offset");
+        assert_eq!(out.call_sites[0].size, 3);
+        assert_eq!(out.call_sites[0].method, None);
+        assert_eq!(out.call_sites[0].sig, Some(sig));
+        assert!(out.relocations.is_empty());
     }
 
     /// `t = a + 1; if (a < b) goto B2; B1: return t; B2: return t;` —

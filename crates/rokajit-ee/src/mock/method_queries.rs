@@ -89,8 +89,14 @@ impl MethodQueries for MockEe {
         ty
     }
 
-    fn get_method_vtable_offset(&self, _method: MethodHandle) -> (u32, u32, bool) {
-        (0, 0, false)
+    fn get_method_vtable_offset(&self, method: MethodHandle) -> (u32, u32, bool) {
+        // Canned per-method verdicts (step_10.12); the default is an
+        // ordinary mid-table slot with no chunk indirection
+        // (`CORINFO_VIRTUALCALL_NO_CHUNK`, corinfo.h:1416).
+        self.vtable_offsets
+            .get(&(method.as_raw() as usize))
+            .copied()
+            .unwrap_or((ffi::CORINFO_VIRTUALCALL_NO_CHUNK, 0x28, false))
     }
 
     fn resolve_virtual_method(&self, _info: &mut ffi::CORINFO_DEVIRTUALIZATION_INFO) -> bool {

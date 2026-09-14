@@ -489,6 +489,14 @@ pub enum Inst {
     /// The EE supplies the entry point via `getHelperFtn`; the call site
     /// records carry no method handle (artifact.rs's CallSite contract).
     CallHelper { id: CorInfoHelpFunc },
+    /// `call reg` — a computed target (step_10.12): a vtable slot's
+    /// contents (`callvirt` dispatch) or a `calli` function pointer. The
+    /// operand materializes into r11 at emit (never an argument
+    /// register); the call site is a GC safepoint with no relocation and
+    /// no method handle (the artifact.rs CallSite contract's
+    /// "signature-less calli" form — the sig records when the statement
+    /// carries one).
+    CallReg { target: Src },
     /// `push reg` (prolog: the frame pointer).
     Push { reg: Gpr },
     /// `sub rsp, <frame size>` — the size is codegen's frame-layout
@@ -660,12 +668,13 @@ impl Inst {
                 uses: &[],
                 defs: &[Gpr::Rcx],
             },
-            Inst::CallDirect { .. } | Inst::CallHelper { .. } | Inst::CallLabel { .. } => {
-                FixedRegs {
-                    uses: &[],
-                    defs: CALL_DEFS,
-                }
-            }
+            Inst::CallDirect { .. }
+            | Inst::CallHelper { .. }
+            | Inst::CallLabel { .. }
+            | Inst::CallReg { .. } => FixedRegs {
+                uses: &[],
+                defs: CALL_DEFS,
+            },
             // A failed bounds check calls RNGCHKFAIL (conditionally).
             Inst::BoundsCheck { .. } => FixedRegs {
                 uses: &[],

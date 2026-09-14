@@ -68,6 +68,7 @@ SUPPORTED = {
     0x25,                    # dup
     0x26,                    # pop
     0x28,                    # call
+    0x29,                    # calli (step_10.12)
     0x2A,                    # ret
     *range(0x2B, 0x2E),      # br.s / brfalse.s / brtrue.s
     *range(0x2E, 0x38),      # short conditional branches
@@ -82,7 +83,7 @@ SUPPORTED = {
     0x6C,                    # conv.r8 (step_10.2)
     0x6D,                    # conv.u4
     0x6E,                    # conv.u8
-    0x6F,                    # callvirt (step_10.4, EE-devirtualized only)
+    0x6F,                    # callvirt (step_10.4; full dispatch step_10.12)
     0x70,                    # cpobj (step_10.9)
     0x71,                    # ldobj (step_10.9)
     0x72,                    # ldstr (step_10.3)
@@ -118,11 +119,15 @@ SUPPORTED = {
 }
 # Supported 0xFE-prefixed opcodes, by second byte (opcode.def):
 #   FE 01..05 = ceq, cgt, cgt.un, clt, clt.un
+#   FE 06 = ldftn, FE 07 = ldvirtftn (step_10.12)
 #   FE 09 = ldarg, FE 0A = ldarga, FE 0B = starg
 #   FE 0C = ldloc, FE 0D = ldloca, FE 0E = stloc
 #   FE 15 = initobj (step_10.9)
 #   FE 1C = sizeof (step_10.10)
-SUPPORTED_FE = {0x01, 0x02, 0x03, 0x04, 0x05, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x15, 0x1C}
+SUPPORTED_FE = {
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x15, 0x1C,
+}
 
 # --- IL linear-scan operand-size tables -------------------------------------
 # Operand sizes for opcodes the scanner may encounter; anything not listed

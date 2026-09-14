@@ -36,9 +36,19 @@ impl TokensAndSignatures for MockEe {
     fn find_sig(
         &self,
         _module: ModuleHandle,
-        _sig_tok: u32,
+        sig_tok: u32,
         _context: Option<ContextHandle>,
     ) -> ffi::CORINFO_SIG_INFO {
+        // A registered calli callsite signature (step_10.12); anything
+        // else stays zeroed.
+        if let Some((sig, arg_list)) = self.calli_sigs.get(&sig_tok) {
+            let call_conv = if sig.has_this {
+                ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS
+            } else {
+                ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT
+            };
+            return self.build_sig_info(call_conv, sig.ret, sig.ret_class, *arg_list);
+        }
         unsafe { std::mem::zeroed() }
     }
 
@@ -196,9 +206,11 @@ impl TokensAndSignatures for MockEe {
         let mut info: ffi::CORINFO_CALL_INFO = unsafe { std::mem::zeroed() };
         if let Some(method) = self.methods.get(&token.token) {
             info.hMethod = method.handle.as_raw();
-            // Designated tokens can a non-direct kind (a vtable dispatch),
-            // exercising the importer's "non-direct call kind" gate.
-            info.kind = if self.non_direct_calls.contains(&token.token) {
+            // Per-token kind overrides first (step_10.12's stub/ldvirtftn
+            // fallback paths), then the step_10.4 set (a vtable dispatch).
+            info.kind = if let Some(kind) = self.call_kinds.get(&token.token) {
+                *kind
+            } else if self.non_direct_calls.contains(&token.token) {
                 ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_VTABLE
             } else {
                 ffi::CORINFO_CALL_KIND_CORINFO_CALL

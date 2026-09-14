@@ -881,6 +881,24 @@ rokajit::lower_rules! {
             insts
         };
 
+    /// `call fnptr(args)` — an indirect call through a computed target
+    /// (step_10.12: `calli`, and the vtable slot the importer's
+    /// `CORINFO_VIRTUALCALL_VTABLE` emission loads). The ABI argument
+    /// moves are a direct call's; the target operand is read LAST — after
+    /// the argument registers are filled — so the argument setup can never
+    /// clobber it (a pool-resident target the moves evicted reads back
+    /// from its frame slot at emit).
+    rule call_indirect: Call { dst, target: rokajit::ir::CallTarget::Indirect(addr), sig, args }
+        if let (Some(moves), Some(t)) = (arg_moves(cx, sig, args), operand_src(**addr))
+        => |cx| {
+            let mut insts = moves;
+            insts.push(Inst::CallReg { target: t });
+            if let Some(d) = dst {
+                insts.extend(call_result_move(cx, sig, *d)?);
+            }
+            insts
+        };
+
     // --- step_10.6: the EH shapes ---
 
     /// `throw` — the exception object into rdi (the normal first SysV
@@ -1848,6 +1866,61 @@ mod tests {
             args: Vec::new(),
         });
         assert_eq!(lower_one(&s), None);
+    }
+
+    #[test]
+    fn call_indirect_reads_the_pointer_after_the_argument_moves() {
+        // step_10.12: `calli` / vtable dispatch — the argument moves are a
+        // direct call's, then `call r11` on the pointer operand, then the
+        // result. The pointer reads LAST: the argument registers it might
+        // pool-occupy are already filled, and codegen's spill makes its
+        // frame slot the source of truth.
+        let sig = rokajit::ir::CallSig {
+            ret: Type::Int32,
+            args: vec![Type::Int32],
+            has_this: false,
+        };
+        let s = stmt(StmtKind::Call {
+            dst: Some(LocalId(2)),
+            target: CallTarget::Indirect(std::boxed::Box::new(Operand::Local(LocalId(0)))),
+            sig,
+            args: vec![Operand::Local(LocalId(1))],
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Reg(Gpr::Rdi),
+                    src: vsrc(1),
+                },
+                Inst::CallReg { target: vsrc(0) },
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: val(2),
+                    src: Src::Reg(Gpr::Rax),
+                },
+            ])
+        );
+        // A constant target (ldftn) lowers to the immediate source form.
+        let s = stmt(StmtKind::Call {
+            dst: None,
+            target: CallTarget::Indirect(std::boxed::Box::new(Operand::Const(Const::NativeInt(
+                0x7777,
+            )))),
+            sig: rokajit::ir::CallSig {
+                ret: Type::Void,
+                args: Vec::new(),
+                has_this: false,
+            },
+            args: Vec::new(),
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::CallReg {
+                target: Src::Imm(0x7777),
+            }])
+        );
     }
 
     #[test]

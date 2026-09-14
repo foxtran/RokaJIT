@@ -20,12 +20,18 @@
 //! out), the compare-branch family `beq`..`blt.un` plus `brfalse`/
 //! `brtrue`/`br` (short and long forms; the null-check forms now also
 //! accept references, and the compare forms floats), `call`, and `ret`.
-//! The step_10.4 object pack adds `callvirt` (scoped: the EE must
-//! devirtualize to a direct call — a real vtable dispatch is
-//! `Unsupported`), instance field access `ldfld`/`stfld`/`ldflda`
+//! The step_10.4 object pack adds `callvirt` (scoped at 10.4 to
+//! EE-devirtualized targets; step_10.12 removed the scope — the EE's
+//! `getCallInfo` verdict drives direct, vtable, and the
+//! header-sanctioned helper fallback for interface/generic-virtual
+//! dispatch), instance field access `ldfld`/`stfld`/`ldflda`
 //! (statics have their own pack), and `newobj` (EE allocation helper + a
 //! direct constructor call; the reference-field store goes through the
-//! EE's checked-write-barrier helper). The step_10.7 statics pack adds
+//! EE's checked-write-barrier helper). Step_10.12 also adds `calli`
+//! (callsite signature via `findSig`, function pointer on top of the
+//! stack), `ldftn` (entry-point constant or slot load), and
+//! `ldvirtftn` (the runtime vtable lookup, materialized at the opcode).
+//! The step_10.7 statics pack adds
 //! `ldsfld`/`ldsflda`/`stsfld`: the field's address comes from the EE's
 //! `getFieldInfo` (a plain static answers `STATIC_ADDRESS` with the
 //! final address as an `IAT_VALUE` constant — no layout math JIT-side;
@@ -514,6 +520,15 @@ enum Op {
     /// null-checked (ECMA-335 §III.4.2: NullReferenceException on a null
     /// `this` even when the EE devirtualizes to a direct call).
     CallVirt(u32),
+    /// `calli` — indirect call through a function pointer with a
+    /// callsite-signature token (0x11000000, the StandAloneSig heap).
+    CallI(u32),
+    /// `ldftn` (0xFE 06) — a method's entry-point address as a `native
+    /// int` value.
+    LdFtn(u32),
+    /// `ldvirtftn` (0xFE 07) — the virtual dispatch target of a method
+    /// *for the object on the stack*, a runtime vtable lookup.
+    LdVirtFtn(u32),
     /// `newobj` — allocation through the EE's `getNewHelper` helper plus a
     /// direct constructor call.
     NewObj(u32),
@@ -822,6 +837,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x6D => Op::Conv(ConvKind::U4),
             0x6E => Op::Conv(ConvKind::U8),
             0x6F => Op::CallVirt(r.u32()?),
+            0x29 => Op::CallI(r.u32()?),
             0x70 => Op::CpObj(r.u32()?),
             0x71 => Op::LdObj(r.u32()?),
             0x72 => Op::LdStr(r.u32()?),
@@ -876,6 +892,8 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                 0x03 => Op::Compare(BinaryOp::UGt),
                 0x04 => Op::Compare(BinaryOp::Lt),
                 0x05 => Op::Compare(BinaryOp::ULt),
+                0x06 => Op::LdFtn(r.u32()?),
+                0x07 => Op::LdVirtFtn(r.u32()?),
                 0x09 => Op::LdArg(r.u16()?),
                 0x0A => Op::LdArgA(r.u16()?),
                 0x0B => Op::StArg(r.u16()?),
@@ -1481,6 +1499,30 @@ fn must_eval(expr: &hir::Expr) -> bool {
         // allocates — both observable.
         hir::Expr::Cast { .. } | hir::Expr::Box { .. } => true,
         hir::Expr::StructVal { addr, .. } => must_eval(addr),
+    }
+}
+
+/// The `CORINFO_HELP_VIRTUAL_FUNC_PTR` lookup call (step_10.12): the EE
+/// helper that resolves `(receiver, classHandle, methodHandle)` to the
+/// dispatch target's entry point — the header-sanctioned implementation
+/// of the `CORINFO_VIRTUALCALL_STUB`/`LDVIRTFTN` verdicts
+/// (corinfo.h:1355; RyuJIT's impImportLdvirtftn, importer.cpp:2764). The
+/// helper throws NullReferenceException on a null receiver
+/// (jithelpers.cpp:704); our caller still wraps the receiver in the
+/// explicit 10.4 trap first.
+fn virtual_func_ptr_call(
+    this: hir::Expr,
+    class_handle: hir::Expr,
+    method_handle: hir::Expr,
+) -> hir::Expr {
+    hir::Expr::Call {
+        target: CallTarget::Helper(CorInfoHelpFunc::VIRTUAL_FUNC_PTR),
+        sig: CallSig {
+            ret: Type::NativeInt,
+            args: vec![Type::Ref, Type::NativeInt, Type::NativeInt],
+            has_this: false,
+        },
+        args: vec![this, class_handle, method_handle],
     }
 }
 
@@ -2251,6 +2293,19 @@ impl BlockImport<'_> {
     /// (ECMA-335 §III.4.2: NullReferenceException on a null `this` even
     /// for a non-virtual target) and forbidden for `call` (§III.4.1
     /// tolerates a null `this`).
+    ///
+    /// Step_10.12: the EE's `getCallInfo` verdict owns the call kind
+    /// (corinfo.h:1326). `CORINFO_CALL` is a direct call;
+    /// `CORINFO_VIRTUALCALL_VTABLE` emits the EE-reported vtable slot
+    /// (`getMethodVTableOffset` — never JIT-side layout math) as an
+    /// indirect call; `CORINFO_VIRTUALCALL_STUB` (interface calls —
+    /// jitinterface.cpp:5400) and `CORINFO_VIRTUALCALL_LDVIRTFTN` take
+    /// the header-sanctioned fallback (corinfo.h:1355: the JIT "is
+    /// allowed to implement the call as if it were
+    /// CORINFO_VIRTUALCALL_LDVIRTFTN"), the `VIRTUAL_FUNC_PTR` helper +
+    /// indirect call. `CORINFO_CALL_CODE_POINTER` and any dispatch
+    /// needing a generic-context runtime lookup stay Unsupported (the
+    /// shared-generics step).
     fn call(
         &mut self,
         token: u32,
@@ -2272,12 +2327,25 @@ impl BlockImport<'_> {
         let call = self
             .ee
             .get_call_info(&mut resolved, None, self.info.ftn, flags);
-        if call.kind != ffi::CORINFO_CALL_KIND_CORINFO_CALL {
-            // Direct calls only: for callvirt the EE devirtualizes
-            // non-virtual and provably-final targets; anything else is a
-            // real vtable/interface dispatch — a later step.
-            return Err(CompileError::Unsupported("non-direct call kind"));
-        }
+        // A dispatch kind is only legal for `callvirt` — a plain `call`
+        // always resolves to the exact method (corinfo.h:1331). The
+        // newobj constructor gate below keeps its own direct-only check.
+        let virtual_kind = match call.kind {
+            ffi::CORINFO_CALL_KIND_CORINFO_CALL => None,
+            kind @ (ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_VTABLE
+            | ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_STUB
+            | ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_LDVIRTFTN) => {
+                if !flags.contains(CallInfoFlags::CALLVIRT) {
+                    return Err(CompileError::BadIl("dispatch kind on a non-callvirt call"));
+                }
+                Some(kind)
+            }
+            _ => {
+                return Err(CompileError::Unsupported(
+                    "non-direct call kind: code pointer (shared generics)",
+                ))
+            }
+        };
         check_call_conv(call.sig.callConv)?;
         let has_this = call.sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0;
         if null_check_this && !has_this {
@@ -2289,7 +2357,7 @@ impl BlockImport<'_> {
             self.ee,
             &mut self.struct_layouts,
         )?;
-        let mut arg_types = sig_arg_types(&call.sig, self.ee, &mut self.struct_layouts)?;
+        let arg_types = sig_arg_types(&call.sig, self.ee, &mut self.struct_layouts)?;
 
         let mut args = Vec::with_capacity(arg_types.len() + usize::from(has_this));
         for &expected in arg_types.iter().rev() {
@@ -2319,7 +2387,151 @@ impl BlockImport<'_> {
                 "get_call_info returned a null method handle",
             ));
         };
-        if let Type::Struct(class) = ret {
+        let target = match virtual_kind {
+            None => CallTarget::Direct(method),
+            Some(ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_VTABLE) => {
+                let this = self.spill_receiver(&mut args, stmts, il_offset)?;
+                CallTarget::Indirect(Box::new(
+                    self.vtable_target(method, hir::Expr::Local(this))?,
+                ))
+            }
+            // STUB (interface dispatch) and LDVIRTFTN (generic virtuals):
+            // the VIRTUAL_FUNC_PTR helper fallback.
+            Some(_) => {
+                let meth = self.embed_handle_expr(&mut resolved, false)?;
+                let class = self.embed_handle_expr(&mut resolved, true)?;
+                let this = self.spill_receiver(&mut args, stmts, il_offset)?;
+                CallTarget::Indirect(Box::new(virtual_func_ptr_call(
+                    hir::Expr::Local(this),
+                    class,
+                    meth,
+                )))
+            }
+        };
+        self.finish_call(
+            target,
+            CallSig {
+                ret,
+                args: arg_types,
+                has_this,
+            },
+            args,
+            stmts,
+            il_offset,
+        )
+    }
+
+    /// Spills a call's (already null-checked) receiver argument into a
+    /// Ref temp, replacing `args[0]` with a read of the temp: a virtual
+    /// dispatch references the receiver twice — as argument and inside
+    /// the target computation — and the temp pins the single evaluation
+    /// (the null check included) before both. Returns the temp.
+    fn spill_receiver(
+        &mut self,
+        args: &mut [hir::Expr],
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<LocalId> {
+        if args.is_empty() {
+            return Err(CompileError::BadIl("virtual dispatch without a receiver"));
+        }
+        self.spill_stack(stmts, il_offset)?;
+        let t = self.temp(Type::Ref);
+        let receiver = std::mem::replace(&mut args[0], hir::Expr::Local(t));
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Store {
+                dst: t,
+                value: receiver,
+            },
+        });
+        Ok(t)
+    }
+
+    /// The dispatch target of a `CORINFO_VIRTUALCALL_VTABLE` verdict: the
+    /// EE's `getMethodVTableOffset` verdict emitted verbatim —
+    /// `[this + 0]` is the MethodTable pointer (the faulting first
+    /// dereference; corinfo.h:1374 makes it the implicit null check, ours
+    /// is the explicit 10.4 trap), a chunk indirection when the offset
+    /// says so (`CORINFO_VIRTUALCALL_NO_CHUNK` = none), then the slot.
+    /// `is_relative` never answers true on this runtime
+    /// (jitinterface.cpp:8707); reject it rather than emit dead math.
+    fn vtable_target(&mut self, method: MethodHandle, this: hir::Expr) -> CompileResult<hir::Expr> {
+        let (indirection, after, is_relative) = self.ee.get_method_vtable_offset(method);
+        if is_relative {
+            return Err(CompileError::Unsupported(
+                "non-direct call kind: relative vtable offset",
+            ));
+        }
+        let load = |addr, offset| hir::Expr::Load {
+            addr: Box::new(addr),
+            offset,
+            ty: Type::NativeInt,
+            access: MemAccess::Natural,
+        };
+        let vtable = load(this, 0);
+        let vtable = if indirection != ffi::CORINFO_VIRTUALCALL_NO_CHUNK {
+            load(vtable, indirection)
+        } else {
+            vtable
+        };
+        Ok(load(vtable, after))
+    }
+
+    /// `embedGenericHandle` → a NativeInt expr for the handle constants
+    /// the `VIRTUAL_FUNC_PTR` helper takes (RyuJIT's impTokenToHandle,
+    /// importer.cpp:1276: `embed_parent` selects method vs. parent type
+    /// handle). A generic-context runtime lookup is the shared-generics
+    /// step; an indirection cell reads through the EE's frozen slot.
+    fn embed_handle_expr(
+        &mut self,
+        resolved: &mut ffi::CORINFO_RESOLVED_TOKEN,
+        embed_parent: bool,
+    ) -> CompileResult<hir::Expr> {
+        let result = self
+            .ee
+            .embed_generic_handle(resolved, embed_parent, self.info.ftn);
+        if result.lookup.lookupKind.needsRuntimeLookup {
+            return Err(CompileError::Unsupported(
+                "non-direct call kind: generic-context runtime lookup (shared generics)",
+            ));
+        }
+        // !needsRuntimeLookup ⇒ the constLookup union member is live
+        // (corinfo.h's CORINFO_LOOKUP contract).
+        let const_lookup = unsafe { result.lookup.__bindgen_anon_1.constLookup };
+        match const_lookup.accessType {
+            ffi::InfoAccessType_IAT_VALUE => {
+                let handle = unsafe { const_lookup.__bindgen_anon_1.handle };
+                Ok(hir::Expr::Const(Const::NativeInt(handle as isize)))
+            }
+            ffi::InfoAccessType_IAT_PVALUE => {
+                let cell = unsafe { const_lookup.__bindgen_anon_1.addr };
+                Ok(hir::Expr::Load {
+                    addr: Box::new(hir::Expr::Const(Const::NativeInt(cell as isize))),
+                    offset: 0,
+                    ty: Type::NativeInt,
+                    access: MemAccess::Natural,
+                })
+            }
+            _ => Err(CompileError::Unsupported(
+                "non-direct call kind: handle through multiple indirections",
+            )),
+        }
+    }
+
+    /// The call tail shared by `call`/`callvirt`/`calli`: the hidden
+    /// return buffer for a non-register-passed struct result (step_10.9,
+    /// the managed convention), then the call as an `Eval` statement
+    /// (void) or a pushed value.
+    fn finish_call(
+        &mut self,
+        target: CallTarget<hir::Expr>,
+        mut sig: CallSig,
+        mut args: Vec<hir::Expr>,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        if let Type::Struct(class) = sig.ret {
             if !self.struct_layouts[&class].sysv.passed_in_registers {
                 // The hidden return buffer (step_10.9): a call returning a
                 // non-register-passed struct takes the address of a fresh
@@ -2328,23 +2540,19 @@ impl BlockImport<'_> {
                 // first-arg convention). The call runs for its retbuf
                 // write; the value is the temp.
                 self.spill_stack(stmts, il_offset)?;
-                let t = self.temp(ret);
-                args.insert(usize::from(has_this), hir::Expr::LocalAddr(t));
-                arg_types.insert(0, Type::ByRef);
+                let t = self.temp(sig.ret);
+                args.insert(usize::from(sig.has_this), hir::Expr::LocalAddr(t));
+                sig.args.insert(0, Type::ByRef);
                 stmts.push(hir::Stmt {
                     il_offset,
                     kind: hir::StmtKind::Eval(hir::Expr::Call {
-                        target: CallTarget::Direct(method),
-                        sig: CallSig {
-                            ret,
-                            args: arg_types,
-                            has_this,
-                        },
+                        target,
+                        sig: sig.clone(),
                         args,
                     }),
                 });
                 return self.push(
-                    ret,
+                    sig.ret,
                     hir::Expr::StructVal {
                         addr: Box::new(hir::Expr::LocalAddr(t)),
                         class,
@@ -2352,15 +2560,8 @@ impl BlockImport<'_> {
                 );
             }
         }
-        let expr = hir::Expr::Call {
-            target: CallTarget::Direct(method),
-            sig: CallSig {
-                ret,
-                args: arg_types,
-                has_this,
-            },
-            args,
-        };
+        let ret = sig.ret;
+        let expr = hir::Expr::Call { target, sig, args };
         if ret == Type::Void {
             self.spill_stack(stmts, il_offset)?;
             stmts.push(hir::Stmt {
@@ -2371,6 +2572,228 @@ impl BlockImport<'_> {
             self.push(ret, expr)?;
         }
         Ok(())
+    }
+
+    /// `calli` (0x29): an indirect call through a function pointer with a
+    /// callsite signature from a StandAloneSig token — the EE's `findSig`
+    /// (RyuJIT's eeGetSig, importercalls.cpp:353 — *not*
+    /// `findCallSiteSig`, which serves varargs method tokens). The
+    /// function pointer sits ON TOP of the IL stack (ECMA-335 §III.3.20:
+    /// `..., arg0..argN, ftn` — csc pushes it last), so it pops first and
+    /// — nested as the `Indirect` target — flattens *after* the argument
+    /// trees, exactly its IL evaluation position (`flatten_call`
+    /// evaluates an indirect target last). The ABI classification
+    /// (structs included, step_10.9) is the signature's own; there is no
+    /// implicit null check (the callee's own prolog/this-use faults).
+    fn calli(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let Some(module) = ModuleHandle::from_raw(self.info.args.scope) else {
+            return Err(CompileError::Internal("calli without a module scope"));
+        };
+        let sig = self.ee.find_sig(
+            module,
+            token,
+            Some(ContextHandle::from_method(self.info.ftn)),
+        );
+        check_call_conv(sig.callConv)?;
+        let has_this = sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0;
+        let ret = sig_elem_type(
+            CorInfoType::from_raw(sig.retType()),
+            ClassHandle::from_raw(sig.retTypeClass),
+            self.ee,
+            &mut self.struct_layouts,
+        )?;
+        let arg_types = sig_arg_types(&sig, self.ee, &mut self.struct_layouts)?;
+        let (fty, fnptr) = self.pop()?;
+        if fty != Type::NativeInt {
+            return Err(CompileError::BadIl(
+                "calli function pointer must be a native int",
+            ));
+        }
+        let mut args = Vec::with_capacity(arg_types.len() + usize::from(has_this));
+        for &expected in arg_types.iter().rev() {
+            let (ty, value) = self.pop()?;
+            if ty != expected {
+                return Err(CompileError::BadIl("calli argument type mismatch"));
+            }
+            args.push(value);
+        }
+        args.reverse();
+        if has_this {
+            let (ty, this) = self.pop()?;
+            if !matches!(ty, Type::Ref | Type::ByRef) {
+                return Err(CompileError::BadIl("`this` must be a reference"));
+            }
+            args.insert(0, this);
+        }
+        self.finish_call(
+            CallTarget::Indirect(Box::new(fnptr)),
+            CallSig {
+                ret,
+                args: arg_types,
+                has_this,
+            },
+            args,
+            stmts,
+            il_offset,
+        )
+    }
+
+    /// `ldftn` (0xFE 06): the method's entry-point address as a `native
+    /// int` — a *constant* for an already-compiled target (IAT_VALUE), a
+    /// load through the EE's entry-point slot for a not-yet-compiled one
+    /// (IAT_PVALUE; RyuJIT's `EC_FUNC_TOKEN_INDIR`, the precode slot the
+    /// EE keeps current). Resolution is `getCallInfo` with
+    /// `CORINFO_CALLINFO_LDFTN` (importer.cpp:8833); a
+    /// `CORINFO_CALL_CODE_POINTER` verdict is shared generics.
+    fn ldftn(&mut self, token: u32) -> CompileResult<()> {
+        let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+            t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+            t.tokenScope = self.info.args.scope;
+            t.token = token;
+            t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Method;
+        });
+        self.ee.resolve_token(&mut resolved);
+        let call = self
+            .ee
+            .get_call_info(&mut resolved, None, self.info.ftn, CallInfoFlags::LDFTN);
+        if call.kind != ffi::CORINFO_CALL_KIND_CORINFO_CALL {
+            return Err(CompileError::Unsupported(
+                "ldftn with a non-direct call kind (shared generics)",
+            ));
+        }
+        let Some(method) = MethodHandle::from_raw(call.hMethod) else {
+            return Err(CompileError::BadIl("ldftn token did not resolve"));
+        };
+        let entry = self.entry_point_expr(method)?;
+        self.push(Type::NativeInt, entry)
+    }
+
+    /// A method's entry point as a NativeInt expr: the
+    /// `getFunctionEntryPoint` verdict — direct address constant
+    /// (IAT_VALUE) or a load through the EE's slot (IAT_PVALUE); deeper
+    /// indirection is out (the step_07 call-emission policy).
+    fn entry_point_expr(&mut self, method: MethodHandle) -> CompileResult<hir::Expr> {
+        let lookup = self.ee.get_function_entry_point(method);
+        match InfoAccessType::from_raw(lookup.accessType) {
+            Some(InfoAccessType::Value) => {
+                let addr = unsafe { lookup.__bindgen_anon_1.addr };
+                Ok(hir::Expr::Const(Const::NativeInt(addr as isize)))
+            }
+            Some(InfoAccessType::PValue) => {
+                let cell = unsafe { lookup.__bindgen_anon_1.addr };
+                Ok(hir::Expr::Load {
+                    addr: Box::new(hir::Expr::Const(Const::NativeInt(cell as isize))),
+                    offset: 0,
+                    ty: Type::NativeInt,
+                    access: MemAccess::Natural,
+                })
+            }
+            _ => Err(CompileError::Unsupported(
+                "function entry point through multiple indirections (IAT_PPVALUE/IAT_RELPVALUE)",
+            )),
+        }
+    }
+
+    /// `ldvirtftn` (0xFE 07): the dispatch target of a method *for the
+    /// object on the stack* — the vtable lookup at runtime
+    /// (`CORINFO_VIRTUALCALL_VTABLE` verdict, same emission as
+    /// callvirt's), the `VIRTUAL_FUNC_PTR` helper for the interface
+    /// (STUB) / generic-virtual (LDVIRTFTN) verdicts, or plain `ldftn`
+    /// when the EE reports the method isn't virtual after all
+    /// (CORINFO_CALL — RyuJIT's DO_LDFTN degrade, importer.cpp:8921). The
+    /// value materializes at the `ldvirtftn` (a temp store), so a null
+    /// receiver traps here — through the explicit check on the vtable
+    /// path (the 10.4 trap model) or inside the helper
+    /// (jithelpers.cpp:704) — never at a later `calli`.
+    fn ldvirtftn(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+            t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+            t.tokenScope = self.info.args.scope;
+            t.token = token;
+            t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Method;
+        });
+        self.ee.resolve_token(&mut resolved);
+        let call = self.ee.get_call_info(
+            &mut resolved,
+            None,
+            self.info.ftn,
+            CallInfoFlags::CALLVIRT | CallInfoFlags::LDFTN,
+        );
+        let (ty, obj) = self.pop()?;
+        if !matches!(ty, Type::Ref | Type::ByRef) {
+            return Err(CompileError::BadIl("ldvirtftn operand must be a reference"));
+        }
+        match call.kind {
+            ffi::CORINFO_CALL_KIND_CORINFO_CALL => {
+                // Not actually virtual: evaluate the object for its
+                // effects (the IL pushed it), then the ldftn constant.
+                let Some(method) = MethodHandle::from_raw(call.hMethod) else {
+                    return Err(CompileError::BadIl("ldvirtftn token did not resolve"));
+                };
+                let entry = self.entry_point_expr(method)?;
+                if must_eval(&obj) {
+                    self.spill_stack(stmts, il_offset)?;
+                    stmts.push(hir::Stmt {
+                        il_offset,
+                        kind: hir::StmtKind::Eval(obj),
+                    });
+                }
+                self.push(Type::NativeInt, entry)
+            }
+            ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_VTABLE => {
+                let Some(method) = MethodHandle::from_raw(call.hMethod) else {
+                    return Err(CompileError::BadIl("ldvirtftn token did not resolve"));
+                };
+                self.spill_stack(stmts, il_offset)?;
+                let t = self.temp(Type::NativeInt);
+                let target =
+                    self.vtable_target(method, hir::Expr::NullCheck { arg: Box::new(obj) })?;
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store {
+                        dst: t,
+                        value: target,
+                    },
+                });
+                self.push(Type::NativeInt, hir::Expr::Local(t))
+            }
+            ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_STUB
+            | ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_LDVIRTFTN => {
+                let meth = self.embed_handle_expr(&mut resolved, false)?;
+                let class = self.embed_handle_expr(&mut resolved, true)?;
+                self.spill_stack(stmts, il_offset)?;
+                let t_obj = self.temp(Type::Ref);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store {
+                        dst: t_obj,
+                        value: hir::Expr::NullCheck { arg: Box::new(obj) },
+                    },
+                });
+                let t = self.temp(Type::NativeInt);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store {
+                        dst: t,
+                        value: virtual_func_ptr_call(hir::Expr::Local(t_obj), class, meth),
+                    },
+                });
+                self.push(Type::NativeInt, hir::Expr::Local(t))
+            }
+            _ => Err(CompileError::Unsupported(
+                "ldvirtftn with a non-direct call kind (shared generics)",
+            )),
+        }
     }
 
     /// Field-token resolution shared by `ldfld`/`stfld`/`ldflda`
@@ -3974,6 +4397,9 @@ impl BlockImport<'_> {
                 Op::CallVirt(token) => {
                     self.call(token, CallInfoFlags::CALLVIRT, true, &mut stmts, il_offset)?
                 }
+                Op::CallI(token) => self.calli(token, &mut stmts, il_offset)?,
+                Op::LdFtn(token) => self.ldftn(token)?,
+                Op::LdVirtFtn(token) => self.ldvirtftn(token, &mut stmts, il_offset)?,
                 Op::NewObj(token) => self.newobj(token, &mut stmts, il_offset)?,
                 Op::LdFld(token) => self.ldfld(token, &mut stmts, il_offset)?,
                 Op::LdFldA(token) => self.ldflda(token, &mut stmts, il_offset)?,
@@ -6373,14 +6799,335 @@ mod tests {
         let (ee, info) = object_fixture(&il);
         assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
 
-        // A real vtable dispatch (the EE declines to devirtualize) is out.
+        // A code-pointer verdict (shared generics) stays out (step_10.12:
+        // the vtable and helper verdicts are handled below).
         let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
         let (mut ee, info) = object_fixture(&il);
-        ee.non_direct_calls.insert(INST_TOKEN);
+        ee.call_kinds
+            .insert(INST_TOKEN, ffi::CORINFO_CALL_KIND_CORINFO_CALL_CODE_POINTER);
         assert!(matches!(
             import(&info, &ee),
             Err(CompileError::Unsupported(_))
         ));
+    }
+
+    // --- step_10.12: vtable/interface dispatch, ldftn/ldvirtftn, calli ---
+
+    /// The receiver temp a virtual call spills: asserts the store of the
+    /// null-checked `ldarg.0` and returns the temp.
+    fn spilled_receiver(m: &hir::Method) -> LocalId {
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(as_local(as_null_check(value)), LocalId(0));
+        dst
+    }
+
+    #[test]
+    fn callvirt_vtable_dispatches_through_the_ee_slot() {
+        // ldarg.0; ldarg.1; callvirt int inst(int) — the EE answers
+        // CORINFO_VIRTUALCALL_VTABLE with the canned slot (no chunk).
+        let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = object_fixture(&il);
+        ee.non_direct_calls.insert(INST_TOKEN);
+        let m = import(&info, &ee).expect("imports");
+        let t_this = spilled_receiver(&m);
+        let hir::Expr::Call { target, args, .. } = return_value(&m, 0) else {
+            panic!("expected Expr::Call")
+        };
+        assert_eq!(as_local(&args[0]), t_this);
+        assert_eq!(as_local(&args[1]), LocalId(1));
+        let CallTarget::Indirect(target) = target else {
+            panic!("expected an indirect target")
+        };
+        // target = [[this + 0] + 0x28]: vtable pointer, then the slot.
+        let hir::Expr::Load {
+            addr: slot_base,
+            offset: 0x28,
+            ty: Type::NativeInt,
+            ..
+        } = &**target
+        else {
+            panic!("expected the slot load")
+        };
+        let hir::Expr::Load {
+            addr: this,
+            offset: 0,
+            ..
+        } = &**slot_base
+        else {
+            panic!("expected the vtable-pointer load")
+        };
+        assert_eq!(as_local(this), t_this);
+    }
+
+    #[test]
+    fn callvirt_vtable_chunk_indirection_follows_the_ee_verdict() {
+        // A far slot: the EE answers (chunk 0x30, slot 0x10) — three loads.
+        let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = object_fixture(&il);
+        ee.non_direct_calls.insert(INST_TOKEN);
+        let handle = ee.methods[&INST_TOKEN].handle;
+        ee.vtable_offsets
+            .insert(handle.as_raw() as usize, (0x30, 0x10, false));
+        let m = import(&info, &ee).expect("imports");
+        let t_this = spilled_receiver(&m);
+        let hir::Expr::Call { target, .. } = return_value(&m, 0) else {
+            panic!("expected Expr::Call")
+        };
+        let CallTarget::Indirect(target) = target else {
+            panic!("expected an indirect target")
+        };
+        let hir::Expr::Load {
+            addr: chunk,
+            offset: 0x10,
+            ..
+        } = &**target
+        else {
+            panic!("expected the slot load")
+        };
+        let hir::Expr::Load {
+            addr: vtable,
+            offset: 0x30,
+            ..
+        } = &**chunk
+        else {
+            panic!("expected the chunk load")
+        };
+        let hir::Expr::Load {
+            addr: this,
+            offset: 0,
+            ..
+        } = &**vtable
+        else {
+            panic!("expected the vtable-pointer load")
+        };
+        assert_eq!(as_local(this), t_this);
+    }
+
+    #[test]
+    fn callvirt_relative_vtable_offset_is_unsupported() {
+        let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = object_fixture(&il);
+        ee.non_direct_calls.insert(INST_TOKEN);
+        let handle = ee.methods[&INST_TOKEN].handle;
+        ee.vtable_offsets.insert(
+            handle.as_raw() as usize,
+            (ffi::CORINFO_VIRTUALCALL_NO_CHUNK, 0x28, true),
+        );
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn callvirt_stub_kind_uses_the_virtual_func_ptr_helper() {
+        // The interface-call verdict (CORINFO_VIRTUALCALL_STUB): the
+        // corinfo.h:1355 fallback — VIRTUAL_FUNC_PTR(this, classHandle,
+        // methodHandle) computes the target at runtime; the call is
+        // indirect through it.
+        let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = object_fixture(&il);
+        ee.call_kinds
+            .insert(INST_TOKEN, ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_STUB);
+        let m = import(&info, &ee).expect("imports");
+        let t_this = spilled_receiver(&m);
+        let hir::Expr::Call { target, args, .. } = return_value(&m, 0) else {
+            panic!("expected Expr::Call")
+        };
+        assert_eq!(as_local(&args[0]), t_this);
+        let CallTarget::Indirect(target) = target else {
+            panic!("expected an indirect target")
+        };
+        let hir::Expr::Call {
+            target: CallTarget::Helper(CorInfoHelpFunc::VIRTUAL_FUNC_PTR),
+            sig,
+            args: helper_args,
+        } = &**target
+        else {
+            panic!("expected the VIRTUAL_FUNC_PTR helper call")
+        };
+        assert_eq!(sig.ret, Type::NativeInt);
+        assert_eq!(as_local(&helper_args[0]), t_this);
+        // The two embedded handles: the mock cans a token-deterministic
+        // IAT_VALUE constant for both the method and its parent type.
+        for handle in &helper_args[1..] {
+            let hir::Expr::Const(Const::NativeInt(v)) = handle else {
+                panic!("expected an embedded handle constant")
+            };
+            assert_eq!(*v, (0x7A7A_0000usize + INST_TOKEN as usize) as isize);
+        }
+    }
+
+    #[test]
+    fn callvirt_stub_kind_with_a_runtime_lookup_is_generics() {
+        let il = [0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = object_fixture(&il);
+        ee.call_kinds
+            .insert(INST_TOKEN, ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_STUB);
+        ee.embed_runtime_lookup = true;
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn ldftn_pushes_the_entry_point_constant() {
+        // native int f(): ldftn fib; ret — IAT_VALUE, a plain constant.
+        let il = [0xFE, 0x06, 0x01, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::NativeInt, &[]), &[]);
+        let handle = ee.methods[&FIB_TOKEN].handle;
+        ee.entry_points
+            .insert(handle.as_raw() as usize, 0x1122_3344);
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Const(Const::NativeInt(v)) = return_value(&m, 0) else {
+            panic!("expected a NativeInt constant")
+        };
+        assert_eq!(*v, 0x1122_3344);
+        assert_eq!(
+            ee.call_info_flags.borrow().as_slice(),
+            [CallInfoFlags::LDFTN]
+        );
+    }
+
+    #[test]
+    fn ldftn_loads_through_the_entry_point_slot() {
+        // IAT_PVALUE (the not-yet-compiled target): a load through the
+        // EE's slot, exactly the call-emission form (07.7).
+        let il = [0xFE, 0x06, 0x01, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::NativeInt, &[]), &[]);
+        let handle = ee.methods[&FIB_TOKEN].handle;
+        ee.entry_point_slots
+            .insert(handle.as_raw() as usize, 0x5000);
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Load {
+            addr, offset: 0, ..
+        } = return_value(&m, 0)
+        else {
+            panic!("expected a load through the slot")
+        };
+        let hir::Expr::Const(Const::NativeInt(cell)) = &**addr else {
+            panic!("expected the slot's constant address")
+        };
+        assert_eq!(*cell, 0x5000);
+    }
+
+    #[test]
+    fn ldvirtftn_does_the_vtable_lookup_at_the_opcode() {
+        // native int f(this): ldarg.0; ldvirtftn inst; ret — the lookup
+        // result materializes in a temp at the ldvirtftn (a null receiver
+        // traps HERE, not at a later calli).
+        let il = [0x02, 0xFE, 0x07, 0x03, 0x00, 0x00, 0x06, 0x2A];
+        let entry = MockSig {
+            ret: CorInfoType::NativeInt,
+            args: Vec::new(),
+            has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        let (mut ee, info) = fixture(&il, &entry, &[]);
+        ee.non_direct_calls.insert(INST_TOKEN);
+        let m = import(&info, &ee).expect("imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        let hir::Expr::Load {
+            addr: vtable,
+            offset: 0x28,
+            ..
+        } = value
+        else {
+            panic!("expected the slot load")
+        };
+        let hir::Expr::Load {
+            addr: this,
+            offset: 0,
+            ..
+        } = &**vtable
+        else {
+            panic!("expected the vtable-pointer load")
+        };
+        assert_eq!(as_local(as_null_check(this)), LocalId(0));
+        assert_eq!(as_local(return_value(&m, 0)), dst);
+        assert_eq!(
+            ee.call_info_flags.borrow().as_slice(),
+            [CallInfoFlags::CALLVIRT | CallInfoFlags::LDFTN]
+        );
+    }
+
+    #[test]
+    fn ldvirtftn_on_a_non_virtual_degrades_to_ldftn() {
+        // The EE answers CORINFO_CALL (the method isn't virtual after
+        // all): the object evaluates for its effects, the entry point is
+        // a constant — RyuJIT's DO_LDFTN (importer.cpp:8921).
+        let il = [0x02, 0xFE, 0x07, 0x03, 0x00, 0x00, 0x06, 0x2A];
+        let entry = MockSig {
+            ret: CorInfoType::NativeInt,
+            args: Vec::new(),
+            has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        let (mut ee, info) = fixture(&il, &entry, &[]);
+        let handle = ee.methods[&INST_TOKEN].handle;
+        ee.entry_points.insert(handle.as_raw() as usize, 0x9999);
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Const(Const::NativeInt(v)) = return_value(&m, 0) else {
+            panic!("expected the entry-point constant")
+        };
+        assert_eq!(*v, 0x9999);
+    }
+
+    #[test]
+    fn calli_pops_the_pointer_first_and_calls_indirect() {
+        // int f(): ldc.i4 3; ldc.i4 4; ldftn fib; calli int(int,int); ret
+        // — the function pointer is ON TOP of the stack (ECMA-335
+        // §III.3.20), popped before the arguments, and the call's target
+        // is its tree.
+        let il = [
+            0x1F, 0x03, 0x00, 0x00, 0x00, 0x1F, 0x04, 0x00, 0x00, 0x00, 0xFE, 0x06, 0x01, 0x00,
+            0x00, 0x06, 0x29, 0x01, 0x00, 0x00, 0x11, 0x2A,
+        ];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let handle = ee.methods[&FIB_TOKEN].handle;
+        ee.entry_points.insert(handle.as_raw() as usize, 0x7777);
+        ee.add_calli_sig(
+            0x1100_0001,
+            sig(CorInfoType::Int, &[CorInfoType::Int, CorInfoType::Int]),
+        );
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Call { target, sig, args } = return_value(&m, 0) else {
+            panic!("expected Expr::Call")
+        };
+        assert!(!sig.has_this);
+        assert_eq!(sig.args, [Type::Int32, Type::Int32]);
+        assert_eq!(as_i32(&args[0]), 3);
+        assert_eq!(as_i32(&args[1]), 4);
+        let CallTarget::Indirect(fnptr) = target else {
+            panic!("expected an indirect target")
+        };
+        let hir::Expr::Const(Const::NativeInt(v)) = &**fnptr else {
+            panic!("expected the ldftn constant")
+        };
+        assert_eq!(*v, 0x7777);
+    }
+
+    #[test]
+    fn calli_rejects_a_mismatched_argument_and_a_non_pointer_target() {
+        // calli int(int,int) with one int and one long on the stack.
+        let il = [
+            0x17, 0x18, 0xFE, 0x06, 0x01, 0x00, 0x00, 0x06, 0x29, 0x01, 0x00, 0x00, 0x11, 0x2A,
+        ];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_calli_sig(
+            0x1100_0001,
+            sig(CorInfoType::Int, &[CorInfoType::Int, CorInfoType::Long]),
+        );
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+
+        // calli with an Int32 (not a native int) where the pointer pops.
+        let il = [0x17, 0x17, 0x29, 0x01, 0x00, 0x00, 0x11, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_calli_sig(0x1100_0001, sig(CorInfoType::Int, &[CorInfoType::Int]));
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
     }
 
     #[test]

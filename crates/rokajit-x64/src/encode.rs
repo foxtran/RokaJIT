@@ -845,6 +845,18 @@ impl Asm {
         self.emit_u32(0);
     }
 
+    /// `call reg` (FF /2, mod=11): the computed-target form — a vtable
+    /// slot's contents or a `calli` function pointer (step_10.12). No
+    /// relocation: the target is a runtime value.
+    pub fn call_reg(&mut self, reg: Gpr) {
+        let r = reg as u8;
+        if r >= 8 {
+            self.emit_u8(0x41); // REX.B
+        }
+        self.emit_u8(0xFF);
+        self.emit_u8(0xD0 | (r & 7));
+    }
+
     /// `push reg`.
     pub fn push(&mut self, reg: Gpr) {
         self.emit_op_plus_reg(0x50, reg);
