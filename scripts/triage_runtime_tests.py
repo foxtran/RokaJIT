@@ -75,7 +75,7 @@ RUNTIME_TESTS = RUNTIME_REPO / "src" / "tests"
 ROKAJIT_WS = Path(os.environ.get("ROKAJIT_WS", MAIN_REPO)).resolve()
 
 STATE_DIR = MAIN_REPO / "target" / "triage"  # target/ is gitignored
-RESULT_VERSION = 3
+RESULT_VERSION = 4
 DEFAULT_RESULTS = STATE_DIR / "results.jsonl"
 DEFAULT_REPORT = MAIN_REPO / "docs" / "runtime-test-triage.md"
 BIN_DIR = STATE_DIR / "bin"
@@ -212,26 +212,36 @@ namespace Xunit
     {
         None = 0, RegularRun = 1 << 0, JitStress = 1 << 1,
         JitStressRegs = 1 << 2, TieredCompilation = 1 << 3,
-        DisableTieredCompilation = 1 << 4, Any = ~0
+        DisableTieredCompilation = 1 << 4, AnyJitOptimizationStress = 1 << 5,
+        AnyGCStress = 1 << 6, HeapVerify = 1 << 7,
+        AnyJitStress = JitStress | JitStressRegs,
+        Any = ~0
     }
+    [System.Flags]
+    public enum TestRuntimes { None = 0, CoreCLR = 1 << 0, Mono = 1 << 1, NativeAOT = 1 << 2, All = ~0 }
     public enum TargetFrameworkMonikers { Net462 = 1, NetCore = 2, Uap = 4, UapAot = 8, NetFramework = 16, Netcoreapp = 32 }
 
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class FactAttribute : System.Attribute
     {
         public string Skip { get; set; }
         public string DisplayName { get; set; }
         public int Timeout { get; set; }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class TheoryAttribute : FactAttribute { }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class InlineDataAttribute : System.Attribute
     {
         public InlineDataAttribute(params object[] data) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class MemberDataAttribute : System.Attribute
     {
         public MemberDataAttribute(string memberName) { }
         public MemberDataAttribute(string memberName, params object[] parameters) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class ConditionalFactAttribute : FactAttribute
     {
         public ConditionalFactAttribute() { }
@@ -239,18 +249,21 @@ namespace Xunit
         public ConditionalFactAttribute(System.Type type, string member) { }
         public ConditionalFactAttribute(System.Type type, string member, params object[] args) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class ConditionalTheoryAttribute : TheoryAttribute
     {
         public ConditionalTheoryAttribute() { }
         public ConditionalTheoryAttribute(params System.Type[] types) { }
         public ConditionalTheoryAttribute(System.Type type, string member) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class OuterLoopAttribute : System.Attribute
     {
         public OuterLoopAttribute() { }
         public OuterLoopAttribute(string reason) { }
         public OuterLoopAttribute(string reason, TestPlatforms platforms) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class ActiveIssueAttribute : System.Attribute
     {
         public ActiveIssueAttribute(int issueNumber) { }
@@ -259,38 +272,116 @@ namespace Xunit
         public ActiveIssueAttribute(string url, TestPlatforms platforms) { }
         public ActiveIssueAttribute(int issueNumber, TestFrameworks frameworks) { }
         public ActiveIssueAttribute(string url, TestFrameworks frameworks) { }
+        public ActiveIssueAttribute(string url, TestRuntimes runtimes) { }
+        public ActiveIssueAttribute(string url, TestRuntimes runtimes, TestPlatforms platforms) { }
         public ActiveIssueAttribute(string url, TestPlatforms platforms, TestFrameworks frameworks) { }
         public ActiveIssueAttribute(int issueNumber, TestPlatforms platforms, TestFrameworks frameworks) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class SkipOnCoreClrAttribute : System.Attribute
     {
         public SkipOnCoreClrAttribute(string reason) { }
         public SkipOnCoreClrAttribute(string reason, RuntimeTestModes modes) { }
         public SkipOnCoreClrAttribute(RuntimeTestModes modes) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class SkipOnMonoAttribute : System.Attribute
     {
         public SkipOnMonoAttribute(string reason) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class SkipOnNativeAotAttribute : System.Attribute
     {
         public SkipOnNativeAotAttribute(string reason) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class SkipOnTargetFrameworkAttribute : System.Attribute
     {
         public SkipOnTargetFrameworkAttribute(string reason, TargetFrameworkMonikers frameworks) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class TraitAttribute : System.Attribute
     {
         public TraitAttribute(string name, string value) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class CollectionAttribute : System.Attribute
     {
         public CollectionAttribute(string name) { }
     }
+    [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = true)]
     public class CollectionDefinitionAttribute : System.Attribute
     {
         public CollectionDefinitionAttribute(string name) { }
+    }
+
+    // Minimal faithful Assert: throws on failure, and the SAME compiled code
+    // runs under both JITs — comparison integrity holds even where this
+    // differs from real xunit (both sides fail identically). step_12.0.
+    public static class Assert
+    {
+        private static void Fail(string msg) { throw new System.Exception("Assert: " + msg); }
+
+        public static void True(bool condition) { if (!condition) Fail("expected True"); }
+        public static void True(bool condition, string userMessage) { if (!condition) Fail(userMessage); }
+        public static void False(bool condition) { if (condition) Fail("expected False"); }
+        public static void False(bool condition, string userMessage) { if (condition) Fail(userMessage); }
+        public static void Null(object o) { if (o != null) Fail("expected null"); }
+        public static void NotNull(object o) { if (o == null) Fail("expected non-null"); }
+        public static void Same(object a, object b) { if (!object.ReferenceEquals(a, b)) Fail("expected same reference"); }
+        public static void NotSame(object a, object b) { if (object.ReferenceEquals(a, b)) Fail("expected different references"); }
+        public static void Fail() { Fail("explicit Fail"); }
+
+        private static bool SeqEq(System.Collections.IEnumerable a, System.Collections.IEnumerable b)
+        {
+            var ea = a.GetEnumerator(); var eb = b.GetEnumerator();
+            while (true)
+            {
+                bool na = ea.MoveNext(), nb = eb.MoveNext();
+                if (na != nb) return false;
+                if (!na) return true;
+                if (!object.Equals(ea.Current, eb.Current)) return false;
+            }
+        }
+
+        public static void Equal<T>(T expected, T actual)
+        {
+            if (expected is System.Collections.IEnumerable ea && actual is System.Collections.IEnumerable eb
+                && !(expected is string))
+            { if (!SeqEq(ea, eb)) Fail("sequences differ"); return; }
+            if (!object.Equals(expected, actual)) Fail($"expected {expected}, got {actual}");
+        }
+        public static void Equal(object expected, object actual) { Equal<object>(expected, actual); }
+        public static void Equal<T>(System.Collections.Generic.IEnumerable<T> expected, System.Collections.Generic.IEnumerable<T> actual)
+        {
+            if (!SeqEq(expected, actual)) Fail("sequences differ");
+        }
+        public static void NotEqual<T>(T notExpected, T actual) { if (object.Equals(notExpected, actual)) Fail("values unexpectedly equal"); }
+
+        public static T Throws<T>(System.Action action) where T : System.Exception
+        {
+            try { action(); }
+            catch (T ex) { return ex; }
+            catch (System.Exception ex) { Fail($"wrong exception type: {ex.GetType()}"); throw; }
+            Fail($"expected {typeof(T)}"); throw new System.Exception("unreachable");
+        }
+        public static T ThrowsAny<T>(System.Action action) where T : System.Exception
+        {
+            try { action(); }
+            catch (System.Exception ex) when (ex is T) { return (T)ex; }
+            catch (System.Exception ex) { Fail($"wrong exception type: {ex.GetType()}"); throw; }
+            Fail($"expected {typeof(T)}"); throw new System.Exception("unreachable");
+        }
+        public static void IsType<T>(object o) { if (!(o is T)) Fail($"wrong type: {o?.GetType()}"); }
+        public static void Empty(System.Collections.IEnumerable e) { if (e.GetEnumerator().MoveNext()) Fail("expected empty"); }
+        public static void NotEmpty(System.Collections.IEnumerable e) { if (!e.GetEnumerator().MoveNext()) Fail("expected non-empty"); }
+        public static void Contains<T>(T item, System.Collections.Generic.IEnumerable<T> collection)
+        {
+            foreach (var x in collection) if (object.Equals(x, item)) return;
+            Fail("item not found");
+        }
+        public static void GreaterThan<T>(T a, T b) where T : System.IComparable<T> { if (a.CompareTo(b) <= 0) Fail("expected greater"); }
+        public static void LessThan<T>(T a, T b) where T : System.IComparable<T> { if (a.CompareTo(b) >= 0) Fail("expected less"); }
     }
 }
 
@@ -322,6 +413,14 @@ namespace TestLibrary
         public static bool IsMonoRuntime => false;
         public static bool IsMonoAnyAOT => false;
         public static bool IsMonoInterpreter => false;
+        public static bool IsMonoLLVMAOT => false;
+        public static bool IsMonoFULLAOT => false;
+        public static bool IsMonoLLVMFULLAOT => false;
+        public static bool IsMonoMINIFULLAOT => false;
+        public static bool IsMonoMiniJIT => false;
+        public static bool IsSimulator => false;
+        public static bool IsNonZeroLowerBoundArraySupported => true;
+        public static bool IsNonZeroLowerBoundArrayNotSupported => false;
         public static bool IsCoreCLR => true;
         public static bool IsNotCoreCLR => false;
         public static bool IsNativeAot => false;
@@ -339,8 +438,27 @@ namespace TestLibrary
         public static bool IsExceptionInteropSupported => false;
         public static bool IsTypeEquivalenceSupported => false;
     }
-}
 
+    public static class Utilities
+    {
+        public static bool IsNativeAot => false;
+        public static bool IsNotNativeAot => true;
+        public static bool IsCoreClr => true;
+        public static bool IsMonoRuntime => false;
+        public static bool IsCoreClrInterpreter => false;
+    }
+}
+"""
+
+# The stub namespaces live in a shared file included in EVERY compile
+# (step_12.0 iteration 2: main-entry tests reference these types too —
+# stubs are not wrapper-only); the entry-point class is per-test.
+STUBS_TEMPLATE = WRAPPER_TEMPLATE
+STUBS_PATH_COMPONENT = "_stubs.cs"
+
+WRAPPER_TEMPLATE = """\
+// Auto-generated by triage_runtime_tests.py — synthesized entry point for a
+// [Fact]-style standalone test (stubs live in _stubs.cs).
 internal static class RokaJitTriageEntryPoint
 {
 %s
@@ -473,9 +591,12 @@ async def compile_candidate(candidate: dict) -> Path:
     rel_path = candidate["test"]
     src = (RUNTIME_TESTS / rel_path).resolve()
     BIN_DIR.mkdir(parents=True, exist_ok=True)
+    stubs = BIN_DIR / STUBS_PATH_COMPONENT
+    _write_if_changed(stubs, STUBS_TEMPLATE)
     base = _sanitize(rel_path)
     dll = BIN_DIR / f"{base}.dll"
     mode_file = BIN_DIR / f"{base}.mode"
+    shared = [str(stubs)]
     wrapper_sources: list[str] = []
     if candidate["entry"] == "fact":
         wrapper = BIN_DIR / f"{base}.wrapper.cs"
@@ -491,7 +612,7 @@ async def compile_candidate(candidate: dict) -> Path:
             sets = [siblings]
         else:  # unknown: try multi, fall back to single
             sets = [siblings, [str(src)]]
-        return [s + wrapper_sources for s in sets]
+        return [s + shared + wrapper_sources for s in sets]
 
     mode = mode_file.read_text().strip() if mode_file.is_file() else ""
     corelib = RUNTIME_BIN / "System.Private.CoreLib.dll"
@@ -513,7 +634,9 @@ async def compile_candidate(candidate: dict) -> Path:
         if result["exit_code"] == 0:
             _write_if_changed(
                 mode_file,
-                "multi" if len(sources) - len(wrapper_sources) > 1 else "single",
+                "multi"
+                if len(sources) - len(wrapper_sources) - len(shared) > 1
+                else "single",
             )
             return dll
         last_error = result["stdout"] + result["stderr"]

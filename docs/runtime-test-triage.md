@@ -27,16 +27,20 @@ are counted under COMPILE_FAIL.
 ## Totals
 
 - .cs files under `runtime/src/tests/JIT`: 3837
-- Candidates: 2 (real Main: 0, [Fact] wrapper: 2)
-- Triaged: 2
+- Candidates: 3281 (real Main: 11, [Fact] wrapper: 3270)
+- Triaged: 3281
 
 ## Outcome categories
 
 | Category | Tests |
 | --- | ---: |
-| CRASH | 2 |
+| MATCH | 669 |
+| MISMATCH | 12 |
+| CRASH | 1747 |
+| TIMEOUT | 21 |
+| COMPILE_FAIL | 832 |
 
-Of the MATCHes, 0 exit 100 (the CoreCLR pass
+Of the MATCHes, 658 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -51,7 +55,18 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| generics | 2 | `JIT/Directed/Arrays/complex1.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M09/b13621/b13621.cs` |
+| generics | 979 | `JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>`JIT/CodeGenBringUpTests/DblArea.cs`<br>`JIT/CodeGenBringUpTests/DblArray.cs`<br>… and 974 more |
+| unsupported IL opcode (importer) | 235 | `JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>`JIT/CodeGenBringUpTests/Localloc.cs`<br>`JIT/CodeGenBringUpTests/LocallocB_N.cs`<br>`JIT/CodeGenBringUpTests/LocallocB_N_PSP.cs`<br>`JIT/CodeGenBringUpTests/LocallocCnstB1.cs`<br>… and 230 more |
+| eval-stack values across block boundaries | 222 | `JIT/CodeGenBringUpTests/OpMembersOfStructLocal.cs`<br>`JIT/CodeGenBringUpTests/Rotate.cs`<br>`JIT/CodeGenBringUpTests/StaticCalls.cs`<br>`JIT/Directed/BitTest/BitTest.cs`<br>`JIT/Directed/CheckedCtor/Generic_Test_CSharp_Base_1.cs`<br>… and 217 more |
+| bad IL rejected by importer | 98 | `JIT/CodeGenBringUpTests/ArrayMD1.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD2.cs`<br>`JIT/Directed/StrAccess/straccess1.cs`<br>`JIT/Directed/StructABI/MisSizedStructs_ArmArch.cs`<br>`JIT/Directed/coverage/oldtests/cse2.cs`<br>… and 93 more |
+| unsupported (unmapped): conv from a non-numeric operand (pointers) | 71 | `JIT/Directed/Convert/FPZero.cs`<br>`JIT/Directed/StructABI/FieldListByteNodeTypeMismatchX86.cs`<br>`JIT/Directed/StructABI/TypeMismatchedArgs.cs`<br>`JIT/Directed/lifetime/ObjBlkMemLiveness.cs`<br>`JIT/Directed/physicalpromotion/addressinterference.cs`<br>… and 66 more |
+| structs & value types | 29 | `JIT/HardwareIntrinsics/General/Regression/GitHub_47236/GitHub_47236.cs`<br>`JIT/HardwareIntrinsics/General/Regression/GitHub_75791/GitHub_75791.cs`<br>`JIT/HardwareIntrinsics/X86/Regression/GitHub_17073/GitHub_17073.cs`<br>`JIT/HardwareIntrinsics/X86_Avx/AvxVnni_V512/AvxVnni_V512SampleTest.cs`<br>`JIT/Regression_2/Runtime_130844/Runtime_130844.cs`<br>… and 24 more |
+| EH filters/faults (out of 10.6 scope) | 14 | `JIT/HardwareIntrinsics/X86/Lzcnt.X64/Lzcnt.X64.cs`<br>`JIT/HardwareIntrinsics/X86/Popcnt.X64/Popcnt.X64.cs`<br>`JIT/HardwareIntrinsics/X86/Sse42.X64/Crc32.cs`<br>`JIT/Regression_o_2/Runtime_109981.cs`<br>`JIT/Regression_o_2/Runtime_114895.cs`<br>… and 9 more |
+| statics pack gates (10.7: TLS/generic/R2R/accessors) | 14 | `JIT/Directed/StructPromote/SpAddr.cs`<br>`JIT/Directed/tls/StaticTlsResolver.cs`<br>`JIT/Generics/Fields/static_assignment_class01.cs`<br>`JIT/Generics/Fields/static_equalnull_class01.cs`<br>`JIT/Regression/CLR-x86-JIT/v2.1/b610562/b610562.cs`<br>… and 9 more |
+| ldtoken handle embedding (10.10 gates) | 7 | `JIT/Generics/Conversions/Reference/GenToNonGen01.cs`<br>`JIT/Generics/Conversions/Reference/GenToNonGen02.cs`<br>`JIT/Regression_o_1/GitHub_15718.cs`<br>`JIT/opt/Devirtualization/exact1.cs`<br>`JIT/opt/Devirtualization/exact2.cs`<br>… and 2 more |
+| non-direct calls (callvirt/calli) | 7 | `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Base_6.cs`<br>`JIT/Directed/CheckedCtor/Generic_Test_CSharp_Peer_6.cs`<br>`JIT/Generics/ConstrainedCall/class1.cs`<br>`JIT/Generics/Conversions/Reference/GenToGen02.cs`<br>`JIT/Generics/Conversions/Reference/GenToGen03.cs`<br>… and 2 more |
+| boxing & casts | 6 | `JIT/Directed/nullabletypes/Desktop/boxunboxvaluetype.cs`<br>`JIT/Directed/nullabletypes/Desktop/nullcomparaison.cs`<br>`JIT/Directed/nullabletypes/unboxnullable.cs`<br>`JIT/Methodical/Boxing/boxunbox/KeepAliveBoxOpt.cs`<br>`JIT/Regression_8/Runtime_100466.cs`<br>… and 1 more |
+| rethrow (out of 10.6 scope) | 3 | `JIT/Regression_o_1/DevDiv_150265.cs`<br>`JIT/jit64/opt/cprop/cprop001.cs`<br>`JIT/opt/ObjectStackAllocation/Runtime_121736.cs` |
 
 ## COMPILE_FAIL by csc error class
 
@@ -61,6 +76,31 @@ entry shapes). Out of scope for triage; listed for the record.
 
 | csc error class | Tests |
 | --- | ---: |
+| CS0103 | 453 |
+| CS0246 | 225 |
+| CS1503 | 94 |
+| CS0234 | 16 |
+| CS1729 | 12 |
+| SYSLIB5003 | 9 |
+| CS1501 | 7 |
+| CS0117 | 3 |
+| CS1744 | 3 |
+| CS0017 | 2 |
+| CS0122 | 2 |
+| CS0051 | 1 |
+| CS0104 | 1 |
+| CS0201 | 1 |
+| CS0430 | 1 |
+| CS1001 | 1 |
+| CS1002 | 1 |
+
+## TIMEOUT detail
+
+| Which JIT timed out | Tests |
+| --- | ---: |
+| rokajit | 11 |
+| ryujit | 8 |
+| ryujit,rokajit | 2 |
 
 ## Needs investigation
 
@@ -68,4 +108,79 @@ RokaJIT failures with no `CompileError` marker in stderr — either
 silent-wrong-result bugs (MISMATCH with a clean run) or crashes the
 error model didn't classify. Each carries its stderr signature.
 
-None.
+| Test | Category | Detail | Stderr signature |
+| --- | --- | --- | --- |
+| `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Base_3.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Peer_3.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Directed/CheckedCtor/Test_CSharp_Base_3.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Directed/CheckedCtor/Test_CSharp_Peer_3.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate001.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate002.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate003.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Generics/Instantiation/delegates/Delegate004.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Generics/Instantiation/delegates/Delegate005.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate006.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate007.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate008.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate009.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate010.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate011.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate012.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate013.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate014.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate015.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate016.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate017.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate018.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate019.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate020.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate021.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate022.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate023.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate024.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate025.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate026.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate027.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate028.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate029.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate030.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate031.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Instantiation/delegates/Delegate032.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/HardwareIntrinsics/General/HwiOp/HwiValueNumbering.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/HardwareIntrinsics/X86/Regression/GitHub_23438/GitHub_23438.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/HardwareIntrinsics/X86/Sse1/StoreFence.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/HardwareIntrinsics/X86/Sse2/LoadFence.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/HardwareIntrinsics/X86/Sse2/MemoryFence.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Methodical/delegate/VirtualDelegate.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Methodical/nonvirtualcall/delegate.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Methodical/nonvirtualcall/valuetype.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Methodical/tailcall_v4/delegateParamCallTarget.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Performance/CodeQuality/BenchmarksGame/fannkuch-redux/fannkuch-redux-5.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Performance/CodeQuality/HWIntrinsic/X86/PacketTracer/Program.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Performance/CodeQuality/SIMD/RayTracer/RayTracerBench.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Performance/CodeQuality/V8/Crypto/Crypto.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14673/b14673.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_2/Runtime_124749/Runtime_124749.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Regression_2/Runtime_70790/Runtime_70790.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_2/Runtime_72775/Runtime_72775.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_PdbOnly_r_3/GitHub_67102.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_do/GitHub_39823.cs` | MISMATCH | ref=100 ours=255 | (no stderr output) |
+| `JIT/Regression_o_1/DevDiv_288222.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_o_3/Runtime_83003.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Regression_ro_2/Runtime_125160.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/SIMD/Matrix4x4.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/jit64/opt/rngchk/ArrayBound.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/jit64/opt/rngchk/ArrayWith2Loops.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/jit64/opt/rngchk/ArrayWithFunc.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/jit64/opt/rngchk/BadMatrixMul.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/jit64/opt/rngchk/JaggedArray.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/jit64/opt/rngchk/RngchkStress1.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/jit64/opt/rngchk/RngchkStress2.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/jit64/opt/rngchk/SimpleArray_01.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/AssertionPropagation/ArrBoundUnsigned.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Enum/hasflag.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Inline/tests/DelegInstanceFtn.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Inline/tests/DelegStaticFtn.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Inline/tests/Inline_DelegateStruct.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Inline/tests/args1.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/ValueNumbering/StaticReadonlyStructWithGC.cs` | CRASH | SIGSEGV | (no stderr output) |
