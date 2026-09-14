@@ -13,31 +13,30 @@ Per-test results cache in
 subset, `--concurrency N` / `--timeout S` tune execution). Output is
 deterministic: same results file → identical document.
 
-Candidates are single-.cs tests the harness can run standalone:
-either a real `static int Main` (compiled as-is) or `[Fact]` no-arg
-`int`/`void` methods (compiled with a synthesized entry point and
-Xunit attribute stubs, mirroring XUnitWrapperGenerator's legacy
-standalone semantics: 100 = pass). Tests needing helper libraries
-(TestLibrary, InlineIL, Xunit.Assert) fail compile and are counted
-under COMPILE_FAIL.
+Candidates are .cs tests the harness can run standalone: either a
+real `static int Main` or `[Fact]` no-arg `int`/`void` methods
+(synthesized entry point + attribute stubs mirroring
+Microsoft.DotNet.XUnitExtensions, legacy standalone semantics:
+100 = pass), compiled with all sibling .cs files from the test's
+directory (single-file fallback on collisions). Stubbed for our
+target with true semantics: `TestLibrary.PlatformDetection`
+(linux-x64 CoreCLR). Tests needing behavior-bearing helpers
+(Xunit.Assert, TestLibrary utilities, InlineIL) fail compile and
+are counted under COMPILE_FAIL.
 
 ## Totals
 
 - .cs files under `runtime/src/tests/JIT`: 3837
-- Candidates: 3281 (real Main: 11, [Fact] wrapper: 3270)
-- Triaged: 3281
+- Candidates: 2 (real Main: 0, [Fact] wrapper: 2)
+- Triaged: 2
 
 ## Outcome categories
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 149 |
-| MISMATCH | 2 |
-| CRASH | 394 |
-| TIMEOUT | 2 |
-| COMPILE_FAIL | 2734 |
+| CRASH | 2 |
 
-Of the MATCHes, 148 exit 100 (the CoreCLR pass
+Of the MATCHes, 0 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -52,16 +51,7 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| generics | 236 | `JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>`JIT/CodeGenBringUpTests/DblArea.cs`<br>`JIT/CodeGenBringUpTests/DblArray.cs`<br>… and 231 more |
-| unsupported IL opcode (importer) | 99 | `JIT/CodeGenBringUpTests/AndRef.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD1.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD2.cs`<br>`JIT/CodeGenBringUpTests/BinaryRMW.cs`<br>`JIT/CodeGenBringUpTests/CastThenBinop.cs`<br>… and 94 more |
-| eval-stack values across block boundaries | 32 | `JIT/CodeGenBringUpTests/Rotate.cs`<br>`JIT/CodeGenBringUpTests/StaticCalls.cs`<br>`JIT/Intrinsics/TypeEqualitySealed.cs`<br>`JIT/Methodical/delegate/DelegateToDelegate.cs`<br>`JIT/Methodical/delegate/GSDelegate.cs`<br>… and 27 more |
-| unsupported (unmapped): conv from a non-numeric operand (pointers) | 5 | `JIT/Regression_3/GitHub_11408/GitHub_11408.cs`<br>`JIT/opt/Cloning/Runtime_61040_5.cs`<br>`JIT/opt/Loops/LoopSideEffectsForHwiStores.cs`<br>`JIT/opt/OSR/livelocaladdress.cs`<br>`JIT/opt/OSR/tailrecursetry2.cs` |
-| ldtoken handle embedding (10.10 gates) | 4 | `JIT/opt/Devirtualization/exact1.cs`<br>`JIT/opt/Devirtualization/exact2.cs`<br>`JIT/opt/Devirtualization/generic.cs`<br>`JIT/opt/Devirtualization/sharedoverride.cs` |
-| statics pack gates (10.7: TLS/generic/R2R/accessors) | 4 | `JIT/Directed/tls/StaticTlsResolver.cs`<br>`JIT/opt/Devirtualization/GitHub_51918.cs`<br>`JIT/opt/OptimizeBools/optboolsreturn.cs`<br>`JIT/opt/ValueNumbering/ConstIndexRVA.cs` |
-| bad IL rejected by importer | 3 | `JIT/Regression_2/Runtime_110958/Runtime_110985.cs`<br>`JIT/jit64/gc/regress/vswhidbey/143837.cs`<br>`JIT/jit64/regress/vsw/524070/test1.cs` |
-| EH filters/faults (out of 10.6 scope) | 1 | `JIT/opt/Cloning/loops_with_eh.cs` |
-| rethrow (out of 10.6 scope) | 1 | `JIT/jit64/opt/cprop/cprop001.cs` |
-| structs & value types | 1 | `JIT/Regression_2/Runtime_72506/Runtime_72506.cs` |
+| generics | 2 | `JIT/Directed/Arrays/complex1.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M09/b13621/b13621.cs` |
 
 ## COMPILE_FAIL by csc error class
 
@@ -71,24 +61,6 @@ entry shapes). Out of scope for triage; listed for the record.
 
 | csc error class | Tests |
 | --- | ---: |
-| CS0246 | 1590 |
-| CS0103 | 851 |
-| CS0234 | 277 |
-| SYSLIB5003 | 9 |
-| CS0017 | 1 |
-| CS0104 | 1 |
-| CS0122 | 1 |
-| CS0430 | 1 |
-| CS1001 | 1 |
-| CS1002 | 1 |
-| CS1503 | 1 |
-
-## TIMEOUT detail
-
-| Which JIT timed out | Tests |
-| --- | ---: |
-| ryujit | 1 |
-| ryujit,rokajit | 1 |
 
 ## Needs investigation
 
@@ -96,15 +68,4 @@ RokaJIT failures with no `CompileError` marker in stderr — either
 silent-wrong-result bugs (MISMATCH with a clean run) or crashes the
 error model didn't classify. Each carries its stderr signature.
 
-| Test | Category | Detail | Stderr signature |
-| --- | --- | --- | --- |
-| `JIT/Methodical/delegate/VirtualDelegate.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/Regression_2/Runtime_124749/Runtime_124749.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/Regression_2/Runtime_70790/Runtime_70790.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/Regression_2/Runtime_72775/Runtime_72775.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/opt/AssertionPropagation/ArrBoundUnsigned.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/opt/Enum/hasflag.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/opt/Inline/tests/DelegInstanceFtn.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/opt/Inline/tests/DelegStaticFtn.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/opt/Inline/tests/Inline_DelegateStruct.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/opt/ValueNumbering/StaticReadonlyStructWithGC.cs` | CRASH | SIGSEGV | (no stderr output) |
+None.

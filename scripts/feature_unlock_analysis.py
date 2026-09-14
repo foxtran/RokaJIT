@@ -74,6 +74,8 @@ SUPPORTED = {
     *range(0x2E, 0x38),      # short conditional branches
     0x38, 0x39, 0x3A,        # br / brfalse / brtrue
     *range(0x3B, 0x45),      # long conditional branches
+    *range(0x46, 0x51),      # ldind.i1/u1/i2/u2/i4/u4/i8/i/r4/r8/ref (10.13)
+    *range(0x51, 0x58),      # stind.ref/i1/i2/i4/i8/r4/r8 (10.13)
     0x58, 0x59, 0x5A,        # add / sub / mul
     0x5B, 0x5C,              # div / div.un
     0x5D, 0x5E,              # rem / rem.un
@@ -115,6 +117,7 @@ SUPPORTED = {
     0xDC,                    # endfinally (step_10.6)
     0xDD,                    # leave (step_10.6)
     0xDE,                    # leave.s (step_10.6)
+    0xDF,                    # stind.i (step_10.13)
     0xE0,                    # conv.u (step_10.7)
 }
 # Supported 0xFE-prefixed opcodes, by second byte (opcode.def):
@@ -122,11 +125,12 @@ SUPPORTED = {
 #   FE 06 = ldftn, FE 07 = ldvirtftn (step_10.12)
 #   FE 09 = ldarg, FE 0A = ldarga, FE 0B = starg
 #   FE 0C = ldloc, FE 0D = ldloca, FE 0E = stloc
+#   FE 12 = unaligned., FE 13 = volatile. (prefixes, step_10.13)
 #   FE 15 = initobj (step_10.9)
 #   FE 1C = sizeof (step_10.10)
 SUPPORTED_FE = {
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x15, 0x1C,
+    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x12, 0x13, 0x15, 0x1C,
 }
 
 # --- IL linear-scan operand-size tables -------------------------------------

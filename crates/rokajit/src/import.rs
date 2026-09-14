@@ -591,6 +591,15 @@ enum Op {
     StElemK(Type, MemAccess, u32),
     /// `stelem` — the element store with the element class token (0xA4).
     StElem(u32),
+    /// `ldind.*` — the fixed indirect loads (0x46..=0x50), each carrying
+    /// its (stack type, cell shape) from [`LDIND_FIXED_KINDS`]
+    /// (step_10.13). The address is a byref or native int — the 10.8
+    /// typed memory matrix with no array addressing on top.
+    LdInd(Type, MemAccess),
+    /// `stind.*` — the fixed indirect stores (0x51..=0x57) plus `stind.i`
+    /// (0xDF), from [`STIND_FIXED_KINDS`] (step_10.13). A reference store
+    /// goes through the checked write barrier, like `stfld`.
+    StInd(Type, MemAccess),
     /// `throw` — raise the stack-top exception reference.
     Throw,
     /// `leave`/`leave.s` — exit the enclosing protected region(s) for
@@ -677,6 +686,39 @@ const STELEM_FIXED_KINDS: [(Type, MemAccess, u32); 8] = [
     (Type::Ref, MemAccess::Natural, 8),       // ref
 ];
 
+/// The fixed `ldind.*` kinds in opcode order (0x46..=0x50: i1, u1, i2,
+/// u2, i4, u4, i8, i, r4, r8, ref) as (stack type, cell shape) — the
+/// load half of [`LDELEM_FIXED_KINDS`] without the element size (no
+/// addressing to scale; step_10.13). Sub-Int32 loads normalize to Int32
+/// on the stack, extended per the cell's signedness.
+const LDIND_FIXED_KINDS: [(Type, MemAccess); 11] = [
+    (Type::Int32, MemAccess::I8),          // i1
+    (Type::Int32, MemAccess::U8),          // u1
+    (Type::Int32, MemAccess::I16),         // i2
+    (Type::Int32, MemAccess::U16),         // u2
+    (Type::Int32, MemAccess::Natural),     // i4
+    (Type::Int32, MemAccess::Natural),     // u4
+    (Type::Int64, MemAccess::Natural),     // i8
+    (Type::NativeInt, MemAccess::Natural), // i
+    (Type::Float, MemAccess::Natural),     // r4
+    (Type::Double, MemAccess::Natural),    // r8
+    (Type::Ref, MemAccess::Natural),       // ref
+];
+
+/// The fixed `stind.*` kinds in opcode order (0x51..=0x57: ref, i1, i2,
+/// i4, i8, r4, r8); `stind.i` (0xDF) decodes separately. Stores write
+/// only the low bytes, so the signedness distinction of the load forms
+/// doesn't exist here.
+const STIND_FIXED_KINDS: [(Type, MemAccess); 7] = [
+    (Type::Ref, MemAccess::Natural),    // ref
+    (Type::Int32, MemAccess::I8),       // i1
+    (Type::Int32, MemAccess::I16),      // i2
+    (Type::Int32, MemAccess::Natural),  // i4
+    (Type::Int64, MemAccess::Natural),  // i8
+    (Type::Float, MemAccess::Natural),  // r4
+    (Type::Double, MemAccess::Natural), // r8
+];
+
 /// Bounds-checked cursor over the IL stream.
 struct Reader<'a> {
     il: &'a [u8],
@@ -739,6 +781,17 @@ fn branch_target(il_len: usize, next_ip: usize, delta: i32) -> CompileResult<u32
 fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
     let mut insns = Vec::new();
     let mut r = Reader { il, ip: 0 };
+    // Pending `unaligned.`/`volatile.` prefixes (step_10.13): they apply
+    // to the next instruction, which decodes as one merged Insn spanning
+    // the prefix bytes (a branch may target the prefix — ECMA-335's
+    // prefix+instruction boundary rule). Both are recorded but change no
+    // emitted code: `unaligned.` is advisory on x64 (misaligned accesses
+    // are legal), and an ordinary aligned x64 store/load is already
+    // release/acquire, which is all `volatile.` asks of tier 0 with no
+    // reordering optimizations.
+    let mut unaligned: Option<u8> = None;
+    let mut volatile = false;
+    let mut prefix_start: Option<u32> = None;
     while r.ip < il.len() {
         let offset = r.ip as u32;
         let opcode = r.u8()?;
@@ -794,6 +847,14 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                 Op::Br {
                     target: branch_target(il.len(), r.ip, d)?,
                 }
+            }
+            0x46..=0x50 => {
+                let (ty, access) = LDIND_FIXED_KINDS[usize::from(opcode - 0x46)];
+                Op::LdInd(ty, access)
+            }
+            0x51..=0x57 => {
+                let (ty, access) = STIND_FIXED_KINDS[usize::from(opcode - 0x51)];
+                Op::StInd(ty, access)
             }
             0x39 | 0x3A => {
                 let d = r.i32()?;
@@ -873,6 +934,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0xD2 => Op::Conv(ConvKind::U1),
             0xD3 => Op::Conv(ConvKind::I),
             0xDC => Op::EndFinally,
+            0xDF => Op::StInd(Type::NativeInt, MemAccess::Natural), // stind.i
             0xDD => {
                 let d = r.i32()?;
                 Op::Leave {
@@ -903,6 +965,27 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                 0x11 => {
                     return Err(CompileError::Unsupported("endfilter (EH filter clauses)"));
                 }
+                0x12 => {
+                    // `unaligned.` — advisory on x64 (the step_10.13 model:
+                    // consume and record, emit nothing different).
+                    let align = r.u8()?;
+                    if !matches!(align, 1 | 2 | 4) {
+                        return Err(CompileError::BadIl(
+                            "unaligned. alignment must be 1, 2, or 4",
+                        ));
+                    }
+                    unaligned = Some(align);
+                    prefix_start = Some(prefix_start.unwrap_or(offset));
+                    continue;
+                }
+                0x13 => {
+                    // `volatile.` — no different code: aligned x64 accesses
+                    // are already acquire/release, and tier 0 reorders
+                    // nothing.
+                    volatile = true;
+                    prefix_start = Some(prefix_start.unwrap_or(offset));
+                    continue;
+                }
                 0x15 => Op::InitObj(r.u32()?),
                 0x1A => return Err(CompileError::Unsupported("rethrow")),
                 0x1C => Op::SizeOf(r.u32()?),
@@ -918,11 +1001,39 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                 ))
             }
         };
+        let start = prefix_start.unwrap_or(offset);
+        if unaligned.is_some() || volatile {
+            // RyuJIT's `impValidateMemoryAccessOpcode` set
+            // (importer.cpp:5317): the ldind/stind family (incl. stind.i),
+            // ldfld/stfld, ldobj/stobj — and, for `volatile.` only,
+            // ldsfld/stsfld. (cpblk/initblk are in RyuJIT's set too; they
+            // stay Unsupported here, so the prefix check never sees them.)
+            let applicable = matches!(
+                op,
+                Op::LdInd(..)
+                    | Op::StInd(..)
+                    | Op::LdFld(..)
+                    | Op::StFld(..)
+                    | Op::LdObj(..)
+                    | Op::StObj(..)
+            ) || (volatile && matches!(op, Op::LdSFld(..) | Op::StSFld(..)));
+            if !applicable {
+                return Err(CompileError::BadIl(
+                    "unaligned./volatile. prefix before a non-memory instruction",
+                ));
+            }
+            unaligned = None;
+            volatile = false;
+            prefix_start = None;
+        }
         insns.push(Insn {
             op,
-            offset,
-            size: r.ip as u32 - offset,
+            offset: start,
+            size: r.ip as u32 - start,
         });
+    }
+    if prefix_start.is_some() {
+        return Err(CompileError::BadIl("prefix with no following instruction"));
     }
     Ok(insns)
 }
@@ -3375,6 +3486,77 @@ impl BlockImport<'_> {
         Ok(addr)
     }
 
+    /// Pops the address operand of an indirect load/store (`ldind.*`/
+    /// `stind.*`, step_10.13): a managed byref or a native-int pointer
+    /// (RyuJIT's `TYP_I_IMPL || TYP_BYREF` assert, importer.cpp's
+    /// CEE_LDIND_*/CEE_STIND_* arms). There is no null check: a bad
+    /// byref faults like any bad pointer and the EE translates.
+    fn pop_ind_addr(&mut self) -> CompileResult<hir::Expr> {
+        let (ty, addr) = self.pop()?;
+        if !matches!(ty, Type::ByRef | Type::NativeInt) {
+            return Err(CompileError::BadIl(
+                "indirect load/store address must be a byref or native int",
+            ));
+        }
+        Ok(addr)
+    }
+
+    /// `ldind.*` (0x46..=0x50): the typed load through the address —
+    /// exactly the 10.8 memory matrix (`hir::Expr::Load`, offset 0) with
+    /// a byref/native-int address source instead of array addressing.
+    fn ldind(&mut self, ty: Type, access: MemAccess) -> CompileResult<()> {
+        let addr = self.pop_ind_addr()?;
+        self.push(
+            ty,
+            hir::Expr::Load {
+                addr: Box::new(addr),
+                offset: 0,
+                ty,
+                access,
+            },
+        )
+    }
+
+    /// `stind.*` (0x51..=0x57) / `stind.i` (0xDF): the typed store through
+    /// the address. A reference store goes through the
+    /// `CORINFO_HELP_CHECKED_ASSIGN_REF` write-barrier helper (the
+    /// destination may be a heap object interior — the `stfld` rule);
+    /// anything else is a plain indirect store.
+    fn stind(
+        &mut self,
+        ty: Type,
+        access: MemAccess,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let (vt, value) = self.pop()?;
+        if vt != ty {
+            return Err(CompileError::BadIl("stind value type mismatch"));
+        }
+        let addr = self.pop_ind_addr()?;
+        self.spill_stack(stmts, il_offset)?;
+        let kind = if ty == Type::Ref {
+            hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::CHECKED_ASSIGN_REF),
+                sig: CallSig {
+                    ret: Type::Void,
+                    args: vec![Type::ByRef, Type::Ref],
+                    has_this: false,
+                },
+                args: vec![addr, value],
+            })
+        } else {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset: 0,
+                value,
+                access,
+            }
+        };
+        stmts.push(hir::Stmt { il_offset, kind });
+        Ok(())
+    }
+
     /// `ldobj` (0x71): the struct value at the address.
     fn ldobj(&mut self, token: u32) -> CompileResult<()> {
         let class = self.resolve_value_class(token)?;
@@ -4103,33 +4285,37 @@ impl BlockImport<'_> {
     /// `ldelema` (0x8F): the element's address, an interior `ByRef` (the
     /// temp it lands in is an interior-pointer GC root, the `unbox`
     /// discipline). A reference element takes the
-    /// `CORINFO_HELP_LDELEMA_REF` helper (`CastHelpers.LdelemaRef`): a
-    /// byref into a covariant array would bypass `stelem.ref`'s
-    /// covariance check, so the helper null-checks, bounds-checks, and
-    /// exact-element-type-checks itself — no separate BoundsCheck.
+    /// `CORINFO_HELP_LDELEMA_REF` helper (`CastHelpers.LdelemaRef(
+    /// array, index, elementType)` — THREE arguments, importer.cpp:7404's
+    /// `gtNewHelperCallNode(..., arr, index, type)`): a byref into a
+    /// covariant array would bypass `stelem.ref`'s covariance check, so
+    /// the helper null-checks, bounds-checks, and exact-element-type-
+    /// checks (against the embedded class handle) itself — no separate
+    /// BoundsCheck.
     fn ldelema(
         &mut self,
         token: u32,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let elem = self.elem_kind_of(token)?;
+        let (elem, elem_class) = self.elem_kind_of(token)?;
         match elem {
             ElemKind::Cell(Type::Ref, _, _) => {
                 let (it, index) = self.pop_index()?;
                 let array = self.pop_array()?;
                 self.spill_stack(stmts, il_offset)?;
                 let index = self.index_native(it, index);
+                let elem_ty = self.embed_class_const(elem_class)?;
                 self.push(
                     Type::ByRef,
                     hir::Expr::Call {
                         target: CallTarget::Helper(CorInfoHelpFunc::LDELEMA_REF),
                         sig: CallSig {
                             ret: Type::ByRef,
-                            args: vec![Type::Ref, Type::NativeInt],
+                            args: vec![Type::Ref, Type::NativeInt, Type::NativeInt],
                             has_this: false,
                         },
-                        args: vec![array, index],
+                        args: vec![array, index, elem_ty],
                     },
                 )
             }
@@ -4152,19 +4338,20 @@ impl BlockImport<'_> {
     /// `asCorInfoType`. A value class is a struct element (the layout
     /// registers into the side table); a reference type is exactly the
     /// `*.ref` fixed form (RyuJIT does the same); anything else maps
-    /// through the stored-cell table.
-    fn elem_kind_of(&mut self, token: u32) -> CompileResult<ElemKind> {
+    /// through the stored-cell table. The class handle comes along:
+    /// `ldelema`-of-ref passes it to the LDELEMA_REF helper.
+    fn elem_kind_of(&mut self, token: u32) -> CompileResult<(ElemKind, ClassHandle)> {
         let (_resolved, class) =
             self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
         let raw = self.ee.as_cor_info_type(class);
         if raw == CorInfoType::ValueClass {
             let ty = sig_elem_type(Some(raw), Some(class), self.ee, &mut self.struct_layouts)?;
-            let Type::Struct(class) = ty else {
+            let Type::Struct(struct_class) = ty else {
                 return Err(CompileError::Internal(
                     "a value-class element is always a struct",
                 ));
             };
-            return Ok(ElemKind::Struct(class));
+            return Ok((ElemKind::Struct(struct_class), class));
         }
         let (ty, access) = corinfo_mem_type(raw)
             .map_err(|_| CompileError::Unsupported("array element type outside the array pack"))?;
@@ -4172,7 +4359,7 @@ impl BlockImport<'_> {
             Some(n) => u32::from(n),
             None => natural_cell_size(ty),
         };
-        Ok(ElemKind::Cell(ty, access, elem_size))
+        Ok((ElemKind::Cell(ty, access, elem_size), class))
     }
 
     /// The shared core of the bounds-checked element accesses: pops the
@@ -4423,16 +4610,18 @@ impl BlockImport<'_> {
                     self.ldelem(ElemKind::Cell(ty, access, size), &mut stmts, il_offset)?
                 }
                 Op::LdElem(token) => {
-                    let elem = self.elem_kind_of(token)?;
+                    let (elem, _) = self.elem_kind_of(token)?;
                     self.ldelem(elem, &mut stmts, il_offset)?
                 }
                 Op::StElemK(ty, access, size) => {
                     self.stelem(ElemKind::Cell(ty, access, size), &mut stmts, il_offset)?
                 }
                 Op::StElem(token) => {
-                    let elem = self.elem_kind_of(token)?;
+                    let (elem, _) = self.elem_kind_of(token)?;
                     self.stelem(elem, &mut stmts, il_offset)?
                 }
+                Op::LdInd(ty, access) => self.ldind(ty, access)?,
+                Op::StInd(ty, access) => self.stind(ty, access, &mut stmts, il_offset)?,
                 Op::Br { target } => {
                     self.note_depth(target, self.stack.len())?;
                     terminator = Some(hir::Terminator::Jump {
@@ -8958,7 +9147,7 @@ mod tests {
             sig,
             &CallSig {
                 ret: Type::ByRef,
-                args: vec![Type::Ref, Type::NativeInt],
+                args: vec![Type::Ref, Type::NativeInt, Type::NativeInt],
                 has_this: false,
             }
         );
@@ -8966,6 +9155,12 @@ mod tests {
         let (to, _, unsigned, _) = as_conv(&args[1]);
         assert_eq!(to, Type::NativeInt);
         assert!(unsigned);
+        // The third argument is the element class handle, embedded as a
+        // raw pointer constant (the helper's exact-type check input).
+        assert!(
+            matches!(&args[2], hir::Expr::Const(Const::NativeInt(v)) if *v == 0xE1EF),
+            "the element class handle embeds raw"
+        );
     }
 
     #[test]
@@ -9194,5 +9389,235 @@ mod tests {
         let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
         let m = import(&info, &ee).expect("imports");
         assert!(m.blocks[0].stmts.is_empty());
+    }
+
+    // --- step_10.13: ldind/stind + the unaligned./volatile. prefixes ---
+
+    #[test]
+    fn ldind_fixed_kinds_import_as_typed_loads_through_the_address() {
+        for (i, &(ty, access)) in LDIND_FIXED_KINDS.iter().enumerate() {
+            // ldarga.s 0; ldind.X; pop; ldc.i4.0; ret
+            let il = [0x0F, 0x00, 0x46 + i as u8, 0x26, 0x16, 0x2A];
+            let m = import_ii(&il).expect("imports");
+            let stmts = &m.blocks[0].stmts;
+            assert_eq!(
+                stmts.len(),
+                1,
+                "opcode {:#04x}: the popped load's Eval",
+                0x46 + i as u8
+            );
+            match &stmts[0].kind {
+                hir::StmtKind::Eval(hir::Expr::Load {
+                    addr,
+                    offset,
+                    ty: lty,
+                    access: lacc,
+                }) => {
+                    assert_eq!(*offset, 0);
+                    assert_eq!(*lty, ty, "opcode {:#04x}", 0x46 + i as u8);
+                    assert_eq!(*lacc, access);
+                    assert!(
+                        matches!(**addr, hir::Expr::LocalAddr(id) if id == LocalId(0)),
+                        "the address is the arg slot's"
+                    );
+                }
+                _ => panic!("expected the Eval of the indirect load"),
+            }
+        }
+    }
+
+    #[test]
+    fn ldind_small_load_extension_diverges_per_signedness() {
+        // The step file's divergence check through the ldind path: i1/i2
+        // sign-extend, u1/u2 zero-extend; both 32-bit forms are full-width.
+        for (op, access) in [
+            (0x46u8, MemAccess::I8),
+            (0x47, MemAccess::U8),
+            (0x48, MemAccess::I16),
+            (0x49, MemAccess::U16),
+            (0x4A, MemAccess::Natural),
+            (0x4B, MemAccess::Natural),
+        ] {
+            let il = [0x0F, 0x00, op, 0x26, 0x16, 0x2A];
+            let m = import_ii(&il).expect("imports");
+            match &m.blocks[0].stmts[0].kind {
+                hir::StmtKind::Eval(hir::Expr::Load { ty, access: a, .. }) => {
+                    assert_eq!(*ty, Type::Int32, "opcode {op:#04x}");
+                    assert_eq!(*a, access, "opcode {op:#04x}");
+                    assert_eq!(a.sign_extends(), matches!(op, 0x46 | 0x48));
+                }
+                _ => panic!("expected the Eval of the indirect load"),
+            }
+        }
+    }
+
+    #[test]
+    fn stind_fixed_kinds_import_as_store_ind_through_the_address() {
+        let cases: [(u8, MemAccess, &[u8]); 7] = [
+            (0x52, MemAccess::I8, &[0x1F, 0x2A]),      // i1: ldc.i4.s 42
+            (0x53, MemAccess::I16, &[0x1F, 0x2A]),     // i2
+            (0x54, MemAccess::Natural, &[0x1F, 0x2A]), // i4
+            (0x55, MemAccess::Natural, &[0x21, 0, 0, 0, 0, 0, 0, 0, 0]), // i8
+            (0x56, MemAccess::Natural, &[0x22, 0, 0, 0x80, 0x3F]), // r4
+            (
+                0x57,
+                MemAccess::Natural,
+                &[0x23, 0, 0, 0, 0, 0, 0, 0xF0, 0x3F],
+            ), // r8
+            (0xDF, MemAccess::Natural, &[0x16, 0xE0]), // i: ldc.i4.0; conv.u
+        ];
+        for (op, access, value_il) in cases {
+            // ldarga.s 0; <value>; stind.X; ldc.i4.0; ret
+            let mut il = vec![0x0F, 0x00];
+            il.extend_from_slice(value_il);
+            il.extend_from_slice(&[op, 0x16, 0x2A]);
+            let m = import_ii(&il).expect("imports");
+            let stmts = &m.blocks[0].stmts;
+            assert_eq!(stmts.len(), 1, "opcode {op:#04x}: the store only");
+            match &stmts[0].kind {
+                hir::StmtKind::StoreInd {
+                    addr,
+                    offset,
+                    access: a,
+                    ..
+                } => {
+                    assert_eq!(*offset, 0);
+                    assert_eq!(*a, access, "opcode {op:#04x}");
+                    assert!(matches!(addr, hir::Expr::LocalAddr(id) if *id == LocalId(0)));
+                }
+                _ => panic!("expected StmtKind::StoreInd"),
+            }
+        }
+    }
+
+    #[test]
+    fn stind_ref_goes_through_the_checked_write_barrier() {
+        // ldarga.s 0; ldnull; stind.ref; ldc.i4.0; ret — the barrier
+        // helper, the same shape as stfld of a reference field.
+        let il = [0x0F, 0x00, 0x14, 0x51, 0x16, 0x2A];
+        let m = import_ii(&il).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "the barrier call only");
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::CHECKED_ASSIGN_REF),
+                    "JIT_CheckedWriteBarrier"
+                );
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::Void,
+                        args: vec![Type::ByRef, Type::Ref],
+                        has_this: false,
+                    }
+                );
+                assert!(matches!(args[0], hir::Expr::LocalAddr(id) if id == LocalId(0)));
+                assert!(matches!(args[1], hir::Expr::Const(Const::NullRef)));
+            }
+            _ => panic!("expected the CHECKED_ASSIGN_REF helper Eval"),
+        }
+    }
+
+    #[test]
+    fn indirect_access_type_gates_are_bad_il() {
+        // An integer address.
+        let il = [0x16, 0x4A, 0x26, 0x16, 0x2A];
+        let err = import_ii(&il).err().expect("an int address is bad IL");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("byref or native int")),
+            "{err:?}"
+        );
+        // An object reference is not an indirection address either.
+        let il = [0x14, 0x4A, 0x26, 0x16, 0x2A];
+        let err = import_ii(&il).err().expect("a ref address is bad IL");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("byref or native int")),
+            "{err:?}"
+        );
+        // A stind value of the wrong stack type (an i8 for stind.i4).
+        let il = [0x0F, 0x00, 0x21, 0, 0, 0, 0, 0, 0, 0, 0, 0x54, 0x16, 0x2A];
+        let err = import_ii(&il).err().expect("an i8 value for stind.i4");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("stind value type mismatch")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn volatile_and_unaligned_prefixes_import_identically() {
+        // ldarga.s 0; volatile. ldind.i4; pop; ldc.i4.0; ret — the prefix
+        // changes nothing (x64: aligned accesses are already
+        // acquire/release; unaligned. is advisory).
+        let il = [0x0F, 0x00, 0xFE, 0x13, 0x4A, 0x26, 0x16, 0x2A];
+        let m = import_ii(&il).expect("volatile. ldind.i4 imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Load { ty, access, .. }) => {
+                assert_eq!(*ty, Type::Int32);
+                assert_eq!(*access, MemAccess::Natural);
+            }
+            _ => panic!("expected the Eval of the indirect load"),
+        }
+        // ldarga.s 0; ldc.i4.s 42; unaligned. volatile. stind.i4 — both
+        // prefixes combined, either order legal (ECMA-335 §III.2.4-5).
+        let il = [
+            0x0F, 0x00, 0x1F, 0x2A, 0xFE, 0x12, 0x01, 0xFE, 0x13, 0x54, 0x16, 0x2A,
+        ];
+        let m = import_ii(&il).expect("unaligned. volatile. stind.i4 imports");
+        assert!(matches!(
+            m.blocks[0].stmts[0].kind,
+            hir::StmtKind::StoreInd { .. }
+        ));
+        // volatile. may also precede a static field access (RyuJIT's
+        // impValidateMemoryAccessOpcode set).
+        let il = [0xFE, 0x13, 0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        import(&info, &ee).expect("volatile. ldsfld imports");
+    }
+
+    #[test]
+    fn a_branch_may_target_a_prefix() {
+        // ldc.i4.1; brtrue.s +0 (target = the volatile. prefix byte);
+        // volatile. ldsfld; pop; ldc.i4.0; ret — prefix and instruction
+        // decode as one merged Insn starting at the prefix, so the target
+        // is an instruction boundary (ECMA-335 §III.2). (ldsfld: the one
+        // prefix-legal memory instruction with no stack input.)
+        let il = [
+            0x17, 0x2D, 0x00, 0xFE, 0x13, 0x7E, 0x01, 0x00, 0x00, 0x04, 0x26, 0x16, 0x2A,
+        ];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let m = import(&info, &ee).expect("branching onto the prefix imports");
+        assert_eq!(m.blocks.len(), 2, "the branch splits the block");
+        assert!(matches!(
+            m.blocks[0].terminator,
+            hir::Terminator::Branch { .. }
+        ));
+    }
+
+    #[test]
+    fn prefix_misuse_is_bad_il() {
+        // volatile. before a non-memory instruction.
+        let il = [0xFE, 0x13, 0x16, 0x2A];
+        let err = import_ii(&il).err().expect("volatile. ldc.i4.0 is bad IL");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("non-memory")),
+            "{err:?}"
+        );
+        // unaligned. with an alignment outside 1/2/4.
+        let il = [0x0F, 0x00, 0xFE, 0x12, 0x03, 0x4A, 0x26, 0x16, 0x2A];
+        let err = import_ii(&il).err().expect("unaligned. 3 is bad IL");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("1, 2, or 4")),
+            "{err:?}"
+        );
+        // A prefix at the end of the IL stream.
+        let il = [0x16, 0xFE, 0x13];
+        let err = import_ii(&il).err().expect("a trailing prefix is bad IL");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("no following instruction")),
+            "{err:?}"
+        );
     }
 }
