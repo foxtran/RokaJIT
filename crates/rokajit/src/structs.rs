@@ -126,8 +126,15 @@ pub struct StructLayout {
 /// The side table: one layout per value class the compilation mentions.
 pub type StructLayouts = HashMap<ClassHandle, StructLayout>;
 
-/// The largest alignment the tier-0 frame contract supports.
-const MAX_STRUCT_ALIGN: u32 = 16;
+/// The largest alignment the tier-0 frame contract supports. 64 covers
+/// every SIMD vector type (Vector512 is 64 bytes at 64-alignment); the
+/// frame's 16-byte base alignment suffices for any of them because no
+/// emitted instruction is alignment-sensitive — block copies decompose
+/// into GPR moves (8/4/2/1) and the float/vector cell moves are scalar
+/// `movss`/`movsd` (step_11.10's measurement: 25 of the 42 gated tests
+/// needed layout/passing only and drained with this lift; the rest need
+/// real SIMD semantics, deferred — see decisions/2026-09-15-simd-*).
+const MAX_STRUCT_ALIGN: u32 = 64;
 
 /// Queries the EE for one class's layout facts (the one query set per
 /// class per compilation — callers cache the result in a
@@ -302,12 +309,27 @@ mod tests {
     #[test]
     fn over_aligned_structs_are_unsupported() {
         let mut ee = MockEe::default();
-        let c = ee.add_class(32, 32, &[], None);
+        let c = ee.add_class(128, 128, &[], None);
         assert!(matches!(
             query_layout(&ee, c),
             Err(CompileError::Unsupported(_))
         ));
         let _ = class(1); // keep the helper used
+    }
+
+    #[test]
+    fn simd_aligned_structs_query_fine() {
+        // step_11.10: Vector256/Vector512 alignments (32/64) are inside
+        // the tier-0 frame contract — no emitted instruction is
+        // alignment-sensitive.
+        let mut ee = MockEe::default();
+        let c32 = ee.add_class(32, 32, &[], None);
+        let layout = query_layout(&ee, c32).expect("32-aligned queries");
+        assert_eq!(layout.align, 32);
+        assert_eq!(layout.size, 32);
+        let c64 = ee.add_class(64, 64, &[], None);
+        let layout = query_layout(&ee, c64).expect("64-aligned queries");
+        assert_eq!(layout.align, 64);
     }
 
     #[test]

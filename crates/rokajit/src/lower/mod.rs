@@ -863,8 +863,12 @@ impl Flatten<'_> {
             hir::Expr::NullCheck { arg } => {
                 // The explicit, trap-based null check (step_10.4): the
                 // checked value is the result — the statement exists purely
-                // for its fault.
+                // for its fault. The arg is a value position
+                // (step_11.10: `ldarga; conv.u; ldfld` retypes a local's
+                // address to a NativeInt receiver — unsafe-5's test_5 —
+                // and an AddrOf has no instruction-source form).
                 let arg = self.flatten_expr(arg, out, il)?;
+                let arg = self.value_operand(arg, out, il);
                 Self::push(out, il, lir::StmtKind::NullCheck { arg });
                 Ok(arg)
             }
@@ -1656,6 +1660,48 @@ mod tests {
             }
             _ => panic!("expected Store"),
         }
+    }
+
+    #[test]
+    fn null_check_of_an_address_of_spills_to_a_temp() {
+        // step_11.10, unsafe-5's test_5: `ldarga; conv.u; ldfld` — the
+        // importer drops the identity conv, so the null check wraps the
+        // LocalAddr itself; the arg flattens to an AddrOf, which has no
+        // instruction-source form — value_operand spills it to a ByRef
+        // temp through the lea copy.
+        let m = lower_ok(method_with_ref_arg(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Load {
+                    addr: Box::new(hir::Expr::NullCheck {
+                        arg: Box::new(hir::Expr::LocalAddr(LocalId(0))),
+                    }),
+                    offset: 0,
+                    ty: Type::Int64,
+                    access: crate::ir::MemAccess::Natural,
+                }),
+            },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 4, "addr spill, null check, load, return");
+        let lir::StmtKind::Copy { dst, src } = &stmts[0].kind else {
+            panic!("expected the AddrOf spill copy")
+        };
+        assert_eq!(*src, lir::Operand::AddrOf(LocalId(0)));
+        assert!(matches!(
+            stmts[1].kind,
+            lir::StmtKind::NullCheck {
+                arg: lir::Operand::Temp(t)
+            } if t == *dst
+        ));
+        assert!(matches!(
+            stmts[2].kind,
+            lir::StmtKind::Load {
+                addr: lir::Operand::Temp(t),
+                ..
+            } if t == *dst
+        ));
     }
 
     #[test]

@@ -466,6 +466,24 @@ enum ElemKind {
     Struct(ClassHandle),
 }
 
+/// The cell shape of a block-op type token (`ldobj`/`stobj`/`cpobj`/
+/// `initobj`): RyuJIT's `TypeHandleToVarType` split (ee_il_dll.hpp:306)
+/// — a true struct, a primitive-typed value class's scalar cell, or
+/// (step_11.10) a reference class, whose "block" is the pointer-sized
+/// reference cell.
+#[derive(Copy, Clone)]
+enum BlockOpCell {
+    /// A true struct: its layout is queried into the side table.
+    Struct,
+    /// A primitive-typed value class's scalar cell (IntPtr, enums).
+    Scalar(Type, MemAccess),
+    /// A reference class: the op moves the reference cell only, never
+    /// the object's payload — the GC story is exactly
+    /// `ldind.ref`/`stind.ref`'s (barriered stores, plain loads), so
+    /// there is no bulk-overwrite-of-refs hazard.
+    Ref,
+}
+
 /// The calling-convention gate (entry sig and `call`/`callvirt` callee
 /// sigs). Step_11.3B lifted the generics rejection:
 /// `CORINFO_CALLCONV_GENERIC` without `CORINFO_CALLCONV_PARAMTYPE` is an
@@ -3936,6 +3954,18 @@ impl BlockImport<'_> {
                 },
             );
         }
+        // The System.Runtime.Intrinsics.X86 leaves (Sse*/Avx*/Aes/Bmi*/
+        // Fma/Lzcnt/Popcnt/…): their CoreLib bodies are deliberately
+        // self-recursive [Intrinsic]s with NO software path (the
+        // GetMethodTable shape), so a literal compile recurses until the
+        // stack overflows (Runtime_106480's family). Real SIMD expansion
+        // is its own unscheduled step (step_11.10 measured and deferred
+        // it); name the gap instead of overflowing.
+        if self.is_hw_intrinsic_leaf(method) {
+            return Err(CompileError::Unsupported(
+                "hardware intrinsics (SIMD vector semantics)",
+            ));
+        }
         let target = match virtual_kind {
             None => CallTarget::Direct(method),
             Some(ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_VTABLE) => {
@@ -4211,6 +4241,24 @@ impl BlockImport<'_> {
                 matches!(name.as_str(), "Double" | "Single") && ns.as_deref() == Some("System")
             }
             None => false,
+        }
+    }
+
+    /// Whether `method` is a leaf hardware intrinsic: the [Intrinsic] bit
+    /// plus a declaring class in the `System.Runtime.Intrinsics.X86` tree
+    /// (Sse through Avx512, Aes, Bmi*, Fma, Lzcnt, Popcnt, Pclmulqdq,
+    /// X86Base — every one a self-recursive IL body with no software
+    /// path). The `System.Runtime.Intrinsics` vector classes themselves
+    /// (Vector64/128/256/512, Vector) are NOT matched: several of their
+    /// members carry compilable software fallbacks.
+    fn is_hw_intrinsic_leaf(&self, method: MethodHandle) -> bool {
+        if !self.ee.is_intrinsic(method) {
+            return false;
+        }
+        let class = self.ee.get_method_class(method);
+        match self.ee.get_class_name_from_metadata(class) {
+            Some((_, Some(ns))) => ns.starts_with("System.Runtime.Intrinsics.X86"),
+            _ => false,
         }
     }
 
@@ -4806,13 +4854,18 @@ impl BlockImport<'_> {
 
     /// The receiver of a field access: a class reference (null-checked at
     /// the access), or — when the field's declaring class is a value class
-    /// (`byref_ok`) — a byref into the struct OR the struct value itself
-    /// (csc emits `ldarg`/`ldloc` + `ldfld` for value reads: the value's
-    /// home is the receiver's memory). Byref/value receivers are never
-    /// null-checked: byrefs are managed pointers and a value is never
-    /// null. Returns the receiver
-    /// (an address expression for the value/byref forms) and whether it
-    /// needs the explicit null check.
+    /// (`byref_ok`) — a byref into the struct, a native-int pointer to it
+    /// (`p->Field` / `&p->Field` on an `S*`, and CoreLib's own
+    /// `MethodTable*` reads — unverifiable-but-valid IL that RyuJIT
+    /// imports unconditionally, importer.cpp:9550+), OR the struct value
+    /// itself (csc emits `ldarg`/`ldloc` + `ldfld` for value reads: the
+    /// value's home is the receiver's memory). The reference AND the
+    /// native-int receiver get the explicit null check (RyuJIT's
+    /// `cmp byte ptr [rax], al` on the pointer — a null `S*` throws the
+    /// NRE at the field access, not wherever the derived address later
+    /// faults); a byref or a value is never null-checked. Returns the
+    /// receiver (an address expression for the value/byref/pointer forms)
+    /// and whether it needs the explicit null check.
     fn pop_field_receiver(
         &mut self,
         byref_ok: bool,
@@ -4823,6 +4876,7 @@ impl BlockImport<'_> {
         match ty {
             Type::Ref => Ok((obj, true)),
             Type::ByRef if byref_ok => Ok((obj, false)),
+            Type::NativeInt if byref_ok => Ok((obj, true)),
             Type::Struct(class) if byref_ok => {
                 let addr = self.struct_addr_of(obj, class, stmts, il_offset);
                 Ok((addr, false))
@@ -5370,7 +5424,16 @@ impl BlockImport<'_> {
     /// Class-token resolution for the struct opcodes (`ldobj`/`stobj`/
     /// `cpobj`/`initobj`): the token-kind hint is `CORINFO_TOKENKIND_Class`
     /// (importer.cpp `impResolveToken`, same as `newobj`'s class side).
-    fn resolve_value_class(&mut self, token: u32) -> CompileResult<ClassHandle> {
+    /// A reference class is NOT rejected (step_11.10): ECMA-verifiable IL
+    /// never produces it, but unsafe/shared-generic code does (`initobj
+    /// !!0` in a shared body, raw-memory tricks), and RyuJIT imports it as
+    /// the pointer-sized reference cell — the `lclTyp != TYP_STRUCT` tail
+    /// of importer.cpp's CEE_INITOBJ/CPOBJ/STOBJ arms and the plain
+    /// TYP_REF load of CEE_LDOBJ. The op then moves the reference cell
+    /// only, never the object's payload, so the GC story is exactly
+    /// `ldind.ref`/`stind.ref`'s (barriered stores, plain loads) — there
+    /// is no bulk-overwrite-of-refs hazard and the EE gates nothing.
+    fn resolve_block_op_cell(&mut self, token: u32) -> CompileResult<(ClassHandle, BlockOpCell)> {
         let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
             t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
             t.tokenScope = self.info.args.scope;
@@ -5382,12 +5445,13 @@ impl BlockImport<'_> {
             return Err(CompileError::BadIl("type token did not resolve to a class"));
         };
         if !self.ee.is_value_class(class) {
-            return Err(CompileError::Unsupported(
-                "initobj/ldobj/stobj/cpobj of a non-value class",
-            ));
+            return Ok((class, BlockOpCell::Ref));
         }
         layout_of(&mut self.struct_layouts, self.ee, class)?;
-        Ok(class)
+        if let Some((ty, access)) = self.scalar_value_class_cell(class) {
+            return Ok((class, BlockOpCell::Scalar(ty, access)));
+        }
+        Ok((class, BlockOpCell::Struct))
     }
 
     /// Pops the address operand of a struct memory opcode: a managed
@@ -5494,12 +5558,14 @@ impl BlockImport<'_> {
     }
 
     /// `ldobj` (0x71): the struct value at the address — or, for a
-    /// primitive-typed value class, the scalar cell load.
+    /// primitive-typed value class, the scalar cell load. A reference
+    /// class (step_11.10) loads the reference cell: a plain `Ref` load
+    /// (importer.cpp:11338's `gtNewLoadValueNode` of the TYP_REF type).
     fn ldobj(&mut self, token: u32) -> CompileResult<()> {
-        let class = self.resolve_value_class(token)?;
+        let (class, cell) = self.resolve_block_op_cell(token)?;
         let addr = self.pop_struct_addr()?;
-        if let Some((ty, access)) = self.scalar_value_class_cell(class) {
-            return self.push(
+        match cell {
+            BlockOpCell::Scalar(ty, access) => self.push(
                 ty,
                 hir::Expr::Load {
                     addr: Box::new(addr),
@@ -5507,132 +5573,219 @@ impl BlockImport<'_> {
                     ty,
                     access,
                 },
-            );
+            ),
+            BlockOpCell::Ref => self.push(
+                Type::Ref,
+                hir::Expr::Load {
+                    addr: Box::new(addr),
+                    offset: 0,
+                    ty: Type::Ref,
+                    access: MemAccess::Natural,
+                },
+            ),
+            BlockOpCell::Struct => self.push(
+                Type::Struct(class),
+                hir::Expr::StructVal {
+                    addr: Box::new(addr),
+                    class,
+                },
+            ),
         }
-        self.push(
-            Type::Struct(class),
-            hir::Expr::StructVal {
-                addr: Box::new(addr),
-                class,
-            },
-        )
     }
 
     /// `stobj` (0x81): the struct value stores through the address — or,
-    /// for a primitive-typed value class, the scalar cell store.
+    /// for a primitive-typed value class, the scalar cell store. A
+    /// reference class (step_11.10) stores the reference cell through the
+    /// checked write barrier — the destination may be a heap object
+    /// interior (the `stind.ref` rule; importer.cpp's STOBJ → STIND tail
+    /// with `lclTyp == TYP_REF`).
     fn stobj(
         &mut self,
         token: u32,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let class = self.resolve_value_class(token)?;
-        if let Some((ty, access)) = self.scalar_value_class_cell(class) {
-            let (vt, value) = self.pop()?;
-            if vt != ty {
-                return Err(CompileError::BadIl("stobj value type mismatch"));
+        let (class, cell) = self.resolve_block_op_cell(token)?;
+        match cell {
+            BlockOpCell::Scalar(ty, access) => {
+                let (vt, value) = self.pop()?;
+                if vt != ty {
+                    return Err(CompileError::BadIl("stobj value type mismatch"));
+                }
+                let addr = self.pop_struct_addr()?;
+                self.spill_stack(stmts, il_offset)?;
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::StoreInd {
+                        addr,
+                        offset: 0,
+                        value,
+                        access,
+                    },
+                });
+                Ok(())
             }
-            let addr = self.pop_struct_addr()?;
-            self.spill_stack(stmts, il_offset)?;
-            stmts.push(hir::Stmt {
-                il_offset,
-                kind: hir::StmtKind::StoreInd {
-                    addr,
-                    offset: 0,
-                    value,
-                    access,
-                },
-            });
-            return Ok(());
+            BlockOpCell::Ref => {
+                let (vt, value) = self.pop()?;
+                if vt != Type::Ref {
+                    return Err(CompileError::BadIl("stobj value type mismatch"));
+                }
+                let addr = self.pop_struct_addr()?;
+                self.spill_stack(stmts, il_offset)?;
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Eval(hir::Expr::Call {
+                        target: CallTarget::Helper(CorInfoHelpFunc::CHECKED_ASSIGN_REF),
+                        sig: CallSig {
+                            ret: Type::Void,
+                            args: vec![Type::ByRef, Type::Ref],
+                            has_this: false,
+                        },
+                        args: vec![addr, value],
+                    }),
+                });
+                Ok(())
+            }
+            BlockOpCell::Struct => {
+                let (vt, value) = self.pop()?;
+                if vt != Type::Struct(class) {
+                    return Err(CompileError::BadIl("stobj value type mismatch"));
+                }
+                let addr = self.pop_struct_addr()?;
+                self.spill_stack(stmts, il_offset)?;
+                self.store_struct_through(addr, class, value, stmts, il_offset)
+            }
         }
-        let (vt, value) = self.pop()?;
-        if vt != Type::Struct(class) {
-            return Err(CompileError::BadIl("stobj value type mismatch"));
-        }
-        let addr = self.pop_struct_addr()?;
-        self.spill_stack(stmts, il_offset)?;
-        self.store_struct_through(addr, class, value, stmts, il_offset)
     }
 
     /// `cpobj` (0x70): struct copy from the source address to the
     /// destination address — a scalar load+store for a primitive-typed
-    /// value class (the same `TypeHandleToVarType` normalization).
+    /// value class (the same `TypeHandleToVarType` normalization). A
+    /// reference class (step_11.10) copies the reference cell: the source
+    /// load is an argument of the barrier call, so it evaluates before
+    /// the store (ECMA's ldobj-then-stobj ordering; importer.cpp:11213's
+    /// load-then-STIND_VALUE).
     fn cpobj(
         &mut self,
         token: u32,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let class = self.resolve_value_class(token)?;
+        let (class, cell) = self.resolve_block_op_cell(token)?;
         let src = self.pop_struct_addr()?;
         let dst = self.pop_struct_addr()?;
         self.spill_stack(stmts, il_offset)?;
-        if let Some((ty, access)) = self.scalar_value_class_cell(class) {
-            stmts.push(hir::Stmt {
-                il_offset,
-                kind: hir::StmtKind::StoreInd {
-                    addr: dst,
-                    offset: 0,
-                    value: hir::Expr::Load {
-                        addr: Box::new(src),
+        match cell {
+            BlockOpCell::Scalar(ty, access) => {
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::StoreInd {
+                        addr: dst,
                         offset: 0,
-                        ty,
+                        value: hir::Expr::Load {
+                            addr: Box::new(src),
+                            offset: 0,
+                            ty,
+                            access,
+                        },
                         access,
                     },
-                    access,
-                },
-            });
-            return Ok(());
-        }
-        self.store_struct_through(
-            dst,
-            class,
-            hir::Expr::StructVal {
-                addr: Box::new(src),
+                });
+                Ok(())
+            }
+            BlockOpCell::Ref => {
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Eval(hir::Expr::Call {
+                        target: CallTarget::Helper(CorInfoHelpFunc::CHECKED_ASSIGN_REF),
+                        sig: CallSig {
+                            ret: Type::Void,
+                            args: vec![Type::ByRef, Type::Ref],
+                            has_this: false,
+                        },
+                        args: vec![
+                            dst,
+                            hir::Expr::Load {
+                                addr: Box::new(src),
+                                offset: 0,
+                                ty: Type::Ref,
+                                access: MemAccess::Natural,
+                            },
+                        ],
+                    }),
+                });
+                Ok(())
+            }
+            BlockOpCell::Struct => self.store_struct_through(
+                dst,
                 class,
-            },
-            stmts,
-            il_offset,
-        )
+                hir::Expr::StructVal {
+                    addr: Box::new(src),
+                    class,
+                },
+                stmts,
+                il_offset,
+            ),
+        }
     }
 
     /// `initobj` (0xFE 15): zero-init the slot at the address — a block
     /// zero for a true struct, the scalar zero store for a primitive-typed
-    /// value class (importer.cpp:11098's `lclTyp != TYP_STRUCT` tail).
+    /// value class (importer.cpp:11098's `lclTyp != TYP_STRUCT` tail), or
+    /// (step_11.10) a null store for a reference class (`gtNewZeroConNode`
+    /// of TYP_REF). Storing null creates no old→young edge, so no write
+    /// barrier anywhere (the struct initobj rule); the cell is raw
+    /// memory, so a NativeInt zero store carries the bits.
     fn initobj(
         &mut self,
         token: u32,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let class = self.resolve_value_class(token)?;
+        let (class, cell) = self.resolve_block_op_cell(token)?;
         let addr = self.pop_struct_addr()?;
         self.spill_stack(stmts, il_offset)?;
-        if let Some((ty, access)) = self.scalar_value_class_cell(class) {
-            let zero = match ty {
-                Type::Int32 => Const::Int32(0),
-                Type::Int64 => Const::Int64(0),
-                Type::NativeInt => Const::NativeInt(0),
-                Type::Float => Const::Float(0.0),
-                Type::Double => Const::Double(0.0),
-                _ => return Err(CompileError::Unsupported("initobj of a reference cell")),
-            };
-            stmts.push(hir::Stmt {
-                il_offset,
-                kind: hir::StmtKind::StoreInd {
-                    addr,
-                    offset: 0,
-                    value: hir::Expr::Const(zero),
-                    access,
-                },
-            });
-            return Ok(());
+        match cell {
+            BlockOpCell::Scalar(ty, access) => {
+                let zero = match ty {
+                    Type::Int32 => Const::Int32(0),
+                    Type::Int64 => Const::Int64(0),
+                    Type::NativeInt => Const::NativeInt(0),
+                    Type::Float => Const::Float(0.0),
+                    Type::Double => Const::Double(0.0),
+                    _ => return Err(CompileError::Unsupported("initobj of a reference cell")),
+                };
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::StoreInd {
+                        addr,
+                        offset: 0,
+                        value: hir::Expr::Const(zero),
+                        access,
+                    },
+                });
+                Ok(())
+            }
+            BlockOpCell::Ref => {
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::StoreInd {
+                        addr,
+                        offset: 0,
+                        value: hir::Expr::Const(Const::NativeInt(0)),
+                        access: MemAccess::Natural,
+                    },
+                });
+                Ok(())
+            }
+            BlockOpCell::Struct => {
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::BlockZero { addr, class },
+                });
+                Ok(())
+            }
         }
-        stmts.push(hir::Stmt {
-            il_offset,
-            kind: hir::StmtKind::BlockZero { addr, class },
-        });
-        Ok(())
     }
 
     /// Pops the byte-count operand of `cpblk`/`initblk` (`unsigned int32`
@@ -12956,6 +13109,91 @@ mod tests {
         ));
     }
 
+    /// A call into the System.Runtime.Intrinsics.X86 leaves (Sse & co.)
+    /// is named Unsupported, never compiled: the CoreLib bodies are
+    /// self-recursive [Intrinsic]s with no software path, so a literal
+    /// compile recurses to a stack overflow (step_11.10's SIMD deferral).
+    /// The vector classes directly under System.Runtime.Intrinsics keep
+    /// compiling — several members have real software fallbacks.
+    #[test]
+    fn hw_intrinsic_leaves_are_a_named_unsupported() {
+        // ldarg.0; ldarg.1; call Sse.Add; ret.
+        let il = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let sse_sig = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::ValueClass, CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![Some(c), Some(c)],
+        };
+        let entry = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::ValueClass, CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![Some(c), Some(c)],
+        };
+        let handle = ee.add_method(0x0600_0033, sse_sig);
+        ee.method_name = Some("Add".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            ("Sse".into(), Some("System.Runtime.Intrinsics.X86".into())),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let info = MethodInfo {
+            ftn: MethodHandle::from_raw(1usize as ffi::CORINFO_METHOD_HANDLE).unwrap(),
+            il: il.to_vec(),
+            max_stack: 8,
+            eh_count: 0,
+            init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
+            args: ee.make_method_sig(&entry),
+            locals: ee.make_locals_sig(&[]),
+        };
+        match import(&info, &ee) {
+            Err(CompileError::Unsupported("hardware intrinsics (SIMD vector semantics)")) => {}
+            Err(e) => panic!("expected the named SIMD gate, got {e:?}"),
+            Ok(_) => panic!("expected the named SIMD gate, but the call imported"),
+        }
+
+        // Same [Intrinsic] bit, Vector128's own namespace: NOT gated.
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let handle = ee.add_method(
+            0x0600_0033,
+            MockSig {
+                ret: CorInfoType::ValueClass,
+                args: vec![CorInfoType::ValueClass, CorInfoType::ValueClass],
+                has_this: false,
+                ret_class: Some(c),
+                arg_classes: vec![Some(c), Some(c)],
+            },
+        );
+        ee.method_name = Some("Add".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            ("Vector128".into(), Some("System.Runtime.Intrinsics".into())),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let _ = c;
+        let info = MethodInfo {
+            ftn: MethodHandle::from_raw(1usize as ffi::CORINFO_METHOD_HANDLE).unwrap(),
+            il: il.to_vec(),
+            max_stack: 8,
+            eh_count: 0,
+            init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
+            args: ee.make_method_sig(&entry),
+            locals: ee.make_locals_sig(&[]),
+        };
+        assert!(
+            import(&info, &ee).is_ok(),
+            "Vector128 members still compile"
+        );
+    }
+
     /// The name+shape match alone is not enough: without the EE's
     /// [Intrinsic] bit the same call is an ordinary direct call.
     #[test]
@@ -13250,26 +13488,160 @@ mod tests {
         }
     }
 
-    #[test]
-    fn struct_opcodes_reject_a_non_value_class() {
-        // A class token the mock resolves to nothing value-class-like.
+    /// A class token the mock resolves to a reference class (a handle in
+    /// no value-class registry): block ops over it are the pointer-sized
+    /// reference cell (step_11.10).
+    fn ref_class_ee() -> (MockEe, ClassHandle) {
         let mut ee = MockEe::default();
-        ee.class_tokens.insert(
-            CLASS_TOKEN,
-            ClassHandle::from_raw(0x999usize as ffi::CORINFO_CLASS_HANDLE).unwrap(),
+        let class = ClassHandle::from_raw(0x999usize as ffi::CORINFO_CLASS_HANDLE).unwrap();
+        ee.class_tokens.insert(CLASS_TOKEN, class);
+        (ee, class)
+    }
+
+    #[test]
+    fn block_ops_on_a_reference_class_move_the_reference_cell() {
+        // ldobj: ldloca.0; ldobj C; stloc.1; ret — a plain Ref load.
+        let (mut ee, _) = ref_class_ee();
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x12, 0x00, 0x71, 0x01, 0x00, 0x00, 0x02, 0x0B, 0x2A],
+            &entry,
+            &[CorInfoType::Class, CorInfoType::Class],
+            &[],
         );
+        let m = import(&info, &ee).expect("ldobj imports");
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(1));
+        match value {
+            hir::Expr::Load {
+                addr,
+                offset: 0,
+                ty: Type::Ref,
+                access: MemAccess::Natural,
+            } => assert_eq!(as_local_addr(addr), LocalId(0)),
+            _ => panic!("expected the Ref cell load"),
+        }
+
+        // stobj: ldloca.0; ldnull; stobj C; ret — the barriered store.
+        let (mut ee, _) = ref_class_ee();
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x12, 0x00, 0x14, 0x81, 0x01, 0x00, 0x00, 0x02, 0x2A],
+            &entry,
+            &[CorInfoType::Class],
+            &[],
+        );
+        let m = import(&info, &ee).expect("stobj imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(matches!(
+                    target,
+                    CallTarget::Helper(h) if *h == CorInfoHelpFunc::CHECKED_ASSIGN_REF
+                ));
+                assert_eq!(sig.args, vec![Type::ByRef, Type::Ref]);
+                assert_eq!(as_local_addr(&args[0]), LocalId(0));
+                assert!(matches!(args[1], hir::Expr::Const(Const::NullRef)));
+            }
+            _ => panic!("expected the checked-write-barrier call"),
+        }
+
+        // cpobj: ldloca.0; ldloca.1; cpobj C; ret — the source load rides
+        // the barrier call's second argument (evaluates before the store).
+        let (mut ee, _) = ref_class_ee();
+        let entry = sig(CorInfoType::Void, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x12, 0x00, 0x12, 0x01, 0x70, 0x01, 0x00, 0x00, 0x02, 0x2A],
+            &entry,
+            &[CorInfoType::Class, CorInfoType::Class],
+            &[],
+        );
+        let m = import(&info, &ee).expect("cpobj imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, args, .. }) => {
+                assert!(matches!(
+                    target,
+                    CallTarget::Helper(h) if *h == CorInfoHelpFunc::CHECKED_ASSIGN_REF
+                ));
+                assert_eq!(as_local_addr(&args[0]), LocalId(0));
+                match &args[1] {
+                    hir::Expr::Load {
+                        addr,
+                        offset: 0,
+                        ty: Type::Ref,
+                        ..
+                    } => assert_eq!(as_local_addr(addr), LocalId(1)),
+                    _ => panic!("expected the source Ref load as the stored value"),
+                }
+            }
+            _ => panic!("expected the checked-write-barrier call"),
+        }
+
+        // initobj: ldloca.0; initobj C; ret — a plain null store (no
+        // barrier: storing null creates no old→young edge).
+        let (mut ee, _) = ref_class_ee();
         let entry = sig(CorInfoType::Void, &[]);
         let info = struct_info(
             &mut ee,
             &[0x12, 0x00, 0xFE, 0x15, 0x01, 0x00, 0x00, 0x02, 0x2A],
             &entry,
-            &[CorInfoType::Int],
+            &[CorInfoType::Class],
             &[],
         );
-        assert!(matches!(
-            import(&info, &ee),
-            Err(CompileError::Unsupported(_))
-        ));
+        let m = import(&info, &ee).expect("initobj imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset: 0,
+                value,
+                access: MemAccess::Natural,
+            } => {
+                assert_eq!(as_local_addr(addr), LocalId(0));
+                assert!(
+                    matches!(value, hir::Expr::Const(Const::NativeInt(0))),
+                    "the zero store"
+                );
+            }
+            _ => panic!("expected the plain zero store"),
+        }
+    }
+
+    #[test]
+    fn struct_field_access_on_a_pointer_receiver_null_checks() {
+        // `p->F` on an `S*` (the Runtime_77636 shape): a native-int
+        // receiver of a value-class field imports as the load through the
+        // explicit null check — RyuJIT's `cmp byte ptr [rax], al`.
+        let (mut ee, c) = struct_ee(8, &[], None);
+        ee.add_struct_field(FIELD_TOKEN, c, 4);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().ty = CorInfoType::Int;
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::NativeInt],
+            has_this: false,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        // ldarg.0; ldfld F; ret.
+        let info = struct_info(
+            &mut ee,
+            &[0x02, 0x7B, 0x01, 0x00, 0x00, 0x04, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::Load { addr, offset, .. } => {
+                assert_eq!(*offset, 4);
+                assert!(
+                    matches!(**addr, hir::Expr::NullCheck { .. }),
+                    "the pointer receiver is null-checked"
+                );
+            }
+            _ => panic!("expected a Load through the null-checked pointer"),
+        }
     }
 
     #[test]

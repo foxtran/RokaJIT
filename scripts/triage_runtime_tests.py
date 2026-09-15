@@ -731,6 +731,7 @@ BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"tail\. prefix"), "tail. prefix (tail calls)"),
     (re.compile(r"newobj of a delegate|call to a delegate member"), "delegates (out of step-11 scope)"),
     (re.compile(r"generic methods"), "generics"),
+    (re.compile(r"hardware intrinsics \(SIMD"), "SIMD hardware intrinsics (real vector semantics — deferred, step_11.10)"),
     (re.compile(r"non-class receiver \(value types\)|initobj/ldobj/stobj/cpobj of a non-value class|struct alignment above 16|SysV descriptor"), "structs & value types"),
     (re.compile(r"newobj of a value class"), "newobj of a value class"),
     (re.compile(r"newarr of a non-SZ array|newarr allocation helper|array element type outside"), "array pack gates (10.8: non-SZ/helper/element)"),
