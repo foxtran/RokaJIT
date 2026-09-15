@@ -74,14 +74,15 @@
 //! is bounds-checked.
 //!
 //! Stack discipline (ECMA-335 §III): the evaluation stack is simulated
-//! statically, with types propagated. It must be **empty at every block
-//! boundary** — values crossing a boundary are legal IL but need temp
-//! materialization, which is a later step; they are rejected as
-//! `Unsupported` (so the ir-design stack-height invariant holds vacuously
-//! for everything the importer accepts). The one exception is a catch
-//! handler's entry block: the VM enters it with the exception object on
-//! the stack, modeled as a synthesized depth-1 entry (step_10.6). A
-//! value may, however, stay on
+//! statically, with types propagated. Values may cross block boundaries
+//! (step_11.2): each control-flow edge spills its pending stack into the
+//! target's per-slot join temps, and the target block's import pushes
+//! reads of those temps as its initial stack. Merge consistency is
+//! verified as the edges record (depth and types; a mismatch is
+//! `BadIl`), a backward edge must match the state the loop header
+//! imported with, and EH region entries keep the empty-stack
+//! requirement (a catch handler's entry is the VM's exception push).
+//! A value may also stay on
 //! the stack across a `stloc` *within* a block: a tree that references
 //! the store's destination observed the pre-store value, so `stloc`
 //! spills every such tree to a temp first (RyuJIT's `impSpillLclRefs`).
@@ -222,7 +223,8 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         context_arg,
         struct_layouts,
         block_of,
-        expected_depth: HashMap::new(),
+        entry_stack: HashMap::new(),
+        current_leader: 0,
         stack: Vec::new(),
         clauses,
         catch_entries,
@@ -232,24 +234,10 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
     for b in 0..leaders.len() {
         blocks.push(importer.import_block(b, &leaders, &insns)?);
     }
-    // Every block was imported assuming an empty entry stack — except a
-    // catch handler's entry block, which starts with the synthesized
-    // exception push (depth 1). A predecessor that recorded a different
-    // depth means values cross a boundary — or, for a catch entry, that
-    // something falls or branches into the handler.
-    for (&leader, &depth) in &importer.expected_depth {
-        if importer.catch_entries.contains(&leader) {
-            if depth != 1 {
-                return Err(CompileError::BadIl(
-                    "inconsistent stack depth at a merge point",
-                ));
-            }
-        } else if depth != 0 {
-            return Err(CompileError::Unsupported(
-                "evaluation-stack values crossing a block boundary",
-            ));
-        }
-    }
+    // Merge consistency was verified as the edges recorded: `record_exit`
+    // checks every edge against the target's recorded state (depth and
+    // types), and `import_block` checked the entry state each block was
+    // imported with (step_11.2).
 
     let locals = importer
         .local_types
@@ -1182,10 +1170,14 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
 
 /// Computes block-start offsets (in layout order) and validates branch
 /// targets: every target must land on an instruction boundary, conditional
-/// branches must have a fallthrough, and code after an unconditional
-/// transfer must be a branch target (i.e. reachable). EH region
-/// boundaries (try/handler starts and ends) and `leave` targets are
-/// block starts too (step_10.6).
+/// branches must have a fallthrough. EH region boundaries (try/handler
+/// starts and ends) and `leave` targets are block starts too (step_10.6).
+///
+/// Code after an unconditional control transfer that no branch targets is
+/// dead: RyuJIT never imports it (its blocks are target-driven), and
+/// neither do we — `import_block` stops at the terminator. Rejecting it
+/// rejected valid IL (step_11.2's bad-IL audit: 72 tests, mostly
+/// VM-generated stubs, carried dead tails).
 fn find_leaders(il: &[u8], insns: &[Insn], clauses: &[Clause]) -> CompileResult<Vec<u32>> {
     let mut is_boundary = vec![false; il.len()];
     for insn in insns {
@@ -1235,20 +1227,6 @@ fn find_leaders(il: &[u8], insns: &[Insn], clauses: &[Clause]) -> CompileResult<
                 ));
             }
             leaders.insert(fallthrough);
-        }
-    }
-    for (i, insn) in insns.iter().enumerate() {
-        if matches!(
-            insn.op,
-            Op::Br { .. } | Op::Ret | Op::Throw | Op::Leave { .. } | Op::EndFinally
-        ) {
-            if let Some(next) = insns.get(i + 1) {
-                if !leaders.contains(&next.offset) {
-                    return Err(CompileError::BadIl(
-                        "unreachable IL after an unconditional control transfer",
-                    ));
-                }
-            }
         }
     }
     Ok(leaders.into_iter().collect())
@@ -1339,8 +1317,15 @@ fn validate_clauses(clauses: &[Clause], insns: &[Insn], il_len: u32) -> CompileR
                     .any(|h| insn.offset >= h.handler_start && insn.offset < h.handler_end)
         });
         if !protects_something {
-            return Err(CompileError::BadIl(
-                "EH try region protects no instructions",
+            // Valid IL (RyuJIT accepts): the try's whole body lies inside
+            // an *enclosing* clause's handler — `try { } finally { try {
+            // } catch { } }`. Our layout model assigns a block to its
+            // innermost handler, which leaves such a try no main-area
+            // blocks; expressing it needs the outer clause's region to
+            // cover the funclet (the EH table's per-funclet duplicate
+            // entries). A named limitation, not bad IL.
+            return Err(CompileError::Unsupported(
+                "EH try region nested inside an enclosing handler",
             ));
         }
     }
@@ -1675,8 +1660,18 @@ struct BlockImport<'a> {
     struct_layouts: StructLayouts,
     /// Leader offset → block index in layout order.
     block_of: HashMap<u32, u32>,
-    /// Stack depth each block entry requires, as told by its predecessors.
-    expected_depth: HashMap<u32, usize>,
+    /// The evaluation-stack state each block entry requires, as recorded
+    /// by its predecessors' edges (step_11.2): slot `i` maps to the join
+    /// temp every incoming edge spills into, and the block's import
+    /// pushes reads of those temps as its initial stack. An entry exists
+    /// (possibly empty) once any edge to the leader was recorded; a block
+    /// imported with no entry started with an empty stack, which fixes
+    /// the loop-header invariant backward edges are checked against.
+    entry_stack: HashMap<u32, Vec<(Type, LocalId)>>,
+    /// Leader offset of the block currently importing: a branch target at
+    /// or before it is a backward edge (or self-loop), whose block's
+    /// entry state is already fixed.
+    current_leader: u32,
     stack: Vec<(Type, hir::Expr)>,
     /// The method's EH clauses in IL space (step_10.6); empty for the
     /// fib subset.
@@ -1695,6 +1690,28 @@ fn binary(op: BinaryOp, lhs: hir::Expr, rhs: hir::Expr) -> hir::Expr {
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     }
+}
+
+/// Byref/native-int interchangeability at type-checked boundaries
+/// (unverifiable but valid IL — RyuJIT checks size compatibility, e.g.
+/// passing a `ref` to a `void*` parameter in `new Span<byte>(ptr, len)`):
+/// a byref and a native int are the same 8-byte slot.
+fn ptr_class_eq(a: Type, b: Type) -> bool {
+    let p = |t: Type| matches!(t, Type::ByRef | Type::NativeInt);
+    a == b || (p(a) && p(b))
+}
+
+/// Store-boundary compatibility (`stloc`/`starg`/`stfld`): the pointer
+/// classes interchange, and so do the two 8-byte integer types (RyuJIT's
+/// release build stores a native int into a `long` local as-is —
+/// importer.cpp's stloc assert is debug-only; found by the mmap-shaped
+/// stubs in the step_11.2 bad-IL audit).
+fn store_compatible(value: Type, slot: Type) -> bool {
+    ptr_class_eq(value, slot)
+        || matches!(
+            (value, slot),
+            (Type::NativeInt, Type::Int64) | (Type::Int64, Type::NativeInt)
+        )
 }
 
 /// Does the tree read local `id` anywhere? Drives the stloc interference
@@ -1863,50 +1880,150 @@ impl BlockImport<'_> {
             op,
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
         );
+        let unsigned = matches!(op, BinaryOp::UDiv | BinaryOp::URem);
         let (rt, rhs) = self.pop()?;
         let (lt, lhs) = self.pop()?;
-        let int = matches!(lt, Type::Int32 | Type::Int64 | Type::NativeInt);
-        let fp = matches!(lt, Type::Float | Type::Double);
-        if lt != rt || !(int || (float_ok && fp)) {
-            return Err(CompileError::BadIl("binary operand type mismatch"));
-        }
-        if fp && op == BinaryOp::Rem {
-            // Float `rem` has no SSE form: it is a call to the EE's
-            // fmod/fmodf helper (CORINFO_HELP_FLTREM/DBLREM) — RyuJIT's
-            // morph.cpp GT_MOD lowering does exactly this.
-            let helper = if lt == Type::Float {
-                CorInfoHelpFunc::FLTREM
+        // A byref that is a local's address counts as a native int once
+        // arithmetic touches it (RyuJIT's impBashVarAddrsToI: a stack
+        // slot's address escapes as a plain integer).
+        let intify = |ty: Type, e: &hir::Expr| {
+            if ty == Type::ByRef && matches!(e, hir::Expr::LocalAddr(_)) {
+                Type::NativeInt
             } else {
-                CorInfoHelpFunc::DBLREM
-            };
-            return self.push(
-                lt,
-                hir::Expr::Call {
-                    target: CallTarget::Helper(helper),
-                    sig: CallSig {
-                        ret: lt,
-                        args: vec![lt, lt],
-                        has_this: false,
+                ty
+            }
+        };
+        let lt = intify(lt, &lhs);
+        let rt = intify(rt, &rhs);
+        let int = |t: Type| matches!(t, Type::Int32 | Type::Int64 | Type::NativeInt);
+        let fp = |t: Type| matches!(t, Type::Float | Type::Double);
+        if lt == rt && (int(lt) || (float_ok && fp(lt))) {
+            if fp(lt) && op == BinaryOp::Rem {
+                // Float `rem` has no SSE form: it is a call to the EE's
+                // fmod/fmodf helper (CORINFO_HELP_FLTREM/DBLREM) — RyuJIT's
+                // morph.cpp GT_MOD lowering does exactly this.
+                let helper = if lt == Type::Float {
+                    CorInfoHelpFunc::FLTREM
+                } else {
+                    CorInfoHelpFunc::DBLREM
+                };
+                return self.push(
+                    lt,
+                    hir::Expr::Call {
+                        target: CallTarget::Helper(helper),
+                        sig: CallSig {
+                            ret: lt,
+                            args: vec![lt, lt],
+                            has_this: false,
+                        },
+                        args: vec![lhs, rhs],
                     },
-                    args: vec![lhs, rhs],
-                },
-            );
+                );
+            }
+            return self.push(lt, binary(op, lhs, rhs));
         }
-        self.push(lt, binary(op, lhs, rhs))
+        // RyuJIT's pointer-class arithmetic (impGetByRefResultType,
+        // importer.cpp:5338 — unverifiable but valid IL, e.g. Unsafe.Add):
+        // a native-int operand promotes an Int32 one (sign-extended,
+        // zero-extended for the `.un` forms); `add`/`sub` also take
+        // byrefs. Int64 never mixes.
+        let widen = |ty: Type, e: hir::Expr| {
+            if ty == Type::Int32 {
+                hir::Expr::Conv {
+                    to: Type::NativeInt,
+                    overflow: false,
+                    unsigned,
+                    arg: Box::new(e),
+                }
+            } else {
+                e
+            }
+        };
+        let narrow_int = |t: Type| matches!(t, Type::Int32 | Type::NativeInt);
+        let (result, lhs, rhs) = if int(lt) && int(rt) && narrow_int(lt) && narrow_int(rt) {
+            // int32 op native int → native int (both sides native-width).
+            (Type::NativeInt, widen(lt, lhs), widen(rt, rhs))
+        } else if op == BinaryOp::Add && lt == Type::ByRef && narrow_int(rt) {
+            (Type::ByRef, lhs, widen(rt, rhs))
+        } else if op == BinaryOp::Add && narrow_int(lt) && rt == Type::ByRef {
+            (Type::ByRef, widen(lt, lhs), rhs)
+        } else if op == BinaryOp::Sub && lt == Type::ByRef && rt == Type::ByRef {
+            (Type::NativeInt, lhs, rhs)
+        } else if op == BinaryOp::Sub && lt == Type::ByRef && narrow_int(rt) {
+            (Type::ByRef, lhs, widen(rt, rhs))
+        } else if op == BinaryOp::Sub && narrow_int(lt) && rt == Type::ByRef {
+            (Type::NativeInt, widen(lt, lhs), rhs)
+        } else {
+            return Err(CompileError::BadIl("binary operand type mismatch"));
+        };
+        self.push(result, binary(op, lhs, rhs))
     }
 
-    fn note_depth(&mut self, leader: u32, depth: usize) -> CompileResult<()> {
-        match self.expected_depth.entry(leader) {
-            std::collections::hash_map::Entry::Occupied(e) => {
-                if *e.get() != depth {
+    /// Records the current evaluation stack as the state carried on the
+    /// edge to `target` (a leader), spilling every pending value into the
+    /// target's join temps (step_11.2). The first edge to a target
+    /// allocates the temps — one per stack slot, bottom first; every
+    /// later edge must agree in depth and types (ECMA-335's merge rules;
+    /// a mismatch is BadIl). A target at or before the block currently
+    /// importing (a backward edge or self-loop) fixed its entry state
+    /// when it imported: no recorded state means it entered empty, and a
+    /// back edge carrying values then violates the loop-header
+    /// invariant.
+    ///
+    /// The edge's spill stores evaluate in stack order (bottom first),
+    /// which is IL order; the stores target fresh temps, so pending
+    /// trees can't observe them. Values are cloned, not moved out: a
+    /// conditional branch records the same stack on both edges (its
+    /// helper spills effectful trees first — see `branch`).
+    fn record_exit(
+        &mut self,
+        target: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        if let Some(expected) = self.entry_stack.get(&target) {
+            if expected.len() != self.stack.len() {
+                return Err(CompileError::BadIl(
+                    "inconsistent evaluation-stack depth at a merge point",
+                ));
+            }
+            for (i, &(ty, tmp)) in expected.clone().iter().enumerate() {
+                if self.stack[i].0 != ty {
                     return Err(CompileError::BadIl(
-                        "inconsistent stack depth at a merge point",
+                        "evaluation-stack type mismatch at a merge point",
                     ));
                 }
+                let value = self.stack[i].1.clone();
+                // A value already read from its own join temp (a block
+                // whose body left the entry value untouched) needs no
+                // store.
+                if !matches!(value, hir::Expr::Local(id) if id == tmp) {
+                    stmts.push(hir::Stmt {
+                        il_offset,
+                        kind: hir::StmtKind::Store { dst: tmp, value },
+                    });
+                }
             }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(depth);
+        } else {
+            if !self.stack.is_empty() && target <= self.current_leader {
+                return Err(CompileError::BadIl(
+                    "backward branch carries evaluation-stack values into an empty loop header",
+                ));
             }
+            let mut expected = Vec::with_capacity(self.stack.len());
+            for i in 0..self.stack.len() {
+                let (ty, _) = self.stack[i];
+                let tmp = self.temp(ty);
+                expected.push((ty, tmp));
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store {
+                        dst: tmp,
+                        value: self.stack[i].1.clone(),
+                    },
+                });
+            }
+            self.entry_stack.insert(target, expected);
         }
         Ok(())
     }
@@ -1976,7 +2093,7 @@ impl BlockImport<'_> {
         il_offset: IlOffset,
     ) -> CompileResult<()> {
         let (ty, value) = self.pop()?;
-        if ty != self.local_types[id.0 as usize] {
+        if !store_compatible(ty, self.local_types[id.0 as usize]) {
             return Err(CompileError::BadIl("store type mismatch"));
         }
         for i in 0..self.stack.len() {
@@ -2095,7 +2212,10 @@ impl BlockImport<'_> {
     }
 
     /// `ceq`/`cgt`/`cgt.un`/`clt`/`clt.un`: pop two operands, push the
-    /// Int32 result. Integer operands must agree in type; the reference
+    /// Int32 result. Integer operands must agree in type — except that an
+    /// Int32 compared against a native int promotes (sign-extends) to
+    /// native int (RyuJIT's ceq normalization, importer.cpp:8034;
+    /// unverifiable but valid IL). The reference
     /// forms (`ceq` and `cgt.un` only, ECMA-335 §III.1.5) also accept
     /// `Ref`/`ByRef`/`NativeInt` operands in any combination (a `null`
     /// literal compares against both references and pointers).
@@ -2108,9 +2228,32 @@ impl BlockImport<'_> {
         let int = |t: Type| matches!(t, Type::Int32 | Type::Int64 | Type::NativeInt);
         let ptr = |t: Type| matches!(t, Type::Ref | Type::ByRef | Type::NativeInt);
         let fp = |t: Type| matches!(t, Type::Float | Type::Double);
+        if int(lt) && int(rt) && lt != rt && lt != Type::Int64 && rt != Type::Int64 {
+            // int32 vs native int: promote the Int32 side.
+            let widen = |ty: Type, e: hir::Expr| {
+                if ty == Type::Int32 {
+                    hir::Expr::Conv {
+                        to: Type::NativeInt,
+                        overflow: false,
+                        unsigned: false,
+                        arg: Box::new(e),
+                    }
+                } else {
+                    e
+                }
+            };
+            return self.push(Type::Int32, binary(op, widen(lt, lhs), widen(rt, rhs)));
+        }
         let ok = if (int(lt) && int(rt)) || (fp(lt) && fp(rt)) {
             // Same-type numeric pairs (int or float).
             lt == rt
+        } else if lt == rt && lt == Type::ByRef {
+            // Byref pairs compare as addresses in every form (ordering
+            // compares on byrefs are unverifiable but valid — RyuJIT's
+            // compare assert passes on equal actual types; GitHub_27279's
+            // `clt.un` on two byrefs). References keep the ECMA restriction
+            // to ceq/cgt.un: GC moves make ref ordering meaningless.
+            true
         } else {
             matches!(op, BinaryOp::Eq | BinaryOp::UGt) && ptr(lt) && ptr(rt)
         };
@@ -2333,9 +2476,32 @@ impl BlockImport<'_> {
         cond: hir::Expr,
         target: u32,
         fallthrough: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
     ) -> CompileResult<hir::Terminator> {
-        self.note_depth(target, self.stack.len())?;
-        self.note_depth(fallthrough, self.stack.len())?;
+        // Both edges record the current stack: a tree whose evaluation
+        // has an observable effect must run exactly once, before the
+        // branch — spill those into temps so each edge's join stores
+        // copy the temp (pure trees duplicate harmlessly into both
+        // edges' stores; the join temps are fresh, so the spills can't
+        // be observed by the condition tree, which IL produced last
+        // anyway).
+        for i in 0..self.stack.len() {
+            let (ty, _) = self.stack[i];
+            if must_eval(&self.stack[i].1) {
+                let value =
+                    std::mem::replace(&mut self.stack[i].1, hir::Expr::Const(Const::Int32(0)));
+                let tmp = self.temp(ty);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store { dst: tmp, value },
+                });
+                let (_, expr) = self.local_value_expr(tmp);
+                self.stack[i].1 = expr;
+            }
+        }
+        self.record_exit(target, stmts, il_offset)?;
+        self.record_exit(fallthrough, stmts, il_offset)?;
         Ok(hir::Terminator::Branch {
             cond,
             then: self.block_id(target)?,
@@ -2349,22 +2515,27 @@ impl BlockImport<'_> {
         il_offset: IlOffset,
     ) -> CompileResult<hir::Terminator> {
         if self.ret_ty == Type::Void {
-            if !self.stack.is_empty() {
-                return Err(CompileError::BadIl(
-                    "stack not empty at ret of a void method",
-                ));
-            }
+            // RyuJIT's non-inline path never checks the stack depth at a
+            // void `ret` (impReturnInstruction) — leftover values are
+            // dropped, but their side effects still run (the spill), e.g.
+            // a VM-generated stub's dead value. (step_11.2 audit.)
+            self.spill_stack(stmts, il_offset)?;
+            self.stack.clear();
             return Ok(hir::Terminator::Return { value: None });
         }
         let (ty, value) = self.pop()?;
-        if ty != self.ret_ty {
+        // Byref and native int are interchangeable at `ret` (RyuJIT's
+        // compatibility assert, importer.cpp:11630 — e.g. `Unsafe.AsRef`'s
+        // `ldarg.0; ret` returns a native-int argument as a byref).
+        let ptr = |t: Type| matches!(t, Type::ByRef | Type::NativeInt);
+        if ty != self.ret_ty && !(ptr(ty) && ptr(self.ret_ty)) {
             return Err(CompileError::BadIl("return value type mismatch"));
         }
-        if !self.stack.is_empty() {
-            return Err(CompileError::BadIl(
-                "more than the return value on the stack at ret",
-            ));
-        }
+        // Leftover values under the return value: dropped after their
+        // side effects, like the void case (RyuJIT pops one and never
+        // checks the depth).
+        self.spill_stack(stmts, il_offset)?;
+        self.stack.clear();
         if let Some(retbuf) = self.retbuf {
             // The hidden-return-buffer convention (step_10.9): the struct
             // value copies through the retbuf pointer, and the callee
@@ -2419,7 +2590,7 @@ impl BlockImport<'_> {
     ) -> CompileResult<hir::Terminator> {
         self.spill_stack(stmts, il_offset)?;
         self.stack.clear();
-        self.note_depth(target, 0)?;
+        self.record_exit(target, stmts, il_offset)?;
         let hops = finally_chain(&self.clauses, il_offset.0, target);
         if !hops.is_empty() {
             let from_catch = matches!(
@@ -2701,6 +2872,20 @@ impl BlockImport<'_> {
             }
         };
         check_call_conv(call.sig.callConv)?;
+        // Delegate invocation is out of step-11 scope (construction is
+        // gated in `newobj`): the target's declaring class carrying the
+        // DELEGATE bit means this call dispatches through delegate
+        // machinery (Invoke's stub), which we must not miscompile.
+        if let Some(target) = MethodHandle::from_raw(call.hMethod) {
+            let class = self.ee.get_method_class(target);
+            if self
+                .ee
+                .get_class_attribs(class)
+                .contains(ClassAttribs::DELEGATE)
+            {
+                return Err(CompileError::Unsupported("call to a delegate member"));
+            }
+        }
         let has_this = call.sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0;
         if null_check_this && !has_this {
             return Err(CompileError::BadIl("callvirt on a static method"));
@@ -2716,7 +2901,7 @@ impl BlockImport<'_> {
         let mut args = Vec::with_capacity(arg_types.len() + usize::from(has_this));
         for &expected in arg_types.iter().rev() {
             let (ty, value) = self.pop()?;
-            if ty != expected {
+            if !ptr_class_eq(ty, expected) {
                 return Err(CompileError::BadIl("call argument type mismatch"));
             }
             args.push(value);
@@ -2728,7 +2913,11 @@ impl BlockImport<'_> {
         let mut receiver_null_checked = false;
         if has_this {
             let (ty, this) = self.pop()?;
-            if !matches!(ty, Type::Ref | Type::ByRef) {
+            // A native int receiver is a raw pointer to the receiver —
+            // valid (unverifiable) IL for value-type instance methods
+            // (`(*ptr).Method()`), and the callvirt null check still
+            // applies to it.
+            if !matches!(ty, Type::Ref | Type::ByRef | Type::NativeInt) {
                 return Err(CompileError::BadIl("`this` must be a reference"));
             }
             // The receiver's null check, when one is owed: plain callvirt
@@ -2830,6 +3019,21 @@ impl BlockImport<'_> {
                     access: MemAccess::Natural,
                 },
             );
+        }
+        // `Volatile.ReadBarrier()`/`WriteBarrier()`: the same deliberately
+        // self-recursive [Intrinsic] shape (System.Threading.Volatile.cs),
+        // compiler fences only — no code on x64, and tier 0 reorders
+        // nothing (RyuJIT's expansion of NI_System_Threading_Volatile_* is
+        // likewise a no-op). Surfaced by the step_11.2 bad-IL audit
+        // (InstrumentedTiers.cs stack-overflowed on the literal body).
+        if virtual_kind.is_none()
+            && constrained_resolved.is_none()
+            && !has_this
+            && ret == Type::Void
+            && arg_types.is_empty()
+            && self.is_volatile_barrier_intrinsic(method)
+        {
+            return Ok(());
         }
         let target = match virtual_kind {
             None => CallTarget::Direct(method),
@@ -3064,6 +3268,24 @@ impl BlockImport<'_> {
             Some((name, ns)) => {
                 name == "RuntimeHelpers" && ns.as_deref() == Some("System.Runtime.CompilerServices")
             }
+            None => false,
+        }
+    }
+
+    /// Whether `method` is `System.Threading.Volatile.ReadBarrier`/
+    /// `WriteBarrier` — the [Intrinsic] bit plus the name match (as
+    /// RyuJIT name-matches them; see `is_get_method_table_intrinsic`).
+    fn is_volatile_barrier_intrinsic(&self, method: MethodHandle) -> bool {
+        if !self.ee.is_intrinsic(method) {
+            return false;
+        }
+        let name = self.ee.get_method_name_from_metadata(method);
+        if !matches!(name.as_deref(), Some("ReadBarrier") | Some("WriteBarrier")) {
+            return false;
+        }
+        let class = self.ee.get_method_class(method);
+        match self.ee.get_class_name_from_metadata(class) {
+            Some((name, ns)) => name == "Volatile" && ns.as_deref() == Some("System.Threading"),
             None => false,
         }
     }
@@ -3423,7 +3645,7 @@ impl BlockImport<'_> {
         let mut args = Vec::with_capacity(arg_types.len() + usize::from(has_this));
         for &expected in arg_types.iter().rev() {
             let (ty, value) = self.pop()?;
-            if ty != expected {
+            if !ptr_class_eq(ty, expected) {
                 return Err(CompileError::BadIl("calli argument type mismatch"));
             }
             args.push(value);
@@ -3431,7 +3653,8 @@ impl BlockImport<'_> {
         args.reverse();
         if has_this {
             let (ty, this) = self.pop()?;
-            if !matches!(ty, Type::Ref | Type::ByRef) {
+            // As in `call`: a native int receiver is a raw pointer.
+            if !matches!(ty, Type::Ref | Type::ByRef | Type::NativeInt) {
                 return Err(CompileError::BadIl("`this` must be a reference"));
             }
             args.insert(0, this);
@@ -3663,8 +3886,9 @@ impl BlockImport<'_> {
     /// (csc emits `ldarg`/`ldloc` + `ldfld` for value reads: the value's
     /// home is the receiver's memory). Byref/value receivers are never
     /// null-checked: byrefs are managed pointers and a value is never
-    /// null. Returns the receiver (an address expression for the
-    /// value/byref forms) and whether it needs the explicit null check.
+    /// null. Returns the receiver
+    /// (an address expression for the value/byref forms) and whether it
+    /// needs the explicit null check.
     fn pop_field_receiver(
         &mut self,
         byref_ok: bool,
@@ -3778,7 +4002,7 @@ impl BlockImport<'_> {
         let (field, offset, byref_ok) = self.resolve_instance_field(token)?;
         let (ty, access) = self.field_mem_type(field)?;
         let (vt, value) = self.pop()?;
-        if vt != ty {
+        if !store_compatible(vt, ty) {
             return Err(CompileError::BadIl("stfld value type mismatch"));
         }
         let (obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
@@ -4326,19 +4550,23 @@ impl BlockImport<'_> {
         Ok(())
     }
 
-    /// The scalar cell shape of a value class whose CorInfoType is a
-    /// primitive rather than VALUECLASS — IntPtr/UIntPtr and enums
-    /// (RyuJIT's `TypeHandleToVarType` maps them to the scalar type, so
-    /// `ldobj`/`stobj`/`initobj`/`cpobj` over them are the plain typed
-    /// memory ops, importer.cpp:11098's `lclTyp != TYP_STRUCT` tail). This
-    /// is the same normalization the field pack applies in
-    /// `field_mem_type`; without it `stobj !!T` over `T = IntPtr` mismatches
-    /// the NativeInt an `ldfld` of the field produced (found by
-    /// GenericCache's TryGet re-JIT in enumerablecloning.cs). `None` for
-    /// a true struct (VALUECLASS, or a type corinfo_mem_type doesn't
-    /// map — e.g. RefAny, which keeps the struct path).
+    /// The scalar cell shape of a primitive-typed value class — IntPtr/
+    /// UIntPtr and enums (RyuJIT's TypeHandleToVarType maps them to the
+    /// scalar type, so `ldobj`/`stobj`/`initobj`/`cpobj` over them are the
+    /// plain typed memory ops, importer.cpp:11098's `lclTyp != TYP_STRUCT`
+    /// tail). This is the same normalization the field pack gets from the
+    /// EE's `get_field_type`; without it `stobj !!T` over `T = IntPtr`
+    /// mismatches the NativeInt an `ldfld` of the field produced (found by
+    /// GenericCache's TryGet re-JIT in enumerablecloning.cs). The query is
+    /// `get_type_for_primitive_value_class`: `as_cor_info_type` reports
+    /// IntPtr as VALUECLASS (its internal element type is not special —
+    /// the normalization lives in the primitive-value-class query).
+    /// `None` for a true struct (UNDEF, or a type corinfo_mem_type
+    /// doesn't map — e.g. RefAny, which keeps the struct path).
     fn scalar_value_class_cell(&mut self, class: ClassHandle) -> Option<(Type, MemAccess)> {
-        corinfo_mem_type(self.ee.as_cor_info_type(class)).ok()
+        self.ee
+            .get_type_for_primitive_value_class(class)
+            .and_then(|ty| corinfo_mem_type(ty).ok())
     }
 
     /// `ldobj` (0x71): the struct value at the address — or, for a
@@ -4509,6 +4737,21 @@ impl BlockImport<'_> {
                 "newobj token did not resolve to a class",
             ));
         };
+        // Delegates are out of step-11 scope: their construction and
+        // invocation are special-cased by the EE/runtime (the constructor
+        // is an FCall pair with the function pointer; Invoke dispatches
+        // through the invoke stub). Gate construction here and invocation
+        // in `call` — silently miscompiling them crashes the process
+        // (surfaced by step_11.2's join support: the csc delegate-cache
+        // shape carries a value across a join, which used to reject the
+        // method before the delegate path ever ran).
+        if self
+            .ee
+            .get_class_attribs(class)
+            .contains(ClassAttribs::DELEGATE)
+        {
+            return Err(CompileError::Unsupported("newobj of a delegate"));
+        }
         // `newobj` of a value class (step_10.10): no allocation — csc's
         // `new S(args)` is in-place construction (RyuJIT's impImportNewObj
         // valuetype path): a fresh struct temp, zero-initialized (initobj
@@ -4572,23 +4815,51 @@ impl BlockImport<'_> {
         // allocation, prepared before the constructor's arguments pop.
         // `this_arg` is the constructor's receiver; `result` is the
         // value the `newobj` pushes.
-        let (this_arg, result) = if is_value_class {
-            layout_of(&mut self.struct_layouts, self.ee, class)?;
-            let t = self.temp(Type::Struct(class));
-            stmts.push(hir::Stmt {
-                il_offset,
-                kind: hir::StmtKind::BlockZero {
-                    addr: hir::Expr::LocalAddr(t),
-                    class,
-                },
-            });
-            (
-                hir::Expr::LocalAddr(t),
-                hir::Expr::StructVal {
-                    addr: Box::new(hir::Expr::LocalAddr(t)),
-                    class,
-                },
-            )
+        let (this_arg, result, result_ty) = if is_value_class {
+            if let Some((scalar_ty, _)) = self.scalar_value_class_cell(class) {
+                // A primitive-typed value class (IntPtr, an enum): its
+                // value IS the scalar (RyuJIT's TypeHandleToVarType — the
+                // same normalization `ldobj` and field_mem_type apply), so
+                // the temp is the scalar cell the constructor writes
+                // through its address. Without this, `new IntPtr(42)`
+                // mismatched every NativeInt-typed consumer (the field
+                // pack reports IntPtr fields as NativeInt — GitHub_18482).
+                let t = self.temp(scalar_ty);
+                let zero = match scalar_ty {
+                    Type::Int32 => hir::Expr::Const(Const::Int32(0)),
+                    Type::Int64 => hir::Expr::Const(Const::Int64(0)),
+                    Type::NativeInt => hir::Expr::Const(Const::NativeInt(0)),
+                    Type::Float => hir::Expr::Const(Const::Float(0.0)),
+                    Type::Double => hir::Expr::Const(Const::Double(0.0)),
+                    _ => return Err(CompileError::Internal("scalar cell of a non-scalar type")),
+                };
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store {
+                        dst: t,
+                        value: zero,
+                    },
+                });
+                (hir::Expr::LocalAddr(t), hir::Expr::Local(t), scalar_ty)
+            } else {
+                layout_of(&mut self.struct_layouts, self.ee, class)?;
+                let t = self.temp(Type::Struct(class));
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::BlockZero {
+                        addr: hir::Expr::LocalAddr(t),
+                        class,
+                    },
+                });
+                (
+                    hir::Expr::LocalAddr(t),
+                    hir::Expr::StructVal {
+                        addr: Box::new(hir::Expr::LocalAddr(t)),
+                        class,
+                    },
+                    Type::Struct(class),
+                )
+            }
         } else {
             let (helper, _has_side_effects) = self.ee.get_new_helper(&resolved, self.info.ftn);
             // The single-argument (MethodTable*) -> Object* class-alloc
@@ -4629,7 +4900,7 @@ impl BlockImport<'_> {
                     },
                 },
             });
-            (hir::Expr::Local(t_obj), hir::Expr::Local(t_obj))
+            (hir::Expr::Local(t_obj), hir::Expr::Local(t_obj), Type::Ref)
         };
 
         // The constructor: a direct instance call whose `this` is the
@@ -4661,7 +4932,7 @@ impl BlockImport<'_> {
         let mut args = Vec::with_capacity(arg_types.len() + 1);
         for &expected in arg_types.iter().rev() {
             let (ty, value) = self.pop()?;
-            if ty != expected {
+            if !ptr_class_eq(ty, expected) {
                 return Err(CompileError::BadIl("call argument type mismatch"));
             }
             args.push(value);
@@ -4689,11 +4960,6 @@ impl BlockImport<'_> {
                 args,
             }),
         });
-        let result_ty = if is_value_class {
-            Type::Struct(class)
-        } else {
-            Type::Ref
-        };
         self.push(result_ty, result)
     }
 
@@ -5359,11 +5625,12 @@ impl BlockImport<'_> {
     }
 
     /// Imports the instructions of block `b` (leader `leaders[b]`). The
-    /// stack starts empty — the entry check below rejects leaders a
-    /// predecessor already entered non-empty, and a later pass over
-    /// `expected_depth` proves the assumption against the remaining
-    /// (backward-edge) predecessors, so any leftover from the previous
-    /// block is discarded here.
+    /// initial stack comes from the entry state the already-imported
+    /// predecessors recorded (step_11.2): one read of each join temp,
+    /// bottom first. EH region entries keep ECMA-335's empty-stack
+    /// requirement (a catch handler's entry is the VM's exception push,
+    /// not an IL edge); backward edges that disagree with the state the
+    /// header imported with were rejected at `record_exit`.
     fn import_block(
         &mut self,
         b: usize,
@@ -5372,19 +5639,36 @@ impl BlockImport<'_> {
     ) -> CompileResult<hir::Block> {
         self.stack.clear();
         let start = leaders[b];
-        // A block an already-imported predecessor entered with a non-empty
-        // evaluation stack (a join carrying values — csc's ternary shape,
-        // e.g. `x + (c ? a : b)`) is outside the supported shape: reject
-        // it here, as Unsupported, rather than underflowing mid-block and
-        // misreporting valid IL as BadIl. (Backward edges are recorded
-        // only after the header imported; the post-pass over
-        // `expected_depth` in `import` is the backstop for those.)
-        if !self.catch_entries.contains(&start)
-            && self.expected_depth.get(&start).is_some_and(|&d| d != 0)
-        {
-            return Err(CompileError::Unsupported(
-                "evaluation-stack values crossing a block boundary",
-            ));
+        self.current_leader = start;
+        if self.catch_entries.contains(&start) {
+            // An IL edge into a catch handler entry is only tolerated at
+            // exactly the exception depth (the pre-11.2 rule, kept).
+            if self.entry_stack.get(&start).is_some_and(|e| e.len() != 1) {
+                return Err(CompileError::BadIl(
+                    "inconsistent stack depth at a merge point",
+                ));
+            }
+        } else if let Some(entry) = self.entry_stack.get(&start) {
+            if !entry.is_empty() {
+                // Entering a protected region or a handler with values on
+                // the evaluation stack is invalid IL (ECMA-335 §III: EH
+                // region entries see an empty stack) — a clean rejection,
+                // never silently miscompiled.
+                if self
+                    .clauses
+                    .iter()
+                    .any(|c| c.try_start == start || c.handler_start == start)
+                {
+                    return Err(CompileError::BadIl(
+                        "non-empty evaluation stack at an EH region entry",
+                    ));
+                }
+                let entry = entry.clone();
+                for &(_, tmp) in &entry {
+                    let (ty, expr) = self.local_value_expr(tmp);
+                    self.push(ty, expr)?;
+                }
+            }
         }
         let end = leaders
             .get(b + 1)
@@ -5399,9 +5683,7 @@ impl BlockImport<'_> {
         // exception object on the eval stack (step_10.6): a synthesized
         // store of the funclet's incoming argument into a fresh Ref temp
         // — an ordinary always-live untracked root, zeroed by the main
-        // prolog — and a read of that temp as the initial stack (depth 1,
-        // which the expected-depth check enforces against any IL-level
-        // predecessor).
+        // prolog — and a read of that temp as the initial stack (depth 1).
         if self.catch_entries.contains(&start) {
             let exc = self.temp(Type::Ref);
             stmts.push(hir::Stmt {
@@ -5414,6 +5696,12 @@ impl BlockImport<'_> {
             self.push(Type::Ref, hir::Expr::Local(exc))?;
         }
         for insn in &insns[first..last] {
+            // A terminator ends the block; anything after it (dead code
+            // no branch targets — `find_leaders` lets it through) is
+            // never imported, like RyuJIT's target-driven blocks.
+            if terminator.is_some() {
+                break;
+            }
             let il_offset = IlOffset(insn.offset);
             match insn.op {
                 Op::Nop => {}
@@ -5532,7 +5820,7 @@ impl BlockImport<'_> {
                 Op::LdInd(ty, access) => self.ldind(ty, access)?,
                 Op::StInd(ty, access) => self.stind(ty, access, &mut stmts, il_offset)?,
                 Op::Br { target } => {
-                    self.note_depth(target, self.stack.len())?;
+                    self.record_exit(target, &mut stmts, il_offset)?;
                     terminator = Some(hir::Terminator::Jump {
                         target: self.block_id(target)?,
                     });
@@ -5554,29 +5842,67 @@ impl BlockImport<'_> {
                         }
                     };
                     let cond = binary(op, value, hir::Expr::Const(zero));
-                    terminator = Some(self.branch(cond, target, insn.offset + insn.size)?);
+                    terminator = Some(self.branch(
+                        cond,
+                        target,
+                        insn.offset + insn.size,
+                        &mut stmts,
+                        il_offset,
+                    )?);
                 }
                 Op::BrCmp { op, target } => {
                     let (rt, rhs) = self.pop()?;
                     let (lt, lhs) = self.pop()?;
-                    // Integer operands must agree in type; `beq`/`bne.un`
-                    // additionally accept reference pairs, and same-type
-                    // float pairs take every form (ECMA-335 §III.1.5; on
-                    // floats the plain forms are ordered, `.un` unordered).
+                    // Integer operands must agree in type — except that an
+                    // Int32 compared against a native int promotes
+                    // (sign-extends), as in `compare` (importer.cpp:8034).
+                    // `beq`/`bne.un` additionally accept reference pairs,
+                    // and same-type float pairs take every form
+                    // (ECMA-335 §III.1.5; on floats the plain forms are
+                    // ordered, `.un` unordered).
                     let int = |t: Type| matches!(t, Type::Int32 | Type::Int64 | Type::NativeInt);
                     let ptr = |t: Type| matches!(t, Type::Ref | Type::ByRef);
                     let fp = |t: Type| matches!(t, Type::Float | Type::Double);
-                    let ok = if (int(lt) && int(rt)) || (fp(lt) && fp(rt)) {
-                        // Same-type numeric pairs (int or float).
-                        lt == rt
-                    } else {
-                        matches!(op, BinaryOp::Eq | BinaryOp::Ne) && ptr(lt) && ptr(rt)
+                    let widen = |ty: Type, e: hir::Expr| {
+                        if ty == Type::Int32 {
+                            hir::Expr::Conv {
+                                to: Type::NativeInt,
+                                overflow: false,
+                                unsigned: false,
+                                arg: Box::new(e),
+                            }
+                        } else {
+                            e
+                        }
                     };
-                    if !ok {
-                        return Err(CompileError::BadIl("compare operand type mismatch"));
-                    }
-                    terminator =
-                        Some(self.branch(binary(op, lhs, rhs), target, insn.offset + insn.size)?);
+                    let (lhs, rhs) = if int(lt) && int(rt) && lt != rt {
+                        if lt == Type::Int64 || rt == Type::Int64 {
+                            return Err(CompileError::BadIl("compare operand type mismatch"));
+                        }
+                        (widen(lt, lhs), widen(rt, rhs))
+                    } else {
+                        let ok = if (int(lt) && int(rt)) || (fp(lt) && fp(rt)) {
+                            // Same-type numeric pairs (int or float).
+                            lt == rt
+                        } else if lt == rt && lt == Type::ByRef {
+                            // Byref pairs: address compares in every form
+                            // (as in `compare`).
+                            true
+                        } else {
+                            matches!(op, BinaryOp::Eq | BinaryOp::Ne) && ptr(lt) && ptr(rt)
+                        };
+                        if !ok {
+                            return Err(CompileError::BadIl("compare operand type mismatch"));
+                        }
+                        (lhs, rhs)
+                    };
+                    terminator = Some(self.branch(
+                        binary(op, lhs, rhs),
+                        target,
+                        insn.offset + insn.size,
+                        &mut stmts,
+                        il_offset,
+                    )?);
                 }
                 Op::Ret => {
                     terminator = Some(self.ret(&mut stmts, il_offset)?);
@@ -5600,7 +5926,7 @@ impl BlockImport<'_> {
                 let Some(&next) = leaders.get(b + 1) else {
                     return Err(CompileError::BadIl("IL falls off the end of the method"));
                 };
-                self.note_depth(next, self.stack.len())?;
+                self.record_exit(next, &mut stmts, IlOffset(end))?;
                 hir::Terminator::Jump {
                     target: BlockId(b as u32 + 1),
                 }
@@ -6117,21 +6443,396 @@ mod tests {
     }
 
     #[test]
-    fn values_crossing_a_join_are_a_clean_unsupported_not_bad_il() {
-        // Regression for the post-10.6 triage: VerifyMagnitudePhase-
-        // Properties (GitHub_18362) — csc's `phase += (phase < 0) ? PI :
-        // -PI` evaluates `phase` before the ternary, so the conditional's
-        // arm blocks and their join carry evaluation-stack values. The
-        // importer doesn't support crossing values; the failure must be a
-        // clean Unsupported (the IL is valid), never a BadIl stack
-        // underflow mid-block.
+    fn values_crossing_a_join_materialize_into_join_temps() {
+        // The GitHub_18362 ternary shape (pre-11.2 this was a clean
+        // Unsupported): csc's `phase += (phase < 0) ? PI : -PI` evaluates
+        // `phase` before the ternary, so the conditional's arm blocks and
+        // their join carry evaluation-stack values (step_11.2).
         //
         // ldarg.0; ldarg.0; brfalse.s F; ldc.i4.1; br.s J; F: ldc.i4.2;
         // J: add; ret.
         let il = [0x02, 0x02, 0x2C, 0x03, 0x17, 0x2B, 0x01, 0x18, 0x58, 0x2A];
-        let err = import_ii(&il).err().expect("crossing values are out");
+        let m = import_ii(&il).expect("crossing values import");
+        // Blocks: b0 [0,4), b1 [4,7) (then-arm), b2 [7,8) (else-arm),
+        // b3 [8,10) (the join). Temps follow the one IL arg: tF (the
+        // value carried into F), tT (into the then-arm), then the join
+        // J's two slots.
+        assert_eq!(m.blocks.len(), 4);
+        assert_eq!(m.locals.len(), 5);
+        for local in &m.locals[1..] {
+            assert_eq!(local.kind, hir::LocalKind::Temp);
+            assert_eq!(local.ty, Type::Int32);
+        }
+        // b0: spill the carried value into both edges' temps (target
+        // first, then the fallthrough), then branch on the popped copy.
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2);
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!((dst, as_local(value)), (LocalId(1), LocalId(0)));
+        let (dst, value) = store(&stmts[1]);
+        assert_eq!((dst, as_local(value)), (LocalId(2), LocalId(0)));
+        match &m.blocks[0].terminator {
+            hir::Terminator::Branch { then, else_, .. } => {
+                assert_eq!(*then, BlockId(2));
+                assert_eq!(*else_, BlockId(1));
+            }
+            _ => panic!("block 0: expected Branch"),
+        }
+        // The join's slots are LocalId(3) (the carried ldarg) and
+        // LocalId(4) (the arm constant): each arm block spills into the
+        // SAME temps.
+        let stmts = &m.blocks[1].stmts;
+        assert_eq!(stmts.len(), 2);
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!((dst, as_local(value)), (LocalId(3), LocalId(2)));
+        let (dst, value) = store(&stmts[1]);
+        assert_eq!((dst, as_i32(value)), (LocalId(4), 1));
+        let stmts = &m.blocks[2].stmts;
+        assert_eq!(stmts.len(), 2);
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!((dst, as_local(value)), (LocalId(3), LocalId(1)));
+        let (dst, value) = store(&stmts[1]);
+        assert_eq!((dst, as_i32(value)), (LocalId(4), 2));
+        // The join block reads the join temps.
+        let (op, lhs, rhs) = as_binary(return_value(&m, 3));
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_local(lhs), LocalId(3));
+        assert_eq!(as_local(rhs), LocalId(4));
+    }
+
+    #[test]
+    fn values_crossing_a_loop_back_edge_update_the_join_temp() {
+        // A loop whose header carries one value (step_11.2): the entry
+        // edge seeds the header's join temp, the back edge overwrites it
+        // with the next value.
+        //
+        // 0: ldc.i4.0            — the seed (acc = 0)
+        // 1: ldc.i4.1; add       — acc + 1
+        // 3: dup; ldc.i4.s 10;   — compare the new acc against 10
+        // 6: blt.s 1             — back edge carries [acc+1]
+        // 8: ret                 — returns the carried value
+        let il = [0x16, 0x17, 0x58, 0x25, 0x1F, 0x0A, 0x32, 0xF9, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let m = import(&info, &ee).expect("loop imports");
+        // Blocks: b0 [0,1) (the seed), b1 [1,8) (header/body), b2 [8,9)
+        // (exit). Temps: t1 = the header's join slot, t2 = the dup
+        // spill, t3 = the exit edge's join slot.
+        assert_eq!(m.blocks.len(), 3);
+        // b0 spills the seed into the header's join temp.
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!((dst, as_i32(value)), (LocalId(0), 0));
+        // b1: dup spills the add into t2; the back edge updates t1 from
+        // it; the fallthrough (exit) edge records t3 from it.
+        let stmts = &m.blocks[1].stmts;
+        assert_eq!(stmts.len(), 3);
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(1), "the dup spill");
+        let (op, lhs, _) = as_binary(value);
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_local(lhs), LocalId(0), "the carried value read back");
+        let (dst, value) = store(&stmts[1]);
+        assert_eq!(
+            (dst, as_local(value)),
+            (LocalId(0), LocalId(1)),
+            "back edge"
+        );
+        let (dst, value) = store(&stmts[2]);
+        assert_eq!(
+            (dst, as_local(value)),
+            (LocalId(2), LocalId(1)),
+            "exit edge"
+        );
+        match &m.blocks[1].terminator {
+            hir::Terminator::Branch { then, else_, .. } => {
+                assert_eq!(*then, BlockId(1), "the back edge");
+                assert_eq!(*else_, BlockId(2));
+            }
+            _ => panic!("block 1: expected Branch"),
+        }
+        assert_eq!(as_local(return_value(&m, 2)), LocalId(2));
+    }
+
+    #[test]
+    fn a_back_edge_into_an_empty_header_is_bad_il() {
+        // The loop-header invariant: the header imported with an empty
+        // stack (its only recorded edge at import time), so a back edge
+        // carrying a value is a merge violation — BadIl, not a crash.
+        //
+        // 0: ldc.i4.0; pop       — the header entered empty
+        // 2: ldc.i4.1; br.s 0    — back edge carries one value
+        let il = [0x16, 0x26, 0x17, 0x2B, 0xFB];
+        let err = import_ii(&il).err().expect("a merge violation");
         assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("crossing a block boundary")),
+            matches!(&err, CompileError::BadIl(m) if m.contains("loop header")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_join_with_a_depth_mismatch_is_bad_il() {
+        // ldarg.0; ldarg.0; brfalse.s J; ldarg.0; J: add; ret — the taken
+        // edge carries one value, the fallthrough two.
+        let il = [0x02, 0x02, 0x2C, 0x01, 0x02, 0x58, 0x2A];
+        let err = import_ii(&il).err().expect("a merge violation");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("depth")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_join_with_a_type_mismatch_is_bad_il() {
+        // ldarg.0; ldarg.0; brfalse.s F; ldc.i4.1; br.s J; F: ldc.i8 0;
+        // J: pop; ldarg.0; ret — J gets an Int32 from one arm, an Int64
+        // from the other (both over the carried ldarg).
+        let il = [
+            0x02, 0x02, 0x2C, 0x03, 0x17, 0x2B, 0x09, 0x21, 0, 0, 0, 0, 0, 0, 0, 0, 0x26, 0x02,
+            0x2A,
+        ];
+        let err = import_ii(&il).err().expect("a merge violation");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("type mismatch at a merge")),
+            "{err:?}"
+        );
+    }
+
+    // --- step_11.2's bad-IL audit: the over-strict rejections ---
+
+    #[test]
+    fn mixed_int32_nativeint_arithmetic_promotes() {
+        // ldarg.0; ldarg.1; add; ret with (int, nint) — the Unsafe.Add
+        // shape: the Int32 promotes (sign-extends) to native int.
+        let (ee, info) = fixture(
+            &[0x02, 0x03, 0x58, 0x2A],
+            &sig(
+                CorInfoType::NativeInt,
+                &[CorInfoType::Int, CorInfoType::NativeInt],
+            ),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Add);
+        match lhs {
+            hir::Expr::Conv {
+                to: Type::NativeInt,
+                unsigned: false,
+                arg,
+                ..
+            } => assert_eq!(as_local(arg), LocalId(0)),
+            _ => panic!("expected the Int32 side sign-extended"),
+        }
+        assert_eq!(as_local(rhs), LocalId(1));
+        // int64 never mixes.
+        let (ee, info) = fixture(
+            &[0x02, 0x03, 0x58, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Int, CorInfoType::Long]),
+            &[],
+        );
+        assert!(
+            matches!(import(&info, &ee), Err(CompileError::BadIl(_))),
+            "int32 + int64 stays rejected"
+        );
+    }
+
+    #[test]
+    fn byref_arithmetic_forms() {
+        // byref + nint → byref (Unsafe.Add's tail).
+        let (ee, info) = fixture(
+            &[0x02, 0x03, 0x58, 0x2A],
+            &sig(
+                CorInfoType::ByRef,
+                &[CorInfoType::ByRef, CorInfoType::NativeInt],
+            ),
+            &[],
+        );
+        let m = import(&info, &ee).expect("byref + nint imports");
+        let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_local(lhs), LocalId(0));
+        assert_eq!(as_local(rhs), LocalId(1));
+        // byref - byref → native int.
+        let (ee, info) = fixture(
+            &[0x02, 0x03, 0x59, 0x2A],
+            &sig(
+                CorInfoType::NativeInt,
+                &[CorInfoType::ByRef, CorInfoType::ByRef],
+            ),
+            &[],
+        );
+        let m = import(&info, &ee).expect("byref - byref imports");
+        let (op, ..) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Sub);
+        // A local's address bashes to native int once arithmetic touches
+        // it: ldloca.0; ldloca.1; sub — two LocalAddr byrefs compute as
+        // native ints.
+        let (ee, info) = fixture(
+            &[0x12, 0x00, 0x12, 0x01, 0x59, 0x2A],
+            &sig(CorInfoType::NativeInt, &[]),
+            &[CorInfoType::Int, CorInfoType::Int],
+        );
+        let m = import(&info, &ee).expect("&local - &local imports");
+        let (op, lhs, rhs) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Sub);
+        assert!(matches!(lhs, hir::Expr::LocalAddr(_)));
+        assert!(matches!(rhs, hir::Expr::LocalAddr(_)));
+    }
+
+    #[test]
+    fn byref_pairs_compare_in_every_form() {
+        // ldarg.0; ldarg.1; clt.un; ret over two byrefs (GitHub_27279's
+        // IsAddressLessThan): unverifiable but valid address ordering.
+        let il = [0x02, 0x03, 0xFE, 0x05, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Int, &[CorInfoType::ByRef, CorInfoType::ByRef]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (op, ..) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::ULt);
+    }
+
+    #[test]
+    fn ret_and_store_boundaries_accept_the_same_width_interchange() {
+        // nint value returned as byref (Unsafe.AsRef's `ldarg.0; ret`).
+        let (ee, info) = fixture(
+            &[0x02, 0x2A],
+            &sig(CorInfoType::ByRef, &[CorInfoType::NativeInt]),
+            &[],
+        );
+        assert!(import(&info, &ee).is_ok());
+        // A native int stored into a long local (the mmap-shaped stubs).
+        let (ee, info) = fixture(
+            &[0x02, 0x0A, 0x16, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::NativeInt]),
+            &[CorInfoType::Long],
+        );
+        assert!(import(&info, &ee).is_ok());
+        // Widths still guard: an int64 value into an int32 local is BadIl.
+        let (ee, info) = fixture(
+            &[0x02, 0x0A, 0x16, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Long]),
+            &[CorInfoType::Int],
+        );
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn a_void_ret_drops_leftover_values_after_their_effects() {
+        // ldarg.0; call fib; ret in a void method: the leftover call must
+        // still execute (the spill), then the value is dropped — RyuJIT's
+        // non-inline ret path never checks the depth (VM stubs carry this
+        // shape).
+        let il = [0x02, 0x28, 0x01, 0x00, 0x00, 0x06, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Void, &[CorInfoType::Int]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.blocks[0].stmts.len(), 1, "the call's spill store");
+        assert!(matches!(
+            m.blocks[0].terminator,
+            hir::Terminator::Return { value: None }
+        ));
+    }
+
+    #[test]
+    fn dead_code_after_an_unconditional_transfer_is_skipped() {
+        // ldarg.0; ret; add — the dead `add` would underflow if imported;
+        // RyuJIT never imports it (target-driven blocks), and neither do
+        // we.
+        let m = import_ii(&[0x02, 0x2A, 0x58]).expect("dead tail imports");
+        assert_eq!(m.blocks.len(), 1);
+        // ldarg.0; br.s +1; ldc.i4.0; L: ret — the ldc is dead between the
+        // jump and its target... no: L: is the target; the ldc at 3 is
+        // dead.
+        let m = import_ii(&[0x02, 0x2B, 0x01, 0x17, 0x2A]).expect("dead mid-code imports");
+        assert_eq!(m.blocks.len(), 2);
+    }
+
+    #[test]
+    fn newobj_of_a_primitive_value_class_is_the_scalar() {
+        // `new IntPtr(42)` — a primitive-typed value class constructs as
+        // the scalar cell (RyuJIT's TypeHandleToVarType), not a StructVal:
+        // every consumer (fields, locals, returns) sees NativeInt.
+        let (mut ee, c) = struct_ee(8, &[], None);
+        ee.class_cor_info_types
+            .insert(c.as_raw() as usize, CorInfoType::NativeInt);
+        ee.add_method(
+            CTOR_TOKEN,
+            MockSig {
+                ret: CorInfoType::Void,
+                args: vec![CorInfoType::Int],
+                has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
+            },
+        );
+        ee.class_tokens.insert(0x0600_0004, c);
+        let entry = sig(CorInfoType::NativeInt, &[]);
+        // ldc.i4.s 42; newobj CTOR; ret
+        let info = struct_info(
+            &mut ee,
+            &[0x1F, 0x2A, 0x73, 0x04, 0x00, 0x00, 0x06, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("newobj of IntPtr imports");
+        assert_eq!(m.locals[0].ty, Type::NativeInt, "the temp is the scalar");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+        let stmts = &m.blocks[0].stmts;
+        // The zero-init store, then the constructor on the temp's address.
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(0));
+        assert!(matches!(value, hir::Expr::Const(Const::NativeInt(0))));
+        match &stmts[1].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { sig, args, .. }) => {
+                assert!(sig.has_this);
+                assert_eq!(as_local_addr(&args[0]), LocalId(0), "byref this");
+            }
+            _ => panic!("expected the constructor call"),
+        }
+    }
+
+    #[test]
+    fn delegates_are_gated_not_miscompiled() {
+        // Delegates are out of step-11 scope; the delegate-cache shape
+        // (dup; brtrue over the cached field) used to hide behind the
+        // join rejection — gate construction and invocation explicitly
+        // (step_11.2: ungated, the latent path segfaulted).
+        let (mut ee, c) = struct_ee(0, &[], None);
+        ee.class_attribs = ClassAttribs::DELEGATE;
+        ee.add_method(
+            CTOR_TOKEN,
+            MockSig {
+                ret: CorInfoType::Void,
+                args: vec![CorInfoType::Class, CorInfoType::NativeInt],
+                has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
+            },
+        );
+        ee.class_tokens.insert(0x0600_0004, c);
+        let entry = sig(CorInfoType::Void, &[]);
+        // ldnull; ldc.i4.0; conv.i; newobj CTOR; pop; ret
+        let info = struct_info(
+            &mut ee,
+            &[0x14, 0x16, 0xD3, 0x73, 0x04, 0x00, 0x00, 0x06, 0x26, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let err = import(&info, &ee).err().expect("newobj of a delegate");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("delegate")),
+            "{err:?}"
+        );
+        // callvirt on a delegate member (Invoke): the target's declaring
+        // class carries the DELEGATE bit.
+        let (mut ee, info) = object_fixture(&[0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A]);
+        ee.class_attribs = ClassAttribs::DELEGATE;
+        let err = import(&info, &ee).err().expect("callvirt on a delegate");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("delegate")),
             "{err:?}"
         );
     }
@@ -6303,11 +7004,9 @@ mod tests {
             Err(CompileError::BadIl(_))
         ));
         assert!(matches!(import_ii(&[0x2B]), Err(CompileError::BadIl(_))));
-        // Unreachable code after ret that no branch targets.
-        assert!(matches!(
-            import_ii(&[0x2A, 0x00]),
-            Err(CompileError::BadIl(_))
-        ));
+        // Unreachable code after ret that no branch targets is dead code,
+        // not an error (RyuJIT never imports it): ldarg.0; ret; nop.
+        assert!(import_ii(&[0x02, 0x2A, 0x00]).is_ok());
         // Return type mismatch (Ref value, Int32 signature).
         let (ee, info) = fixture(
             &[0x02, 0x2A],
@@ -6315,11 +7014,10 @@ mod tests {
             &[],
         );
         assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
-        // Stack not empty at ret.
-        assert!(matches!(
-            import_ii(&[0x02, 0x16, 0x2A]),
-            Err(CompileError::BadIl(_))
-        ));
+        // Values under the return value at ret: dropped after their side
+        // effects (RyuJIT's non-inline path pops one and never checks the
+        // depth — step_11.2 audit).
+        assert!(import_ii(&[0x02, 0x16, 0x2A]).is_ok());
         // Call argument type mismatch (Ref pushed, Int32 declared).
         let il = [0x02, 0x28, 0x01, 0x00, 0x00, 0x06, 0x2A];
         let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Class]), &[]);
@@ -6358,15 +7056,44 @@ mod tests {
     }
 
     #[test]
-    fn stack_values_crossing_a_boundary_are_unsupported() {
-        // ldc.i4.0; br.s L; L: ldc.i4.0; stloc.0; ldc.i4.0; ret — the branch
-        // carries one stack value into L.
-        let il = [0x16, 0x2B, 0x00, 0x16, 0x0A, 0x16, 0x2A];
-        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::Int]);
+    fn a_value_carried_by_an_unconditional_branch_imports() {
+        // ldc.i4.5; br.s L; L: ldc.i4.1; add; ret — the branch carries one
+        // stack value into L (the pre-11.2 Unsupported shape, now
+        // accepted): the branch block spills into the join temp and the
+        // target block reads it back.
+        let il = [0x1B, 0x2B, 0x00, 0x17, 0x58, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.blocks.len(), 2);
+        assert_eq!(m.locals.len(), 1, "one join temp");
+        assert_eq!(m.locals[0].kind, hir::LocalKind::Temp);
+        let (dst, value) = store(&m.blocks[0].stmts[0]);
+        assert_eq!((dst, as_i32(value)), (LocalId(0), 5));
         assert!(matches!(
-            import(&info, &ee),
-            Err(CompileError::Unsupported(_))
+            m.blocks[0].terminator,
+            hir::Terminator::Jump { target: BlockId(1) }
         ));
+        let (op, lhs, rhs) = as_binary(return_value(&m, 1));
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_local(lhs), LocalId(0));
+        assert_eq!(as_i32(rhs), 1);
+    }
+
+    #[test]
+    fn an_eh_region_entry_with_a_non_empty_stack_is_bad_il() {
+        // ldc.i4.0; br.s T — T is the try region's entry, reached with a
+        // value on the stack: invalid IL (ECMA-335's empty-stack rule for
+        // EH region entries), still rejected after step_11.2.
+        //
+        // 0: ldc.i4.0; 1: br.s 3; 3: leave.s +1 (-> 6); 5: endfinally;
+        // 6: ret — finally clause try [3,5), handler [5,6).
+        let il = [0x16, 0x2B, 0x00, 0xDE, 0x01, 0xDC, 0x2A];
+        let (ee, info) = eh_fixture(&il, &[], &[finally_clause(3, 2, 5, 1)]);
+        let err = import(&info, &ee).err().expect("an EH-entry violation");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("EH region entry")),
+            "{err:?}"
+        );
     }
 
     // --- step_10.6: EH (try/catch/finally) ---
@@ -6821,7 +7548,8 @@ mod tests {
             matches!(&err, CompileError::BadIl(m) if m.contains("empty EH region")),
             "{err:?}"
         );
-        // A try covering only handler IL protects nothing.
+        // A try nested inside an enclosing handler: valid IL our layout
+        // model can't express — Unsupported, not BadIl (step_11.2 audit).
         let il = [0x00, 0x00, 0xDC, 0xDC, 0x2A];
         let (ee, info) = eh_fixture(
             &il,
@@ -6833,7 +7561,7 @@ mod tests {
         );
         let err = import(&info, &ee).err().expect("try of pure handler IL");
         assert!(
-            matches!(&err, CompileError::BadIl(m) if m.contains("protects no instructions")),
+            matches!(&err, CompileError::Unsupported(m) if m.contains("nested inside an enclosing handler")),
             "{err:?}"
         );
     }
@@ -9795,6 +10523,29 @@ mod tests {
             panic!("expected the [obj+0] MethodTable load")
         };
         assert_eq!(as_local(addr), LocalId(0), "the object argument");
+    }
+
+    /// `Volatile.ReadBarrier`/`WriteBarrier`: the same self-recursive
+    /// [Intrinsic] body shape, expanded to no code (compiler fences;
+    /// tier 0 reorders nothing).
+    #[test]
+    fn volatile_barrier_intrinsics_expand_to_no_code() {
+        // call ReadBarrier; ret — in a void method.
+        let il = [0x28, 0x31, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[]);
+        let handle = ee.add_method(0x0600_0031, sig(CorInfoType::Void, &[]));
+        ee.method_name = Some("ReadBarrier".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            ("Volatile".into(), Some("System.Threading".into())),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let m = import(&info, &ee).expect("imports");
+        assert!(m.blocks[0].stmts.is_empty(), "no code");
+        assert!(matches!(
+            m.blocks[0].terminator,
+            hir::Terminator::Return { value: None }
+        ));
     }
 
     /// The name+shape match alone is not enough: without the EE's

@@ -211,8 +211,13 @@ impl ClassQueries for MockEe {
         None
     }
 
-    fn get_type_for_primitive_value_class(&self, _cls: ClassHandle) -> Option<CorInfoType> {
-        None
+    fn get_type_for_primitive_value_class(&self, cls: ClassHandle) -> Option<CorInfoType> {
+        // Canned through `class_cor_info_types` like `as_cor_info_type`:
+        // a primitive answer there IS the primitive-value-class verdict.
+        match self.class_cor_info_types.get(&(cls.as_raw() as usize)) {
+            Some(&ty) if ty != CorInfoType::ValueClass && ty != CorInfoType::Class => Some(ty),
+            _ => None,
+        }
     }
 
     fn can_cast(&self, _child: ClassHandle, _parent: ClassHandle) -> bool {

@@ -167,6 +167,13 @@ fn compile_method(
             let result = error.to_cor_jit_result();
             let name = rokajit_ee::ee_info::MethodQueries::print_method_name(ee, ftn);
             eprintln!("rokajit: compilation failed: {name}: {error:?} → {result:?}");
+            if std::env::var_os("ROKAJIT_DUMP_IL").is_some() {
+                eprintln!(
+                    "rokajit: IL {}: {:02X?}",
+                    method_info.il.len(),
+                    method_info.il
+                );
+            }
             result.to_raw()
         }
     }

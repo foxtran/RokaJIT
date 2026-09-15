@@ -352,6 +352,15 @@ impl ValueState {
     /// rematerialize into their slots; local aliases copy into their own
     /// slots. After this, every value reads from its own slot — the state
     /// a successor block assumes.
+    ///
+    /// Two passes: registers/constants/local-aliases first (their sources
+    /// are IL-local slots or the value itself, so no ordering hazard);
+    /// then copies of spilled temps — a `Loc::Mem` alias of ANOTHER
+    /// value's slot, which must be copied home only after that source is
+    /// itself slot-resident (step_11.2's join temps are the first values
+    /// read in a block other than the one that defined them — the
+    /// one-pass form read the source's stale slot when the source was
+    /// still register-tagged and later in the sweep).
     pub fn spill_all(&mut self) -> Vec<Move> {
         let mut moves = Vec::new();
         for i in 0..self.locs.len() {
@@ -397,6 +406,26 @@ impl ValueState {
                     self.locs[i] = Some(Loc::Mem(self.slot_of(id)));
                 }
                 None | Some(Loc::Mem(_)) => {}
+            }
+        }
+        for i in 0..self.locs.len() {
+            let id = LocalId(i as u32);
+            if let Some(Loc::Mem(off)) = self.locs[i] {
+                if off != self.slot_of(id) {
+                    let (reg, mut alloc) = self.take_scratch(&[]);
+                    moves.append(&mut alloc);
+                    moves.push(Move::Reload {
+                        slot: off,
+                        ty: self.ty_of(id),
+                        reg,
+                    });
+                    moves.push(Move::Spill {
+                        reg,
+                        slot: self.slot_of(id),
+                        ty: self.ty_of(id),
+                    });
+                    self.locs[i] = Some(Loc::Mem(self.slot_of(id)));
+                }
             }
         }
         moves
@@ -722,6 +751,56 @@ mod tests {
         assert_eq!(vs.read(LocalId(3)), ReadSrc::Reg(R1));
         // Unrelated aliases are untouched.
         assert_eq!(vs.before_local_write(LocalId(1)), vec![]);
+    }
+
+    #[test]
+    fn join_spill_copies_an_alias_of_a_spilled_temp_home() {
+        // step_11.2: a copy of a spilled temp aliases the SOURCE's slot
+        // (Loc::Mem naming another value's slot); the join discipline must
+        // copy it into its own slot — a successor block reads it there.
+        let mut vs = state();
+        vs.define(LocalId(2), Loc::Mem(4));
+        let moves = vs.spill_all();
+        assert_eq!(
+            moves,
+            vec![
+                Move::Reload {
+                    slot: 4,
+                    ty: Type::Int32,
+                    reg: R0
+                },
+                spill(R0, 12),
+            ]
+        );
+        assert_eq!(vs.read(LocalId(2)), ReadSrc::Slot(12));
+        // Loc::Mem naming the value's OWN slot is already frame-resident.
+        let mut vs = state();
+        vs.define(LocalId(2), Loc::Mem(12));
+        assert_eq!(vs.spill_all(), vec![]);
+    }
+
+    #[test]
+    fn join_spill_alias_of_a_register_tagged_source_reads_the_fresh_value() {
+        // The two-pass ordering: the alias (L0 → L1's slot) must not
+        // reload the slot before L1's register tag spills into it.
+        let mut vs = state();
+        vs.define(LocalId(1), Loc::Reg(R0));
+        vs.define(LocalId(0), Loc::Mem(8));
+        let moves = vs.spill_all();
+        assert_eq!(
+            moves,
+            vec![
+                spill(R0, 8),
+                Move::Reload {
+                    slot: 8,
+                    ty: Type::Int32,
+                    reg: R0
+                },
+                spill(R0, 4),
+            ]
+        );
+        assert_eq!(vs.read(LocalId(0)), ReadSrc::Slot(4));
+        assert_eq!(vs.read(LocalId(1)), ReadSrc::Slot(8));
     }
 
     #[test]

@@ -723,6 +723,7 @@ PANIC_RE = re.compile(r"rokajit: panic in compileMethod")
 BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"EH filter clauses|EH fault clauses"), "EH filters/faults (out of 10.6 scope)"),
     (re.compile(r"^rethrow$"), "rethrow (out of 10.6 scope)"),
+    (re.compile(r"newobj of a delegate|call to a delegate member"), "delegates (out of step-11 scope)"),
     (re.compile(r"generic methods"), "generics"),
     (re.compile(r"non-class receiver \(value types\)|initobj/ldobj/stobj/cpobj of a non-value class|struct alignment above 16|SysV descriptor"), "structs & value types"),
     (re.compile(r"newobj of a value class"), "newobj of a value class"),
