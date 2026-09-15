@@ -1101,7 +1101,8 @@ async def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--concurrency", type=int, default=12)
+    parser.add_argument("--concurrency", type=int, default=4,
+                        help="parallel test processes (default: 4 — this machine's core count)")
     parser.add_argument("--timeout", type=int, default=10, help="per-test seconds")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--only", default="", help="regex over candidate relpaths")

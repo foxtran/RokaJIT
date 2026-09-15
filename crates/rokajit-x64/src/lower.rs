@@ -827,12 +827,12 @@ rokajit::lower_rules! {
     /// here, the HIR→LIR lowering expands them — step_10.11.) A 32-bit
     /// *unsigned* target still converts through the 64-bit form (values
     /// up to 2³²−1 exact; beyond is ECMA-unspecified), keeping the low
-    /// half.
+    /// half. `NativeInt` (conv.i, step_11.9) is the signed 64-bit form.
     rule conv_f_to_i: Conv { dst, to, unsigned, src, .. }
         if let (Some(w64), Some(w), Some(s)) = (
             match to {
                 Type::Int32 => Some(*unsigned),
-                Type::Int64 => Some(true),
+                Type::Int64 | Type::NativeInt => Some(true),
                 _ => None,
             },
             operand_fwidth(cx, *src),
@@ -1251,6 +1251,11 @@ pub fn lower_method(method: &lir::Method) -> CompileResult<LoweredMethod> {
             match lower_stmt(stmt, &cx) {
                 Some(lowered) => insts.extend(lowered),
                 None => {
+                    // Audit tooling (the ROKAJIT_DUMP_IL precedent): the
+                    // missed statement's kind, on request.
+                    if std::env::var_os("ROKAJIT_DEBUG_LOWER").is_some() {
+                        eprintln!("rokajit-x64: no rule for LIR {}", stmt.kind.kind_name());
+                    }
                     return Err(CompileError::Unsupported(
                         "no x64 lowering rule matched an LIR statement",
                     ));
@@ -3379,6 +3384,24 @@ mod tests {
                 src: xsrc(0),
             }])
         );
+        // conv.i of a double (step_11.9): NativeInt — the same signed
+        // 64-bit form.
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(4),
+            to: Type::NativeInt,
+            overflow: false,
+            unsigned: false,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::CvtFToInt {
+                src_width: FWidth::D,
+                dst_w64: true,
+                dst: Place::Val(Val(LocalId(4))),
+                src: xsrc(0),
+            }])
+        );
         // conv.r4 of a double / conv.r8 of a float: cvt between widths.
         let s = stmt(StmtKind::Conv {
             dst: LocalId(3),
@@ -3626,5 +3649,84 @@ mod tests {
                 Inst::Ret,
             ])
         );
+    }
+}
+
+#[cfg(test)]
+mod ptrconv_repro_tests {
+    use super::*;
+    use rokajit::pipeline::MethodInfo;
+    use rokajit_ee::enums::CorInfoType;
+    use rokajit_ee::handles::MethodHandle;
+    use rokajit_ee::mock::{MockEe, MockSig};
+
+    #[test]
+    fn repro_github_19288_byref_conv_compare() {
+        // `ldloca.s 0; conv.u; ldc.i4.0; conv.u; bge.un.s +1; nop; ret`
+        let mut ee = MockEe::default();
+        let sig = MockSig {
+            ret: CorInfoType::Void,
+            args: vec![],
+            has_this: false,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        let info = MethodInfo {
+            ftn: MethodHandle::from_raw(std::ptr::dangling_mut::<u8>() as _).unwrap(),
+            il: vec![0x12, 0x00, 0xE0, 0x16, 0xE0, 0x33, 0x01, 0x00, 0x2A],
+            max_stack: 8,
+            eh_count: 0,
+            init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
+            args: ee.make_method_sig(&sig),
+            locals: ee.make_locals_sig(&[CorInfoType::Int]),
+        };
+        let hir = rokajit::pipeline::import(&info, &ee).expect("imports");
+        let hir = rokajit::pipeline::morph(hir).expect("morphs");
+        let lir = rokajit::pipeline::lower(hir, &crate::X64Target).expect("lowers");
+        let cx = Cx::new(&lir.locals, &lir.struct_layouts);
+        for (bi, b) in lir.blocks.iter().enumerate() {
+            for (si, s) in b.stmts.iter().enumerate() {
+                assert!(lower_stmt(s, &cx).is_some(), "stmt {bi}/{si} missed a rule");
+            }
+        }
+        assert!(lower_method(&lir).is_ok(), "whole method lowers");
+    }
+
+    #[test]
+    fn repro_github_19288_ldarga_of_a_value_class_arg() {
+        // The actual test shape: `ldarga.s 0` of a by-value struct arg
+        // (PixelData p), conv.u, compare against zero.
+        let mut ee = MockEe::default();
+        let class = ee.add_class(3, 1, &[], None);
+        let sig = MockSig {
+            ret: CorInfoType::Void,
+            args: vec![CorInfoType::ValueClass],
+            has_this: true,
+            ret_class: None,
+            arg_classes: vec![Some(class)],
+        };
+        let info = MethodInfo {
+            ftn: MethodHandle::from_raw(std::ptr::dangling_mut::<u8>() as _).unwrap(),
+            il: vec![0x0F, 0x01, 0xE0, 0x16, 0xE0, 0x33, 0x01, 0x00, 0x2A],
+            max_stack: 8,
+            eh_count: 0,
+            init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
+            args: ee.make_method_sig(&sig),
+            locals: ee.make_locals_sig(&[]),
+        };
+        let hir = rokajit::pipeline::import(&info, &ee).expect("imports");
+        let hir = rokajit::pipeline::morph(hir).expect("morphs");
+        let lir = rokajit::pipeline::lower(hir, &crate::X64Target).expect("lowers");
+        let cx = Cx::new(&lir.locals, &lir.struct_layouts);
+        for (bi, b) in lir.blocks.iter().enumerate() {
+            for (si, s) in b.stmts.iter().enumerate() {
+                assert!(lower_stmt(s, &cx).is_some(), "stmt {bi}/{si} missed a rule");
+            }
+        }
+        assert!(lower_method(&lir).is_ok(), "whole method lowers");
     }
 }

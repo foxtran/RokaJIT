@@ -2707,15 +2707,28 @@ impl BlockImport<'_> {
     /// become `hir::Expr::Conv` nodes whose `unsigned` flag selects sign-
     /// vs zero-extension at lowering. Float sources truncate toward zero
     /// (`cvtt*`); `conv.r4`/`conv.r8` convert from any numeric operand.
+    /// A byref operand (step_11.9) is the pointer reinterpretation:
+    /// ECMA-335 Table III.8 lists `&` for conv.i/conv.u and RyuJIT's
+    /// `_CONV` has no source gate at all (importer.cpp:8452), so every
+    /// integer target takes it. The address is a 64-bit value — the
+    /// conversion re-types it to NativeInt semantics and it STOPS being
+    /// a GC-tracked interior pointer here (a raw address is not a root;
+    /// decisions/2026-09-15-pointer-conv.md).
     fn conv(&mut self, kind: ConvKind) -> CompileResult<()> {
         let (ty, value) = self.pop()?;
-        // Pointer conversions (`conv.i`/`conv.u` from a byref) stay out.
-        let int = matches!(ty, Type::Int32 | Type::Int64 | Type::NativeInt);
         let fp = matches!(ty, Type::Float | Type::Double);
+        if matches!(ty, Type::ByRef) && matches!(kind, ConvKind::R4 | ConvKind::R8 | ConvKind::RUn)
+        {
+            return Err(CompileError::BadIl("conv.r* from a byref operand"));
+        }
+        let ty = if matches!(ty, Type::ByRef) {
+            Type::NativeInt
+        } else {
+            ty
+        };
+        let int = matches!(ty, Type::Int32 | Type::Int64 | Type::NativeInt);
         if !int && !fp {
-            return Err(CompileError::Unsupported(
-                "conv from a non-numeric operand (pointers)",
-            ));
+            return Err(CompileError::Unsupported("conv from a non-numeric operand"));
         }
         match kind {
             ConvKind::I1 => self.conv_narrow(8, false, ty, value),
@@ -2763,13 +2776,11 @@ impl BlockImport<'_> {
                 }
             }
             // conv.i: to native int (step_10.11) — sign-extend from
-            // Int32, the identity on a 64-bit operand. From a float the
-            // saturating signed conversion is the still-open 10.2 follow-
-            // up (see the conv_narrow comment), so it stays unsupported.
+            // Int32, the identity on a 64-bit operand. From a float it
+            // is the truncating signed conversion to a 64-bit slot
+            // (step_11.9 — RyuJIT's TYP_I_IMPL cast target is the LONG
+            // cast on x64), the result typed NativeInt.
             ConvKind::I => {
-                if fp {
-                    return Err(CompileError::Unsupported("conv.i from a float operand"));
-                }
                 if ty == Type::Int64 || ty == Type::NativeInt {
                     self.push(Type::NativeInt, value)
                 } else {
@@ -9729,16 +9740,81 @@ mod tests {
         let m = import(&info, &ee).expect("imports");
         assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
 
-        // From a float the saturating signed conversion is the still-open
-        // 10.2 follow-up — stays unsupported.
+        // From a float (step_11.9): the truncating signed conversion to
+        // a 64-bit slot, result typed NativeInt (RyuJIT's TYP_I_IMPL
+        // cast target is the LONG cast on x64).
         let (ee, info) = fixture(
             &[0x02, 0xD3, 0x2A],
             &sig(CorInfoType::NativeInt, &[CorInfoType::Double]),
             &[],
         );
+        let m = import(&info, &ee).expect("conv.i of a double imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::NativeInt);
+        assert!(!overflow && !unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+    }
+
+    #[test]
+    fn conv_of_a_byref_is_the_pointer_reinterpretation() {
+        // step_11.9: `ldloca.s 0; conv.i; ret` — the byref becomes a
+        // plain NativeInt (the identity; the value stops being a
+        // GC-tracked interior pointer here). conv.u is the same retype.
+        for conv in [0xD3u8, 0xE0] {
+            let (ee, info) = fixture(
+                &[0x12, 0x00, conv, 0x2A],
+                &sig(CorInfoType::NativeInt, &[]),
+                &[CorInfoType::Int],
+            );
+            let m = import(&info, &ee).expect("conv.i/conv.u of a byref imports");
+            assert!(matches!(return_value(&m, 0), hir::Expr::LocalAddr(id) if *id == LocalId(0)),);
+        }
+
+        // conv.u8/conv.i8 of a byref: the identity, stack type Int64.
+        for conv in [0x6Au8, 0x6E] {
+            let (ee, info) = fixture(
+                &[0x12, 0x00, conv, 0x2A],
+                &sig(CorInfoType::Long, &[]),
+                &[CorInfoType::Int],
+            );
+            let m = import(&info, &ee).expect("conv.i8/u8 of a byref imports");
+            assert!(matches!(return_value(&m, 0), hir::Expr::LocalAddr(id) if *id == LocalId(0)),);
+        }
+
+        // conv.u4 of a byref truncates the 64-bit address (RyuJIT's
+        // _CONV has no source gate; ECMA-335 Table III.8 lists & only
+        // for conv.i/conv.u, but permissive matches the reference).
+        let (ee, info) = fixture(
+            &[0x12, 0x00, 0x6D, 0x2A],
+            &sig(CorInfoType::Int, &[]),
+            &[CorInfoType::Int],
+        );
+        let m = import(&info, &ee).expect("conv.u4 of a byref imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int32);
+        assert!(!overflow && unsigned);
+        assert!(matches!(arg, hir::Expr::LocalAddr(id) if *id == LocalId(0)));
+    }
+
+    #[test]
+    fn conv_of_a_byref_to_float_is_bad_il_and_refs_stay_out() {
+        // conv.r8 of a byref: no pointer→float conversion exists.
+        let (ee, info) = fixture(
+            &[0x12, 0x00, 0x6C, 0x2A],
+            &sig(CorInfoType::Double, &[]),
+            &[CorInfoType::Int],
+        );
         assert!(matches!(
             import(&info, &ee),
-            Err(CompileError::Unsupported(_))
+            Err(CompileError::BadIl(m)) if m.contains("conv.r* from a byref"),
+        ));
+
+        // An object reference is still not a conv operand (ldnull;
+        // conv.u).
+        let (ee, info) = fixture(&[0x14, 0xE0, 0x2A], &sig(CorInfoType::NativeInt, &[]), &[]);
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(m)) if m.contains("non-numeric"),
         ));
     }
 
@@ -9811,7 +9887,9 @@ mod tests {
 
     #[test]
     fn conv_r_un_of_a_pointer_is_unsupported() {
-        // conv.r.un of a byref (ldloca.0): the conv() non-numeric gate.
+        // conv.r.un of a byref (ldloca.0): no pointer→float conversion
+        // exists — BadIl since step_11.9 made byref a legal *integer*
+        // conv source (the conv.r* gate in conv()).
         let (ee, info) = fixture(
             &[0x12, 0x00, 0x76, 0x2A],
             &sig(CorInfoType::Double, &[]),
@@ -9819,7 +9897,7 @@ mod tests {
         );
         assert!(matches!(
             import(&info, &ee),
-            Err(CompileError::Unsupported(_))
+            Err(CompileError::BadIl(m)) if m.contains("conv.r* from a byref"),
         ));
     }
 

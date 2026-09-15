@@ -34,13 +34,13 @@ are counted under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 956 |
-| MISMATCH | 6 |
-| CRASH | 1485 |
+| MATCH | 1015 |
+| MISMATCH | 7 |
+| CRASH | 1425 |
 | TIMEOUT | 2 |
 | COMPILE_FAIL | 832 |
 
-Of the MATCHes, 945 exit 100 (the CoreCLR pass
+Of the MATCHes, 1004 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -55,17 +55,15 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| statics pack gates (10.7: TLS/generic/R2R/accessors) | 1040 | `JIT/CodeGenBringUpTests/ArrayMD1.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD2.cs`<br>`JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>… and 1035 more |
+| statics pack gates (10.7: TLS/generic/R2R/accessors) | 1055 | `JIT/CodeGenBringUpTests/ArrayMD1.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD2.cs`<br>`JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>… and 1050 more |
 | delegates (out of step-11 scope) | 133 | `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Base_3.cs`<br>`JIT/Directed/CheckedCtor/Generic_Test_CSharp_Base_4.cs`<br>`JIT/Directed/CheckedCtor/Generic_Test_CSharp_Peer_3.cs`<br>`JIT/Directed/CheckedCtor/Generic_Test_CSharp_Peer_4.cs`<br>`JIT/Directed/CheckedCtor/Test_CSharp_Base_3.cs`<br>… and 128 more |
-| unsupported (unmapped): conv from a non-numeric operand (pointers) | 94 | `JIT/Directed/Convert/FPZero.cs`<br>`JIT/Directed/Convert/out_of_range_fp_to_int_conversions.cs`<br>`JIT/Directed/StructABI/FieldListByteNodeTypeMismatchX86.cs`<br>`JIT/Directed/StructABI/TypeMismatchedArgs.cs`<br>`JIT/Directed/lifetime/ObjBlkMemLiveness.cs`<br>… and 89 more |
-| structs & value types | 86 | `JIT/Directed/StructABI/structreturn.cs`<br>`JIT/Generics/Arrays/TypeParameters/Jagged/struct01.cs`<br>`JIT/Generics/Fields/instance_passing_class01.cs`<br>`JIT/Generics/Fields/instance_passing_struct01.cs`<br>`JIT/Generics/Fields/static_passing_class01.cs`<br>… and 81 more |
+| structs & value types | 97 | `JIT/Directed/StructABI/structreturn.cs`<br>`JIT/Generics/Arrays/TypeParameters/Jagged/struct01.cs`<br>`JIT/Generics/Fields/instance_passing_class01.cs`<br>`JIT/Generics/Fields/instance_passing_struct01.cs`<br>`JIT/Generics/Fields/static_passing_class01.cs`<br>… and 92 more |
 | unsupported (unmapped): EH try region nested inside an enclosing handler | 24 | `JIT/Generics/Exceptions/general_class_instance01.cs`<br>`JIT/Generics/Exceptions/general_class_static01.cs`<br>`JIT/Generics/Exceptions/general_struct_instance01.cs`<br>`JIT/Generics/Exceptions/general_struct_static01.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b11490/b11490.cs`<br>… and 19 more |
 | unsupported (unmapped): generic callconv on a calli/ldftn/newobj site (shared generics) | 16 | `JIT/Generics/Instantiation/delegates/Delegate005.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate006.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate007.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate008.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate011.cs`<br>… and 11 more |
 | EH filters/faults (out of 10.6 scope) | 15 | `JIT/HardwareIntrinsics/X86/Lzcnt.X64/Lzcnt.X64.cs`<br>`JIT/HardwareIntrinsics/X86/Popcnt.X64/Popcnt.X64.cs`<br>`JIT/HardwareIntrinsics/X86/Sse42.X64/Crc32.cs`<br>`JIT/Regression_2/Runtime_133120/Runtime_133120.cs`<br>`JIT/Regression_o_2/Runtime_109981.cs`<br>… and 10 more |
 | boxing & casts | 14 | `JIT/Directed/nullabletypes/Desktop/boxunboxvaluetype.cs`<br>`JIT/Directed/nullabletypes/Desktop/nullcomparaison.cs`<br>`JIT/Directed/nullabletypes/gettype.cs`<br>`JIT/Directed/nullabletypes/unboxnullable.cs`<br>`JIT/Generics/Conversions/Boxing/box_isinst_br_nullable.cs`<br>… and 9 more |
-| non-default calling conventions | 2 | `JIT/Directed/StructABI/MisSizedStructs_ArmArch.cs`<br>`JIT/Regression_ro_2/Runtime_65937.cs` |
-| unsupported (unmapped): conv.i from a float operand | 2 | `JIT/Regression_o_2/Runtime_115493.cs`<br>`JIT/SIMD/SqrtGeneric.cs` |
-| unsupported (unmapped): field type outside the object pack | 2 | `JIT/Regression_ro_2/Runtime_56743/Runtime_56743_0.cs`<br>`JIT/opt/Vectorization/ReadUtf8.cs` |
+| non-default calling conventions | 7 | `JIT/Directed/StructABI/MisSizedStructs_ArmArch.cs`<br>`JIT/Directed/pinvoke/sysinfo.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b91855/b91855.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b92568/b92568.cs`<br>`JIT/Regression_o_3/Runtime_71632.cs`<br>… and 2 more |
+| unsupported (unmapped): field type outside the object pack | 2 | `JIT/Regression_ro_2/Runtime_56743/Runtime_56743_0.cs`<br>`JIT/opt/Tailcall/ImplicitByrefTailCallsAliasing.cs` |
 | unsupported (unmapped): newobj of a shared-generic value class | 2 | `JIT/Regression_o_2/Runtime_41100.cs`<br>`JIT/Regression_ro_1/Runtime_45557.cs` |
 | unsupported (unmapped): prolog class-init trigger in shared generic code (INITINSTCLASS) | 2 | `JIT/Regression_2/Runtime_121066/Runtime_121066.cs`<br>`JIT/Regression_o_3/Runtime_87597.cs` |
 | bad IL rejected by importer | 1 | `JIT/Regression_o_1/GitHub_16377.cs` |
@@ -134,6 +132,7 @@ error model didn't classify. Each carries its stderr signature.
 | `JIT/HardwareIntrinsics/General/HwiOp/HwiValueNumbering.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/HardwareIntrinsics/X86/Lzcnt/Lzcnt.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/HardwareIntrinsics/X86/Popcnt/Popcnt.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/HardwareIntrinsics/X86/Regression/GitHub_21666/GitHub_21666.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/HardwareIntrinsics/X86/Regression/GitHub_21855/GitHub_21855.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/HardwareIntrinsics/X86/Regression/GitHub_21899/GitHub_21899.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/HardwareIntrinsics/X86/Regression/GitHub_22815/GitHub_22815.cs` | CRASH | SIGABRT | Stack overflow. |
@@ -153,13 +152,17 @@ error model didn't classify. Each carries its stderr signature.
 | `JIT/Regression_2/Runtime_70790/Runtime_70790.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Regression_NoOptimize_r_1/GitHub_22850.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/Regression_do/GitHub_39823.cs` | MISMATCH | ref=100 ours=255 | (no stderr output) |
+| `JIT/Regression_o_1/GitHub_19149.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Regression_o_1/Runtime_101175.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Regression_o_3/Runtime_91062.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Regression_ro_1/GitHub_19583.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Regression_ro_1/ImageSharp_2117.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/Regression_ro_1/Runtime_44762.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/Regression_ro_2/Runtime_125160.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/Regression_ro_2/Runtime_125328.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Regression_ro_2/Runtime_130286.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/SIMD/Matrix4x4.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/jit64/opt/regress/vswhidbey/193825/repro.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/jit64/opt/regress/vswhidbey/193825/repro.cs` | MISMATCH | ref=100 ours=1 | (no stderr output) |
 | `JIT/opt/Devirtualization/GDV_GenericInterface.cs` | CRASH | SIGABRT | Fatal error. |
 | `JIT/opt/Devirtualization/GitHub_10311.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/opt/Devirtualization/GitHub_51918.cs` | CRASH | SIGSEGV | (no stderr output) |
@@ -168,4 +171,5 @@ error model didn't classify. Each carries its stderr signature.
 | `JIT/opt/Devirtualization/sharedoverride.cs` | CRASH | SIGABRT | Fatal error. |
 | `JIT/opt/Enum/hasflag.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/opt/Inline/tests/args1.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Loops/LoopSideEffectsForHwiStores.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/opt/ObjectStackAllocation/Runtime_111922v2.cs` | CRASH | SIGSEGV | (no stderr output) |

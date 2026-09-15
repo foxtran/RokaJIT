@@ -460,6 +460,9 @@ impl Flatten<'_> {
                         );
                     } else {
                         let addr = self.addr_value(addr, &mut stmts, stmt.il_offset);
+                        // The stored VALUE is a value position (`*p =
+                        // &local` — step_11.9's Store-with-AddrOf gap).
+                        let src = self.value_operand(src, &mut stmts, stmt.il_offset);
                         Self::push(
                             &mut stmts,
                             stmt.il_offset,
@@ -608,6 +611,31 @@ impl Flatten<'_> {
         }
     }
 
+    /// A child operand in *value* position: an address-of-local has no
+    /// instruction-source form (x64's `operand_src` returns `None` for
+    /// `AddrOf` — the address needs a `lea`), so it materializes into a
+    /// fresh ByRef temp through a `Copy` (the `copy_addr_of` rule), the
+    /// same materialization `FieldAddr` does. Address consumers
+    /// (`Load`/`Store`/block ops/call args) take `AddrOf` directly and
+    /// never come through here. (step_11.9 surfaced the gap: conv of a
+    /// byref — `conv.u4` of `&local` — fed an address-of straight into a
+    /// compare operand, GitHub_19288's `&p == null` shape.)
+    fn value_operand(
+        &mut self,
+        operand: lir::Operand,
+        out: &mut Vec<lir::Stmt>,
+        il: IlOffset,
+    ) -> lir::Operand {
+        match operand {
+            lir::Operand::AddrOf(_) => {
+                let dst = self.temp(Type::ByRef);
+                Self::push(out, il, lir::StmtKind::Copy { dst, src: operand });
+                lir::Operand::Temp(dst)
+            }
+            _ => operand,
+        }
+    }
+
     /// Tree → flat statements; returns the operand holding the value.
     /// Children flatten depth-first in field order, preserving the IL
     /// push order the importer encoded (ir-design.md, "Evaluation order").
@@ -629,6 +657,8 @@ impl Flatten<'_> {
             hir::Expr::Binary { op, lhs, rhs } => {
                 let lhs = self.flatten_expr(lhs, out, il)?;
                 let rhs = self.flatten_expr(rhs, out, il)?;
+                let lhs = self.value_operand(lhs, out, il);
+                let rhs = self.value_operand(rhs, out, il);
                 // A compare's result is Int32 (ECMA-335 III.1.5); every
                 // other binary op has its (integer) operands' type — for
                 // shifts that is the value operand's, per the importer.
@@ -662,6 +692,8 @@ impl Flatten<'_> {
                 // (integer) operands' promoted type, like `Binary`.
                 let lhs = self.flatten_expr(lhs, out, il)?;
                 let rhs = self.flatten_expr(rhs, out, il)?;
+                let lhs = self.value_operand(lhs, out, il);
+                let rhs = self.value_operand(rhs, out, il);
                 let ty = self.operand_ty(&lhs)?;
                 let dst = self.temp(ty);
                 Self::push(
@@ -750,6 +782,7 @@ impl Flatten<'_> {
             )),
             hir::Expr::Unary { op, arg } => {
                 let src = self.flatten_expr(arg, out, il)?;
+                let src = self.value_operand(src, out, il);
                 let ty = self.operand_ty(&src)?;
                 let dst = self.temp(ty);
                 Self::push(out, il, lir::StmtKind::Unary { dst, op: *op, src });
@@ -767,6 +800,7 @@ impl Flatten<'_> {
                     return Err(CompileError::Unsupported("checked (ovf) conversion"));
                 }
                 let src = self.flatten_expr(arg, out, il)?;
+                let src = self.value_operand(src, out, il);
                 // A float source with an unsigned integer target is the
                 // saturating conversion (step_10.11) — expanded to a
                 // statement sequence, not a single Conv.
@@ -802,6 +836,7 @@ impl Flatten<'_> {
                 // explicit target width/signedness to codegen (the
                 // conditional OVERFLOW helper call, the BinaryOvf shape).
                 let src = self.flatten_expr(arg, out, il)?;
+                let src = self.value_operand(src, out, il);
                 let dst = self.temp(*to);
                 Self::push(
                     out,
@@ -1016,10 +1051,13 @@ impl Flatten<'_> {
                     hir::Expr::Binary { op, lhs, rhs } if is_compare(*op) => {
                         let lhs = self.flatten_expr(lhs, out, IL_OFFSET_NONE)?;
                         let rhs = self.flatten_expr(rhs, out, IL_OFFSET_NONE)?;
+                        let lhs = self.value_operand(lhs, out, IL_OFFSET_NONE);
+                        let rhs = self.value_operand(rhs, out, IL_OFFSET_NONE);
                         lir::BranchCond::Cmp { op: *op, lhs, rhs }
                     }
                     _ => {
                         let value = self.flatten_expr(cond, out, IL_OFFSET_NONE)?;
+                        let value = self.value_operand(value, out, IL_OFFSET_NONE);
                         lir::BranchCond::True(value)
                     }
                 };
@@ -1056,7 +1094,10 @@ impl Flatten<'_> {
                 } else {
                     let value = value
                         .as_ref()
-                        .map(|e| self.flatten_expr(e, out, IL_OFFSET_NONE))
+                        .map(|e| {
+                            self.flatten_expr(e, out, IL_OFFSET_NONE)
+                                .map(|v| self.value_operand(v, out, IL_OFFSET_NONE))
+                        })
                         .transpose()?;
                     Self::push(out, IL_OFFSET_NONE, lir::StmtKind::Return { value });
                 }
@@ -1067,6 +1108,7 @@ impl Flatten<'_> {
                 default,
             } => {
                 let value = self.flatten_expr(value, out, IL_OFFSET_NONE)?;
+                let value = self.value_operand(value, out, IL_OFFSET_NONE);
                 Self::push(
                     out,
                     IL_OFFSET_NONE,

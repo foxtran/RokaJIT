@@ -698,9 +698,14 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
                 // (the resume address in rax, then the epilog); the
                 // ruleset's plain-jump form covers everywhere else.
                 StmtKind::Leave { target } if in_catch => crate::lower::catch_leave(*target),
-                _ => lower_stmt(stmt, &cx).ok_or(CompileError::Unsupported(
-                    "no x64 lowering rule matched an LIR statement",
-                ))?,
+                _ => lower_stmt(stmt, &cx).ok_or_else(|| {
+                    // Audit tooling (the ROKAJIT_DUMP_IL precedent): the
+                    // missed statement's kind, on request.
+                    if std::env::var_os("ROKAJIT_DEBUG_LOWER").is_some() {
+                        eprintln!("rokajit-x64: no rule for LIR {}", stmt.kind.kind_name());
+                    }
+                    CompileError::Unsupported("no x64 lowering rule matched an LIR statement")
+                })?,
             };
             // CallFinally's continuation jump elides when the
             // continuation is the next block in layout (the fallthrough).

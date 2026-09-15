@@ -792,6 +792,48 @@ pub mod lir {
         EndFinally,
     }
 
+    impl StmtKind {
+        /// The variant name, for error messages (the LIR types
+        /// deliberately have no `Debug`; a rule-miss error that names the
+        /// statement kind is what the triage buckets key on).
+        pub fn kind_name(&self) -> &'static str {
+            match self {
+                StmtKind::Copy { .. } => "Copy",
+                StmtKind::Unary { .. } => "Unary",
+                StmtKind::Binary { .. } => "Binary",
+                StmtKind::BinaryOvf { .. } => "BinaryOvf",
+                StmtKind::Conv { .. } => "Conv",
+                StmtKind::ConvOvf { .. } => "ConvOvf",
+                StmtKind::CkFinite { .. } => "CkFinite",
+                StmtKind::Load { .. } => "Load",
+                StmtKind::Store { .. } => "Store",
+                StmtKind::Call { .. } => "Call",
+                StmtKind::ArrLen { .. } => "ArrLen",
+                StmtKind::ArrElemAddr { .. } => "ArrElemAddr",
+                StmtKind::LocAlloc { .. } => "LocAlloc",
+                StmtKind::BoundsCheck { .. } => "BoundsCheck",
+                StmtKind::Cast { .. } => "Cast",
+                StmtKind::Box { .. } => "Box",
+                StmtKind::NullCheck { .. } => "NullCheck",
+                StmtKind::BlockCopy { .. } => "BlockCopy",
+                StmtKind::BlockZero { .. } => "BlockZero",
+                StmtKind::BlockCopyDyn { .. } => "BlockCopyDyn",
+                StmtKind::BlockFillDyn { .. } => "BlockFillDyn",
+                StmtKind::ReturnStruct { .. } => "ReturnStruct",
+                StmtKind::Branch { .. } => "Branch",
+                StmtKind::Jump { .. } => "Jump",
+                StmtKind::Switch { .. } => "Switch",
+                StmtKind::Return { .. } => "Return",
+                StmtKind::Throw { .. } => "Throw",
+                StmtKind::Rethrow => "Rethrow",
+                StmtKind::Leave { .. } => "Leave",
+                StmtKind::CatchArg { .. } => "CatchArg",
+                StmtKind::CallFinally { .. } => "CallFinally",
+                StmtKind::EndFinally => "EndFinally",
+            }
+        }
+    }
+
     #[derive(Copy, Clone, PartialEq, Debug)]
     pub enum BranchCond {
         True(Operand),
