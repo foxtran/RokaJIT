@@ -13,7 +13,7 @@
 //! `conv.i1`/`i2`/`i4`/`i8`/`u1`/`u2`/`u4`/`u8`/`u`/`i` (float sources
 //! truncate toward zero, saturating for the unsigned targets —
 //! step_10.11) plus
-//! `conv.r4`/`conv.r8`,
+//! `conv.r4`/`conv.r8` and `conv.r.un` (unsigned integer → double),
 //! `dup`/`pop`, `ldloca`/`ldarga`/`starg` (short and wide forms),
 //! `ldnull`, `ldstr` (resolved through the EE's `constructStringLiteral`
 //! to a frozen-ref constant; the IAT_PVALUE/PPVALUE indirection forms are
@@ -53,8 +53,9 @@
 //! catch handler's entry block starts with a synthesized store of the
 //! exception object ([`hir::Expr::CatchArg`]), and a `leave` that crosses
 //! finally handlers becomes a chain of step blocks ending in
-//! [`hir::Terminator::CallFinally`] hops. Filter and fault clauses and
-//! `rethrow`/`endfilter` are Unsupported. The step_10.10 pack adds
+//! [`hir::Terminator::CallFinally`] hops. `rethrow` (catch handlers only)
+//! is a `CORINFO_HELP_RETHROW` helper call; filter and fault clauses and
+//! `endfilter` stay Unsupported. The step_10.10 pack adds
 //! `ldtoken` (the token's raw handle embedded via `embed_generic_handle`
 //! — IAT_VALUE only — and converted to the RuntimeTypeHandle/
 //! RuntimeMethodHandle/RuntimeFieldHandle struct through the
@@ -67,7 +68,15 @@
 //! `IndexOutOfRangeException` — plus the typed load/store through the
 //! computed element address; `stelem.ref` and `ldelema` of a reference
 //! element go through the `ARRADDR_ST`/`LDELEMA_REF` helpers, which
-//! check bounds, covariance, and barriers internally). Anything else
+//! check bounds, covariance, and barriers internally; `readonly.
+//! ldelema` skips the helper's covariance check). `break` decodes to a
+//! `CORINFO_HELP_USER_BREAKPOINT` call. The TypedReference ops serve
+//! csc's `__makeref`/`__refvalue`/`__reftype` keywords: `mkrefany`
+//! builds the TypedReference struct temp inline (two field stores),
+//! `refanytype` loads its type field and converts it through
+//! TYPEHANDLE_TO_RUNTIMETYPEHANDLE (the `ldtoken` emission), and
+//! `refanyval` calls GETREFANY with the TypedReference by value.
+//! Anything else
 //! is
 //! [`CompileError::Unsupported`]; malformed IL is
 //! [`CompileError::BadIl`]. The importer never panics: every operand read
@@ -93,7 +102,9 @@
 //! `get_field_info` for the statics),
 //! `embed_class_handle`, `init_class`, and `get_new_helper` (the object
 //! pack), `embed_generic_handle`/`get_token_type_as_handle` (ldtoken) and
-//! `get_class_size` (sizeof), `get_new_arr_helper`/`is_sd_array`/
+//! `get_class_size` (sizeof), `get_builtin_class` (the TypedReference
+//! ops' CLASSID_TYPED_BYREF/CLASSID_TYPE_HANDLE),
+//! `get_new_arr_helper`/`is_sd_array`/
 //! `as_cor_info_type` (the array pack), and
 //! signature walking (`get_arg_type`/`get_arg_next`,
 //! bounded by `numArgs` — the real EE's `getArgNext` never returns null, so
@@ -106,8 +117,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use rokajit_ee::ee_info::{zeroed_out, EeInfo};
 use rokajit_ee::enums::{
-    CallInfoFlags, ClassAttribs, CorInfoHelpFunc, CorInfoInitClassResult, CorInfoType,
-    InfoAccessType,
+    CallInfoFlags, ClassAttribs, CorInfoClassId, CorInfoHelpFunc, CorInfoInitClassResult,
+    CorInfoType, InfoAccessType,
 };
 use rokajit_ee::handles::{
     ArgListHandle, ClassHandle, ContextHandle, FieldHandle, MethodHandle, ModuleHandle,
@@ -520,9 +531,13 @@ struct Insn {
 
 /// The supported opcode set, operands already decoded. Branch targets are
 /// absolute IL offsets, range-checked at decode time.
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 enum Op {
     Nop,
+    /// `break` (0x01) — the debugger-break hint: a void no-arg
+    /// `CORINFO_HELP_USER_BREAKPOINT` helper call that returns normally
+    /// (importer.cpp:11364). No stack transition.
+    Break,
     LdArg(u16),
     LdLoc(u16),
     StLoc(u16),
@@ -546,6 +561,19 @@ enum Op {
     /// (type, method, or field); the raw EE handle converts through the
     /// TYPEHANDLE_TO_* helper family (step_10.10).
     LdToken(u32),
+    /// `mkrefany` (0xC6) — build a TypedReference struct value from the
+    /// data pointer on the stack and the type-token operand (csc's
+    /// `__makeref`): a pure struct-temp construction, no helper
+    /// (importer.cpp's CEE_MKREFANY).
+    MkRefAny(u32),
+    /// `refanyval` (0xC2) — the TypedReference's data pointer, checked
+    /// against the type-token operand by the EE's GETREFANY helper
+    /// (csc's `__refvalue`); pushes a `ByRef`.
+    RefAnyVal(u32),
+    /// `refanytype` (0xFE 1D, no operand) — the TypedReference's type
+    /// field converted to a RuntimeTypeHandle through the
+    /// TYPEHANDLE_TO_RUNTIMETYPEHANDLE helper (csc's `__reftype`).
+    RefAnyType,
     LdNull,
     Dup,
     Pop,
@@ -554,6 +582,11 @@ enum Op {
     /// valid for `add`/`sub`/`mul`/`div`/`rem` only (ECMA-335 §III.1.5);
     /// float `rem` expands to the EE helper call at import.
     Binary(BinaryOp),
+    /// `add.ovf`/`add.ovf.un`/`sub.ovf`/`sub.ovf.un`/`mul.ovf`/
+    /// `mul.ovf.un` (0xD6..=0xDB): the checked forms — integer operands
+    /// only (the integer half of [`Op::Binary`]'s matrix), throwing
+    /// `OverflowException` on overflow. The bool is the `.un` suffix.
+    BinaryOvf(BinaryOp, bool),
     /// `shl`/`shr`/`shr.un`: the shift count's type is independent of the
     /// value's (ECMA-335 §III.1.5), so these are not [`Op::Binary`].
     Shift(BinaryOp),
@@ -564,6 +597,15 @@ enum Op {
     Compare(BinaryOp),
     /// `conv.i1`/`i2`/`i4`/`i8`/`u4`/`u8` (unchecked forms only).
     Conv(ConvKind),
+    /// `conv.ovf.i1`..`conv.ovf.u8`/`conv.ovf.i`/`conv.ovf.u`
+    /// (0xB3..=0xBA, 0xD4, 0xD5) and their `.un` forms (0x82..=0x8B): the
+    /// checked conversions — the source, read with the `.un` signedness,
+    /// must fit the target's range or the conversion throws
+    /// `OverflowException`. The bool is the `.un` suffix.
+    ConvOvf(ConvOvfKind, bool),
+    /// `ckfinite` (0xC3): throw on a non-finite float operand (`±Inf`,
+    /// NaN); the value passes through unchanged otherwise.
+    CkFinite,
     Br {
         target: u32,
     },
@@ -576,6 +618,13 @@ enum Op {
     BrCmp {
         op: BinaryOp,
         target: u32,
+    },
+    /// `switch` (0x45): the N case targets as absolute IL offsets (the
+    /// i32 deltas are relative to the end of the offset table — the end
+    /// of the instruction). Out-of-range values fall through to the next
+    /// instruction (the default).
+    Switch {
+        targets: Vec<u32>,
     },
     /// `call` — exact-target call; `constrained` carries the
     /// `constrained.` prefix's type-token operand (0xFE 16), which RyuJIT
@@ -653,8 +702,14 @@ enum Op {
     /// `ldlen` — the array's element count (step_10.8).
     LdLen,
     /// `ldelema` — the element's address, an interior `ByRef` (element
-    /// class token; step_10.8).
-    LdElemA(u32),
+    /// class token; step_10.8). `readonly` carries the `readonly.` prefix
+    /// (0xFE 1E): the reference-element covariance check is then skipped
+    /// (the address is load-only), so the plain bounds-checked path serves
+    /// instead of the LDELEMA_REF helper (importer.cpp:7377).
+    LdElemA {
+        token: u32,
+        readonly: bool,
+    },
     /// `ldelem.*` — the fixed element kinds (0x90..=0x9A), each carrying
     /// its (stack type, cell shape, element size) from
     /// [`LDELEM_FIXED_KINDS`] (step_10.8).
@@ -684,6 +739,23 @@ enum Op {
     },
     /// `endfinally` — return from a finally funclet.
     EndFinally,
+    /// `rethrow` (0xFE 1A) — re-raise the in-flight exception: a void
+    /// no-arg `CORINFO_HELP_RETHROW` helper call (importer.cpp:11072).
+    /// Valid only inside a catch handler; the call never returns, so it
+    /// ends the block (IL after it is dead).
+    Rethrow,
+    /// `localloc` (0xFE 0F) — dynamic stack allocation: pops the byte
+    /// count, pushes the fresh (zero-initialized) space's address as a
+    /// `native int`.
+    LocAlloc,
+    /// `cpblk` (0xFE 17) — copy a runtime-sized byte block between two
+    /// addresses: pops size, source address, destination address; pushes
+    /// nothing. Unaligned copies are legal; no null checks (a bad pointer
+    /// faults like any bad byref).
+    CpBlk,
+    /// `initblk` (0xFE 18) — fill a runtime-sized byte block with the low
+    /// byte of an int32 value: pops size, value, address; pushes nothing.
+    InitBlk,
     Ret,
 }
 
@@ -711,6 +783,95 @@ enum ConvKind {
     U,
     R4,
     R8,
+    /// `conv.r.un` (0x76) — unsigned integer to float. The push type is
+    /// Double (RyuJIT's TYP_DOUBLE; csc follows with `conv.r4` when it
+    /// wants a float). A float source degrades to plain `conv.r8`
+    /// semantics (RyuJIT clears GTF_UNSIGNED on float sources,
+    /// importer.cpp:8439).
+    RUn,
+}
+
+/// The checked-conversion targets of `conv.ovf.*` (0xB3..=0xBA, 0xD4,
+/// 0xD5) and their `.un` forms (0x82..=0x8B), in opcode order (i1, i2,
+/// i4, i8, u1, u2, u4, u8) plus the native-int pair. The sub-Int32 kinds
+/// carry their target width through import — the IR's type vocabulary
+/// normalizes it away (ECMA-335 §III.1.1.1), and the checked range is the
+/// small type's, so [`super::ir::hir::Expr::Conv`] (which only names a
+/// stack type) cannot express them.
+#[derive(Copy, Clone)]
+enum ConvOvfKind {
+    I1,
+    I2,
+    I4,
+    I8,
+    U1,
+    U2,
+    U4,
+    U8,
+    /// `conv.ovf.i[.un]` — to native int: i8 semantics on x64 (the IL
+    /// stack type is NativeInt).
+    I,
+    /// `conv.ovf.u[.un]` — to native uint: u8 semantics on x64.
+    U,
+}
+
+/// The checked-conversion target kinds in opcode order: the plain run
+/// (0xB3..=0xBA) interleaves signed/unsigned per width (i1, u1, i2, u2,
+/// …), the `.un` run (0x82..=0x89) groups all signed widths first (i1,
+/// i2, i4, i8, u1, u2, u4, u8) — opcode.def:167-175 vs 216-223.
+const CONV_OVF_KINDS: [ConvOvfKind; 8] = [
+    ConvOvfKind::I1,
+    ConvOvfKind::U1,
+    ConvOvfKind::I2,
+    ConvOvfKind::U2,
+    ConvOvfKind::I4,
+    ConvOvfKind::U4,
+    ConvOvfKind::I8,
+    ConvOvfKind::U8,
+];
+
+/// The `.un` run's kind order (see [`CONV_OVF_KINDS`]).
+const CONV_OVF_UN_KINDS: [ConvOvfKind; 8] = [
+    ConvOvfKind::I1,
+    ConvOvfKind::I2,
+    ConvOvfKind::I4,
+    ConvOvfKind::I8,
+    ConvOvfKind::U1,
+    ConvOvfKind::U2,
+    ConvOvfKind::U4,
+    ConvOvfKind::U8,
+];
+
+impl ConvOvfKind {
+    /// The target's bit width (8/16/32/64; the native forms are 64 on
+    /// x64).
+    fn bits(self) -> u32 {
+        match self {
+            ConvOvfKind::I1 | ConvOvfKind::U1 => 8,
+            ConvOvfKind::I2 | ConvOvfKind::U2 => 16,
+            ConvOvfKind::I4 | ConvOvfKind::U4 => 32,
+            ConvOvfKind::I8 | ConvOvfKind::U8 | ConvOvfKind::I | ConvOvfKind::U => 64,
+        }
+    }
+
+    /// Whether the target range is signed (`i1`/`i2`/`i4`/`i8`/`i`).
+    fn signed(self) -> bool {
+        matches!(
+            self,
+            ConvOvfKind::I1 | ConvOvfKind::I2 | ConvOvfKind::I4 | ConvOvfKind::I8 | ConvOvfKind::I
+        )
+    }
+
+    /// The eval-stack type the conversion pushes: Int32 for the
+    /// ≤32-bit targets (ECMA-335 §III.1.1.1), Int64 for `i8`/`u8`,
+    /// NativeInt for `i`/`u` (the opcode.def PushI/PushI8 split).
+    fn stack_type(self) -> Type {
+        match self {
+            ConvOvfKind::I8 | ConvOvfKind::U8 => Type::Int64,
+            ConvOvfKind::I | ConvOvfKind::U => Type::NativeInt,
+            _ => Type::Int32,
+        }
+    }
 }
 
 /// The compare ops of `beq`..`blt.un` in opcode order (0x2E..=0x37 short,
@@ -794,6 +955,13 @@ const STIND_FIXED_KINDS: [(Type, MemAccess); 7] = [
     (Type::Double, MemAccess::Natural), // r8
 ];
 
+/// The TypedReference field offsets (corinfo.h:2078-2079,
+/// OFFSETOF__CORINFO_TypedReference__dataPtr/__type): two pointer-sized
+/// slots — the data pointer (a GC-tracked interior pointer) at 0, the
+/// native type handle at 8.
+const TYPED_REF_DATA_OFFSET: u32 = 0;
+const TYPED_REF_TYPE_OFFSET: u32 = 8;
+
 /// Bounds-checked cursor over the IL stream.
 struct Reader<'a> {
     il: &'a [u8],
@@ -869,12 +1037,16 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
     // A pending `constrained.` prefix (step_11.3C): the type token, merged
     // into the following callvirt's operand.
     let mut constrained: Option<u32> = None;
+    // A pending `readonly.` prefix: merged into a following `ldelema`
+    // (skips the covariance check), accepted-and-ignored before a call.
+    let mut readonly = false;
     let mut prefix_start: Option<u32> = None;
     while r.ip < il.len() {
         let offset = r.ip as u32;
         let opcode = r.u8()?;
         let op = match opcode {
             0x00 => Op::Nop,
+            0x01 => Op::Break,
             0x02..=0x05 => Op::LdArg(u16::from(opcode - 0x02)),
             0x06..=0x09 => Op::LdLoc(u16::from(opcode - 0x06)),
             0x0A..=0x0D => Op::StLoc(u16::from(opcode - 0x0A)),
@@ -893,6 +1065,9 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x23 => Op::LdcR8(f64::from_bits(r.u64()?)),
             0x25 => Op::Dup,
             0x26 => Op::Pop,
+            0x27 => {
+                return Err(CompileError::Unsupported("jmp (tail-call transfer)"));
+            }
             0x28 => Op::Call {
                 token: r.u32()?,
                 constrained: None,
@@ -955,6 +1130,21 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                     target: branch_target(il.len(), r.ip, d)?,
                 }
             }
+            0x45 => {
+                // switch: u32 N, then N i32 deltas, each relative to the
+                // END of the offset table (the end of the instruction).
+                let n = r.u32()?;
+                let mut deltas = Vec::new();
+                for _ in 0..n {
+                    deltas.push(r.i32()?);
+                }
+                let end_of_table = r.ip;
+                let targets = deltas
+                    .into_iter()
+                    .map(|d| branch_target(il.len(), end_of_table, d))
+                    .collect::<CompileResult<Vec<_>>>()?;
+                Op::Switch { targets }
+            }
             0x58 => Op::Binary(BinaryOp::Add),
             0x59 => Op::Binary(BinaryOp::Sub),
             0x5A => Op::Binary(BinaryOp::Mul),
@@ -968,6 +1158,12 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x62 => Op::Shift(BinaryOp::Shl),
             0x63 => Op::Shift(BinaryOp::Shr),
             0x64 => Op::Shift(BinaryOp::UShr),
+            0xD6 => Op::BinaryOvf(BinaryOp::Add, false),
+            0xD7 => Op::BinaryOvf(BinaryOp::Add, true),
+            0xD8 => Op::BinaryOvf(BinaryOp::Mul, false),
+            0xD9 => Op::BinaryOvf(BinaryOp::Mul, true),
+            0xDA => Op::BinaryOvf(BinaryOp::Sub, false),
+            0xDB => Op::BinaryOvf(BinaryOp::Sub, true),
             0x65 => Op::Unary(UnaryOp::Neg),
             0x66 => Op::Unary(UnaryOp::Not),
             0x67 => Op::Conv(ConvKind::I1),
@@ -989,6 +1185,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x73 => Op::NewObj(r.u32()?),
             0x74 => Op::CastClass(r.u32()?),
             0x75 => Op::IsInst(r.u32()?),
+            0x76 => Op::Conv(ConvKind::RUn),
             0x79 => Op::Unbox(r.u32()?),
             0x7A => Op::Throw,
             0x7B => Op::LdFld(r.u32()?),
@@ -998,10 +1195,16 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0x7F => Op::LdSFldA(r.u32()?),
             0x80 => Op::StSFld(r.u32()?),
             0x81 => Op::StObj(r.u32()?),
+            0x82..=0x89 => Op::ConvOvf(CONV_OVF_UN_KINDS[usize::from(opcode - 0x82)], true),
+            0x8A => Op::ConvOvf(ConvOvfKind::I, true),
+            0x8B => Op::ConvOvf(ConvOvfKind::U, true),
             0x8C => Op::Box(r.u32()?),
             0x8D => Op::NewArr(r.u32()?),
             0x8E => Op::LdLen,
-            0x8F => Op::LdElemA(r.u32()?),
+            0x8F => Op::LdElemA {
+                token: r.u32()?,
+                readonly: false,
+            },
             0x90..=0x9A => {
                 let (ty, access, size) = LDELEM_FIXED_KINDS[usize::from(opcode - 0x90)];
                 Op::LdElemK(ty, access, size)
@@ -1013,10 +1216,16 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             0xA3 => Op::LdElem(r.u32()?),
             0xA4 => Op::StElem(r.u32()?),
             0xA5 => Op::UnboxAny(r.u32()?),
+            0xB3..=0xBA => Op::ConvOvf(CONV_OVF_KINDS[usize::from(opcode - 0xB3)], false),
+            0xC3 => Op::CkFinite,
+            0xC2 => Op::RefAnyVal(r.u32()?),
+            0xC6 => Op::MkRefAny(r.u32()?),
             0xD0 => Op::LdToken(r.u32()?),
             0xD1 => Op::Conv(ConvKind::U2),
             0xD2 => Op::Conv(ConvKind::U1),
             0xD3 => Op::Conv(ConvKind::I),
+            0xD4 => Op::ConvOvf(ConvOvfKind::I, false),
+            0xD5 => Op::ConvOvf(ConvOvfKind::U, false),
             0xDC => Op::EndFinally,
             0xDF => Op::StInd(Type::NativeInt, MemAccess::Natural), // stind.i
             0xDD => {
@@ -1033,6 +1242,9 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
             }
             0xE0 => Op::Conv(ConvKind::U),
             0xFE => match r.u8()? {
+                0x00 => {
+                    return Err(CompileError::Unsupported("arglist (varargs)"));
+                }
                 0x01 => Op::Compare(BinaryOp::Eq),
                 0x02 => Op::Compare(BinaryOp::Gt),
                 0x03 => Op::Compare(BinaryOp::UGt),
@@ -1046,6 +1258,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                 0x0C => Op::LdLoc(r.u16()?),
                 0x0D => Op::LdLoca(r.u16()?),
                 0x0E => Op::StLoc(r.u16()?),
+                0x0F => Op::LocAlloc,
                 0x11 => {
                     return Err(CompileError::Unsupported("endfilter (EH filter clauses)"));
                 }
@@ -1070,7 +1283,12 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                     prefix_start = Some(prefix_start.unwrap_or(offset));
                     continue;
                 }
+                0x14 => {
+                    return Err(CompileError::Unsupported("tail. prefix (tail calls)"));
+                }
                 0x15 => Op::InitObj(r.u32()?),
+                0x17 => Op::CpBlk,
+                0x18 => Op::InitBlk,
                 0x16 => {
                     // `constrained.` (step_11.3C/D): the following call's
                     // `this` is a byref into a value of the operand type
@@ -1084,8 +1302,18 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                     prefix_start = Some(prefix_start.unwrap_or(offset));
                     continue;
                 }
-                0x1A => return Err(CompileError::Unsupported("rethrow")),
+                0x1A => Op::Rethrow,
+                0x1E => {
+                    // `readonly.` — advisory on every follower but
+                    // `ldelema`, where it selects the unchecked
+                    // element-address path (the merge below enforces the
+                    // follower set: ldelema or a call, importer.cpp:8975).
+                    readonly = true;
+                    prefix_start = Some(prefix_start.unwrap_or(offset));
+                    continue;
+                }
                 0x1C => Op::SizeOf(r.u32()?),
+                0x1D => Op::RefAnyType,
                 _ => {
                     return Err(CompileError::Unsupported(
                         "0xFE-prefixed opcode outside the supported set",
@@ -1132,12 +1360,35 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                 }
             }
         }
+        if readonly {
+            // `readonly.` (importer.cpp:8968): before `ldelema` it merges
+            // in as the unchecked-path flag; before a call it is advisory
+            // (RyuJIT's flag only feeds inlining decisions) — accept and
+            // ignore. Anything else is BadIl. (`constrained.` merging ran
+            // first, so `readonly. constrained. callvirt` lands here as a
+            // CallVirt.)
+            match op {
+                Op::LdElemA { token, .. } => {
+                    op = Op::LdElemA {
+                        token,
+                        readonly: true,
+                    };
+                }
+                Op::Call { .. } | Op::CallVirt { .. } | Op::CallI(_) => {}
+                _ => {
+                    return Err(CompileError::BadIl(
+                        "readonly. prefix before a non-ldelema, non-call instruction",
+                    ));
+                }
+            }
+            readonly = false;
+            prefix_start = None;
+        }
         if unaligned.is_some() || volatile {
             // RyuJIT's `impValidateMemoryAccessOpcode` set
             // (importer.cpp:5317): the ldind/stind family (incl. stind.i),
-            // ldfld/stfld, ldobj/stobj — and, for `volatile.` only,
-            // ldsfld/stsfld. (cpblk/initblk are in RyuJIT's set too; they
-            // stay Unsupported here, so the prefix check never sees them.)
+            // ldfld/stfld, ldobj/stobj, cpblk/initblk — and, for
+            // `volatile.` only, ldsfld/stsfld.
             let applicable = matches!(
                 op,
                 Op::LdInd(..)
@@ -1146,6 +1397,8 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                     | Op::StFld(..)
                     | Op::LdObj(..)
                     | Op::StObj(..)
+                    | Op::CpBlk
+                    | Op::InitBlk
             ) || (volatile && matches!(op, Op::LdSFld(..) | Op::StSFld(..)));
             if !applicable {
                 return Err(CompileError::BadIl(
@@ -1205,21 +1458,34 @@ fn find_leaders(il: &[u8], insns: &[Insn], clauses: &[Clause]) -> CompileResult<
         }
     }
     for insn in insns {
-        match insn.op {
+        match &insn.op {
             Op::Br { target }
             | Op::BrZero { target, .. }
             | Op::BrCmp { target, .. }
             | Op::Leave { target } => {
-                if !is_boundary[target as usize] {
+                if !is_boundary[*target as usize] {
                     return Err(CompileError::BadIl(
                         "branch target is not an instruction boundary",
                     ));
                 }
-                leaders.insert(target);
+                leaders.insert(*target);
+            }
+            Op::Switch { targets } => {
+                for &target in targets {
+                    if !is_boundary[target as usize] {
+                        return Err(CompileError::BadIl(
+                            "branch target is not an instruction boundary",
+                        ));
+                    }
+                    leaders.insert(target);
+                }
             }
             _ => {}
         }
-        if matches!(insn.op, Op::BrZero { .. } | Op::BrCmp { .. }) {
+        if matches!(
+            insn.op,
+            Op::BrZero { .. } | Op::BrCmp { .. } | Op::Switch { .. }
+        ) {
             let fallthrough = insn.offset + insn.size;
             if fallthrough as usize >= il.len() {
                 return Err(CompileError::BadIl(
@@ -1533,6 +1799,7 @@ fn rebuild_blocks(
                     }
                     hir::Terminator::Return { .. }
                     | hir::Terminator::Throw { .. }
+                    | hir::Terminator::Rethrow
                     | hir::Terminator::EndFinally => {}
                     hir::Terminator::CallFinally { .. } => {
                         return Err(CompileError::Internal(
@@ -1724,10 +1991,11 @@ fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
         hir::Expr::Load { addr, .. } => references_local(addr, id),
         hir::Expr::FieldAddr { obj, .. } => references_local(obj, id),
         hir::Expr::Unary { arg, .. } => references_local(arg, id),
-        hir::Expr::Binary { lhs, rhs, .. } => {
+        hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
             references_local(lhs, id) || references_local(rhs, id)
         }
         hir::Expr::Conv { arg, .. } => references_local(arg, id),
+        hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => references_local(arg, id),
         hir::Expr::Call { target, args, .. } => {
             let target_ref = match target {
                 CallTarget::Indirect(addr) => references_local(addr, id),
@@ -1742,6 +2010,7 @@ fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
         }
         hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => references_local(arg, id),
         hir::Expr::StructVal { addr, .. } => references_local(addr, id),
+        hir::Expr::LocAlloc { size } => references_local(size, id),
     }
 }
 
@@ -1764,7 +2033,13 @@ fn must_eval(expr: &hir::Expr) -> bool {
             ) || must_eval(lhs)
                 || must_eval(rhs)
         }
+        // The checked forms can throw OverflowException — observable even
+        // when the value is discarded.
+        hir::Expr::BinaryOvf { .. } => true,
         hir::Expr::Conv { arg, .. } => must_eval(arg),
+        // The checked conversion and the finiteness check can throw —
+        // observable even when the value is discarded.
+        hir::Expr::ConvOvf { .. } | hir::Expr::CkFinite { .. } => true,
         hir::Expr::Call { .. } => true,
         hir::Expr::NullCheck { .. } => true, // the check itself can fault
         hir::Expr::ArrLen { .. } => true,    // faults on a null array
@@ -1773,6 +2048,9 @@ fn must_eval(expr: &hir::Expr) -> bool {
         // allocates — both observable.
         hir::Expr::Cast { .. } | hir::Expr::Box { .. } => true,
         hir::Expr::StructVal { addr, .. } => must_eval(addr),
+        // The allocation moves rsp for the rest of the method — an effect
+        // even when the address is discarded.
+        hir::Expr::LocAlloc { .. } => true,
     }
 }
 
@@ -1957,6 +2235,58 @@ impl BlockImport<'_> {
             return Err(CompileError::BadIl("binary operand type mismatch"));
         };
         self.push(result, binary(op, lhs, rhs))
+    }
+
+    /// `add.ovf`/`sub.ovf`/`mul.ovf` and their `.un` forms (0xD6..=0xDB):
+    /// checked integer arithmetic, throwing `OverflowException` on
+    /// overflow. The operand matrix is the integer half of [`Self::arith`]
+    /// (ECMA-335 §III.1.5's ovf tables): same-type int32/int64/native-int
+    /// pairs, or an int32/native-int mix promoted to native int — the
+    /// Int32 side extends sign- or zero- per the `.un` suffix (as `arith`
+    /// does for its unsigned forms). Int64 never mixes, and floats,
+    /// references, and byrefs are all BadIl (no pointer-class arithmetic
+    /// on the checked forms). The result is the promoted type.
+    fn arith_ovf(&mut self, op: BinaryOp, unsigned: bool) -> CompileResult<()> {
+        let (rt, rhs) = self.pop()?;
+        let (lt, lhs) = self.pop()?;
+        let int = |t: Type| matches!(t, Type::Int32 | Type::Int64 | Type::NativeInt);
+        if !int(lt) || !int(rt) {
+            return Err(CompileError::BadIl(
+                "checked arithmetic operands must be integers",
+            ));
+        }
+        let widen = |ty: Type, e: hir::Expr| {
+            if ty == Type::Int32 {
+                hir::Expr::Conv {
+                    to: Type::NativeInt,
+                    overflow: false,
+                    unsigned,
+                    arg: Box::new(e),
+                }
+            } else {
+                e
+            }
+        };
+        let narrow_int = |t: Type| matches!(t, Type::Int32 | Type::NativeInt);
+        let (result, lhs, rhs) = if lt == rt {
+            (lt, lhs, rhs)
+        } else if narrow_int(lt) && narrow_int(rt) {
+            // int32 op native int → native int (both sides native-width).
+            (Type::NativeInt, widen(lt, lhs), widen(rt, rhs))
+        } else {
+            return Err(CompileError::BadIl(
+                "checked arithmetic operand type mismatch",
+            ));
+        };
+        self.push(
+            result,
+            hir::Expr::BinaryOvf {
+                op,
+                unsigned,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+        )
     }
 
     /// Records the current evaluation stack as the state carried on the
@@ -2278,6 +2608,98 @@ impl BlockImport<'_> {
         self.push(vt, binary(op, value, count))
     }
 
+    /// `localloc` (0xFE 0F): pops the byte count and pushes the fresh
+    /// space's address as a `native int` (RyuJIT's TYP_I_IMPL; a ByRef
+    /// would make the address a GC-reported interior-pointer root over
+    /// untracked memory). The count is `int32`/`native int`/`int64`
+    /// (ECMA-335 §III.3.47), normalized to native width — an Int32
+    /// sign-extends (a negative count wraps huge, RyuJIT's unchecked
+    /// genLclHeap behavior); anything else is BadIl. ECMA-335 §I.12.3.2.4
+    /// forbids localloc inside an exception handler: handlers are
+    /// funclets running on the parent's rbp, and a dynamic rsp adjustment
+    /// there would corrupt the parent frame — a BadIl gate, not silent
+    /// miscode. (Strictly, ECMA forbids try bodies too; RyuJIT allows
+    /// them, and so do we — the parent frame stays rbp-walkable and the
+    /// VM re-establishes the funclet's rsp from the fixed frame.)
+    fn localloc(&mut self, offset: u32) -> CompileResult<()> {
+        if innermost_handler(&self.clauses, offset).is_some() {
+            return Err(CompileError::BadIl(
+                "localloc in an exception-handling block",
+            ));
+        }
+        let (ty, size) = self.pop()?;
+        let size = match ty {
+            Type::NativeInt | Type::Int64 => size,
+            Type::Int32 => hir::Expr::Conv {
+                to: Type::NativeInt,
+                overflow: false,
+                unsigned: false,
+                arg: Box::new(size),
+            },
+            _ => return Err(CompileError::BadIl("localloc size must be an integer")),
+        };
+        self.push(
+            Type::NativeInt,
+            hir::Expr::LocAlloc {
+                size: Box::new(size),
+            },
+        )
+    }
+
+    /// A void no-arg helper call as a statement (the `break`/`rethrow`
+    /// shape): pending trees spill first, so they evaluate before the
+    /// helper runs (RyuJIT's SPILL_APPEND/EVAL_APPEND).
+    fn void_helper_call(
+        &mut self,
+        helper: CorInfoHelpFunc,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        self.spill_stack(stmts, il_offset)?;
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Helper(helper),
+                sig: CallSig {
+                    ret: Type::Void,
+                    args: vec![],
+                    has_this: false,
+                },
+                args: vec![],
+            }),
+        });
+        Ok(())
+    }
+
+    /// `break` (0x01): the debugger-break hint, a `USER_BREAKPOINT`
+    /// helper call that returns normally (importer.cpp:11364). No stack
+    /// transition.
+    fn break_(&mut self, stmts: &mut Vec<hir::Stmt>, il_offset: IlOffset) -> CompileResult<()> {
+        self.void_helper_call(CorInfoHelpFunc::USER_BREAKPOINT, stmts, il_offset)
+    }
+
+    /// `rethrow` (0xFE 1A): re-raise the in-flight exception. Valid only
+    /// inside a catch handler (ECMA-335 §III.4.29; RyuJIT BADCODEs with
+    /// no exception clauses at all, importer.cpp:11076 — we gate on the
+    /// handler region itself, the localloc discipline). The helper call
+    /// never returns — the VM finds the in-flight exception via the stack
+    /// walk, and our catch funclets run on the parent frame (step_10.6) —
+    /// so the block ENDS here like a `throw`: IL after it is dead, and a
+    /// region-end fallthrough would otherwise fabricate a merge edge into
+    /// the next region (csc emits bare `pop; rethrow` handler tails).
+    fn rethrow(
+        &mut self,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<hir::Terminator> {
+        match innermost_handler(&self.clauses, il_offset.0) {
+            Some(c) if matches!(self.clauses[c].kind, ClauseKind::Catch { .. }) => {}
+            _ => return Err(CompileError::BadIl("rethrow outside a catch handler")),
+        }
+        self.spill_stack(stmts, il_offset)?;
+        Ok(hir::Terminator::Rethrow)
+    }
+
     /// `conv.*` (unchecked): stack-type transitions of the scalar-cheap
     /// and float packs. Same-width conversions are the identity;
     /// `conv.i1`/`conv.i2`/`conv.u1`/`conv.u2` expand to shift pairs
@@ -2403,6 +2825,56 @@ impl BlockImport<'_> {
                     )
                 }
             }
+            // conv.r.un (0x76): unsigned integer → Double (the push type
+            // is always double; csc follows with `conv.r4` when it wants
+            // a float — RyuJIT peeks for that pair, tier 0 converts to
+            // double and lets conv.r4 narrow). An Int32 source zero-
+            // extends to Int64 and then converts SIGNED — every u32 is
+            // exact in an f64, so the composed pair is the semantics. A
+            // 64-bit source keeps the `unsigned` flag on the Conv node,
+            // which the x64 backend expands to the branchy u64→f64 fixup
+            // sequence (codegenxarch.cpp:7007). A float source is the
+            // plain conv.r8 (RyuJIT clears GTF_UNSIGNED on float sources,
+            // importer.cpp:8439 — unsignedness is meaningless there).
+            ConvKind::RUn => match ty {
+                Type::Int32 => {
+                    let wide = hir::Expr::Conv {
+                        to: Type::Int64,
+                        overflow: false,
+                        unsigned: true,
+                        arg: Box::new(value),
+                    };
+                    self.push(
+                        Type::Double,
+                        hir::Expr::Conv {
+                            to: Type::Double,
+                            overflow: false,
+                            unsigned: false,
+                            arg: Box::new(wide),
+                        },
+                    )
+                }
+                Type::Int64 | Type::NativeInt => self.push(
+                    Type::Double,
+                    hir::Expr::Conv {
+                        to: Type::Double,
+                        overflow: false,
+                        unsigned: true,
+                        arg: Box::new(value),
+                    },
+                ),
+                Type::Float => self.push(
+                    Type::Double,
+                    hir::Expr::Conv {
+                        to: Type::Double,
+                        overflow: false,
+                        unsigned: false,
+                        arg: Box::new(value),
+                    },
+                ),
+                // Already a double: the identity.
+                _ => self.push(Type::Double, value),
+            },
         }
     }
 
@@ -2471,6 +2943,162 @@ impl BlockImport<'_> {
         self.push(Type::Int32, back)
     }
 
+    /// `conv.ovf.*` (0xB3..=0xBA, 0xD4, 0xD5) and their `.un` forms
+    /// (0x82..=0x8B): the checked conversions. `un` is the `.un` suffix —
+    /// the SOURCE is read unsigned (the target's signedness is part of
+    /// `kind`). Throws `OverflowException` when the source value is
+    /// outside the target range (ECMA-335 §III.3.x; RyuJIT importer.cpp
+    /// CAST_OVF handling).
+    ///
+    /// Integer sources: when the source's range (its width plus the `.un`
+    /// signedness) is contained in the target's range, no check can fire —
+    /// the conversion is the plain widening/identity (`conv.ovf.i8` of an
+    /// i32 is `movsxd`, `conv.ovf.i4` of an i32 is a nop, …). Otherwise a
+    /// [`hir::Expr::ConvOvf`] node carries the explicit target width and
+    /// signedness to lowering (the eval-stack types normalize both away);
+    /// codegen emits the inline range check with the `BinaryOvf`
+    /// conditional-throw shape.
+    ///
+    /// Float sources (RyuJIT morph.cpp:340-440): the 32/64-bit targets go
+    /// to the `DBL2*_OVF` EE helpers chosen by TARGET (the `.un` suffix is
+    /// meaningless on a float source — morph.cpp:411 clears the unsigned
+    /// flag), the Float source widening to Double first
+    /// (flowgraph.cpp:1334-1340); the small targets convert float→Int32
+    /// with the plain truncating `cvtt*` (NaN/out-of-range → the
+    /// "integer indefinite" INT_MIN, which no small range contains) and
+    /// then run the integer-domain checked narrow (morph.cpp:369-371).
+    fn conv_ovf(&mut self, kind: ConvOvfKind, un: bool) -> CompileResult<()> {
+        let (ty, value) = self.pop()?;
+        let int = matches!(ty, Type::Int32 | Type::Int64 | Type::NativeInt);
+        let fp = matches!(ty, Type::Float | Type::Double);
+        if !int && !fp {
+            // The same gate as the unchecked forms (pointers).
+            return Err(CompileError::Unsupported(
+                "conv from a non-numeric operand (pointers)",
+            ));
+        }
+        if fp {
+            let helper = match kind {
+                ConvOvfKind::I4 => Some((CorInfoHelpFunc::DBL2INT_OVF, Type::Int32)),
+                ConvOvfKind::U4 => Some((CorInfoHelpFunc::DBL2UINT_OVF, Type::Int32)),
+                ConvOvfKind::I8 => Some((CorInfoHelpFunc::DBL2LNG_OVF, Type::Int64)),
+                ConvOvfKind::U8 => Some((CorInfoHelpFunc::DBL2ULNG_OVF, Type::Int64)),
+                ConvOvfKind::I => Some((CorInfoHelpFunc::DBL2LNG_OVF, Type::NativeInt)),
+                ConvOvfKind::U => Some((CorInfoHelpFunc::DBL2ULNG_OVF, Type::NativeInt)),
+                _ => None,
+            };
+            return match helper {
+                Some((helper, ret)) => {
+                    // The helper takes a double; a float32 source widens
+                    // first (flowgraph.cpp:1334-1340).
+                    let arg = if ty == Type::Float {
+                        hir::Expr::Conv {
+                            to: Type::Double,
+                            overflow: false,
+                            unsigned: false,
+                            arg: Box::new(value),
+                        }
+                    } else {
+                        value
+                    };
+                    self.push(
+                        ret,
+                        hir::Expr::Call {
+                            target: CallTarget::Helper(helper),
+                            sig: CallSig {
+                                ret,
+                                args: vec![Type::Double],
+                                has_this: false,
+                            },
+                            args: vec![arg],
+                        },
+                    )
+                }
+                // The small targets: plain truncating float→Int32 (of the
+                // ORIGINAL width — no widening, morph.cpp:369-371), then
+                // the integer-domain checked narrow with a signed source
+                // (the `.un` suffix dies with the float source).
+                None => {
+                    let as_int = hir::Expr::Conv {
+                        to: Type::Int32,
+                        overflow: false,
+                        unsigned: false,
+                        arg: Box::new(value),
+                    };
+                    self.push(
+                        Type::Int32,
+                        hir::Expr::ConvOvf {
+                            to: Type::Int32,
+                            dst_bits: kind.bits(),
+                            signed_dst: kind.signed(),
+                            unsigned_src: false,
+                            arg: Box::new(as_int),
+                        },
+                    )
+                }
+            };
+        }
+        // Integer source: does its range already fit the target's?
+        let src_wide = !matches!(ty, Type::Int32);
+        let contained = match (kind.bits(), kind.signed()) {
+            // The small targets contain no source range.
+            (8 | 16, _) => false,
+            // i4 contains exactly the signed 32-bit source; u4 exactly the
+            // unsigned 32-bit one.
+            (32, signed) => !src_wide && un != signed,
+            // i8/i contain every 32-bit source and the signed 64-bit one;
+            // u8/u contain the unsigned sources only.
+            (64, true) => !src_wide || !un,
+            (64, false) => un,
+            _ => unreachable!("checked-conversion widths are 8/16/32/64"),
+        };
+        let to = kind.stack_type();
+        if contained {
+            if src_wide || kind.bits() <= 32 {
+                // Same-width identity (the stack type still re-types).
+                return self.push(to, value);
+            }
+            // A 32-bit source widens to a 64-bit target: sign- or
+            // zero-extension per the source's signedness (`.un`).
+            return self.push(
+                to,
+                hir::Expr::Conv {
+                    to,
+                    overflow: false,
+                    unsigned: un,
+                    arg: Box::new(value),
+                },
+            );
+        }
+        self.push(
+            to,
+            hir::Expr::ConvOvf {
+                to,
+                dst_bits: kind.bits(),
+                signed_dst: kind.signed(),
+                unsigned_src: un,
+                arg: Box::new(value),
+            },
+        )
+    }
+
+    /// `ckfinite` (0xC3): pop a Float or Double (anything else is BadIl —
+    /// ECMA-335 §III.3.16), push the SAME type. The check itself lowers to
+    /// the inline exponent-mask compare with the OVERFLOW helper as its
+    /// throw edge (codegenxarch.cpp:7082-7118).
+    fn ckfinite(&mut self) -> CompileResult<()> {
+        let (ty, value) = self.pop()?;
+        if !matches!(ty, Type::Float | Type::Double) {
+            return Err(CompileError::BadIl("ckfinite operand must be a float"));
+        }
+        self.push(
+            ty,
+            hir::Expr::CkFinite {
+                arg: Box::new(value),
+            },
+        )
+    }
+
     fn branch(
         &mut self,
         cond: hir::Expr,
@@ -2506,6 +3134,55 @@ impl BlockImport<'_> {
             cond,
             then: self.block_id(target)?,
             else_: self.block_id(fallthrough)?,
+        })
+    }
+
+    /// `switch` (0x45): pop the Int32 selector, then every distinct edge
+    /// — the N case targets in table order, then the fallthrough (the
+    /// default) — records the current stack as its entry state. The
+    /// pending-tree spill is `branch`'s: an effectful tree evaluates
+    /// once, before the dispatch. Duplicate targets share one recorded
+    /// edge; the terminator keeps all N block ids (the compare chain
+    /// tests each case index).
+    fn switch(
+        &mut self,
+        targets: &[u32],
+        fallthrough: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<hir::Terminator> {
+        let (ty, value) = self.pop()?;
+        if ty != Type::Int32 {
+            return Err(CompileError::BadIl("switch operand must be an int32"));
+        }
+        for i in 0..self.stack.len() {
+            let (ty, _) = self.stack[i];
+            if must_eval(&self.stack[i].1) {
+                let value =
+                    std::mem::replace(&mut self.stack[i].1, hir::Expr::Const(Const::Int32(0)));
+                let tmp = self.temp(ty);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store { dst: tmp, value },
+                });
+                let (_, expr) = self.local_value_expr(tmp);
+                self.stack[i].1 = expr;
+            }
+        }
+        let mut seen: Vec<u32> = Vec::with_capacity(targets.len() + 1);
+        for &edge in targets.iter().chain(std::iter::once(&fallthrough)) {
+            if !seen.contains(&edge) {
+                seen.push(edge);
+                self.record_exit(edge, stmts, il_offset)?;
+            }
+        }
+        Ok(hir::Terminator::Switch {
+            value,
+            targets: targets
+                .iter()
+                .map(|&t| self.block_id(t))
+                .collect::<CompileResult<Vec<_>>>()?,
+            default: self.block_id(fallthrough)?,
         })
     }
 
@@ -2743,6 +3420,179 @@ impl BlockImport<'_> {
                     has_this: false,
                 },
                 args: vec![handle_expr],
+            },
+        )
+    }
+
+    /// The TypedReference class (`System.TypedReference`), the EE's
+    /// `getBuiltinClass(CLASSID_TYPED_BYREF)` — RyuJIT's
+    /// `impGetRefAnyClass`. Its layout (16 bytes; the `data` cell a byref
+    /// — corinfo.h:2078-2079) goes into the side table: the GC-layout
+    /// query is what reports the interior pointer to the GC.
+    fn typed_ref_class(&mut self) -> CompileResult<ClassHandle> {
+        let Some(class) = self.ee.get_builtin_class(CorInfoClassId::TypedByref) else {
+            return Err(CompileError::Internal(
+                "getBuiltinClass(CLASSID_TYPED_BYREF) unanswered",
+            ));
+        };
+        layout_of(&mut self.struct_layouts, self.ee, class)?;
+        Ok(class)
+    }
+
+    /// Pops a TypedReference value (`refanytype`/`refanyval` operand,
+    /// ECMA-335 §III.4.22-23) as its address — the `StructVal` discipline,
+    /// spilling a non-address shape (a register-passed call result) to a
+    /// temp first (RyuJIT's impNormStructVal/impGetNodeAddr pair).
+    fn pop_typed_ref_addr(
+        &mut self,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<(ClassHandle, hir::Expr)> {
+        let (ty, value) = self.pop()?;
+        let Type::Struct(class) = ty else {
+            return Err(CompileError::BadIl(
+                "refanytype/refanyval operand must be a TypedReference",
+            ));
+        };
+        // The spill-to-temp store `struct_addr_of` may push is a side
+        // effect: pending trees below the operand evaluate first.
+        self.spill_stack(stmts, il_offset)?;
+        let addr = self.struct_addr_of(value, class, stmts, il_offset);
+        Ok((class, addr))
+    }
+
+    /// `mkrefany` (0xC6): build the TypedReference value `{ data = ptr,
+    /// type = handle }` in a fresh struct temp — RyuJIT's CEE_MKREFANY
+    /// (importer.cpp:11260): two field stores, no helper. The type token
+    /// embeds through the generic-handle path with the mustRestoreHandle
+    /// notification (impTokenToHandle's `true` argument); the pointer
+    /// operand is a byref or native int (the TYP_INT tolerance of
+    /// RyuJIT's SPECVIOLATION assert stays out — it is unverifiable IL).
+    /// The stores need no write barrier: the temp is a frame slot, and
+    /// its byref cell is a reported GC root via the class's GC layout
+    /// (zero-initialized in the prolog until the stores land).
+    fn mkrefany(
+        &mut self,
+        token: u32,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let (mut resolved, _class) =
+            self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
+        let handle = self.class_handle_expr(&mut resolved, false, true)?;
+        let (ty, ptr) = self.pop()?;
+        if !matches!(ty, Type::ByRef | Type::NativeInt) {
+            return Err(CompileError::BadIl(
+                "mkrefany operand must be a byref or native int",
+            ));
+        }
+        let class = self.typed_ref_class()?;
+        self.spill_stack(stmts, il_offset)?;
+        // An address-of operand (`ldarga`/`ldloca` feeding `__makeref`)
+        // has no store-source form: materialize it into a temp first
+        // (the flattener's `addr_value` discipline, applied to the data
+        // value rather than the address).
+        let ptr = if matches!(ptr, hir::Expr::LocalAddr(_)) {
+            let t_ptr = self.temp(ty);
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Store {
+                    dst: t_ptr,
+                    value: ptr,
+                },
+            });
+            hir::Expr::Local(t_ptr)
+        } else {
+            ptr
+        };
+        let t = self.temp(Type::Struct(class));
+        for (offset, value) in [
+            (TYPED_REF_DATA_OFFSET, ptr),
+            (TYPED_REF_TYPE_OFFSET, handle),
+        ] {
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::StoreInd {
+                    addr: hir::Expr::LocalAddr(t),
+                    offset,
+                    value,
+                    access: MemAccess::Natural,
+                },
+            });
+        }
+        self.push(
+            Type::Struct(class),
+            hir::Expr::StructVal {
+                addr: Box::new(hir::Expr::LocalAddr(t)),
+                class,
+            },
+        )
+    }
+
+    /// `refanyval` (0xC2): the checked extraction of the TypedReference's
+    /// data pointer — RyuJIT's CEE_REFANYVAL (importer.cpp:10529), the
+    /// `GETREFANY(classHandle, typedref)` helper call, the TypedReference
+    /// passed BY VALUE (SysV INTEGER,INTEGER — the by-value struct-argument
+    /// machinery of step_10.9). The helper itself throws
+    /// `InvalidCastException` on a type mismatch (the VM's
+    /// TypedReference.GetRefAny); the result is a `ByRef`.
+    fn refanyval(&mut self, token: u32) -> CompileResult<()> {
+        let (mut resolved, _class) =
+            self.resolve_box_cast_class(token, ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Class)?;
+        let handle = self.class_handle_expr(&mut resolved, false, false)?;
+        let (ty, value) = self.pop()?;
+        let Type::Struct(class) = ty else {
+            return Err(CompileError::BadIl(
+                "refanyval operand must be a TypedReference",
+            ));
+        };
+        self.push(
+            Type::ByRef,
+            hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::GETREFANY),
+                sig: CallSig {
+                    ret: Type::ByRef,
+                    args: vec![Type::NativeInt, Type::Struct(class)],
+                    has_this: false,
+                },
+                args: vec![handle, value],
+            },
+        )
+    }
+
+    /// `refanytype` (0xFE 1D): the TypedReference's type field as a
+    /// RuntimeTypeHandle — RyuJIT's CEE_REFANYTYPE (importer.cpp:10559):
+    /// load the `type` slot, convert through the
+    /// TYPEHANDLE_TO_RUNTIMETYPEHANDLE helper (the same emission
+    /// `ldtoken`'s class arm uses; the RuntimeTypeHandle class is the
+    /// EE's CLASSID_TYPE_HANDLE). Divergence from RyuJIT: its inline null
+    /// check on a zero handle (`(handle == 0) ? default : helper(handle)`
+    /// — a `default(TypedReference)` guard) needs mid-instruction control
+    /// flow the importer has no machinery for; the helper faults on a
+    /// null handle instead.
+    fn refanytype(&mut self, stmts: &mut Vec<hir::Stmt>, il_offset: IlOffset) -> CompileResult<()> {
+        let (_class, addr) = self.pop_typed_ref_addr(stmts, il_offset)?;
+        let Some(handle_class) = self.ee.get_builtin_class(CorInfoClassId::TypeHandle) else {
+            return Err(CompileError::Internal(
+                "getBuiltinClass(CLASSID_TYPE_HANDLE) unanswered",
+            ));
+        };
+        layout_of(&mut self.struct_layouts, self.ee, handle_class)?;
+        self.push(
+            Type::Struct(handle_class),
+            hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::TYPEHANDLE_TO_RUNTIMETYPEHANDLE),
+                sig: CallSig {
+                    ret: Type::Struct(handle_class),
+                    args: vec![Type::NativeInt],
+                    has_this: false,
+                },
+                args: vec![hir::Expr::Load {
+                    addr: Box::new(addr),
+                    offset: TYPED_REF_TYPE_OFFSET,
+                    ty: Type::NativeInt,
+                    access: MemAccess::Natural,
+                }],
             },
         )
     }
@@ -3035,6 +3885,46 @@ impl BlockImport<'_> {
         {
             return Ok(());
         }
+        // `System.Double/Single.ConvertToIntegerNative<T>(value)`: the
+        // [Intrinsic] the managed DBL2*_OVF dynamic helpers
+        // (jithelpers.h:90-95 — Math.ConvertToInt32Checked & co.) call
+        // after their range guard. Its CoreLib IL body is deliberately
+        // self-recursive (Double.cs:670 — "indirect calls produce the
+        // same result as direct invocation"), so compiling it literally
+        // recurses until the stack overflows; the intrinsic IS the
+        // truncating conversion. The guard has already excluded NaN and
+        // out-of-range values, so a plain `conv` node is exact (the
+        // unsigned targets ride the saturating expansion, matching the
+        // intrinsic's documented semantics anyway).
+        if virtual_kind.is_none()
+            && constrained_resolved.is_none()
+            && !has_this
+            && arg_types.len() == 1
+            && matches!(arg_types[0], Type::Float | Type::Double)
+            && self.is_convert_to_integer_native_intrinsic(method)
+        {
+            let value = args.pop().expect("the intrinsic's one argument");
+            let (to, unsigned) = match CorInfoType::from_raw(call.sig.retType()) {
+                Some(CorInfoType::Int) => (Type::Int32, false),
+                Some(CorInfoType::UInt) => (Type::Int32, true),
+                Some(CorInfoType::Long) => (Type::Int64, false),
+                Some(CorInfoType::ULong) => (Type::Int64, true),
+                _ => {
+                    return Err(CompileError::Unsupported(
+                        "ConvertToIntegerNative to a non-int/uint/long/ulong target",
+                    ))
+                }
+            };
+            return self.push(
+                to,
+                hir::Expr::Conv {
+                    to,
+                    overflow: false,
+                    unsigned,
+                    arg: Box::new(value),
+                },
+            );
+        }
         let target = match virtual_kind {
             None => CallTarget::Direct(method),
             Some(ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_VTABLE) => {
@@ -3286,6 +4176,29 @@ impl BlockImport<'_> {
         let class = self.ee.get_method_class(method);
         match self.ee.get_class_name_from_metadata(class) {
             Some((name, ns)) => name == "Volatile" && ns.as_deref() == Some("System.Threading"),
+            None => false,
+        }
+    }
+
+    /// Whether `method` is `System.Double.ConvertToIntegerNative<T>` /
+    /// `System.Single.ConvertToIntegerNative<T>` — the [Intrinsic] bit
+    /// plus the name match (as RyuJIT name-matches; see
+    /// `is_get_method_table_intrinsic`). The target type `T` is the
+    /// instantiated method's return type, read at the call site.
+    fn is_convert_to_integer_native_intrinsic(&self, method: MethodHandle) -> bool {
+        if !self.ee.is_intrinsic(method) {
+            return false;
+        }
+        if self.ee.get_method_name_from_metadata(method).as_deref()
+            != Some("ConvertToIntegerNative")
+        {
+            return false;
+        }
+        let class = self.ee.get_method_class(method);
+        match self.ee.get_class_name_from_metadata(class) {
+            Some((name, ns)) => {
+                matches!(name.as_str(), "Double" | "Single") && ns.as_deref() == Some("System")
+            }
             None => false,
         }
     }
@@ -4711,6 +5624,66 @@ impl BlockImport<'_> {
         Ok(())
     }
 
+    /// Pops the byte-count operand of `cpblk`/`initblk` (`unsigned int32`
+    /// or `native unsigned int`, ECMA-335 §III.4.9-10), normalized to
+    /// native width: an Int32 zero-extends (RyuJIT's `fromUnsigned` cast
+    /// of the size to TYP_LONG, importer.cpp:11166); a native int or an
+    /// i64 rides through (native width on x64, as in `localloc`).
+    fn pop_blk_size(&mut self) -> CompileResult<hir::Expr> {
+        let (ty, size) = self.pop()?;
+        match ty {
+            Type::NativeInt | Type::Int64 => Ok(size),
+            Type::Int32 => Ok(hir::Expr::Conv {
+                to: Type::NativeInt,
+                overflow: false,
+                unsigned: true,
+                arg: Box::new(size),
+            }),
+            _ => Err(CompileError::BadIl("block-op size must be an integer")),
+        }
+    }
+
+    /// `cpblk` (0xFE 17): copy `size` bytes from the source address to the
+    /// destination address (ECMA-335 §III.4.10). Unaligned copies are
+    /// legal; the IL itself adds no null checks — a bad pointer faults
+    /// like any bad byref (RyuJIT's plain store/helper-call shape,
+    /// importer.cpp:11110). The addresses are byrefs or native ints (the
+    /// `ldind` address rule).
+    fn cpblk(&mut self, stmts: &mut Vec<hir::Stmt>, il_offset: IlOffset) -> CompileResult<()> {
+        let size = self.pop_blk_size()?;
+        let src = self.pop_ind_addr()?;
+        let dst = self.pop_ind_addr()?;
+        self.spill_stack(stmts, il_offset)?;
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::BlockCopyDyn { dst, src, size },
+        });
+        Ok(())
+    }
+
+    /// `initblk` (0xFE 18): fill `size` bytes at the address with the low
+    /// byte of the int32 value (ECMA-335 §III.4.9 — the value is int32;
+    /// the MEMSET helper's `int` argument masks to the low byte). Same
+    /// no-null-check rule as `cpblk`.
+    fn initblk(&mut self, stmts: &mut Vec<hir::Stmt>, il_offset: IlOffset) -> CompileResult<()> {
+        let size = self.pop_blk_size()?;
+        let (vt, fill) = self.pop()?;
+        if vt != Type::Int32 {
+            return Err(CompileError::BadIl("initblk value must be int32"));
+        }
+        let addr = self.pop_ind_addr()?;
+        self.spill_stack(stmts, il_offset)?;
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::BlockFillDyn {
+                dst: addr,
+                fill,
+                size,
+            },
+        });
+        Ok(())
+    }
+
     /// `newobj` (0x73): allocate through the EE's `getNewHelper` helper
     /// (the `CORINFO_HELP_NEWFAST`/`NEWSFAST` families — the
     /// single-argument `(MethodTable*) -> Object*` forms), then run the
@@ -5450,15 +6423,22 @@ impl BlockImport<'_> {
     /// covariant array would bypass `stelem.ref`'s covariance check, so
     /// the helper null-checks, bounds-checks, and exact-element-type-
     /// checks (against the embedded class handle) itself — no separate
-    /// BoundsCheck.
+    /// BoundsCheck. With the `readonly.` prefix the address is load-only,
+    /// so the covariance check is skipped and the plain bounds-checked
+    /// path serves a reference element too (importer.cpp:7377).
     fn ldelema(
         &mut self,
         token: u32,
+        readonly: bool,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
         let (elem, _elem_class, mut resolved) = self.elem_kind_of(token)?;
         match elem {
+            ElemKind::Cell(Type::Ref, _, elem_size) if readonly => {
+                let addr = self.bounds_checked_addr(Type::Ref, elem_size, stmts, il_offset)?;
+                self.push(Type::ByRef, addr)
+            }
             ElemKind::Cell(Type::Ref, _, _) => {
                 let (it, index) = self.pop_index()?;
                 let array = self.pop_array()?;
@@ -5705,6 +6685,7 @@ impl BlockImport<'_> {
             let il_offset = IlOffset(insn.offset);
             match insn.op {
                 Op::Nop => {}
+                Op::Break => self.break_(&mut stmts, il_offset)?,
                 Op::LdArg(index) => {
                     let id = self.il_arg_id(u32::from(index))?;
                     let (ty, expr) = self.local_value_expr(id);
@@ -5737,11 +6718,15 @@ impl BlockImport<'_> {
                 Op::LdcR8(v) => self.push(Type::Double, hir::Expr::Const(Const::Double(v)))?,
                 Op::LdStr(token) => self.ldstr(token)?,
                 Op::LdToken(token) => self.ldtoken(token)?,
+                Op::MkRefAny(token) => self.mkrefany(token, &mut stmts, il_offset)?,
+                Op::RefAnyVal(token) => self.refanyval(token)?,
+                Op::RefAnyType => self.refanytype(&mut stmts, il_offset)?,
                 Op::SizeOf(token) => self.sizeof_(token)?,
                 Op::LdNull => self.push(Type::Ref, hir::Expr::Const(Const::NullRef))?,
                 Op::Dup => self.dup(&mut stmts, il_offset)?,
                 Op::Pop => self.pop_value(&mut stmts, il_offset)?,
                 Op::Binary(op) => self.arith(op)?,
+                Op::BinaryOvf(op, unsigned) => self.arith_ovf(op, unsigned)?,
                 Op::Shift(op) => self.shift(op)?,
                 Op::Compare(op) => self.compare(op)?,
                 Op::Unary(op) => {
@@ -5765,6 +6750,8 @@ impl BlockImport<'_> {
                     )?;
                 }
                 Op::Conv(kind) => self.conv(kind)?,
+                Op::ConvOvf(kind, un) => self.conv_ovf(kind, un)?,
+                Op::CkFinite => self.ckfinite()?,
                 Op::Call { token, constrained } => self.call(
                     token,
                     CallInfoFlags::EMPTY,
@@ -5802,7 +6789,9 @@ impl BlockImport<'_> {
                 Op::UnboxAny(token) => self.unbox_any(token)?,
                 Op::NewArr(token) => self.newarr(token, &mut stmts, il_offset)?,
                 Op::LdLen => self.ldlen()?,
-                Op::LdElemA(token) => self.ldelema(token, &mut stmts, il_offset)?,
+                Op::LdElemA { token, readonly } => {
+                    self.ldelema(token, readonly, &mut stmts, il_offset)?
+                }
                 Op::LdElemK(ty, access, size) => {
                     self.ldelem(ElemKind::Cell(ty, access, size), &mut stmts, il_offset)?
                 }
@@ -5819,6 +6808,9 @@ impl BlockImport<'_> {
                 }
                 Op::LdInd(ty, access) => self.ldind(ty, access)?,
                 Op::StInd(ty, access) => self.stind(ty, access, &mut stmts, il_offset)?,
+                Op::LocAlloc => self.localloc(insn.offset)?,
+                Op::CpBlk => self.cpblk(&mut stmts, il_offset)?,
+                Op::InitBlk => self.initblk(&mut stmts, il_offset)?,
                 Op::Br { target } => {
                     self.record_exit(target, &mut stmts, il_offset)?;
                     terminator = Some(hir::Terminator::Jump {
@@ -5907,8 +6899,19 @@ impl BlockImport<'_> {
                 Op::Ret => {
                     terminator = Some(self.ret(&mut stmts, il_offset)?);
                 }
+                Op::Switch { ref targets } => {
+                    terminator = Some(self.switch(
+                        targets,
+                        insn.offset + insn.size,
+                        &mut stmts,
+                        il_offset,
+                    )?);
+                }
                 Op::Throw => {
                     terminator = Some(self.throw(&mut stmts, il_offset)?);
+                }
+                Op::Rethrow => {
+                    terminator = Some(self.rethrow(&mut stmts, il_offset)?);
                 }
                 Op::Leave { target } => {
                     terminator = Some(self.leave(b, target, &mut stmts, il_offset)?);
@@ -6364,6 +7367,142 @@ mod tests {
         }
     }
 
+    // --- checked arithmetic (`add.ovf`..`sub.ovf.un`, 0xD6..=0xDB) ---
+
+    fn as_binary_ovf(e: &hir::Expr) -> (BinaryOp, bool, &hir::Expr, &hir::Expr) {
+        match e {
+            hir::Expr::BinaryOvf {
+                op,
+                unsigned,
+                lhs,
+                rhs,
+            } => (*op, *unsigned, lhs, rhs),
+            _ => panic!("expected Expr::BinaryOvf"),
+        }
+    }
+
+    #[test]
+    fn checked_arithmetic_ops_decode() {
+        // ldarg.0; ldarg.1; op; ret — each byte maps to its (op, unsigned)
+        // pair (opcode.def: D6 add.ovf, D7 add.ovf.un, D8 mul.ovf,
+        // D9 mul.ovf.un, DA sub.ovf, DB sub.ovf.un).
+        for (opcode, expected_op, unsigned) in [
+            (0xD6u8, BinaryOp::Add, false),
+            (0xD7, BinaryOp::Add, true),
+            (0xD8, BinaryOp::Mul, false),
+            (0xD9, BinaryOp::Mul, true),
+            (0xDA, BinaryOp::Sub, false),
+            (0xDB, BinaryOp::Sub, true),
+        ] {
+            let il = [0x02, 0x03, opcode, 0x2A];
+            let (ee, info) = fixture(
+                &il,
+                &sig(CorInfoType::Int, &[CorInfoType::Int, CorInfoType::Int]),
+                &[],
+            );
+            let m = import(&info, &ee).unwrap_or_else(|e| panic!("0x{opcode:02X}: {e:?}"));
+            let (op, un, lhs, rhs) = as_binary_ovf(return_value(&m, 0));
+            assert_eq!((op, un), (expected_op, unsigned), "0x{opcode:02X}");
+            assert_eq!(as_local(lhs), LocalId(0));
+            assert_eq!(as_local(rhs), LocalId(1));
+        }
+    }
+
+    #[test]
+    fn checked_arithmetic_is_integer_only() {
+        // Float operands are BadIl — unlike the unchecked forms, the
+        // checked ops have no float rows (ECMA-335 §III.1.5).
+        let il = [0x02, 0x03, 0xD6, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(
+                CorInfoType::Double,
+                &[CorInfoType::Double, CorInfoType::Double],
+            ),
+            &[],
+        );
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+        // Reference operands likewise (ldnull; ldnull; add.ovf.un).
+        let il = [0x14, 0x14, 0xD7, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+        // And int64 never mixes with int32 (the unchecked rule).
+        let il = [0x02, 0x03, 0xDA, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Long, &[CorInfoType::Int, CorInfoType::Long]),
+            &[],
+        );
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn checked_arithmetic_promotes_int32_nativeint() {
+        // ldarg.0; ldarg.1; add.ovf.un; ret with (int, nint): the Int32
+        // side zero-extends (the `.un` suffix) to native int, as `arith`
+        // does for its unsigned forms.
+        let (ee, info) = fixture(
+            &[0x02, 0x03, 0xD7, 0x2A],
+            &sig(
+                CorInfoType::NativeInt,
+                &[CorInfoType::Int, CorInfoType::NativeInt],
+            ),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (op, unsigned, lhs, rhs) = as_binary_ovf(return_value(&m, 0));
+        assert_eq!((op, unsigned), (BinaryOp::Add, true));
+        match lhs {
+            hir::Expr::Conv {
+                to: Type::NativeInt,
+                unsigned: true,
+                arg,
+                ..
+            } => assert_eq!(as_local(arg), LocalId(0)),
+            _ => panic!("expected the Int32 side zero-extended"),
+        }
+        assert_eq!(as_local(rhs), LocalId(1));
+        // The signed form sign-extends.
+        let (ee, info) = fixture(
+            &[0x02, 0x03, 0xD6, 0x2A],
+            &sig(
+                CorInfoType::NativeInt,
+                &[CorInfoType::Int, CorInfoType::NativeInt],
+            ),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (_, _, lhs, _) = as_binary_ovf(return_value(&m, 0));
+        match lhs {
+            hir::Expr::Conv {
+                to: Type::NativeInt,
+                unsigned: false,
+                ..
+            } => {}
+            _ => panic!("expected the Int32 side sign-extended"),
+        }
+    }
+
+    #[test]
+    fn pop_of_checked_arithmetic_still_evaluates() {
+        // ldarg.0; ldarg.1; mul.ovf; pop; ret — the tree can throw
+        // OverflowException, so `pop` evaluates it (the div/rem rule).
+        let il = [0x02, 0x03, 0xD8, 0x26, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Void, &[CorInfoType::Int, CorInfoType::Int]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(value) => {
+                let (op, unsigned, _, _) = as_binary_ovf(value);
+                assert_eq!((op, unsigned), (BinaryOp::Mul, false));
+            }
+            _ => panic!("expected StmtKind::Eval"),
+        }
+    }
+
     #[test]
     fn compare_branches_all_forms() {
         // ldarg.0; ldarg.1; bXX L; else: ldc.i4.0; ret; L: ldc.i4.1; ret.
@@ -6440,6 +7579,400 @@ mod tests {
                 _ => panic!("expected Branch"),
             }
         }
+    }
+
+    // --- switch (0x45) ---
+
+    /// ldarg.0; switch (C0, C1, C1) — N=3, two cases sharing a target.
+    /// Deltas are relative to the end of the offset table (offset 18).
+    ///
+    /// 0:  ldarg.0
+    /// 1:  switch 3 -> [+2, +4, +4]   (ends at 18)
+    /// 18: ldc.i4.3; ret              — the default (fallthrough)
+    /// 20: ldc.i4.0; ret              — case 0
+    /// 22: ldc.i4.1; ret              — cases 1 and 2
+    const SWITCH_IL: [u8; 24] = [
+        0x02, 0x45, 0x03, 0, 0, 0, 0x02, 0, 0, 0, 0x04, 0, 0, 0, 0x04, 0, 0, 0, 0x19, 0x2A, 0x16,
+        0x2A, 0x17, 0x2A,
+    ];
+
+    #[test]
+    fn switch_decodes_and_records_every_edge() {
+        let m = import_ii(&SWITCH_IL).expect("imports");
+        // Leaders: 0, 18 (default), 20 (case 0), 22 (cases 1/2).
+        assert_eq!(m.blocks.len(), 4);
+        match &m.blocks[0].terminator {
+            hir::Terminator::Switch {
+                value,
+                targets,
+                default,
+            } => {
+                assert_eq!(as_local(value), LocalId(0));
+                assert_eq!(*targets, vec![BlockId(2), BlockId(3), BlockId(3)]);
+                assert_eq!(*default, BlockId(1));
+            }
+            _ => panic!("expected Switch"),
+        }
+        assert_eq!(as_i32(return_value(&m, 1)), 3);
+        assert_eq!(as_i32(return_value(&m, 2)), 0);
+        assert_eq!(as_i32(return_value(&m, 3)), 1);
+    }
+
+    #[test]
+    fn switch_rejects_a_non_int32_operand() {
+        // `long f(long a)`: ldarg.0 pushes an Int64 — BadIl at the switch.
+        let il = [0x02, 0x45, 0, 0, 0, 0, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Long, &[CorInfoType::Long]), &[]);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn switch_rejects_a_misaligned_or_wild_target() {
+        // Case 0 lands mid-instruction (offset 19, the `ret` of the
+        // default block).
+        let mut il = SWITCH_IL;
+        il[6..10].copy_from_slice(&1i32.to_le_bytes());
+        assert!(matches!(import_ii(&il), Err(CompileError::BadIl(_))));
+        // A delta past the end of the IL stream fails at decode.
+        let mut il = SWITCH_IL;
+        il[6..10].copy_from_slice(&1000i32.to_le_bytes());
+        assert!(matches!(import_ii(&il), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn switch_records_distinct_edges_once() {
+        // A carried value under the selector: one join store on the edge
+        // even though the case target and the default coincide.
+        //
+        // 0:  ldarg.0            — the carried value
+        // 1:  ldarg.0            — the selector
+        // 2:  switch 1 -> [+0]   (ends at 11; case 0 == the default)
+        // 11: ldc.i4.1; add; ret
+        let il = [
+            0x02, 0x02, 0x45, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x17, 0x58, 0x2A,
+        ];
+        let m = import_ii(&il).expect("imports");
+        assert_eq!(m.blocks.len(), 2);
+        // b0: one store of the carried arg into the edge's join temp.
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1);
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!((dst, as_local(value)), (LocalId(1), LocalId(0)));
+        match &m.blocks[0].terminator {
+            hir::Terminator::Switch {
+                value,
+                targets,
+                default,
+            } => {
+                assert_eq!(as_local(value), LocalId(0));
+                assert_eq!(*targets, vec![BlockId(1)]);
+                assert_eq!(*default, BlockId(1));
+            }
+            _ => panic!("expected Switch"),
+        }
+        // The target block adds 1 to the join temp.
+        let (op, lhs, rhs) = as_binary(return_value(&m, 1));
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_local(lhs), LocalId(1));
+        assert_eq!(as_i32(rhs), 1);
+    }
+
+    // --- localloc (0xFE 0F) ---
+
+    #[test]
+    fn localloc_pushes_a_native_int() {
+        // `native int f()`: ldc.i4.5; localloc; ret — the Int32 count
+        // sign-extends to native width; the result is a NativeInt.
+        let il = [0x1B, 0xFE, 0x0F, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::NativeInt, &[]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::LocAlloc { size } => match size.as_ref() {
+                hir::Expr::Conv { to, arg, .. } => {
+                    assert_eq!(*to, Type::NativeInt);
+                    assert_eq!(as_i32(arg), 5);
+                }
+                _ => panic!("an Int32 count sign-extends to NativeInt"),
+            },
+            _ => panic!("expected Expr::LocAlloc"),
+        }
+    }
+
+    #[test]
+    fn localloc_accepts_native_int_and_i64_counts() {
+        // `native int f(native int n)`: ldarg.0; localloc; ret — already
+        // native width, no conversion node.
+        let il = [0x02, 0xFE, 0x0F, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::NativeInt, &[CorInfoType::NativeInt]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::LocAlloc { size } => assert_eq!(as_local(size), LocalId(0)),
+            _ => panic!("expected Expr::LocAlloc"),
+        }
+        // `native int f()`: ldc.i8 5; localloc; ret — an i64 count rides
+        // through untouched (native width on x64).
+        let il = [0x21, 5, 0, 0, 0, 0, 0, 0, 0, 0xFE, 0x0F, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::NativeInt, &[]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::LocAlloc { size } => {
+                assert!(matches!(size.as_ref(), hir::Expr::Const(Const::Int64(5))));
+            }
+            _ => panic!("expected Expr::LocAlloc"),
+        }
+    }
+
+    #[test]
+    fn localloc_rejects_a_non_integer_size() {
+        // ldc.r4 1.0; localloc — a float count is BadIl.
+        let il = [0x22, 0, 0, 0x80, 0x3F, 0xFE, 0x0F, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::NativeInt, &[]), &[]);
+        let err = import(&info, &ee).err().expect("float size");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("localloc")),
+            "{err:?}"
+        );
+        // An empty stack underflows.
+        let il = [0xFE, 0x0F, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::NativeInt, &[]), &[]);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn localloc_survives_pop_as_an_eval() {
+        // ldc.i4.8; localloc; pop; ret — the allocation is effectful (it
+        // moves rsp), so `pop` keeps it as an Eval statement.
+        let il = [0x1E, 0xFE, 0x0F, 0x26, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(
+            &stmts[0].kind,
+            hir::StmtKind::Eval(hir::Expr::LocAlloc { .. })
+        ));
+    }
+
+    #[test]
+    fn localloc_in_a_handler_is_bad_il_but_a_try_body_is_fine() {
+        // 0: nop; 1: leave.s +3 (-> 6); 3: ldc.i4.8; 4: localloc — the
+        // localloc sits in the catch handler (a funclet on the parent's
+        // rbp; a dynamic rsp adjustment there corrupts the parent frame).
+        let il = [0x00, 0xDE, 0x03, 0x1E, 0xFE, 0x0F, 0x2A];
+        let (ee, info) = eh_fixture(&il, &[], &[catch_clause(0, 3, 3, 3, 0x0200_0042)]);
+        let err = import(&info, &ee).err().expect("gated");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("localloc in an exception-handling block")),
+            "{err:?}"
+        );
+
+        // The same localloc in a TRY body (not a funclet) is allowed:
+        // 0: ldc.i4.8; 1: localloc; 3: pop; 4: leave.s +1 (-> 7);
+        // 6: endfinally; 7: ret — try [0,6), finally [6,7).
+        let il = [0x1E, 0xFE, 0x0F, 0x26, 0xDE, 0x01, 0xDC, 0x2A];
+        let (ee, info) = eh_fixture(&il, &[], &[finally_clause(0, 6, 6, 1)]);
+        let m = import(&info, &ee).expect("try-body localloc imports");
+        assert_eq!(m.eh_regions.len(), 1);
+    }
+
+    // --- cpblk/initblk (0xFE 17 / 0xFE 18) ---
+
+    #[test]
+    fn cpblk_imports_as_a_block_copy_dyn() {
+        // `void f()`: ldloca.s 0; ldloca.s 1; ldc.i4.4; cpblk; ret — the
+        // operands pop size, src, dst; the Int32 size zero-extends to
+        // native width (the size is unsigned).
+        let il = [0x12, 0x00, 0x12, 0x01, 0x1A, 0xFE, 0x17, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Void, &[]),
+            &[CorInfoType::Int, CorInfoType::Int],
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.blocks[0].stmts.len(), 1);
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::BlockCopyDyn { dst, src, size } => {
+                assert_eq!(as_local_addr(dst), LocalId(0));
+                assert_eq!(as_local_addr(src), LocalId(1));
+                match size {
+                    hir::Expr::Conv {
+                        to,
+                        unsigned: true,
+                        arg,
+                        ..
+                    } => {
+                        assert_eq!(*to, Type::NativeInt);
+                        assert_eq!(as_i32(arg), 4);
+                    }
+                    _ => panic!("an Int32 size zero-extends to NativeInt"),
+                }
+            }
+            _ => panic!("expected StmtKind::BlockCopyDyn"),
+        }
+    }
+
+    #[test]
+    fn cpblk_accepts_native_int_addresses_and_size() {
+        // `void f(native int dst, native int src, native int n)`:
+        // ldarg.0; ldarg.1; ldarg.2; cpblk; ret — native-int addresses
+        // pass, and the native-width size rides through with no conv.
+        let il = [0x02, 0x03, 0x04, 0xFE, 0x17, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(
+                CorInfoType::Void,
+                &[
+                    CorInfoType::NativeInt,
+                    CorInfoType::NativeInt,
+                    CorInfoType::NativeInt,
+                ],
+            ),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::BlockCopyDyn { dst, src, size } => {
+                assert_eq!(as_local(dst), LocalId(0));
+                assert_eq!(as_local(src), LocalId(1));
+                assert_eq!(as_local(size), LocalId(2));
+            }
+            _ => panic!("expected StmtKind::BlockCopyDyn"),
+        }
+    }
+
+    #[test]
+    fn cpblk_rejects_bad_operands() {
+        // A float address: ldc.r4 1.0; ldloca.s 0; ldc.i4.4; cpblk.
+        let il = [0x22, 0, 0, 0x80, 0x3F, 0x12, 0x00, 0x1A, 0xFE, 0x17, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[CorInfoType::Int]);
+        let err = import(&info, &ee).err().expect("a float dst address");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("byref or native int")),
+            "{err:?}"
+        );
+        // A reference source address: ldloca.s 0; ldnull; ldc.i4.4; cpblk.
+        let il = [0x12, 0x00, 0x14, 0x1A, 0xFE, 0x17, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[CorInfoType::Int]);
+        let err = import(&info, &ee).err().expect("a ref src address");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("byref or native int")),
+            "{err:?}"
+        );
+        // A float size: ldloca.s 0; ldloca.s 0; ldc.r4 1.0; cpblk.
+        let il = [
+            0x12, 0x00, 0x12, 0x00, 0x22, 0, 0, 0x80, 0x3F, 0xFE, 0x17, 0x2A,
+        ];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[CorInfoType::Int]);
+        let err = import(&info, &ee).err().expect("a float size");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("size must be an integer")),
+            "{err:?}"
+        );
+        // An empty stack underflows.
+        let il = [0xFE, 0x17, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[]);
+        assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
+    fn initblk_imports_as_a_block_fill_dyn() {
+        // `void f()`: ldloca.s 0; ldc.i4.s 42; ldc.i4.8; initblk; ret —
+        // addr, fill, size in IL push order; the size zero-extends.
+        let il = [0x12, 0x00, 0x1F, 0x2A, 0x1E, 0xFE, 0x18, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[CorInfoType::Int]);
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::BlockFillDyn { dst, fill, size } => {
+                assert_eq!(as_local_addr(dst), LocalId(0));
+                assert_eq!(as_i32(fill), 42);
+                assert!(matches!(
+                    size,
+                    hir::Expr::Conv {
+                        to: Type::NativeInt,
+                        unsigned: true,
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("expected StmtKind::BlockFillDyn"),
+        }
+    }
+
+    #[test]
+    fn initblk_rejects_a_non_int32_value() {
+        // `void f(native int a, native int v)`: ldarg.0; ldarg.1;
+        // ldc.i4.4; initblk — the fill value is int32 only (ECMA-335
+        // §III.4.9); a native int is BadIl.
+        let il = [0x02, 0x03, 0x1A, 0xFE, 0x18, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(
+                CorInfoType::Void,
+                &[CorInfoType::NativeInt, CorInfoType::NativeInt],
+            ),
+            &[],
+        );
+        let err = import(&info, &ee).err().expect("a native-int fill");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("initblk value must be int32")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn volatile_and_unaligned_prefixes_apply_to_cpblk_and_initblk() {
+        // ldloca.s 0; ldloca.s 1; ldc.i4.4; volatile. cpblk; ret — both
+        // prefixes are in RyuJIT's impValidateMemoryAccessOpcode set for
+        // cpblk/initblk (importer.cpp:5325) and change no emitted code.
+        let il = [0x12, 0x00, 0x12, 0x01, 0x1A, 0xFE, 0x13, 0xFE, 0x17, 0x2A];
+        let (ee, info) = fixture(
+            &il,
+            &sig(CorInfoType::Void, &[]),
+            &[CorInfoType::Int, CorInfoType::Int],
+        );
+        let m = import(&info, &ee).expect("volatile. cpblk imports");
+        assert!(matches!(
+            m.blocks[0].stmts[0].kind,
+            hir::StmtKind::BlockCopyDyn { .. }
+        ));
+        // ldloca.s 0; ldc.i4.0; ldc.i4.4; unaligned.1 initblk; ret.
+        let il = [0x12, 0x00, 0x16, 0x1A, 0xFE, 0x12, 0x01, 0xFE, 0x18, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[CorInfoType::Int]);
+        let m = import(&info, &ee).expect("unaligned. initblk imports");
+        assert!(matches!(
+            m.blocks[0].stmts[0].kind,
+            hir::StmtKind::BlockFillDyn { .. }
+        ));
+    }
+
+    #[test]
+    fn deferred_opcodes_reject_with_named_messages() {
+        // jmp (0x27) with its method-token operand; ret after — decode
+        // rejects by name.
+        let il = [0x27, 0x01, 0x00, 0x00, 0x06, 0x2A];
+        let err = import_ii(&il).err().expect("jmp is unsupported");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("jmp (tail-call transfer)")),
+            "{err:?}"
+        );
+        // arglist (0xFE 0x00); pop; ret.
+        let il = [0xFE, 0x00, 0x26, 0x2A];
+        let err = import_ii(&il).err().expect("arglist is unsupported");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("arglist (varargs)")),
+            "{err:?}"
+        );
+        // tail. (0xFE 0x14) before a ret.
+        let il = [0xFE, 0x14, 0x2A];
+        let err = import_ii(&il).err().expect("tail. is unsupported");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("tail. prefix (tail calls)")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -6938,12 +8471,12 @@ mod tests {
 
     #[test]
     fn unknown_opcodes_are_unsupported() {
-        // cpobj's byte neighbor, an undefined single byte, an unsupported
-        // 0xFE form.
+        // cpobj's byte neighbor, an undefined single byte, an undefined
+        // 0xFE form (0xFE 08 is a gap in opcode.def).
         for il in [
             &[0x77, 0x2A][..],
             &[0xFF, 0x2A][..],
-            &[0xFE, 0x17, 0x2A][..],
+            &[0xFE, 0x08, 0x2A][..],
         ] {
             assert!(
                 matches!(import_ii(il), Err(CompileError::Unsupported(_))),
@@ -7211,6 +8744,56 @@ mod tests {
     }
 
     #[test]
+    fn break_imports_as_the_user_breakpoint_helper() {
+        // break; ldc.i4.0; ret — a void no-arg helper Eval, then the
+        // constant return. `break` has no stack transition.
+        let il = [0x01, 0x16, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(call) => {
+                let (helper, sig, args) = as_helper_call(call);
+                assert_eq!(helper, CorInfoHelpFunc::USER_BREAKPOINT);
+                assert_eq!(
+                    sig,
+                    &CallSig {
+                        ret: Type::Void,
+                        args: vec![],
+                        has_this: false,
+                    }
+                );
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected the USER_BREAKPOINT helper Eval"),
+        }
+        assert_eq!(as_i32(return_value(&m, 0)), 0);
+    }
+
+    #[test]
+    fn break_spills_pending_trees_first() {
+        // ldarg.0; call fib; break; pop; ldc.i4.0; ret — the pending call
+        // tree spills to a temp before the helper runs (RyuJIT's
+        // SPILL_APPEND); the later pop of the temp read is pure.
+        let il = [0x02, 0x28, 0x01, 0x00, 0x00, 0x06, 0x01, 0x26, 0x16, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Int]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the spill store, then the break Eval");
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(1), "the spill temp follows the one arg");
+        assert!(matches!(value, hir::Expr::Call { .. }));
+        match &stmts[1].kind {
+            hir::StmtKind::Eval(call) => {
+                let (helper, _, _) = as_helper_call(call);
+                assert_eq!(helper, CorInfoHelpFunc::USER_BREAKPOINT);
+            }
+            _ => panic!("expected the USER_BREAKPOINT helper Eval"),
+        }
+    }
+
+    #[test]
     fn leave_forms_decode_and_import() {
         // nop; leave.s -3 (-> 0) — the negative-delta short form loops to
         // the method start. No enclosing region: a plain Leave. (One
@@ -7229,17 +8812,65 @@ mod tests {
     }
 
     #[test]
-    fn rethrow_and_endfilter_stay_unsupported() {
-        let err = import_ii(&[0xFE, 0x1A]).err().expect("rethrow");
-        assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("rethrow")),
-            "{err:?}"
-        );
+    fn endfilter_stays_unsupported() {
         let err = import_ii(&[0xFE, 0x11]).err().expect("endfilter");
         assert!(
             matches!(&err, CompileError::Unsupported(m) if m.contains("filter")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn rethrow_outside_a_catch_handler_is_bad_il() {
+        // No EH clauses at all.
+        let err = import_ii(&[0xFE, 0x1A, 0x16, 0x2A]).err().expect("rethrow");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("rethrow outside a catch handler")),
+            "{err:?}"
+        );
+        // Inside a TRY body but outside the handler: still BadIl.
+        // 0: rethrow; 2: leave.s +3 (-> 7); 4: pop; 5: leave.s +0 (-> 7);
+        // 7: ret — the clause's try covers [0,4), the handler [4,7).
+        let il = [0xFE, 0x1A, 0xDE, 0x03, 0x26, 0xDE, 0x00, 0x2A];
+        let (ee, info) = eh_fixture(&il, &[], &[catch_clause(0, 4, 4, 3, 0x0200_0042)]);
+        let err = import(&info, &ee).err().expect("rethrow in the try body");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("rethrow outside a catch handler")),
+            "{err:?}"
+        );
+        // Inside a FINALLY handler: BadIl too (only catches rethrow).
+        // 0: nop; 1: leave.s +3 (-> 6); 3: rethrow; 5: endfinally; 6: ret.
+        let il = [0x00, 0xDE, 0x03, 0xFE, 0x1A, 0xDC, 0x2A];
+        let (ee, info) = eh_fixture(&il, &[], &[finally_clause(0, 3, 3, 3)]);
+        let err = import(&info, &ee)
+            .err()
+            .expect("rethrow in a finally handler");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("rethrow outside a catch handler")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rethrow_in_a_catch_handler_ends_the_block() {
+        // 0: nop; 1: leave.s +3 (-> 6); 3: pop; 4: rethrow; 6: leave.s +0
+        // (-> 8); 8: ret — the catch pops the exception and rethrows.
+        let il = [0x00, 0xDE, 0x03, 0x26, 0xFE, 0x1A, 0xDE, 0x00, 0x2A];
+        let (ee, info) = eh_fixture(&il, &[], &[catch_clause(0, 3, 3, 5, 0x0200_0042)]);
+        let m = import(&info, &ee).expect("imports");
+        // The catch handler's entry block ends at the rethrow: just the
+        // synthesized exception-object store (the pop of the temp read is
+        // pure and vanishes), the Rethrow terminator — and NO fallthrough
+        // edge into the outer region (the next IL belongs to a different
+        // region).
+        let handler = m
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, hir::Terminator::Rethrow))
+            .expect("a block ends with Rethrow");
+        assert_eq!(handler.stmts.len(), 1, "the catch-arg store only");
+        let (_, value) = store(&handler.stmts[0]);
+        assert!(matches!(value, hir::Expr::CatchArg));
     }
 
     #[test]
@@ -8112,6 +9743,432 @@ mod tests {
     }
 
     #[test]
+    fn conv_r_un_imports_for_the_whole_numeric_matrix() {
+        // conv.r.un (0x76) of an i32 arg: a zero-extension to Int64
+        // composed with the SIGNED i64→f64 conversion (every u32 is exact
+        // in an f64).
+        let (ee, info) = fixture(
+            &[0x02, 0x76, 0x2A],
+            &sig(CorInfoType::Double, &[CorInfoType::Int]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Double);
+        assert!(!overflow && !unsigned);
+        let (to, _, unsigned, arg) = as_conv(arg);
+        assert_eq!(to, Type::Int64);
+        assert!(unsigned, "the inner widening zero-extends");
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // Of an i64 arg: the Conv node keeps the unsigned flag for the
+        // backend's branchy u64→f64 expansion.
+        let (ee, info) = fixture(
+            &[0x02, 0x76, 0x2A],
+            &sig(CorInfoType::Double, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Double);
+        assert!(!overflow && unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // Of a native-int arg: same unsigned 64-bit form.
+        let (ee, info) = fixture(
+            &[0x02, 0x76, 0x2A],
+            &sig(CorInfoType::Double, &[CorInfoType::NativeInt]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Double);
+        assert!(unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // Of a float arg: the plain conv.r8 widening — unsignedness is
+        // meaningless on a float source (RyuJIT clears GTF_UNSIGNED).
+        let (ee, info) = fixture(
+            &[0x02, 0x76, 0x2A],
+            &sig(CorInfoType::Double, &[CorInfoType::Float]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Double);
+        assert!(!unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // Of a double: the identity.
+        let (ee, info) = fixture(
+            &[0x02, 0x76, 0x2A],
+            &sig(CorInfoType::Double, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+    }
+
+    #[test]
+    fn conv_r_un_of_a_pointer_is_unsupported() {
+        // conv.r.un of a byref (ldloca.0): the conv() non-numeric gate.
+        let (ee, info) = fixture(
+            &[0x12, 0x00, 0x76, 0x2A],
+            &sig(CorInfoType::Double, &[]),
+            &[CorInfoType::Int],
+        );
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(_))
+        ));
+    }
+
+    /// A checked-conversion node as (stack type, dst bits, signed target,
+    /// unsigned source, arg).
+    fn as_conv_ovf(e: &hir::Expr) -> (Type, u32, bool, bool, &hir::Expr) {
+        match e {
+            hir::Expr::ConvOvf {
+                to,
+                dst_bits,
+                signed_dst,
+                unsigned_src,
+                arg,
+            } => (*to, *dst_bits, *signed_dst, *unsigned_src, arg),
+            _ => panic!("expected Expr::ConvOvf"),
+        }
+    }
+
+    #[test]
+    fn conv_ovf_decodes_the_whole_opcode_family() {
+        // Every conv.ovf.* opcode of an i64 arg: 0x82..=0x8B (the .un
+        // forms), 0xB3..=0xBA, 0xD4, 0xD5. The return type matches the
+        // conversion's stack type (ret type-checks against it).
+        for op in 0x82u8..=0x8B {
+            let il = [0x02, op, 0x2A];
+            let ret = match op {
+                0x85 | 0x89 => CorInfoType::Long,      // conv.ovf.i8.un/u8.un
+                0x8A | 0x8B => CorInfoType::NativeInt, // conv.ovf.i.un/u.un
+                _ => CorInfoType::Int,
+            };
+            let (ee, info) = fixture(&il, &sig(ret, &[CorInfoType::Long]), &[]);
+            import(&info, &ee).unwrap_or_else(|e| panic!("0x{op:02X} imports: {e:?}"));
+        }
+        for op in 0xB3u8..=0xBA {
+            let il = [0x02, op, 0x2A];
+            let ret = match op {
+                0xB9 | 0xBA => CorInfoType::Long, // conv.ovf.i8/u8
+                _ => CorInfoType::Int,
+            };
+            let (ee, info) = fixture(&il, &sig(ret, &[CorInfoType::Long]), &[]);
+            import(&info, &ee).unwrap_or_else(|e| panic!("0x{op:02X} imports: {e:?}"));
+        }
+        for (op, ret) in [
+            (0xD4, CorInfoType::NativeInt),
+            (0xD5, CorInfoType::NativeInt),
+        ] {
+            let il = [0x02, op, 0x2A];
+            let (ee, info) = fixture(&il, &sig(ret, &[CorInfoType::Long]), &[]);
+            import(&info, &ee).unwrap_or_else(|e| panic!("0x{op:02X} imports: {e:?}"));
+        }
+        // ckfinite (0xC3) of a double.
+        let (ee, info) = fixture(
+            &[0x02, 0xC3, 0x2A],
+            &sig(CorInfoType::Double, &[CorInfoType::Double]),
+            &[],
+        );
+        import(&info, &ee).expect("ckfinite imports");
+    }
+
+    #[test]
+    fn conv_ovf_contained_ranges_skip_the_check() {
+        // conv.ovf.i4 of an i32: the identity — no node at all.
+        let m = import_ii(&[0x02, 0xB7, 0x2A]).expect("conv.ovf.i4 of i32");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+
+        // conv.ovf.u4.un of an i32 (read unsigned): the identity too.
+        let m = import_ii(&[0x02, 0x88, 0x2A]).expect("conv.ovf.u4.un of i32");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+
+        // conv.ovf.i8 of an i32: the plain sign-extension (movsxd), no
+        // check — every i32 fits an i64.
+        let (ee, info) = fixture(
+            &[0x02, 0xB9, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Int]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int64);
+        assert!(!overflow && !unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // conv.ovf.i8.un of an i32 (read unsigned): the zero-extension.
+        let (ee, info) = fixture(
+            &[0x02, 0x85, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Int]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, unsigned, _) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int64);
+        assert!(unsigned);
+
+        // conv.ovf.u8.un of an i64: the identity (u64 ⊆ u64).
+        let (ee, info) = fixture(
+            &[0x02, 0x89, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+
+        // conv.ovf.u.un of an i32 (u32 → native uint): the plain
+        // zero-extension to NativeInt.
+        let (ee, info) = fixture(
+            &[0x02, 0x8B, 0x2A],
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Int]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, unsigned, _) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::NativeInt);
+        assert!(unsigned);
+    }
+
+    #[test]
+    fn conv_ovf_out_of_containment_builds_the_checked_node() {
+        // conv.ovf.i4 of an i64: checked, 32-bit signed target, signed
+        // source — the movsxd/cmp form at codegen.
+        let (ee, info) = fixture(
+            &[0x02, 0xB7, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, bits, signed_dst, unsigned_src, arg) = as_conv_ovf(return_value(&m, 0));
+        assert_eq!((to, bits), (Type::Int32, 32));
+        assert!(signed_dst && !unsigned_src);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // conv.ovf.i4.un of an i32 (read unsigned): checked — values
+        // above i32::MAX throw.
+        let m = import_ii(&[0x02, 0x84, 0x2A]).expect("conv.ovf.i4.un of i32");
+        let (_, bits, signed_dst, unsigned_src, _) = as_conv_ovf(return_value(&m, 0));
+        assert_eq!(bits, 32);
+        assert!(signed_dst && unsigned_src);
+
+        // conv.ovf.u4 of an i32: checked — negatives throw.
+        let m = import_ii(&[0x02, 0xB8, 0x2A]).expect("conv.ovf.u4 of i32");
+        let (_, bits, signed_dst, unsigned_src, _) = as_conv_ovf(return_value(&m, 0));
+        assert_eq!(bits, 32);
+        assert!(!signed_dst && !unsigned_src);
+
+        // conv.ovf.u1 of an i64: the 8-bit unsigned target, signed
+        // 64-bit source.
+        let (ee, info) = fixture(
+            &[0x02, 0xB4, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, bits, signed_dst, unsigned_src, _) = as_conv_ovf(return_value(&m, 0));
+        assert_eq!((to, bits), (Type::Int32, 8));
+        assert!(!signed_dst && !unsigned_src);
+
+        // conv.ovf.i2.un of an i64 (read unsigned): 16-bit signed
+        // target, unsigned source.
+        let (ee, info) = fixture(
+            &[0x02, 0x83, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (_, bits, signed_dst, unsigned_src, _) = as_conv_ovf(return_value(&m, 0));
+        assert_eq!(bits, 16);
+        assert!(signed_dst && unsigned_src);
+
+        // conv.ovf.i8.un of an i64 (u64 → i64): checked — values above
+        // i64::MAX throw.
+        let (ee, info) = fixture(
+            &[0x02, 0x85, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, bits, signed_dst, unsigned_src, _) = as_conv_ovf(return_value(&m, 0));
+        assert_eq!((to, bits), (Type::Int64, 64));
+        assert!(signed_dst && unsigned_src);
+
+        // conv.ovf.u8 of an i64: checked — negatives throw.
+        let (ee, info) = fixture(
+            &[0x02, 0xBA, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (_, bits, signed_dst, unsigned_src, _) = as_conv_ovf(return_value(&m, 0));
+        assert_eq!(bits, 64);
+        assert!(!signed_dst && !unsigned_src);
+
+        // conv.ovf.i of an i64: the identity on x64 (i8 semantics)…
+        let (ee, info) = fixture(
+            &[0x02, 0xD4, 0x2A],
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_local(return_value(&m, 0)), LocalId(0));
+
+        // …but conv.ovf.u of an i64 is checked (negatives throw).
+        let (ee, info) = fixture(
+            &[0x02, 0xD5, 0x2A],
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Long]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, bits, signed_dst, unsigned_src, _) = as_conv_ovf(return_value(&m, 0));
+        assert_eq!((to, bits), (Type::NativeInt, 64));
+        assert!(!signed_dst && !unsigned_src);
+    }
+
+    #[test]
+    fn conv_ovf_from_a_float_is_the_dbl2_ovf_helper() {
+        // conv.ovf.i4 of a double: CORINFO_HELP_DBL2INT_OVF(double) ->
+        // int (RyuJIT's fgCastRequiresHelper split, morph.cpp:413-436).
+        let (ee, info) = fixture(
+            &[0x02, 0xB7, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (helper, csig, args) = as_helper_call(return_value(&m, 0));
+        assert_eq!(helper, CorInfoHelpFunc::DBL2INT_OVF);
+        assert_eq!(csig.ret, Type::Int32);
+        assert_eq!(csig.args, &[Type::Double]);
+        assert_eq!(as_local(&args[0]), LocalId(0));
+
+        // conv.ovf.u8.un of a double: the .un suffix dies with the float
+        // source — the helper is chosen by TARGET (DBL2ULNG_OVF).
+        let (ee, info) = fixture(
+            &[0x02, 0x89, 0x2A],
+            &sig(CorInfoType::Long, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (helper, csig, _) = as_helper_call(return_value(&m, 0));
+        assert_eq!(helper, CorInfoHelpFunc::DBL2ULNG_OVF);
+        assert_eq!(csig.ret, Type::Int64);
+
+        // conv.ovf.i of a double: DBL2LNG_OVF, re-typed NativeInt.
+        let (ee, info) = fixture(
+            &[0x02, 0xD4, 0x2A],
+            &sig(CorInfoType::NativeInt, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (helper, csig, _) = as_helper_call(return_value(&m, 0));
+        assert_eq!(helper, CorInfoHelpFunc::DBL2LNG_OVF);
+        assert_eq!(csig.ret, Type::NativeInt);
+
+        // conv.ovf.u4 of a float32: the source widens to Double first
+        // (flowgraph.cpp:1334-1340).
+        let (ee, info) = fixture(
+            &[0x02, 0xB8, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Float]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (helper, _, args) = as_helper_call(return_value(&m, 0));
+        assert_eq!(helper, CorInfoHelpFunc::DBL2UINT_OVF);
+        let (to, _, _, arg) = as_conv(&args[0]);
+        assert_eq!(to, Type::Double);
+        assert_eq!(as_local(arg), LocalId(0));
+    }
+
+    #[test]
+    fn conv_ovf_small_target_from_a_float_converts_then_checks() {
+        // conv.ovf.u1 of a double (RyuJIT morph.cpp:347-371): the plain
+        // truncating double→Int32 conversion (NaN/out-of-range → the
+        // integer-indefinite INT_MIN, outside every small range), then
+        // the integer-domain checked narrow with a SIGNED source (the
+        // .un-ness dies with the float source).
+        let (ee, info) = fixture(
+            &[0x02, 0xB4, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (to, bits, signed_dst, unsigned_src, arg) = as_conv_ovf(return_value(&m, 0));
+        assert_eq!((to, bits), (Type::Int32, 8));
+        assert!(!signed_dst && !unsigned_src);
+        let (to, overflow, unsigned, arg) = as_conv(arg);
+        assert_eq!(to, Type::Int32);
+        assert!(!overflow && !unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // conv.ovf.i1.un of a float32: same shape (still signed source
+        // after the cvtt), the float NOT widened for the cvtt.
+        let (ee, info) = fixture(
+            &[0x02, 0x82, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Float]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (_, bits, signed_dst, unsigned_src, arg) = as_conv_ovf(return_value(&m, 0));
+        assert_eq!(bits, 8);
+        assert!(signed_dst && !unsigned_src);
+        let (to, _, _, arg) = as_conv(arg);
+        assert_eq!(to, Type::Int32);
+        assert_eq!(as_local(arg), LocalId(0));
+    }
+
+    #[test]
+    fn conv_ovf_of_a_pointer_is_unsupported() {
+        // conv.ovf.i4 of a byref (ldloca.0): the conv non-numeric gate.
+        let (ee, info) = fixture(
+            &[0x12, 0x00, 0xB7, 0x2A],
+            &sig(CorInfoType::Int, &[]),
+            &[CorInfoType::Int],
+        );
+        assert!(matches!(
+            import(&info, &ee),
+            Err(CompileError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn ckfinite_passes_the_value_through() {
+        // ckfinite of a double: a CkFinite node pushing the SAME type.
+        let (ee, info) = fixture(
+            &[0x02, 0xC3, 0x2A],
+            &sig(CorInfoType::Double, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::CkFinite { arg } => assert_eq!(as_local(arg), LocalId(0)),
+            _ => panic!("expected Expr::CkFinite"),
+        }
+
+        // Of a float32: same, at Float width.
+        let (ee, info) = fixture(
+            &[0x02, 0xC3, 0x2A],
+            &sig(CorInfoType::Float, &[CorInfoType::Float]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::CkFinite { arg } => assert_eq!(as_local(arg), LocalId(0)),
+            _ => panic!("expected Expr::CkFinite"),
+        }
+
+        // Of an integer: BadIl (ECMA-335 §III.3.16).
+        let m = import_ii(&[0x02, 0xC3, 0x2A]);
+        assert!(matches!(m, Err(CompileError::BadIl(_))));
+    }
+
+    #[test]
     fn ldnull_pushes_a_null_ref_and_branches_on_it() {
         // ldnull; stloc.0; ldloc.0; brfalse.s L; ldc.i4.1; ret; L: ldc.i4.2; ret
         // — a Ref local holding null, branched on directly.
@@ -8320,6 +10377,210 @@ mod tests {
         let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
         let err = import(&info, &ee).err().expect("rejected");
         assert!(matches!(err, CompileError::BadIl(m) if m.contains("did not resolve")));
+    }
+
+    // --- the TypedReference ops: mkrefany / refanyval / refanytype ---
+
+    const REFANY_TOKEN: u32 = 0x0200_0009;
+
+    /// A MockEe answering the two `get_builtin_class` queries the
+    /// TypedReference ops make: CLASSID_TYPED_BYREF (16 bytes, the data
+    /// cell a byref GC pointer, INTEGER_BYREF+INTEGER eightbytes) and
+    /// CLASSID_TYPE_HANDLE (the 8-byte RuntimeTypeHandle stand-in).
+    /// Returns the fixture plus the two class handles.
+    fn refany_fixture(il: &[u8]) -> (MockEe, MethodInfo, ClassHandle, ClassHandle) {
+        let (mut ee, info) = fixture(il, &sig(CorInfoType::Int, &[CorInfoType::Int]), &[]);
+        let typed_ref = ee.add_class(
+            16,
+            8,
+            &[(0, true)],
+            Some(rokajit_ee::mock::sysv_descriptor(&[
+                (
+                    ffi::SystemVClassificationType_SystemVClassificationTypeIntegerByRef,
+                    8,
+                ),
+                (
+                    ffi::SystemVClassificationType_SystemVClassificationTypeInteger,
+                    8,
+                ),
+            ])),
+        );
+        let handle_class = ee.add_class(
+            8,
+            8,
+            &[(0, false)],
+            Some(rokajit_ee::mock::sysv_descriptor(&[(
+                ffi::SystemVClassificationType_SystemVClassificationTypeInteger,
+                8,
+            )])),
+        );
+        ee.builtin_classes
+            .insert(CorInfoClassId::TypedByref.to_raw(), typed_ref);
+        ee.builtin_classes
+            .insert(CorInfoClassId::TypeHandle.to_raw(), handle_class);
+        (ee, info, typed_ref, handle_class)
+    }
+
+    /// Registers the canned element-type token the refany ops resolve.
+    fn refany_class_token(ee: &mut MockEe) {
+        let elem = ee.add_class(16, 8, &[], None);
+        ee.class_tokens.insert(REFANY_TOKEN, elem);
+    }
+
+    /// The embedded class-handle constant the mock cans for a token.
+    fn assert_embedded_handle(e: &hir::Expr, token: u32) {
+        assert!(
+            matches!(e, hir::Expr::Const(Const::NativeInt(v)) if *v == (0x7A7A_0000usize + token as usize) as isize),
+            "expected the embedded handle constant"
+        );
+    }
+
+    #[test]
+    fn mkrefany_builds_the_struct_temp_with_two_field_stores() {
+        // ldarga.s 0; mkrefany TK; pop; ldc.i4.0; ret.
+        let il = [0x0F, 0x00, 0xC6, 0x09, 0x00, 0x00, 0x02, 0x26, 0x16, 0x2A];
+        let (mut ee, info, typed_ref, _) = refany_fixture(&il);
+        refany_class_token(&mut ee);
+        let m = import(&info, &ee).expect("imports");
+
+        // The ldarga address spills into a byref temp first (an
+        // address-of form has no store-source shape), then two StoreInd
+        // statements into the fresh struct temp: the data pointer at
+        // offset 0, the embedded type handle at 8.
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(
+            stmts.len(),
+            3,
+            "the address spill, then the two field stores"
+        );
+        let (dst, value) = store(&stmts[0]);
+        assert_eq!(dst, LocalId(1));
+        assert_eq!(m.locals[1].ty, Type::ByRef);
+        assert!(matches!(value, hir::Expr::LocalAddr(id) if *id == LocalId(0)));
+        let temp = LocalId(2);
+        assert_eq!(m.locals[temp.0 as usize].ty, Type::Struct(typed_ref));
+        for (stmt, offset) in stmts[1..].iter().zip([0, 8]) {
+            let hir::StmtKind::StoreInd {
+                addr,
+                offset: off,
+                value,
+                access,
+            } = &stmt.kind
+            else {
+                panic!("expected a StoreInd, got {:?}", stmt.il_offset)
+            };
+            assert_eq!(*off, offset);
+            assert_eq!(*access, MemAccess::Natural);
+            assert!(matches!(addr, hir::Expr::LocalAddr(id) if *id == temp));
+            if offset == 0 {
+                assert!(matches!(value, hir::Expr::Local(id) if *id == LocalId(1)));
+            } else {
+                assert_embedded_handle(value, REFANY_TOKEN);
+            }
+        }
+        // The temp's class layout — byref cell at 0 — is in the side
+        // table (the GC-root reporting of the interior pointer).
+        let layout = &m.struct_layouts[&typed_ref];
+        assert_eq!(layout.gc_cells.len(), 1);
+        assert!(layout.gc_cells[0].is_byref);
+        assert_eq!(layout.gc_cells[0].offset, 0);
+    }
+
+    #[test]
+    fn mkrefany_of_a_non_pointer_operand_is_bad_il() {
+        // ldc.i4.0; mkrefany TK — RyuJIT tolerates TYP_INT here
+        // (SPECVIOLATION); tier 0 does not (unverifiable IL).
+        let il = [0x16, 0xC6, 0x09, 0x00, 0x00, 0x02, 0x26, 0x16, 0x2A];
+        let (mut ee, info, _, _) = refany_fixture(&il);
+        refany_class_token(&mut ee);
+        let err = import(&info, &ee).err().expect("rejected");
+        assert!(matches!(err, CompileError::BadIl(m) if m.contains("mkrefany")));
+    }
+
+    #[test]
+    fn refanytype_loads_the_type_field_and_calls_the_convert_helper() {
+        // ldarga.s 0; mkrefany TK; refanytype; pop; ldc.i4.0; ret.
+        let il = [
+            0x0F, 0x00, 0xC6, 0x09, 0x00, 0x00, 0x02, 0xFE, 0x1D, 0x26, 0x16, 0x2A,
+        ];
+        let (mut ee, info, typed_ref, handle_class) = refany_fixture(&il);
+        refany_class_token(&mut ee);
+        let m = import(&info, &ee).expect("imports");
+
+        // stmts: the address spill and the two mkrefany field stores,
+        // then the Eval of the discarded conversion call.
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 4);
+        let hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) = &stmts[3].kind else {
+            panic!("expected the Eval of the conversion helper call")
+        };
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::TYPEHANDLE_TO_RUNTIMETYPEHANDLE)
+        );
+        assert_eq!(sig.ret, Type::Struct(handle_class));
+        assert_eq!(sig.args, vec![Type::NativeInt]);
+        // The argument is the type-field load at offset 8 off the
+        // mkrefany temp.
+        let hir::Expr::Load {
+            addr,
+            offset: 8,
+            ty: Type::NativeInt,
+            access: MemAccess::Natural,
+        } = &args[0]
+        else {
+            panic!("expected the type-field load")
+        };
+        assert!(
+            matches!(&**addr, hir::Expr::LocalAddr(id) if m.locals[id.0 as usize].ty == Type::Struct(typed_ref))
+        );
+        assert!(m.struct_layouts.contains_key(&handle_class));
+    }
+
+    #[test]
+    fn refanyval_calls_getrefany_with_the_typedref_by_value() {
+        // ldarga.s 0; mkrefany TK; refanyval TK; pop; ldc.i4.0; ret.
+        let il = [
+            0x0F, 0x00, 0xC6, 0x09, 0x00, 0x00, 0x02, 0xC2, 0x09, 0x00, 0x00, 0x02, 0x26, 0x16,
+            0x2A,
+        ];
+        let (mut ee, info, typed_ref, _) = refany_fixture(&il);
+        refany_class_token(&mut ee);
+        let m = import(&info, &ee).expect("imports");
+
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 4, "the spill, two field stores, then the Eval");
+        let hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) = &stmts[3].kind else {
+            panic!("expected the Eval of the GETREFANY call")
+        };
+        assert!(matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::GETREFANY));
+        assert_eq!(sig.ret, Type::ByRef);
+        assert_eq!(sig.args, vec![Type::NativeInt, Type::Struct(typed_ref)]);
+        assert_embedded_handle(&args[0], REFANY_TOKEN);
+        // The TypedReference goes by value — the stack value IS the
+        // StructVal of the mkrefany temp.
+        let hir::Expr::StructVal { addr, class } = &args[1] else {
+            panic!("expected the StructVal argument")
+        };
+        assert_eq!(*class, typed_ref);
+        assert!(
+            matches!(&**addr, hir::Expr::LocalAddr(id) if m.locals[id.0 as usize].ty == Type::Struct(typed_ref))
+        );
+    }
+
+    #[test]
+    fn refanytype_and_refanyval_of_a_non_struct_operand_are_bad_il() {
+        // ldc.i4.0; refanytype / refanyval TK — the operand must be a
+        // TypedReference value.
+        let il = [0x16, 0xFE, 0x1D, 0x26, 0x16, 0x2A];
+        let (ee, info, _, _) = refany_fixture(&il);
+        let err = import(&info, &ee).err().expect("rejected");
+        assert!(matches!(err, CompileError::BadIl(m) if m.contains("TypedReference")));
+
+        let il = [0x16, 0xC2, 0x09, 0x00, 0x00, 0x02, 0x26, 0x16, 0x2A];
+        let (mut ee, info, _, _) = refany_fixture(&il);
+        refany_class_token(&mut ee);
+        let err = import(&info, &ee).err().expect("rejected");
+        assert!(matches!(err, CompileError::BadIl(m) if m.contains("refanyval")));
     }
 
     // --- step_10.2: the float pack ---
@@ -10548,6 +12809,75 @@ mod tests {
         ));
     }
 
+    /// `Double.ConvertToIntegerNative<int>(value)`: the self-recursive
+    /// [Intrinsic] body (Double.cs:670) must never compile — the importer
+    /// expands the call to the plain truncating conversion (the managed
+    /// DBL2*_OVF helpers call it after their range guard). The unsigned
+    /// target form keeps the `unsigned` flag for the saturating lowering.
+    #[test]
+    fn convert_to_integer_native_intrinsic_expands_to_the_conv() {
+        // ldarg.0; call ConvertToIntegerNative<int>; ret.
+        let il = [0x02, 0x28, 0x32, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Double]), &[]);
+        let handle = ee.add_method(0x0600_0032, sig(CorInfoType::Int, &[CorInfoType::Double]));
+        ee.method_name = Some("ConvertToIntegerNative".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            ("Double".into(), Some("System".into())),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let m = import(&info, &ee).expect("imports");
+        let (to, overflow, unsigned, arg) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int32);
+        assert!(!overflow && !unsigned);
+        assert_eq!(as_local(arg), LocalId(0));
+
+        // The uint instantiation: unsigned (saturating) flag set.
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Double]), &[]);
+        let handle = ee.add_method(0x0600_0032, sig(CorInfoType::UInt, &[CorInfoType::Double]));
+        ee.method_name = Some("ConvertToIntegerNative".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            ("Double".into(), Some("System".into())),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, unsigned, _) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int32);
+        assert!(unsigned);
+
+        // The ulong instantiation: Int64, unsigned.
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Long, &[CorInfoType::Double]), &[]);
+        let handle = ee.add_method(0x0600_0032, sig(CorInfoType::ULong, &[CorInfoType::Double]));
+        ee.method_name = Some("ConvertToIntegerNative".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            ("Double".into(), Some("System".into())),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let m = import(&info, &ee).expect("imports");
+        let (to, _, unsigned, _) = as_conv(return_value(&m, 0));
+        assert_eq!(to, Type::Int64);
+        assert!(unsigned);
+
+        // Without the [Intrinsic] bit the same shape is a plain call.
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Double]), &[]);
+        let handle = ee.add_method(0x0600_0032, sig(CorInfoType::Int, &[CorInfoType::Double]));
+        ee.method_name = Some("ConvertToIntegerNative".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            ("Double".into(), Some("System".into())),
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert!(matches!(
+            return_value(&m, 0),
+            hir::Expr::Call {
+                target: CallTarget::Direct(_),
+                ..
+            }
+        ));
+    }
+
     /// The name+shape match alone is not enough: without the EE's
     /// [Intrinsic] bit the same call is an ordinary direct call.
     #[test]
@@ -11865,6 +14195,67 @@ mod tests {
         assert!(
             matches!(&args[2], hir::Expr::Const(Const::NativeInt(v)) if *v == (0x7A7A_0000usize + ELEM_TOKEN as usize) as isize),
             "the element class handle embeds through embed_generic_handle"
+        );
+    }
+
+    #[test]
+    fn readonly_ldelema_of_a_reference_element_skips_the_helper() {
+        // readonly.; ldelema <a reference type> (importer.cpp:7377): the
+        // address is load-only, so the covariance check is skipped — the
+        // plain bounds-checked element-address path serves, exactly like a
+        // primitive element.
+        let t = tok(ELEM_TOKEN);
+        let il = [
+            0x02, 0x16, 0xFE, 0x1E, 0x8F, t[0], t[1], t[2], t[3], 0x0A, 0x16, 0x2A,
+        ];
+        let (mut ee, info) = array_fixture(
+            &il,
+            &sig(CorInfoType::Int, &[CorInfoType::Class]),
+            &[CorInfoType::ByRef],
+        );
+        let elem = ClassHandle::from_raw(0xE1EFusize as ffi::CORINFO_CLASS_HANDLE).unwrap();
+        ee.class_tokens.insert(ELEM_TOKEN, elem); // a reference type (the default)
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the bounds check, then the stloc");
+        let (array, index) = as_bounds_check(&stmts[0]);
+        assert_eq!(as_local(array), LocalId(0));
+        assert_eq!(as_i32(index), 0);
+        let (dst, value) = store(&stmts[1]);
+        assert_eq!(dst, LocalId(1), "the ByRef IL local");
+        let (_, _, elem_ty, elem_size) = as_arr_elem_addr(value);
+        assert_eq!(elem_ty, Type::Ref);
+        assert_eq!(elem_size, 8);
+    }
+
+    #[test]
+    fn readonly_before_a_call_is_accepted_and_ignored() {
+        // ldarg.0; readonly.; call fib; ret — the prefix is advisory
+        // before a call (RyuJIT's flag only feeds inlining decisions).
+        let t = tok(FIB_TOKEN);
+        let il = [0x02, 0xFE, 0x1E, 0x28, t[0], t[1], t[2], t[3], 0x2A];
+        let m = import_ii(&il).expect("imports");
+        let (sig, args) = as_call(return_value(&m, 0));
+        assert_eq!(sig.ret, Type::Int32);
+        assert_eq!(as_local(&args[0]), LocalId(0));
+    }
+
+    #[test]
+    fn readonly_before_anything_else_is_bad_il() {
+        // readonly.; ldc.i4.0 — the prefix's follower set is ldelema and
+        // the call opcodes only (importer.cpp:8975).
+        let err = import_ii(&[0xFE, 0x1E, 0x16, 0x2A])
+            .err()
+            .expect("readonly before ldc");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("readonly.")),
+            "{err:?}"
+        );
+        // A dangling readonly. prefix (no following instruction).
+        let err = import_ii(&[0xFE, 0x1E]).err().expect("dangling readonly");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("prefix with no following instruction")),
+            "{err:?}"
         );
     }
 

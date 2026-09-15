@@ -207,8 +207,8 @@ impl ClassQueries for MockEe {
             .push(format!("class_must_be_loaded_before_code_is_run({cls:?})"));
     }
 
-    fn get_builtin_class(&self, _class_id: CorInfoClassId) -> Option<ClassHandle> {
-        None
+    fn get_builtin_class(&self, class_id: CorInfoClassId) -> Option<ClassHandle> {
+        self.builtin_classes.get(&class_id.to_raw()).copied()
     }
 
     fn get_type_for_primitive_value_class(&self, cls: ClassHandle) -> Option<CorInfoType> {

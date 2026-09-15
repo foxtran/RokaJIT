@@ -49,6 +49,7 @@ OPCODE_DEF = WORKSPACE / "runtime" / "src" / "coreclr" / "inc" / "opcode.def"
 # Keep in sync with the decode() gate in crates/rokajit/src/import.rs.
 SUPPORTED = {
     0x00,                    # nop
+    0x01,                    # break
     *range(0x02, 0x06),      # ldarg.0..3
     *range(0x06, 0x0A),      # ldloc.0..3
     *range(0x0A, 0x0E),      # stloc.0..3
@@ -74,6 +75,7 @@ SUPPORTED = {
     *range(0x2E, 0x38),      # short conditional branches
     0x38, 0x39, 0x3A,        # br / brfalse / brtrue
     *range(0x3B, 0x45),      # long conditional branches
+    0x45,                    # switch
     *range(0x46, 0x51),      # ldind.i1/u1/i2/u2/i4/u4/i8/i/r4/r8/ref (10.13)
     *range(0x51, 0x58),      # stind.ref/i1/i2/i4/i8/r4/r8 (10.13)
     0x58, 0x59, 0x5A,        # add / sub / mul
@@ -92,8 +94,10 @@ SUPPORTED = {
     0x73,                    # newobj (step_10.4)
     0x74,                    # castclass (step_10.5)
     0x75,                    # isinst (step_10.5)
+    0x76,                    # conv.r.un
     0x79,                    # unbox (step_10.5)
     0x7A,                    # throw (step_10.6)
+    *range(0x82, 0x8C),      # conv.ovf.i1/i2/i4/i8/u1/u2/u4/u8/i/u .un (checked conv)
     0x7B,                    # ldfld (step_10.4)
     0x7C,                    # ldflda (step_10.4)
     0x7D,                    # stfld (step_10.4)
@@ -110,10 +114,16 @@ SUPPORTED = {
     0xA3,                    # ldelem (token form, step_10.8)
     0xA4,                    # stelem (token form, step_10.8)
     0xA5,                    # unbox.any (step_10.5)
+    *range(0xB3, 0xBB),      # conv.ovf.i1/u1/i2/u2/i4/u4/i8/u8 (checked conv)
+    0xC3,                    # ckfinite
+    0xC2,                    # refanyval (TypedReference)
+    0xC6,                    # mkrefany (TypedReference)
     0xD0,                    # ldtoken (step_10.10)
     0xD1,                    # conv.u2 (step_10.7)
     0xD2,                    # conv.u1 (step_10.7)
     0xD3,                    # conv.i (step_10.11, integer sources)
+    0xD4, 0xD5,              # conv.ovf.i / conv.ovf.u (checked conv)
+    *range(0xD6, 0xDC),      # add/sub/mul.ovf[.un] (checked arithmetic)
     0xDC,                    # endfinally (step_10.6)
     0xDD,                    # leave (step_10.6)
     0xDE,                    # leave.s (step_10.6)
@@ -124,13 +134,17 @@ SUPPORTED = {
 #   FE 01..05 = ceq, cgt, cgt.un, clt, clt.un
 #   FE 06 = ldftn, FE 07 = ldvirtftn (step_10.12)
 #   FE 09 = ldarg, FE 0A = ldarga, FE 0B = starg
-#   FE 0C = ldloc, FE 0D = ldloca, FE 0E = stloc
+#   FE 0C = ldloc, FE 0D = ldloca, FE 0E = stloc, FE 0F = localloc
 #   FE 12 = unaligned., FE 13 = volatile. (prefixes, step_10.13)
-#   FE 15 = initobj (step_10.9)
+#   FE 15 = initobj (step_10.9), FE 17 = cpblk, FE 18 = initblk
+#   FE 1A = rethrow, FE 1E = readonly. (prefix)
 #   FE 1C = sizeof (step_10.10)
+#   FE 16 = constrained. (step_11.3C)
+#   FE 1D = refanytype (TypedReference)
 SUPPORTED_FE = {
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x12, 0x13, 0x15, 0x1C,
+    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x12, 0x13, 0x15, 0x16, 0x17,
+    0x18, 0x1A, 0x1C, 0x1D, 0x1E,
 }
 
 # --- IL linear-scan operand-size tables -------------------------------------
@@ -138,11 +152,14 @@ SUPPORTED_FE = {
 # has a zero-byte operand. Only used to keep the linear scan in sync.
 OP4 = {0x28, 0x29, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x79, 0x7B,
        0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x8C, 0x8D, 0x8F, 0xA3, 0xA4,
-       0xA5, 0xC6, 0xD0}
+       0xA5, 0xC2, 0xC6, 0xD0}
 OP1 = {0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x1F}
 IMM = {0x20: 4, 0x21: 8, 0x22: 4, 0x23: 8}
 BRS = set(range(0x2B, 0x38))   # short branches: i8 operand
+BRS.add(0xDE)                  # leave.s: i8 operand
 BRL = set(range(0x38, 0x45))   # long branches: i32 operand
+BRL.add(0xDD)                  # leave: i32 operand
+FE_OP1 = {0x12}  # unaligned. takes a 1-byte alignment operand
 FE_OP2 = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E}
 FE_OP4 = {0x06, 0x07, 0x15, 0x16, 0x1C}
 
@@ -324,7 +341,9 @@ def il_opcodes(data, secs, rva):
             op2 = il[i]
             i += 1
             ops.add(0xFE00 | op2)
-            if op2 in FE_OP2:
+            if op2 in FE_OP1:
+                i += 1
+            elif op2 in FE_OP2:
                 i += 2
             elif op2 in FE_OP4:
                 i += 4
@@ -398,12 +417,18 @@ def scan_tests(results):
     return per_test, unmatched, sorted(anomalies)
 
 
-def unsupported_by_test(per_test):
-    """{test: frozenset of unsupported opcodes}. EH tests are no longer
-    excluded: step_10.6 implemented try/catch/finally, so EH-bearing
-    tests enter the unlock pool like any other."""
+def unsupported_by_test(per_test, results):
+    """{test: frozenset of unsupported opcodes} over FAILING tests only.
+
+    EH tests are no longer excluded: step_10.6 implemented
+    try/catch/finally, so EH-bearing tests enter the unlock pool like
+    any other. MATCH tests are excluded (step_11.1): an opcode already
+    passing under it unlocks nothing — counting MATCH tests inflated
+    every bucket with already-unlocked tests.
+    """
     return {t: frozenset(o for o in ops if not is_supported(o))
-            for t, (ops, _eh) in per_test.items()}
+            for t, (ops, _eh) in per_test.items()
+            if results.get(t) not in (None, "MATCH")}
 
 
 def greedy_ladder(unsup):
@@ -463,7 +488,7 @@ def main(argv=None):
     for a in anomalies:
         print(f"warning: {a}", file=sys.stderr)
 
-    pool = unsupported_by_test(per_test)
+    pool = unsupported_by_test(per_test, results)
     needs = {t: s for t, s in pool.items() if s}
 
     solo = Counter()       # tests whose ONLY unsupported opcode is X

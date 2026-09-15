@@ -370,7 +370,10 @@ fn float_jcc_tail(op: BinaryOp) -> CondCode {
 /// the offset [`rokajit::pipeline::GcRootSlot`] records. The outgoing
 /// stack-argument area (step_10.9) sits below every slot, addressed
 /// `[rsp + off]` at call sites; `frame_size` covers it, so `rsp ≡ 0
-/// (mod 16)` holds at every call as before.
+/// (mod 16)` holds at every call as before. A `localloc`'s dynamic `sub
+/// rsp` re-reserves this area below the allocated block (the result
+/// points `outgoing_bytes` above the new rsp), so the rsp-relative
+/// outgoing stores stay correct while localloc space is live.
 pub struct FrameLayout {
     pub slots: Vec<u32>,
     pub frame_size: u32,
@@ -710,7 +713,10 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
             // Join discipline: before an edge, every value becomes
             // frame-resident (before the compare, so the flag pair stays
             // adjacent — spills are `mov`s and don't clobber flags).
-            if matches!(stmt.kind, StmtKind::Branch { .. } | StmtKind::Jump { .. }) {
+            if matches!(
+                stmt.kind,
+                StmtKind::Branch { .. } | StmtKind::Jump { .. } | StmtKind::Switch { .. }
+            ) {
                 let moves = em.vs.spill_all();
                 em.apply(moves)?;
             }
@@ -741,10 +747,15 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
         // A block whose terminator lowered to a fallthrough (jump-to-next
         // elision) still ends in an edge: the successor must see the same
         // frame-resident state. After a `Return` there is no edge — nor
-        // after the EH terminals (Throw never returns; EndFinally and the
-        // catch-Leave return out of the funclet).
+        // after the EH terminals (Throw and Rethrow never return;
+        // EndFinally and the catch-Leave return out of the funclet).
         let terminal = match block.stmts.last().map(|s| &s.kind) {
-            Some(StmtKind::Return { .. } | StmtKind::Throw { .. } | StmtKind::EndFinally) => true,
+            Some(
+                StmtKind::Return { .. }
+                | StmtKind::Throw { .. }
+                | StmtKind::Rethrow
+                | StmtKind::EndFinally,
+            ) => true,
             Some(StmtKind::Leave { .. }) => in_catch,
             _ => false,
         };
@@ -1318,6 +1329,45 @@ impl<'a> Emitter<'a> {
         self.define_xmm(dst, width, SCRATCH_XMM_A)
     }
 
+    /// u64 → f32/f64 (`conv.r.un` of a 64-bit operand): RyuJIT's fixup
+    /// expansion (codegenxarch.cpp:7007), branchy because the encoder has
+    /// no cmov. A non-negative source converts with the plain signed
+    /// `cvtsi2s*`; a negative one converts `(src >> 1) | (src & 1)` — the
+    /// round-to-nearest-even-safe halving — then doubles the float. Both
+    /// GPR operands are OWNED scratch copies: the `and` destroys the
+    /// source copy, so a register-resident operand must never be touched
+    /// in place.
+    fn emit_cvt_u64_to_f(&mut self, width: FWidth, dst: XmmPlace, src: Src) -> CompileResult<()> {
+        let (ps, moves) = self.vs.take_scratch(&[]);
+        self.apply(moves)?;
+        let gs = gpr_of(ps)?;
+        let rm = self.rm_of(src, Width::W64, &[ps])?;
+        let rmi = match rm {
+            Rm::Reg(g) => Rmi::Reg(g),
+            Rm::Mem(m) => Rmi::Mem(m),
+        };
+        self.asm.mov(Width::W64, Rm::Reg(gs), rmi);
+        let pos = self.synthetic_label();
+        let done = self.synthetic_label();
+        self.asm.test(Width::W64, Rm::Reg(gs), Rmi::Reg(gs));
+        self.asm.jcc(CondCode::NotSign, pos);
+        let (pt, moves) = self.vs.take_scratch(&[ps]);
+        self.apply(moves)?;
+        let gt = gpr_of(pt)?;
+        self.asm.mov(Width::W64, Rm::Reg(gt), Rmi::Reg(gs));
+        self.asm.shift_imm(ShiftOp::Shr, Width::W64, Rm::Reg(gt), 1);
+        self.asm.and(Width::W64, Rm::Reg(gs), Rmi::Imm(1));
+        self.asm.or(Width::W64, Rm::Reg(gt), Rmi::Reg(gs));
+        self.asm.cvtsi2s(width, SCRATCH_XMM_A, Rm::Reg(gt), true);
+        self.asm
+            .arith_f(ArithFOp::Add, width, SCRATCH_XMM_A, RmX::Reg(SCRATCH_XMM_A));
+        self.asm.jmp(done);
+        self.asm.bind(pos);
+        self.asm.cvtsi2s(width, SCRATCH_XMM_A, Rm::Reg(gs), true);
+        self.asm.bind(done);
+        self.define_xmm(dst, width, SCRATCH_XMM_A)
+    }
+
     /// `cvttss2si`/`cvttsd2si` (`conv.i4`/`i8`/`u4` from a float):
     /// truncation toward zero; out-of-range/NaN → the "integer indefinite"
     /// value, matching RyuJIT's cast lowering.
@@ -1772,6 +1822,50 @@ impl<'a> Emitter<'a> {
         self.emit_call_lookup(None, addr, slot)
     }
 
+    /// A runtime-sized block copy (`cpblk`, `Inst::BlockCopyDyn`):
+    /// always the EE's `CORINFO_HELP_MEMCPY(dst, src, size)` call — with
+    /// a dynamic size there is no inline-threshold decision to take.
+    /// The pool spills first (any call's discipline), so the operand
+    /// reads below hit frame slots; the arguments then set up in
+    /// rdi/rsi/rdx like [`Emitter::emit_block_helper`].
+    fn emit_block_copy_dyn(
+        &mut self,
+        dst: BlockAddr,
+        src: BlockAddr,
+        size: Src,
+    ) -> CompileResult<()> {
+        let moves = self.vs.spill_registers();
+        self.apply(moves)?;
+        self.block_addr_into_reg(Gpr::Rdi, dst, 0)?;
+        self.block_addr_into_reg(Gpr::Rsi, src, 0)?;
+        let size = self.rmi_of(size)?;
+        self.asm.mov(Width::W64, Rm::Reg(Gpr::Rdx), size);
+        self.emit_helper_call(CorInfoHelpFunc::MEMCPY)
+    }
+
+    /// A runtime-sized block fill (`initblk`, `Inst::BlockFillDyn`):
+    /// always `CORINFO_HELP_MEMSET(dst, fill & 0xFF, size)` — the helper
+    /// takes a C `int` and fills with its low byte; the mask is explicit
+    /// here (an immediate folds it). Same spill and argument discipline
+    /// as [`Emitter::emit_block_copy_dyn`].
+    fn emit_block_fill_dyn(&mut self, dst: BlockAddr, fill: Src, size: Src) -> CompileResult<()> {
+        let moves = self.vs.spill_registers();
+        self.apply(moves)?;
+        self.block_addr_into_reg(Gpr::Rdi, dst, 0)?;
+        match self.rmi_of(fill)? {
+            Rmi::Imm(i) => self
+                .asm
+                .mov(Width::W32, Rm::Reg(Gpr::Rsi), Rmi::Imm(i & 0xFF)),
+            fill => {
+                self.asm.mov(Width::W32, Rm::Reg(Gpr::Rsi), fill);
+                self.asm.and(Width::W32, Rm::Reg(Gpr::Rsi), Rmi::Imm(0xFF));
+            }
+        }
+        let size = self.rmi_of(size)?;
+        self.asm.mov(Width::W64, Rm::Reg(Gpr::Rdx), size);
+        self.emit_helper_call(CorInfoHelpFunc::MEMSET)
+    }
+
     /// A block address into a specific ABI register (the block-helper
     /// argument setup): value reads and frame-slot `lea`s, no scratch.
     fn block_addr_into_reg(&mut self, reg: Gpr, addr: BlockAddr, disp: u32) -> CompileResult<()> {
@@ -1806,6 +1900,10 @@ impl<'a> Emitter<'a> {
     /// `mov [rsp + offset], src` — an outgoing scalar stack argument.
     /// A slot-resident source reloads through a scratch (no mem,mem
     /// form); a too-wide constant materializes (the wide-imm rule).
+    /// The store is rsp-relative even in a localloc frame: `localloc`'s
+    /// `sub rsp` re-reserves the outgoing area below the allocated block
+    /// (RyuJIT's FEATURE_FIXED_OUT_ARGS shape), so `[rsp + offset]` is
+    /// always the live outgoing slot.
     fn emit_store_stack_arg(&mut self, width: Width, offset: u32, src: Src) -> CompileResult<()> {
         let mem = Mem::base_disp(regs::STACK_POINTER, offset as i32);
         match self.wide_imm(width, src, &[])? {
@@ -1849,7 +1947,8 @@ impl<'a> Emitter<'a> {
 
     /// An outgoing stack-passed struct argument: `size` bytes from
     /// `[addr]` to `[rsp + offset]`, always inline (no helper call in
-    /// the middle of argument setup).
+    /// the middle of argument setup). rsp-relative like
+    /// [`Emitter::emit_store_stack_arg`].
     fn emit_copy_stack_arg(
         &mut self,
         addr: BlockAddr,
@@ -1870,6 +1969,83 @@ impl<'a> Emitter<'a> {
             );
         }
         Ok(())
+    }
+
+    /// `localloc` (`Inst::LocAlloc`): dynamic stack allocation in the main
+    /// frame, RyuJIT's FEATURE_FIXED_OUT_ARGS shape (genLclHeap,
+    /// codegenxarch.cpp:2806): the `sub rsp` covers the 16-rounded size
+    /// PLUS the frame's outgoing-argument area, and the result points
+    /// `outgoing_bytes` above the new rsp — so the outgoing stores, which
+    /// stay `[rsp + off]`-relative for the callee's sake, always land
+    /// below every localloc block, however many are live. The size goes
+    /// into a writable scratch copy and rounds up (`add 15; and -16` —
+    /// rsp stays 16-aligned, so call sites keep the SysV contract; a
+    /// negative size wraps huge, RyuJIT's unchecked behavior — no check).
+    /// The space is then zeroed through the EE's `CORINFO_HELP_MEMSET`
+    /// (the unconditional zero-init policy, same as the prolog's locals):
+    /// writing every byte from the lowest address up touches each fresh
+    /// guard page in order, subsuming RyuJIT's probe loop. The original
+    /// (unrounded) size is MEMSET's count — the argument registers are
+    /// claimed before the rounding clobbers the scratch.
+    fn emit_loc_alloc(&mut self, dst: Place, size: Src) -> CompileResult<()> {
+        if self.cur_funclet_sp.is_some() {
+            return Err(CompileError::Internal(
+                "localloc inside a funclet (the importer gates handler regions)",
+            ));
+        }
+        let Place::Val(t) = dst else {
+            return Err(CompileError::Internal(
+                "localloc destination is always a value",
+            ));
+        };
+        let outgoing = self.layout.outgoing_bytes;
+        // The MEMSET argument registers stay out of the scratch
+        // allocations below: the emission writes them itself.
+        let arg_regs = [Gpr::Rdi.phys(), Gpr::Rsi.phys(), Gpr::Rdx.phys()];
+        // A writable copy of the size in a scratch register.
+        let size_rmi = self.rmi_of(size)?;
+        let mut ex = arg_regs.to_vec();
+        if let Rmi::Reg(g) = size_rmi {
+            ex.push(g.phys());
+        }
+        let exclude = &self.scratch_exclude(&ex);
+        let (p, moves) = self.vs.take_scratch(exclude);
+        self.apply(moves)?;
+        let g = gpr_of(p)?;
+        self.asm.mov(Width::W64, Rm::Reg(g), size_rmi);
+        // Claim the argument registers (spilling any tracked temp), and
+        // keep the original size in rdx before the rounding clobbers it.
+        for reg in arg_regs {
+            let moves = self.vs.clobber(reg);
+            self.apply(moves)?;
+        }
+        self.asm.mov(Width::W64, Rm::Reg(Gpr::Rdx), Rmi::Reg(g));
+        self.asm.add(Width::W64, Rm::Reg(g), Rmi::Imm(15));
+        self.asm.and(Width::W64, Rm::Reg(g), Rmi::Imm(-16));
+        if outgoing != 0 {
+            // Re-reserve the outgoing area below the localloc block.
+            self.asm
+                .add(Width::W64, Rm::Reg(g), Rmi::Imm(i64::from(outgoing)));
+        }
+        self.asm
+            .sub(Width::W64, Rm::Reg(regs::STACK_POINTER), Rmi::Reg(g));
+        // dst := rsp + outgoing — the allocation's base, above the
+        // re-reserved outgoing area. The temp is NativeInt (never a GC
+        // root); the memset call's spill makes it frame-resident.
+        let exclude = &self.scratch_exclude(&arg_regs);
+        let (p, moves) = self.vs.take_scratch(exclude);
+        self.apply(moves)?;
+        let g2 = gpr_of(p)?;
+        self.asm
+            .lea(g2, Mem::base_disp(regs::STACK_POINTER, outgoing as i32));
+        self.define_temp_reg(t.0, g2)?;
+        // memset(rdi = rsp + outgoing, rsi = 0, rdx = size).
+        self.asm.lea(
+            Gpr::Rdi,
+            Mem::base_disp(regs::STACK_POINTER, outgoing as i32),
+        );
+        self.asm.mov(Width::W32, Rm::Reg(Gpr::Rsi), Rmi::Imm(0));
+        self.emit_helper_call(CorInfoHelpFunc::MEMSET)
     }
 
     fn emit_inst(&mut self, inst: &Inst) -> CompileResult<()> {
@@ -1898,6 +2074,7 @@ impl<'a> Emitter<'a> {
                 dst,
                 src,
             } => self.emit_cvt_int_to_f(width, src_w64, dst, src),
+            Inst::CvtU64ToF { width, dst, src } => self.emit_cvt_u64_to_f(width, dst, src),
             Inst::CvtFToInt {
                 src_width,
                 dst_w64,
@@ -1940,6 +2117,23 @@ impl<'a> Emitter<'a> {
                 self.asm.div(width, rm);
                 Ok(())
             }
+            Inst::ArithOvf {
+                op,
+                unsigned,
+                width,
+                dst,
+                lhs,
+                rhs,
+            } => self.emit_arith_ovf(op, unsigned, width, dst, lhs, rhs),
+            Inst::ConvOvf {
+                width_src,
+                width_dst,
+                signed_dst,
+                unsigned_src,
+                dst,
+                src,
+            } => self.emit_conv_ovf(width_src, width_dst, signed_dst, unsigned_src, dst, src),
+            Inst::CkFinite { width, dst, src } => self.emit_ckfinite(width, dst, src),
             Inst::Shift {
                 op,
                 width,
@@ -2031,6 +2225,8 @@ impl<'a> Emitter<'a> {
                 dst_disp,
                 size,
             } => self.emit_block_zero(dst, dst_disp, size),
+            Inst::BlockCopyDyn { dst, src, size } => self.emit_block_copy_dyn(dst, src, size),
+            Inst::BlockFillDyn { dst, fill, size } => self.emit_block_fill_dyn(dst, fill, size),
             Inst::Jcc { cc, target } => {
                 self.asm.jcc(cc, target);
                 Ok(())
@@ -2054,6 +2250,7 @@ impl<'a> Emitter<'a> {
                 );
                 Ok(())
             }
+            Inst::LocAlloc { dst, size } => self.emit_loc_alloc(dst, size),
             Inst::Leave => {
                 // Main-area epilog: the interruptible segment closes at
                 // the `leave` — from it on, rbp is the caller's, so
@@ -2685,6 +2882,287 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// Checked integer arithmetic (`add.ovf`/`sub.ovf`/`mul.ovf` and the
+    /// `.un` forms): the conditional-throw shape of
+    /// [`Emitter::emit_bounds_check`] — every register-resident value
+    /// spills FIRST (the OVERFLOW call is a throw edge, and its own spill
+    /// must not leave the value machine claiming slot residency the
+    /// no-throw path never wrote), then the op, then the no-overflow
+    /// conditional jump over the never-returning `CORINFO_HELP_OVERFLOW`
+    /// call (`OverflowException`); the trailing NOP keeps the call's
+    /// return address a valid in-region byte. `dst` is defined only on
+    /// the no-overflow edge (the op writes the flags, so nothing may
+    /// intervene between it and the `jcc` — the `Cmp` adjacency
+    /// contract). The overflow condition: the signed forms test OF
+    /// (`jno` over the call), the `.un` forms CF (`jnc` — carry for
+    /// `add`, borrow for `sub`). `Add`/`Sub` are the destructive
+    /// two-operand forms (`emit_arith`'s shape); `Mul` is the
+    /// one-operand `imul`/`mul` — `lhs` into `rax`, then `rdx:rax :=
+    /// rax * rhs` (the divisor discipline: `rhs` avoids the fixed pair),
+    /// and OF=CF set exactly on overflow, so the same `jcc` choice
+    /// serves both signednesses. The low half (`rax`) is the result.
+    fn emit_arith_ovf(
+        &mut self,
+        op: BinaryOp,
+        unsigned: bool,
+        width: Width,
+        dst: Place,
+        lhs: Src,
+        rhs: Src,
+    ) -> CompileResult<()> {
+        let Place::Val(t) = dst else {
+            return Err(CompileError::Internal(
+                "checked-arithmetic destination is always a value",
+            ));
+        };
+        let moves = self.vs.spill_registers();
+        self.apply(moves)?;
+        let no_overflow = if unsigned {
+            CondCode::UGe // jnc
+        } else {
+            CondCode::NotOverflow // jno
+        };
+        match op {
+            BinaryOp::Add | BinaryOp::Sub => {
+                let (d, moves) = self.vs.take_scratch(&[]);
+                self.apply(moves)?;
+                let dg = gpr_of(d)?;
+                let lhs_rmi = self.rmi_of(lhs)?;
+                self.asm.mov(width, Rm::Reg(dg), lhs_rmi);
+                let rhs_rmi = self.wide_imm(width, rhs, &[d])?;
+                match op {
+                    BinaryOp::Add => self.asm.add(width, Rm::Reg(dg), rhs_rmi),
+                    _ => self.asm.sub(width, Rm::Reg(dg), rhs_rmi),
+                }
+                let ok = self.synthetic_label();
+                self.asm.jcc(no_overflow, ok);
+                self.emit_helper_call(CorInfoHelpFunc::OVERFLOW)?;
+                self.asm.nop();
+                self.asm.bind(ok);
+                self.define_temp_reg(t.0, dg)
+            }
+            BinaryOp::Mul => {
+                self.emit_mov(width, Place::Reg(Gpr::Rax), lhs)?;
+                let moves = self.vs.clobber(Gpr::Rdx.phys());
+                self.apply(moves)?;
+                let rm = self.rm_of(rhs, width, &[Gpr::Rax.phys(), Gpr::Rdx.phys()])?;
+                if unsigned {
+                    self.asm.mul(width, rm);
+                } else {
+                    self.asm.imul1(width, rm);
+                }
+                let ok = self.synthetic_label();
+                self.asm.jcc(no_overflow, ok);
+                self.emit_helper_call(CorInfoHelpFunc::OVERFLOW)?;
+                self.asm.nop();
+                self.asm.bind(ok);
+                self.define_temp_reg(t.0, Gpr::Rax)
+            }
+            _ => Err(CompileError::Internal(
+                "checked arithmetic lowers Add/Sub/Mul only",
+            )),
+        }
+    }
+
+    /// Checked conversion (`conv.ovf.*`, integer sources): the
+    /// conditional-throw shape of [`Emitter::emit_arith_ovf`] — every
+    /// register-resident value spills FIRST, then an owned scratch copy of
+    /// the source carries the range check, a `jcc` skips the
+    /// never-returning `CORINFO_HELP_OVERFLOW` call, and the trailing NOP
+    /// keeps its return address in-region. `dst` is defined only on the
+    /// no-overflow edge. The check forms, by target and source:
+    ///
+    /// - small signed target (`i1`/`i2`, any source): the bias trick —
+    ///   `add src, 2^(d-1)` / `cmp src, 2^d - 1` / `jbe ok` reads the
+    ///   signed range as one unsigned compare;
+    /// - small unsigned target (`u1`/`u2`, any source): `cmp src, max` /
+    ///   `jbe ok` — the unsigned compare catches negative signed sources
+    ///   (they read huge) and `.un` sources alike;
+    /// - `i4` of a u32 / `u4` of an i32 (the equal-width cells): the
+    ///   32-bit sign bit must be clear (`test` / `jns ok`);
+    /// - `i4` of an i64: the value fits iff its low half sign-extends
+    ///   back to it (`movsxd tmp, src` / `cmp tmp, src` / `je ok`);
+    /// - `i4` of a u64 (`.un`): `cmp src, i32::MAX` / `jbe ok`;
+    /// - `u4` of a 64-bit source: the high half must be zero (`shr tmp,
+    ///   32` / `test` / `jz ok`) — a negative signed source reads
+    ///   all-ones there, the `.un` source's excess bits live there too;
+    /// - `i8`/`i` of a u64, `u8`/`u` of a signed source: the source's own
+    ///   sign bit must be clear (`test` / `jns ok`).
+    ///
+    /// The importer emits the node only for cells that can throw, so the
+    /// complement (same-width same-signedness, containments like i32→i8)
+    /// reaching here is an Internal error. After the check the result is
+    /// the shift-pair narrow (small targets), the low half (32-bit
+    /// targets), or the zero-extending/plain copy (64-bit targets).
+    fn emit_conv_ovf(
+        &mut self,
+        width_src: Width,
+        width_dst: u32,
+        signed_dst: bool,
+        unsigned_src: bool,
+        dst: Place,
+        src: Src,
+    ) -> CompileResult<()> {
+        let Place::Val(t) = dst else {
+            return Err(CompileError::Internal(
+                "checked-conversion destination is always a value",
+            ));
+        };
+        let moves = self.vs.spill_registers();
+        self.apply(moves)?;
+        let (ps, moves) = self.vs.take_scratch(&[]);
+        self.apply(moves)?;
+        let gs = gpr_of(ps)?;
+        let src_rm = self.rm_of(src, width_src, &[ps])?;
+        let src_rmi = match src_rm {
+            Rm::Reg(g) => Rmi::Reg(g),
+            Rm::Mem(m) => Rmi::Mem(m),
+        };
+        self.asm.mov(width_src, Rm::Reg(gs), src_rmi);
+        let ok = self.synthetic_label();
+        // The equal-width check cells are the signedness-mismatched ones
+        // (an unsigned source into a signed target or vice versa); the
+        // importer turns the rest into no-check identities. A wider
+        // source always checks.
+        match (width_dst, signed_dst, width_src, unsigned_src) {
+            (8 | 16, true, _, _) => {
+                let bias = 1i64 << (width_dst - 1);
+                let span = (1i64 << width_dst) - 1;
+                self.asm.add(width_src, Rm::Reg(gs), Rmi::Imm(bias));
+                self.asm.cmp(width_src, Rm::Reg(gs), Rmi::Imm(span));
+                self.asm.jcc(CondCode::ULe, ok);
+            }
+            (8 | 16, false, _, _) => {
+                let max = (1i64 << width_dst) - 1;
+                self.asm.cmp(width_src, Rm::Reg(gs), Rmi::Imm(max));
+                self.asm.jcc(CondCode::ULe, ok);
+            }
+            (32, s, Width::W32, un) if un == s => {
+                self.asm.test(Width::W32, Rm::Reg(gs), Rmi::Reg(gs));
+                self.asm.jcc(CondCode::NotSign, ok);
+            }
+            (32, true, Width::W64, false) => {
+                let (pt, moves) = self.vs.take_scratch(&[ps]);
+                self.apply(moves)?;
+                let gt = gpr_of(pt)?;
+                self.asm.movsxd(gt, Rm::Reg(gs));
+                self.asm.cmp(Width::W64, Rm::Reg(gt), Rmi::Reg(gs));
+                self.asm.jcc(CondCode::Eq, ok);
+            }
+            (32, true, Width::W64, true) => {
+                self.asm
+                    .cmp(Width::W64, Rm::Reg(gs), Rmi::Imm(i64::from(i32::MAX)));
+                self.asm.jcc(CondCode::ULe, ok);
+            }
+            (32, false, Width::W64, _) => {
+                let (pt, moves) = self.vs.take_scratch(&[ps]);
+                self.apply(moves)?;
+                let gt = gpr_of(pt)?;
+                self.asm.mov(Width::W64, Rm::Reg(gt), Rmi::Reg(gs));
+                self.asm
+                    .shift_imm(ShiftOp::Shr, Width::W64, Rm::Reg(gt), 32);
+                self.asm.test(Width::W64, Rm::Reg(gt), Rmi::Reg(gt));
+                self.asm.jcc(CondCode::Eq, ok);
+            }
+            (64, true, Width::W64, true) | (64, false, _, false) => {
+                self.asm.test(width_src, Rm::Reg(gs), Rmi::Reg(gs));
+                self.asm.jcc(CondCode::NotSign, ok);
+            }
+            _ => {
+                return Err(CompileError::Internal(
+                    "checked conversion in a no-check cell",
+                ))
+            }
+        }
+        self.emit_helper_call(CorInfoHelpFunc::OVERFLOW)?;
+        self.asm.nop();
+        self.asm.bind(ok);
+        // The result, from the unmodified source operand (the check may
+        // have clobbered the scratch copy).
+        match width_dst {
+            8 | 16 => {
+                let shift = 32 - width_dst;
+                let src_rmi = self.rmi_of(src)?;
+                self.asm.mov(Width::W32, Rm::Reg(gs), src_rmi);
+                self.asm
+                    .shift_imm(ShiftOp::Shl, Width::W32, Rm::Reg(gs), i64::from(shift));
+                let back = if signed_dst {
+                    ShiftOp::Sar
+                } else {
+                    ShiftOp::Shr
+                };
+                self.asm
+                    .shift_imm(back, Width::W32, Rm::Reg(gs), i64::from(shift));
+            }
+            // The low half (a 64-bit slot's low bytes read as W32; an
+            // immediate truncates — the inst.rs wide-imm rule).
+            32 => {
+                let src_rmi = self.rmi_of(src)?;
+                self.asm.mov(Width::W32, Rm::Reg(gs), src_rmi);
+            }
+            // A 32-bit source zero-extends (the surviving range is
+            // non-negative); a 64-bit source copies whole.
+            64 => {
+                let src_rmi = self.rmi_of(src)?;
+                self.asm.mov(width_src, Rm::Reg(gs), src_rmi);
+            }
+            _ => {
+                return Err(CompileError::Internal(
+                    "checked-conversion widths are 8/16/32/64",
+                ))
+            }
+        }
+        self.define_temp_reg(t.0, gs)
+    }
+
+    /// `ckfinite`: the conditional-throw shape of
+    /// [`Emitter::emit_conv_ovf`] over the value's exponent field — the
+    /// bits cross to a GPR (`movd`/`movq` from an XMM source, a plain
+    /// load for the frame-resident ones, an immediate for constants), the
+    /// exponent masks out (`and` with 0x7F80_0000 for f32; `shr 32` then
+    /// compare against 0x7FF0_0000 for f64 — codegenxarch.cpp:7082-7118),
+    /// and all-ones (±Inf/NaN) falls into the never-returning
+    /// `CORINFO_HELP_OVERFLOW` call (RyuJIT's SCK_ARITH_EXCPN helper,
+    /// flowgraph.cpp:3494). The value passes to `dst` unchanged on the
+    /// no-throw edge.
+    fn emit_ckfinite(&mut self, width: FWidth, dst: XmmPlace, src: XmmSrc) -> CompileResult<()> {
+        let moves = self.vs.spill_registers();
+        self.apply(moves)?;
+        let (ps, moves) = self.vs.take_scratch(&[]);
+        self.apply(moves)?;
+        let g = gpr_of(ps)?;
+        let w = match width {
+            FWidth::S => Width::W32,
+            FWidth::D => Width::W64,
+        };
+        match src {
+            XmmSrc::Reg(x) => self.asm.mov_xmm_to_gpr(width, g, x),
+            XmmSrc::Val(v) => match self.vs.read(v.0) {
+                ReadSrc::Slot(off) => {
+                    self.asm.mov(w, Rm::Reg(g), Rmi::Mem(self.slot_mem(off)));
+                }
+                _ => return Err(CompileError::Internal("float value not slot-resident")),
+            },
+            XmmSrc::Bits(bits) => self.asm.mov(w, Rm::Reg(g), Rmi::Imm(bits as i64)),
+        }
+        let ok = self.synthetic_label();
+        match width {
+            FWidth::S => {
+                self.asm.and(Width::W32, Rm::Reg(g), Rmi::Imm(0x7F80_0000));
+                self.asm.cmp(Width::W32, Rm::Reg(g), Rmi::Imm(0x7F80_0000));
+            }
+            FWidth::D => {
+                self.asm.shift_imm(ShiftOp::Shr, Width::W64, Rm::Reg(g), 32);
+                self.asm.cmp(Width::W32, Rm::Reg(g), Rmi::Imm(0x7FF0_0000));
+            }
+        }
+        self.asm.jcc(CondCode::Ne, ok);
+        self.emit_helper_call(CorInfoHelpFunc::OVERFLOW)?;
+        self.asm.nop();
+        self.asm.bind(ok);
+        self.emit_mov_f(width, dst, src)
+    }
+
     /// A direct IL call: spill every register-resident temp (the pool is
     /// caller-saved), resolve the target through the EE, emit the call, and
     /// record the safepoint + relocation for 07.7. Two machine forms:
@@ -2805,7 +3283,8 @@ mod tests {
     //! -b binary -m i386:x86-64` (the fib test comments carry the
     //! disassembly). Methods: a trivial return, a call (stack-alignment
     //! check), a branch join (deterministic spill-state check), a `rem`
-    //! (idiv fixed-register sequence), GC-slot residency, and fib's exact
+    //! (idiv fixed-register sequence), a `conv.r.un` (the branchy
+    //! u64→f64 expansion), GC-slot residency, and fib's exact
     //! IL bytes end to end through the pipeline.
 
     use super::*;
@@ -3849,6 +4328,63 @@ mod tests {
         assert_eq!(out.code.hot.bytes, expected);
     }
 
+    /// `double m(long a) => (double)(ulong)a` — `conv.r.un` of a 64-bit
+    /// operand: the branchy CvtU64ToF expansion (the negative path halves
+    /// with the round-bit fold and doubles the float result).
+    #[test]
+    fn conv_r_un_method_bytes() {
+        let m = method(
+            vec![
+                local(Type::Int64, LocalKind::IlArg(0)),
+                local(Type::Double, LocalKind::Temp),
+            ],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Conv {
+                        dst: LocalId(1),
+                        to: Type::Double,
+                        overflow: false,
+                        unsigned: true,
+                        src: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg spill
+            // --- CvtU64ToF: rax = owned copy of the source ---
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax
+            0x48, 0x85, 0xC0, // testq %rax, %rax
+            0x0F, 0x89, 0x1C, 0x00, 0x00, 0x00, // jns pos (0x35)
+            // negative: convert (src >> 1) | (src & 1), then double
+            0x48, 0x89, 0xC1, // movq %rax, %rcx
+            0x48, 0xD1, 0xE9, // shrq $1, %rcx
+            0x48, 0x83, 0xE0, 0x01, // andq $1, %rax
+            0x48, 0x09, 0xC1, // orq %rax, %rcx
+            0xF2, 0x4C, 0x0F, 0x2A, 0xF9, // cvtsi2sd %rcx, %xmm15
+            0xF2, 0x45, 0x0F, 0x58, 0xFF, // addsd %xmm15, %xmm15
+            0xE9, 0x05, 0x00, 0x00, 0x00, // jmp done (0x3a)
+            // pos:
+            0xF2, 0x4C, 0x0F, 0x2A, 0xF8, // cvtsi2sd %rax, %xmm15
+            // done: define the double temp, then the return value
+            0xF2, 0x44, 0x0F, 0x11, 0x7D, 0xF0, // movsd %xmm15, -16(%rbp)
+            0xF2, 0x0F, 0x10, 0x45, 0xF0, // movsd -16(%rbp), %xmm0
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
     /// `int m(int n) { return n % 3; }` — the idiv fixed-register
     /// sequence, with the immediate divisor materialized clear of rax/rdx.
     #[test]
@@ -4146,6 +4682,136 @@ mod tests {
         assert_eq!(out.relocations.len(), 1);
     }
 
+    /// `cpblk` — a runtime-sized copy is always the `CORINFO_HELP_MEMCPY`
+    /// call (no inline-threshold decision on a dynamic size): the pool
+    /// spills, the arguments reload from their slots into rdi/rsi/rdx.
+    #[test]
+    fn cpblk_dyn_uses_memcpy_helper() {
+        let m = method(
+            vec![
+                local(Type::NativeInt, LocalKind::IlArg(0)),
+                local(Type::NativeInt, LocalKind::IlArg(1)),
+                local(Type::NativeInt, LocalKind::IlArg(2)),
+            ],
+            3,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BlockCopyDyn {
+                        dst_addr: Operand::Local(LocalId(0)),
+                        src_addr: Operand::Local(LocalId(1)),
+                        size: Operand::Local(LocalId(2)),
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        // Slots: the three NativeInt args at 8, 16, 24; frame rounds to 32.
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg spills
+            0x48, 0x89, 0x75, 0xF0, // movq %rsi, -16(%rbp)
+            0x48, 0x89, 0x55, 0xE8, // movq %rdx, -24(%rbp)
+            0x48, 0x8B, 0x7D, 0xF8, // movq -8(%rbp), %rdi  — memcpy dst
+            0x48, 0x8B, 0x75, 0xF0, // movq -16(%rbp), %rsi — memcpy src
+            0x48, 0x8B, 0x55, 0xE8, // movq -24(%rbp), %rdx — memcpy size
+            0xE8, 0, 0, 0, 0, // call rel32 (MEMCPY)
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].method, None, "a helper call site");
+        assert_eq!(out.relocations.len(), 1);
+    }
+
+    /// `initblk` — always `CORINFO_HELP_MEMSET(dst, fill & 0xFF, size)`:
+    /// a slot-resident fill reloads and masks (`and $0xFF`); an immediate
+    /// fill folds the mask into the constant.
+    #[test]
+    fn initblk_dyn_masks_the_fill_byte() {
+        let m = method(
+            vec![
+                local(Type::NativeInt, LocalKind::IlArg(0)),
+                int_arg(1),
+                local(Type::NativeInt, LocalKind::IlArg(2)),
+            ],
+            3,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BlockFillDyn {
+                        dst_addr: Operand::Local(LocalId(0)),
+                        fill: Operand::Local(LocalId(1)),
+                        size: Operand::Local(LocalId(2)),
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        // Slots: NativeInt arg 0 at 8, Int32 arg 1 at 12, NativeInt arg 2
+        // at 24; frame rounds to 32.
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg spills
+            0x89, 0x75, 0xF4, // movl %esi, -12(%rbp)
+            0x48, 0x89, 0x55, 0xE8, // movq %rdx, -24(%rbp)
+            0x48, 0x8B, 0x7D, 0xF8, // movq -8(%rbp), %rdi  — memset dst
+            0x8B, 0x75, 0xF4, // movl -12(%rbp), %esi     — the fill
+            0x81, 0xE6, 0xFF, 0, 0, 0, // andl $0xFF, %esi  — low byte
+            0x48, 0x8B, 0x55, 0xE8, // movq -24(%rbp), %rdx — memset size
+            0xE8, 0, 0, 0, 0, // call rel32 (MEMSET)
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].method, None, "a helper call site");
+
+        // An immediate fill folds the mask: 0x1AB becomes 0xAB.
+        let m = method(
+            vec![local(Type::NativeInt, LocalKind::IlArg(0))],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BlockFillDyn {
+                        dst_addr: Operand::Local(LocalId(0)),
+                        fill: Operand::Const(Const::Int32(0x1AB)),
+                        size: Operand::Const(Const::NativeInt(24)),
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg spill
+            0x48, 0x8B, 0x7D, 0xF8, // movq -8(%rbp), %rdi  — memset dst
+            0xBE, 0xAB, 0, 0, 0, // movl $0xAB, %esi        — mask folded
+            0x48, 0xC7, 0xC2, 24, 0, 0, 0, // movq $24, %rdx — memset size
+            0xE8, 0, 0, 0, 0, // call rel32 (MEMSET)
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
     /// Seven integer arguments: the seventh stores into the outgoing
     /// stack area at [rsp], sized into the frame.
     #[test]
@@ -4191,6 +4857,124 @@ mod tests {
             0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax  — the stack arg
             0x89, 0x04, 0x24, // movl %eax, (%rsp)
             0xE8, 0, 0, 0, 0, // call rel32
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(out.frame.frame_size, 32);
+    }
+
+    /// `localloc(40)`: the size materializes into a scratch, rounds up to
+    /// 16 (`add 15; and -16`), `sub rsp` allocates, the base goes to the
+    /// destination temp (`lea [rsp + outgoing]`, and the MEMSET helper
+    /// zero-init call follows (rdi = the base, rsi = 0, rdx = the
+    /// original size).
+    #[test]
+    fn localloc_method_bytes() {
+        let m = method(
+            vec![local(Type::NativeInt, LocalKind::Temp)],
+            0,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::LocAlloc {
+                        dst: LocalId(0),
+                        size: Operand::Const(Const::NativeInt(40)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(0))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0xC7, 0xC0, 40, 0, 0, 0, // movq $40, %rax — the size
+            0x48, 0x89, 0xC2, // movq %rax, %rdx — original size for memset
+            0x48, 0x83, 0xC0, 0x0F, // addq $15, %rax
+            0x48, 0x83, 0xE0, 0xF0, // andq $-16, %rax
+            0x48, 0x29, 0xC4, // subq %rax, %rsp — the allocation
+            0x48, 0x8D, 0x0C, 0x24, // leaq (%rsp), %rcx — dst := the base
+            0x48, 0x8D, 0x3C, 0x24, // leaq (%rsp), %rdi — memset dst
+            0xBE, 0, 0, 0, 0, // movl $0, %esi — memset fill
+            0x48, 0x89, 0x4D, 0xF8, // movq %rcx, -8(%rbp) — call spill
+            0xE8, 0, 0, 0, 0, // call MEMSET (patched by 07.7)
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax — the result
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        // The memset call is a recorded helper safepoint.
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].method, None);
+    }
+
+    /// An outgoing stack argument after a `localloc`: the store is
+    /// `[rsp + off]`-relative (the callee reads its stack args off the
+    /// current rsp), and the localloc's `sub rsp` has re-reserved the
+    /// 16-byte outgoing area below the allocated block — the store lands
+    /// below the block, not inside it.
+    #[test]
+    fn stack_arg_after_localloc_stays_below_the_block() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let sig = CallSig {
+            ret: Type::Void,
+            args: vec![Type::Int32; 7],
+            has_this: false,
+        };
+        let m = method(
+            vec![local(Type::NativeInt, LocalKind::Temp)],
+            0,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::LocAlloc {
+                        dst: LocalId(0),
+                        size: Operand::Const(Const::NativeInt(40)),
+                    }),
+                    stmt(StmtKind::Call {
+                        dst: None,
+                        target: rokajit::ir::CallTarget::Direct(f),
+                        sig,
+                        args: vec![Operand::Const(Const::Int32(1)); 7],
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &ee);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp (slot + 16 outgoing)
+            0x48, 0xC7, 0xC0, 40, 0, 0, 0, // movq $40, %rax
+            0x48, 0x89, 0xC2, // movq %rax, %rdx
+            0x48, 0x83, 0xC0, 0x0F, // addq $15, %rax
+            0x48, 0x83, 0xE0, 0xF0, // andq $-16, %rax
+            0x48, 0x83, 0xC0, 0x10, // addq $16, %rax — outgoing re-reserve
+            0x48, 0x29, 0xC4, // subq %rax, %rsp
+            0x48, 0x8D, 0x4C, 0x24, 0x10, // leaq 16(%rsp), %rcx — the base
+            0x48, 0x8D, 0x7C, 0x24, 0x10, // leaq 16(%rsp), %rdi — memset dst
+            0xBE, 0, 0, 0, 0, // movl $0, %esi
+            0x48, 0x89, 0x4D, 0xF8, // movq %rcx, -8(%rbp) — spill
+            0xE8, 0, 0, 0, 0, // call MEMSET
+            0xBF, 1, 0, 0, 0, // movl $1, %edi
+            0xBE, 1, 0, 0, 0, // movl $1, %esi
+            0xBA, 1, 0, 0, 0, // movl $1, %edx
+            0xB9, 1, 0, 0, 0, // movl $1, %ecx
+            0x41, 0xB8, 1, 0, 0, 0, // movl $1, %r8d
+            0x41, 0xB9, 1, 0, 0, 0, // movl $1, %r9d
+            0xC7, 0x04, 0x24, 1, 0, 0, 0, // movl $1, (%rsp) — stack arg
+            0xE8, 0, 0, 0, 0, // call f (patched by 07.7)
             0xC9, // leave
             0xC3, // ret
         ];
@@ -4709,6 +5493,69 @@ mod tests {
             0xC9, 0xC3,
             // B2 (offset 49): return 1
             0xB8, 0x01, 0, 0, 0, // movl $1, %eax
+            0xC9, 0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `int m(int a)` — `switch (a) { case 0: return 1; case 1: return 2;
+    /// default: return 0; }`: the compare chain (one `cmp`/`je` per case,
+    /// then the default `jmp`; out-of-range falls through the `je`s).
+    #[test]
+    fn switch_method_bytes() {
+        let m = method(
+            vec![int_arg(0)],
+            1,
+            0,
+            vec![
+                block(
+                    0,
+                    vec![stmt(StmtKind::Switch {
+                        value: Operand::Local(LocalId(0)),
+                        targets: vec![BlockId(2), BlockId(3)],
+                        default: BlockId(1),
+                    })],
+                ),
+                block(
+                    1,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Const(Const::Int32(0))),
+                    })],
+                ),
+                block(
+                    2,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Const(Const::Int32(1))),
+                    })],
+                ),
+                block(
+                    3,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Const(Const::Int32(2))),
+                    })],
+                ),
+            ],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)
+            0x83, 0x7D, 0xFC, 0x00, // cmpl $0, -4(%rbp)
+            0x0F, 0x84, 0x16, 0, 0, 0, // je B2 (rel +22)
+            0x83, 0x7D, 0xFC, 0x01, // cmpl $1, -4(%rbp)
+            0x0F, 0x84, 0x13, 0, 0, 0, // je B3 (rel +19)
+            0xE9, 0, 0, 0, 0, // jmp B1 (rel 0) — the default is next
+            // B1 (offset 36): return 0
+            0xB8, 0, 0, 0, 0, // movl $0, %eax
+            0xC9, 0xC3,
+            // B2 (offset 43): return 1
+            0xB8, 0x01, 0, 0, 0, // movl $1, %eax
+            0xC9, 0xC3,
+            // B3 (offset 50): return 2
+            0xB8, 0x02, 0, 0, 0, // movl $2, %eax
             0xC9, 0xC3,
         ];
         assert_eq!(out.code.hot.bytes, expected);
@@ -5960,9 +6807,342 @@ mod tests {
         assert_eq!(out.code.hot.bytes, expected);
     }
 
-    /// The EH clause ordering (genReportEH): innermost first (nested try
-    /// starts later), same-try clauses contiguous in EE order with
-    /// SAMETRY on the 2nd+ of the run.
+    /// `int f(int a, int b) { return checked(a + b); }` — `add.ovf`:
+    /// the destructive add sets OF, `jno` skips the never-returning
+    /// OVERFLOW helper call (OverflowException); the result defines only
+    /// on the no-overflow edge.
+    #[test]
+    fn add_ovf_method_bytes() {
+        let m = method(
+            vec![int_arg(0), int_arg(1), int_temp()],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BinaryOvf {
+                        dst: LocalId(2),
+                        op: BinaryOp::Add,
+                        unsigned: false,
+                        lhs: Operand::Local(LocalId(0)),
+                        rhs: Operand::Local(LocalId(1)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(2))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)  — arg a
+            0x89, 0x75, 0xF8, // movl %esi, -8(%rbp)  — arg b
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax
+            0x03, 0x45, 0xF8, // addl -8(%rbp), %eax — sets OF
+            0x0F, 0x81, 0x06, 0, 0, 0, // jno over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_OVERFLOW
+            0x90, // nop — the return address stays inside the region
+            0x89, 0x45, 0xF4, // movl %eax, -12(%rbp) — the return's clobber spill
+            0x8B, 0x45, 0xF4, // movl -12(%rbp), %eax
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].method, None, "a helper call");
+        assert_eq!(out.relocations.len(), 1);
+    }
+
+    /// `long f(long a, long b) { return checked(a + b); }` with unsigned
+    /// operands — `add.ovf.un`: the 64-bit add, `jnc` (carry clear) over
+    /// the OVERFLOW call.
+    #[test]
+    fn add_ovf_un_method_bytes() {
+        let long_arg = |i| local(Type::Int64, LocalKind::IlArg(i));
+        let m = method(
+            vec![
+                long_arg(0),
+                long_arg(1),
+                local(Type::Int64, LocalKind::Temp),
+            ],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BinaryOvf {
+                        dst: LocalId(2),
+                        op: BinaryOp::Add,
+                        unsigned: true,
+                        lhs: Operand::Local(LocalId(0)),
+                        rhs: Operand::Local(LocalId(1)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(2))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg a
+            0x48, 0x89, 0x75, 0xF0, // movq %rsi, -16(%rbp) — arg b
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax
+            0x48, 0x03, 0x45, 0xF0, // addq -16(%rbp), %rax — sets CF
+            0x0F, 0x83, 0x06, 0, 0, 0, // jnc over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_OVERFLOW
+            0x90, // nop
+            0x48, 0x89, 0x45, 0xE8, // movq %rax, -24(%rbp) — the clobber spill
+            0x48, 0x8B, 0x45, 0xE8, // movq -24(%rbp), %rax
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `ulong f(ulong a, ulong b) { return checked(a * b); }` —
+    /// `mul.ovf.un`: the one-operand `mul` through the fixed rdx:rax pair
+    /// (the divisor discipline — the rhs operand must avoid both), OF=CF
+    /// set iff the upper half is nonzero, `jnc` over the OVERFLOW call.
+    #[test]
+    fn mul_ovf_un_method_bytes() {
+        let long_arg = |i| local(Type::Int64, LocalKind::IlArg(i));
+        let m = method(
+            vec![
+                long_arg(0),
+                long_arg(1),
+                local(Type::Int64, LocalKind::Temp),
+            ],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::BinaryOvf {
+                        dst: LocalId(2),
+                        op: BinaryOp::Mul,
+                        unsigned: true,
+                        lhs: Operand::Local(LocalId(0)),
+                        rhs: Operand::Local(LocalId(1)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(2))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp)  — arg a
+            0x48, 0x89, 0x75, 0xF0, // movq %rsi, -16(%rbp) — arg b
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax — the multiplicand
+            0x48, 0xF7, 0x65, 0xF0, // mulq -16(%rbp) — rdx:rax := rax * b
+            0x0F, 0x83, 0x06, 0, 0, 0, // jnc over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_OVERFLOW
+            0x90, // nop
+            0x48, 0x89, 0x45, 0xE8, // movq %rax, -24(%rbp) — the clobber spill
+            0x48, 0x8B, 0x45, 0xE8, // movq -24(%rbp), %rax
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `int f(long a) { return checked((int)a); }` — `conv.ovf.i4` of an
+    /// i64: the value fits iff its low half sign-extends back to it —
+    /// `movsxd` + `cmp` + `je` over the never-returning OVERFLOW call;
+    /// the result (the low half) defines only on the no-throw edge.
+    #[test]
+    fn conv_ovf_i4_of_i64_method_bytes() {
+        let m = method(
+            vec![
+                local(Type::Int64, LocalKind::IlArg(0)),
+                local(Type::Int32, LocalKind::Temp),
+            ],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::ConvOvf {
+                        dst: LocalId(1),
+                        dst_bits: 32,
+                        signed_dst: true,
+                        unsigned_src: false,
+                        src: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF8, // movq %rdi, -8(%rbp) — arg a
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax — the source copy
+            0x48, 0x63, 0xC8, // movsxd %eax, %rcx
+            0x48, 0x39, 0xC1, // cmpq %rax, %rcx — in range iff equal
+            0x0F, 0x84, 0x06, 0, 0, 0, // je over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_OVERFLOW
+            0x90, // nop
+            0x8B, 0x45, 0xF8, // movl -8(%rbp), %eax — the low half
+            0x89, 0x45, 0xF4, // movl %eax, -12(%rbp) — the return's clobber spill
+            0x8B, 0x45, 0xF4, // movl -12(%rbp), %eax
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `int f(int a) { return checked((byte)a); }` — `conv.ovf.u1` of an
+    /// i32: one unsigned compare against 255 (`jbe` over the OVERFLOW
+    /// call), then the zero-extending shift pair narrows.
+    #[test]
+    fn conv_ovf_u1_of_i32_method_bytes() {
+        let m = method(
+            vec![int_arg(0), int_temp()],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::ConvOvf {
+                        dst: LocalId(1),
+                        dst_bits: 8,
+                        signed_dst: false,
+                        unsigned_src: false,
+                        src: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp) — arg a
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax — the source copy
+            0x81, 0xF8, 0xFF, 0x00, 0x00, 0x00, // cmpl $255, %eax — unsigned
+            0x0F, 0x86, 0x06, 0, 0, 0, // jbe over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_OVERFLOW
+            0x90, // nop
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax
+            0xC1, 0xE0, 0x18, // shll $24, %eax
+            0xC1, 0xE8, 0x18, // shrl $24, %eax — zero-extended u1
+            0x89, 0x45, 0xF8, // movl %eax, -8(%rbp) — the return's clobber spill
+            0x8B, 0x45, 0xF8, // movl -8(%rbp), %eax
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `double f(double a) { return ckfinite(a); }` — the f64 exponent
+    /// check: the bits cross to a GPR, `shr 32` isolates the exponent
+    /// (and sign), `cmp` against 0x7FF00000, `jne` over the OVERFLOW
+    /// call; the value passes to the result unchanged.
+    #[test]
+    fn ckfinite_f64_method_bytes() {
+        let m = method(
+            vec![dbl_arg(0), dbl_temp()],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::CkFinite {
+                        dst: LocalId(1),
+                        src: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0xF2, 0x0F, 0x11, 0x45, 0xF8, // movsd %xmm0, -8(%rbp) — arg a
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax — the bits
+            0x48, 0xC1, 0xE8, 0x20, // shrq $32, %rax — the exponent (+sign)
+            0x81, 0xF8, 0x00, 0x00, 0xF0, 0x7F, // cmpl $0x7FF00000, %eax
+            0x0F, 0x85, 0x06, 0, 0, 0, // jne over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_OVERFLOW
+            0x90, // nop
+            0xF2, 0x44, 0x0F, 0x10, 0x7D, 0xF8, // movsd -8(%rbp), %xmm15
+            0xF2, 0x44, 0x0F, 0x11, 0x7D, 0xF0, // movsd %xmm15, -16(%rbp)
+            0xF2, 0x0F, 0x10, 0x45, 0xF0, // movsd -16(%rbp), %xmm0 — return
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `float f(float a) { return ckfinite(a); }` — the f32 form: `and`
+    /// masks the exponent field, `cmp` against 0x7F800000, `jne` over
+    /// the OVERFLOW call.
+    #[test]
+    fn ckfinite_f32_method_bytes() {
+        let m = method(
+            vec![
+                local(Type::Float, LocalKind::IlArg(0)),
+                local(Type::Float, LocalKind::Temp),
+            ],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::CkFinite {
+                        dst: LocalId(1),
+                        src: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0xF3, 0x0F, 0x11, 0x45, 0xFC, // movss %xmm0, -4(%rbp) — arg a
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax — the bits
+            0x81, 0xE0, 0x00, 0x00, 0x80, 0x7F, // andl $0x7F800000, %eax
+            0x81, 0xF8, 0x00, 0x00, 0x80, 0x7F, // cmpl $0x7F800000, %eax
+            0x0F, 0x85, 0x06, 0, 0, 0, // jne over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_OVERFLOW
+            0x90, // nop
+            0xF3, 0x44, 0x0F, 0x10, 0x7D, 0xFC, // movss -4(%rbp), %xmm15
+            0xF3, 0x44, 0x0F, 0x11, 0x7D, 0xF8, // movss %xmm15, -8(%rbp)
+            0xF3, 0x0F, 0x10, 0x45, 0xF8, // movss -8(%rbp), %xmm0 — return
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
     #[test]
     fn eh_clauses_order_innermost_first_with_sametry() {
         // EE order: outer catch A, same-try catch B, inner catch C.

@@ -484,6 +484,40 @@ impl Flatten<'_> {
                         },
                     );
                 }
+                hir::StmtKind::BlockCopyDyn { dst, src, size } => {
+                    // `cpblk`: IL push order is dst, src, size; the
+                    // addresses get the block-op const-materialization.
+                    let dst = self.flatten_expr(dst, &mut stmts, stmt.il_offset)?;
+                    let src = self.flatten_expr(src, &mut stmts, stmt.il_offset)?;
+                    let size = self.flatten_expr(size, &mut stmts, stmt.il_offset)?;
+                    let dst = self.block_addr_value(dst, &mut stmts, stmt.il_offset);
+                    let src = self.block_addr_value(src, &mut stmts, stmt.il_offset);
+                    Self::push(
+                        &mut stmts,
+                        stmt.il_offset,
+                        lir::StmtKind::BlockCopyDyn {
+                            dst_addr: dst,
+                            src_addr: src,
+                            size,
+                        },
+                    );
+                }
+                hir::StmtKind::BlockFillDyn { dst, fill, size } => {
+                    // `initblk`: IL push order is dst, fill, size.
+                    let dst = self.flatten_expr(dst, &mut stmts, stmt.il_offset)?;
+                    let fill = self.flatten_expr(fill, &mut stmts, stmt.il_offset)?;
+                    let size = self.flatten_expr(size, &mut stmts, stmt.il_offset)?;
+                    let dst = self.block_addr_value(dst, &mut stmts, stmt.il_offset);
+                    Self::push(
+                        &mut stmts,
+                        stmt.il_offset,
+                        lir::StmtKind::BlockFillDyn {
+                            dst_addr: dst,
+                            fill,
+                            size,
+                        },
+                    );
+                }
                 hir::StmtKind::BoundsCheck { array, index } => {
                     // The bounds check (step_10.8): a statement consuming
                     // the array and index operands (IL order: array first).
@@ -552,7 +586,8 @@ impl Flatten<'_> {
         }
     }
 
-    /// A block-op address (`BlockCopy`/`BlockZero`, struct values): the
+    /// A block-op address (`BlockCopy`/`BlockZero` and their
+    /// runtime-sized `cpblk`/`initblk` siblings, struct values): the
     /// x64 block rules take a frame slot or a pointer-typed slot, so a
     /// *constant* address (a static field's frozen address, step_10.7)
     /// materializes into a fresh ByRef temp first. `AddrOf` and slot
@@ -615,6 +650,33 @@ impl Flatten<'_> {
                 );
                 Ok(lir::Operand::Temp(dst))
             }
+            hir::Expr::BinaryOvf {
+                op,
+                unsigned,
+                lhs,
+                rhs,
+            } => {
+                // Checked arithmetic: same flattening as `Binary`, but the
+                // statement carries the overflow check to codegen (the
+                // conditional OVERFLOW helper call). The result has the
+                // (integer) operands' promoted type, like `Binary`.
+                let lhs = self.flatten_expr(lhs, out, il)?;
+                let rhs = self.flatten_expr(rhs, out, il)?;
+                let ty = self.operand_ty(&lhs)?;
+                let dst = self.temp(ty);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::BinaryOvf {
+                        dst,
+                        op: *op,
+                        unsigned: *unsigned,
+                        lhs,
+                        rhs,
+                    },
+                );
+                Ok(lir::Operand::Temp(dst))
+            }
             hir::Expr::Call { target, sig, args } => {
                 match self.flatten_call(target, sig, args, out, il)? {
                     // A struct call result lives in the call's destination
@@ -627,6 +689,16 @@ impl Flatten<'_> {
                     // call in value position unreachable.
                     None => Err(CompileError::Internal("void call used as a value")),
                 }
+            }
+            hir::Expr::LocAlloc { size } => {
+                // localloc: a statement-level dynamic stack allocation
+                // (it moves rsp and its zero-init is a helper call), so
+                // it forces to statement level like a call, its address
+                // landing in a fresh NativeInt temp.
+                let size = self.flatten_expr(size, out, il)?;
+                let dst = self.temp(Type::NativeInt);
+                Self::push(out, il, lir::StmtKind::LocAlloc { dst, size });
+                Ok(lir::Operand::Temp(dst))
             }
             hir::Expr::Load {
                 addr,
@@ -717,6 +789,40 @@ impl Flatten<'_> {
                         src,
                     },
                 );
+                Ok(lir::Operand::Temp(dst))
+            }
+            hir::Expr::ConvOvf {
+                to,
+                dst_bits,
+                signed_dst,
+                unsigned_src,
+                arg,
+            } => {
+                // The checked conversion: one statement carrying the
+                // explicit target width/signedness to codegen (the
+                // conditional OVERFLOW helper call, the BinaryOvf shape).
+                let src = self.flatten_expr(arg, out, il)?;
+                let dst = self.temp(*to);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::ConvOvf {
+                        dst,
+                        dst_bits: *dst_bits,
+                        signed_dst: *signed_dst,
+                        unsigned_src: *unsigned_src,
+                        src,
+                    },
+                );
+                Ok(lir::Operand::Temp(dst))
+            }
+            hir::Expr::CkFinite { arg } => {
+                // The value passes through unchanged (same float type);
+                // the statement exists for its finiteness check.
+                let src = self.flatten_expr(arg, out, il)?;
+                let ty = self.operand_ty(&src)?;
+                let dst = self.temp(ty);
+                Self::push(out, il, lir::StmtKind::CkFinite { dst, src });
                 Ok(lir::Operand::Temp(dst))
             }
             hir::Expr::NullCheck { arg } => {
@@ -955,8 +1061,21 @@ impl Flatten<'_> {
                     Self::push(out, IL_OFFSET_NONE, lir::StmtKind::Return { value });
                 }
             }
-            hir::Terminator::Switch { .. } => {
-                return Err(CompileError::Unsupported("switch: not yet supported"));
+            hir::Terminator::Switch {
+                value,
+                targets,
+                default,
+            } => {
+                let value = self.flatten_expr(value, out, IL_OFFSET_NONE)?;
+                Self::push(
+                    out,
+                    IL_OFFSET_NONE,
+                    lir::StmtKind::Switch {
+                        value,
+                        targets: targets.clone(),
+                        default: *default,
+                    },
+                );
             }
             hir::Terminator::Throw { exception } => {
                 // The exception tree flattens like a branch condition
@@ -987,6 +1106,9 @@ impl Flatten<'_> {
             }
             hir::Terminator::EndFinally => {
                 Self::push(out, IL_OFFSET_NONE, lir::StmtKind::EndFinally);
+            }
+            hir::Terminator::Rethrow => {
+                Self::push(out, IL_OFFSET_NONE, lir::StmtKind::Rethrow);
             }
         }
         Ok(())
@@ -1237,6 +1359,53 @@ mod tests {
     }
 
     #[test]
+    fn localloc_forces_to_statement_level_with_a_native_int_temp() {
+        // return localloc(n): the size tree flattens first, then the
+        // LocAlloc statement defines a fresh NativeInt temp the Return
+        // reads — the call-shaped discipline (it moves rsp; it never
+        // nests in an operand).
+        let m = method_with(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::LocAlloc {
+                    size: Box::new(hir::Expr::Binary {
+                        op: BinaryOp::Mul,
+                        lhs: Box::new(hir::Expr::Local(LocalId(0))),
+                        rhs: Box::new(hir::Expr::Const(Const::Int32(4))),
+                    }),
+                }),
+            },
+        ));
+        let m = lower_ok(m);
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 3, "mul, localloc, return");
+        assert!(matches!(
+            stmts[0].kind,
+            lir::StmtKind::Binary {
+                dst: LocalId(1),
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
+        match &stmts[1].kind {
+            lir::StmtKind::LocAlloc { dst, size } => {
+                assert_eq!(*dst, LocalId(2));
+                assert_eq!(*size, lir::Operand::Temp(LocalId(1)));
+            }
+            _ => panic!("expected LocAlloc"),
+        }
+        assert_eq!(m.locals[2].ty, Type::NativeInt);
+        assert_eq!(m.locals[2].kind, hir::LocalKind::Temp);
+        assert!(matches!(
+            stmts[2].kind,
+            lir::StmtKind::Return {
+                value: Some(lir::Operand::Temp(LocalId(2)))
+            }
+        ));
+    }
+
+    #[test]
     fn branch_folds_compare_and_elides_fallthrough_jump() {
         // if (n < 2) goto B2; ...B1... ; B2: ... — B1 is next in layout,
         // so no Jump statement follows the Branch.
@@ -1323,21 +1492,40 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_nodes_fail_with_unsupported() {
-        // Switches remain outside the lowering subset.
-        let switch = method_with(block(
+    fn switch_flattens_to_lir_switch() {
+        // switch (local0) { 0: B1, 1: B2, default: B3 } — the operand
+        // flattens in place; targets and default carry through.
+        let mut m = method_with(block(
             0,
             Vec::new(),
             hir::Terminator::Switch {
                 value: hir::Expr::Local(LocalId(0)),
-                targets: Vec::new(),
-                default: BlockId(0),
+                targets: vec![BlockId(1), BlockId(2)],
+                default: BlockId(3),
             },
         ));
-        assert!(matches!(
-            lower(switch, &MockTarget),
-            Err(CompileError::Unsupported(_))
-        ));
+        for id in 1..=3 {
+            m.blocks.push(block(
+                id,
+                Vec::new(),
+                hir::Terminator::Return { value: None },
+            ));
+        }
+        let m = lower_ok(m);
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0].kind {
+            lir::StmtKind::Switch {
+                value,
+                targets,
+                default,
+            } => {
+                assert_eq!(*value, lir::Operand::Local(LocalId(0)));
+                assert_eq!(*targets, vec![BlockId(1), BlockId(2)]);
+                assert_eq!(*default, BlockId(3));
+            }
+            _ => panic!("expected Switch"),
+        }
     }
 
     // --- step_10.4: the object pack flattening ---
@@ -1619,6 +1807,62 @@ mod tests {
                 assert_eq!(*class, c);
             }
             _ => panic!("expected BlockZero"),
+        }
+    }
+
+    #[test]
+    fn cpblk_initblk_lower_to_the_dynamic_block_ops() {
+        // `cpblk`: dst/src addresses and the size flatten in IL push
+        // order; a constant address materializes into a ByRef temp (the
+        // block-op rule takes slots or pointer values).
+        let m = method_with(block(
+            0,
+            vec![hstmt(hir::StmtKind::BlockCopyDyn {
+                dst: hir::Expr::LocalAddr(LocalId(0)),
+                src: hir::Expr::Const(Const::NativeInt(0x1000)),
+                size: hir::Expr::Local(LocalId(0)),
+            })],
+            hir::Terminator::Return { value: None },
+        ));
+        let m = lower_ok(m);
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 3, "const-src copy, the cpblk, the return");
+        match &stmts[1].kind {
+            lir::StmtKind::BlockCopyDyn {
+                dst_addr,
+                src_addr,
+                size,
+            } => {
+                assert_eq!(*dst_addr, lir::Operand::AddrOf(LocalId(0)));
+                assert_eq!(*src_addr, lir::Operand::Temp(LocalId(1)));
+                assert_eq!(*size, lir::Operand::Local(LocalId(0)));
+            }
+            _ => panic!("expected BlockCopyDyn"),
+        }
+        assert_eq!(m.locals[1].ty, Type::ByRef, "the materialization temp");
+
+        // `initblk`: the fill and size pass through as operands.
+        let m = method_with(block(
+            0,
+            vec![hstmt(hir::StmtKind::BlockFillDyn {
+                dst: hir::Expr::Local(LocalId(0)),
+                fill: hir::Expr::Const(Const::Int32(0x7F)),
+                size: hir::Expr::Const(Const::NativeInt(24)),
+            })],
+            hir::Terminator::Return { value: None },
+        ));
+        let m = lower_ok(m);
+        match &m.blocks[0].stmts[0].kind {
+            lir::StmtKind::BlockFillDyn {
+                dst_addr,
+                fill,
+                size,
+            } => {
+                assert_eq!(*dst_addr, lir::Operand::Local(LocalId(0)));
+                assert_eq!(*fill, lir::Operand::Const(Const::Int32(0x7F)));
+                assert_eq!(*size, lir::Operand::Const(Const::NativeInt(24)));
+            }
+            _ => panic!("expected BlockFillDyn"),
         }
     }
 
@@ -2056,6 +2300,59 @@ mod tests {
             &MockTarget,
         );
         assert!(matches!(m, Err(CompileError::Unsupported(_))));
+    }
+
+    #[test]
+    fn checked_conv_and_ckfinite_flatten_to_their_statements() {
+        // conv.ovf.u1 of an i32 arg: the ConvOvf statement carries the
+        // explicit target width/signedness and the source's signedness;
+        // the temp is Int32 (the eval-stack normalization).
+        let m = lower_ret(hir::Expr::ConvOvf {
+            to: Type::Int32,
+            dst_bits: 8,
+            signed_dst: false,
+            unsigned_src: false,
+            arg: Box::new(hir::Expr::Local(LocalId(0))),
+        });
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the conversion, then the return");
+        match &stmts[0].kind {
+            lir::StmtKind::ConvOvf {
+                dst,
+                dst_bits,
+                signed_dst,
+                unsigned_src,
+                src,
+            } => {
+                assert_eq!((*dst_bits, *signed_dst, *unsigned_src), (8, false, false));
+                assert_eq!(*src, lir::Operand::Local(LocalId(0)));
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::Int32);
+            }
+            _ => panic!("expected ConvOvf"),
+        }
+
+        // ckfinite of a double arg: the CkFinite statement, the temp
+        // carrying the same float type.
+        let mut mm = method_with(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::CkFinite {
+                    arg: Box::new(hir::Expr::Local(LocalId(0))),
+                }),
+            },
+        ));
+        mm.locals[0] = local(Type::Double, hir::LocalKind::IlArg(0));
+        let mm = lower_ok(mm);
+        let stmts = &mm.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the check, then the return");
+        match &stmts[0].kind {
+            lir::StmtKind::CkFinite { dst, src } => {
+                assert_eq!(*src, lir::Operand::Local(LocalId(0)));
+                assert_eq!(mm.locals[dst.0 as usize].ty, Type::Double);
+            }
+            _ => panic!("expected CkFinite"),
+        }
     }
 
     // --- step_10.2: float pack flattening ---

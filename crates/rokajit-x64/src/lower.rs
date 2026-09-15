@@ -633,6 +633,54 @@ rokajit::lower_rules! {
             ]
         };
 
+    /// `t := a + b` … `a * b`, checked (`add.ovf`/`sub.ovf`/`mul.ovf` and
+    /// the `.un` forms) — one descriptor carrying the operator, width,
+    /// and signedness; codegen owns the conditional OVERFLOW helper call
+    /// (the `Inst::BoundsCheck` conditional-throw shape) and, for `Mul`,
+    /// the one-operand `imul`/`mul` fixed-register sequence.
+    rule arith_ovf: BinaryOvf { dst, op, unsigned, lhs, rhs }
+        if let (Some(w), Some(l), Some(r), true) = (
+            width_of(cx, *dst),
+            operand_src(*lhs),
+            operand_src(*rhs),
+            matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul),
+        )
+        => |_| vec![Inst::ArithOvf {
+            op: *op,
+            unsigned: *unsigned,
+            width: w,
+            dst: Place::Val(Val(*dst)),
+            lhs: l,
+            rhs: r,
+        }];
+
+    /// `t := (checked) a` — `conv.ovf.*` from an integer source (LIR
+    /// `ConvOvf`): one descriptor carrying the source width/signedness and
+    /// the target range; codegen owns the range check and conditional
+    /// OVERFLOW helper call. Same-width cells the importer proved
+    /// no-check never reach here.
+    rule conv_ovf: ConvOvf { dst, dst_bits, signed_dst, unsigned_src, src }
+        if let (Some(w), Some(s)) = (operand_width(cx, *src), operand_src(*src))
+        => |_| vec![Inst::ConvOvf {
+            width_src: w,
+            width_dst: *dst_bits,
+            signed_dst: *signed_dst,
+            unsigned_src: *unsigned_src,
+            dst: Place::Val(Val(*dst)),
+            src: s,
+        }];
+
+    /// `t := ckfinite a` — one descriptor; codegen emits the exponent-mask
+    /// check with the conditional OVERFLOW helper call and copies the
+    /// value through on the no-throw edge.
+    rule ckfinite: CkFinite { dst, src }
+        if let (Some(w), Some(s)) = (operand_fwidth(cx, *src), xmm_opnd(cx, *src))
+        => |_| vec![Inst::CkFinite {
+            width: w,
+            dst: XmmPlace::Val(Val(*dst)),
+            src: s,
+        }];
+
     /// `t := a << b`, `a >> b` — one descriptor; codegen emits the
     /// destructive pair, with the count in `cl` when it isn't constant.
     /// The signedness flip (`shr` → `sar`, `shr.un` → `shr`) happens in
@@ -736,12 +784,30 @@ rokajit::lower_rules! {
             signed: !unsigned,
         }];
 
+    /// `conv.r.un` from a 64-bit operand (u64 → f32/f64): no SSE2
+    /// unsigned conversion exists; codegen emits the branchy fixup
+    /// expansion (`Inst::CvtU64ToF`). A 32-bit unsigned source never
+    /// reaches here — the importer pre-zero-extends it to Int64, and the
+    /// signed 64-bit conversion below converts it exactly.
+    rule conv_u64_to_f: Conv { dst, to, unsigned, src, .. }
+        if let (true, Some(w), Some(Width::W64), Some(s)) = (
+            *unsigned,
+            FWidth::of(*to),
+            operand_width(cx, *src),
+            operand_src(*src),
+        )
+        => |_| vec![Inst::CvtU64ToF {
+            width: w,
+            dst: XmmPlace::Val(Val(*dst)),
+            src: s,
+        }];
+
     /// `conv.r4`/`conv.r8` from an integer operand: `cvtsi2ss`/`cvtsi2sd`,
-    /// the 32- or 64-bit form from the source's width. (`conv.r.un` and
-    /// unsigned 64-bit sources are outside the pack — the importer rejects
-    /// them.)
-    rule conv_i_to_f: Conv { dst, to, src, .. }
-        if let (Some(w), Some(src_w), Some(s)) = (
+    /// the 32- or 64-bit form from the source's width. (Signed sources
+    /// only — an unsigned 64-bit source is `conv_u64_to_f` above.)
+    rule conv_i_to_f: Conv { dst, to, unsigned, src, .. }
+        if let (false, Some(w), Some(src_w), Some(s)) = (
+            *unsigned,
             FWidth::of(*to),
             operand_width(cx, *src),
             operand_src(*src),
@@ -848,6 +914,31 @@ rokajit::lower_rules! {
     rule jump: Jump { target }
         => |_| vec![Inst::Jmp { target: Label(*target) }];
 
+    /// `switch (v)` — the tier-0 compare chain: one `cmp`/`je` pair per
+    /// case, then the default jump. A value outside [0, N) matches no
+    /// `je` and reaches the default — no explicit range check. (The
+    /// operand is Int32 by the importer's validation, so W32 compares.)
+    rule switch_chain: Switch { value, targets, default }
+        if let Some(s) = operand_src(*value)
+        => |_| {
+            let mut insts = Vec::with_capacity(2 * targets.len() + 1);
+            for (i, target) in targets.iter().enumerate() {
+                insts.push(Inst::Cmp {
+                    width: Width::W32,
+                    lhs: s,
+                    rhs: Src::Imm(i as i64),
+                });
+                insts.push(Inst::Jcc {
+                    cc: CondCode::Eq,
+                    target: Label(*target),
+                });
+            }
+            insts.push(Inst::Jmp {
+                target: Label(*default),
+            });
+            insts
+        };
+
     /// `call m(args)` — direct: argument moves per the ABI classification
     /// (mixed int/float signatures interleave the GPR and XMM sequences;
     /// struct arguments load per eightbyte or block-copy to the outgoing
@@ -920,6 +1011,18 @@ rokajit::lower_rules! {
             Inst::Nop,
         ];
 
+    /// `rethrow` — the never-returning `CORINFO_HELP_RETHROW` call (no
+    /// argument: the VM finds the in-flight exception via the stack
+    /// walk), with the same padding NOP as `throw` so the call's return
+    /// address stays a valid in-region byte (clr-abi.md's rule).
+    rule rethrow_helper: Rethrow
+        => |_| vec![
+            Inst::CallHelper {
+                id: rokajit_ee::enums::CorInfoHelpFunc::RETHROW,
+            },
+            Inst::Nop,
+        ];
+
     /// `leave` in the main body or a finally funclet — a plain jump.
     /// (Inside a CATCH region a `Leave` is the funclet return instead;
     /// that choice needs the region table, which the statement ruleset
@@ -979,6 +1082,46 @@ rokajit::lower_rules! {
             dst: d,
             dst_disp: 0,
             size: layout.size,
+        }];
+
+    /// `cpblk` — a runtime-sized block copy: one descriptor; codegen
+    /// always emits the MEMCPY helper (the size is dynamic, so there is
+    /// no inline-threshold decision to take at lowering).
+    rule block_copy_dyn: BlockCopyDyn { dst_addr, src_addr, size }
+        if let (Some(d), Some(s), Some(n)) = (
+            block_addr(*dst_addr),
+            block_addr(*src_addr),
+            operand_src(*size),
+        )
+        => |_| vec![Inst::BlockCopyDyn {
+            dst: d,
+            src: s,
+            size: n,
+        }];
+
+    /// `initblk` — a runtime-sized block fill: one descriptor; codegen
+    /// always emits the MEMSET helper, masking the fill to its low byte.
+    rule block_fill_dyn: BlockFillDyn { dst_addr, fill, size }
+        if let (Some(d), Some(f), Some(n)) = (
+            block_addr(*dst_addr),
+            operand_src(*fill),
+            operand_src(*size),
+        )
+        => |_| vec![Inst::BlockFillDyn {
+            dst: d,
+            fill: f,
+            size: n,
+        }];
+
+    /// `localloc` — dynamic stack allocation: one descriptor; the
+    /// rounding, the `sub rsp`, and the zero-init MEMSET call are
+    /// codegen's emission (the frame layout's facts live there). The
+    /// size is a native-width integer value or constant.
+    rule loc_alloc: LocAlloc { dst, size }
+        if let Some(s) = operand_src(*size)
+        => |_| vec![Inst::LocAlloc {
+            dst: Place::Val(Val(*dst)),
+            size: s,
         }];
 
     /// `return <struct>` — a register-passed struct return (step_10.9):
@@ -1464,6 +1607,60 @@ mod tests {
     }
 
     #[test]
+    fn arith_ovf_lowers_to_one_descriptor() {
+        // All six checked forms: op and the `.un` signedness pass through
+        // on the descriptor; codegen owns the conditional-throw sequence.
+        for (op, unsigned) in [
+            (BinaryOp::Add, false),
+            (BinaryOp::Add, true),
+            (BinaryOp::Sub, false),
+            (BinaryOp::Sub, true),
+            (BinaryOp::Mul, false),
+            (BinaryOp::Mul, true),
+        ] {
+            let s = stmt(StmtKind::BinaryOvf {
+                dst: LocalId(2),
+                op,
+                unsigned,
+                lhs: Operand::Local(LocalId(0)),
+                rhs: Operand::Local(LocalId(1)),
+            });
+            assert_eq!(
+                lower_one(&s),
+                Some(vec![Inst::ArithOvf {
+                    op,
+                    unsigned,
+                    width: Width::W32,
+                    dst: val(2),
+                    lhs: vsrc(0),
+                    rhs: vsrc(1),
+                }]),
+                "{op:?} unsigned={unsigned}"
+            );
+        }
+        // A 64-bit destination widens the descriptor; a non-Add/Sub/Mul
+        // operator matches no rule (the importer never builds one).
+        let s = stmt(StmtKind::BinaryOvf {
+            dst: LocalId(4),
+            op: BinaryOp::Mul,
+            unsigned: false,
+            lhs: Operand::Local(LocalId(0)),
+            rhs: Operand::Const(Const::Int64(3)),
+        });
+        assert_eq!(
+            lower_with(&locals_mixed(), &s),
+            Some(vec![Inst::ArithOvf {
+                op: BinaryOp::Mul,
+                unsigned: false,
+                width: Width::W64,
+                dst: val(4),
+                lhs: vsrc(0),
+                rhs: Src::Imm(3),
+            }])
+        );
+    }
+
+    #[test]
     fn shifts_lower_to_the_shift_descriptor() {
         // `shr` (signed) is arithmetic (`sar`); `shr.un` is logical
         // (`shr`). 64-bit value, 32-bit count.
@@ -1602,6 +1799,115 @@ mod tests {
     }
 
     #[test]
+    fn conv_ovf_lowers_to_the_checked_descriptor() {
+        // conv.ovf.i4 of an i64 source: one ConvOvf descriptor carrying
+        // the source width, target range, and both signednesses.
+        let s = stmt(StmtKind::ConvOvf {
+            dst: LocalId(2),
+            dst_bits: 32,
+            signed_dst: true,
+            unsigned_src: false,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_with(&locals_mixed(), &s),
+            Some(vec![Inst::ConvOvf {
+                width_src: Width::W64,
+                width_dst: 32,
+                signed_dst: true,
+                unsigned_src: false,
+                dst: val(2),
+                src: vsrc(0),
+            }])
+        );
+        // conv.ovf.u2.un of a 32-bit source.
+        let s = stmt(StmtKind::ConvOvf {
+            dst: LocalId(2),
+            dst_bits: 16,
+            signed_dst: false,
+            unsigned_src: true,
+            src: Operand::Local(LocalId(3)),
+        });
+        assert_eq!(
+            lower_with(&locals_mixed(), &s),
+            Some(vec![Inst::ConvOvf {
+                width_src: Width::W32,
+                width_dst: 16,
+                signed_dst: false,
+                unsigned_src: true,
+                dst: val(2),
+                src: vsrc(3),
+            }])
+        );
+        // A float source matches no rule (the importer emits helper
+        // calls — a float-typed src has no GPR width).
+        let locals = vec![
+            hir::Local {
+                ty: Type::Double,
+                kind: hir::LocalKind::IlLocal(0),
+                pinned: false,
+            },
+            hir::Local {
+                ty: Type::Int32,
+                kind: hir::LocalKind::IlLocal(1),
+                pinned: false,
+            },
+        ];
+        let s = stmt(StmtKind::ConvOvf {
+            dst: LocalId(1),
+            dst_bits: 32,
+            signed_dst: true,
+            unsigned_src: false,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(lower_with(&locals, &s), None);
+    }
+
+    #[test]
+    fn ckfinite_lowers_to_the_check_descriptor() {
+        // ckfinite of a double: one CkFinite descriptor at FWidth::D.
+        let locals = vec![
+            hir::Local {
+                ty: Type::Double,
+                kind: hir::LocalKind::IlLocal(0),
+                pinned: false,
+            },
+            hir::Local {
+                ty: Type::Double,
+                kind: hir::LocalKind::IlLocal(1),
+                pinned: false,
+            },
+        ];
+        let s = stmt(StmtKind::CkFinite {
+            dst: LocalId(1),
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_with(&locals, &s),
+            Some(vec![Inst::CkFinite {
+                width: FWidth::D,
+                dst: XmmPlace::Val(Val(LocalId(1))),
+                src: XmmSrc::Val(Val(LocalId(0))),
+            }])
+        );
+        // Of a float32 constant: the Bits source at FWidth::S.
+        let s = stmt(StmtKind::CkFinite {
+            dst: LocalId(1),
+            src: Operand::Const(Const::Float(1.5)),
+        });
+        // dst must be Float-typed for the rule? dst type is not guarded;
+        // keep the double locals — the src width drives the descriptor.
+        assert_eq!(
+            lower_with(&locals, &s),
+            Some(vec![Inst::CkFinite {
+                width: FWidth::S,
+                dst: XmmPlace::Val(Val(LocalId(1))),
+                src: XmmSrc::Bits(1.5f32.to_bits() as u64),
+            }])
+        );
+    }
+
+    #[test]
     fn byref_call_arg_materializes_with_lea() {
         let sig = rokajit::ir::CallSig {
             ret: Type::Void,
@@ -1626,6 +1932,89 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn localloc_lowers_to_one_descriptor() {
+        // Value form: the size operand passes through as a Src; codegen
+        // owns the rounding, the rsp adjustment, and the zero-init call.
+        let s = stmt(StmtKind::LocAlloc {
+            dst: LocalId(2),
+            size: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::LocAlloc {
+                dst: val(2),
+                size: vsrc(0),
+            }])
+        );
+        // A constant size is an immediate source.
+        let s = stmt(StmtKind::LocAlloc {
+            dst: LocalId(2),
+            size: Operand::Const(Const::NativeInt(64)),
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::LocAlloc {
+                dst: val(2),
+                size: Src::Imm(64),
+            }])
+        );
+    }
+
+    #[test]
+    fn cpblk_initblk_lower_to_one_descriptor_each() {
+        // `cpblk`: addresses keep the block-op shapes (a frame slot or a
+        // pointer value); the size is a value or constant source.
+        let s = stmt(StmtKind::BlockCopyDyn {
+            dst_addr: Operand::Local(LocalId(0)),
+            src_addr: Operand::AddrOf(LocalId(1)),
+            size: Operand::Local(LocalId(2)),
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::BlockCopyDyn {
+                dst: BlockAddr::Val(Val(LocalId(0))),
+                src: BlockAddr::FrameSlot(LocalId(1)),
+                size: vsrc(2),
+            }])
+        );
+        let s = stmt(StmtKind::BlockCopyDyn {
+            dst_addr: Operand::Local(LocalId(0)),
+            src_addr: Operand::Local(LocalId(1)),
+            size: Operand::Const(Const::NativeInt(24)),
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::BlockCopyDyn {
+                dst: BlockAddr::Val(Val(LocalId(0))),
+                src: BlockAddr::Val(Val(LocalId(1))),
+                size: Src::Imm(24),
+            }])
+        );
+        // `initblk`: the fill is a value or immediate source.
+        let s = stmt(StmtKind::BlockFillDyn {
+            dst_addr: Operand::Local(LocalId(0)),
+            fill: Operand::Const(Const::Int32(0x7F)),
+            size: Operand::Local(LocalId(2)),
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::BlockFillDyn {
+                dst: BlockAddr::Val(Val(LocalId(0))),
+                fill: Src::Imm(0x7F),
+                size: vsrc(2),
+            }])
+        );
+        // A constant address matches no rule (the LIR flattener
+        // materializes it into a ByRef temp first).
+        let s = stmt(StmtKind::BlockCopyDyn {
+            dst_addr: Operand::Const(Const::NativeInt(0x1000)),
+            src_addr: Operand::Local(LocalId(1)),
+            size: Operand::Local(LocalId(2)),
+        });
+        assert_eq!(lower_one(&s), None);
     }
 
     #[test]
@@ -1721,6 +2110,53 @@ mod tests {
             Some(vec![Inst::Jmp {
                 target: Label(BlockId(1))
             }])
+        );
+    }
+
+    #[test]
+    fn switch_lowers_to_a_compare_chain() {
+        // switch (v0) { 0: B2, 1: B3, 2: B3, default: B1 } — one cmp/je
+        // pair per case (duplicate targets keep their pair), then the
+        // default jmp.
+        let s = stmt(StmtKind::Switch {
+            value: Operand::Local(LocalId(0)),
+            targets: vec![BlockId(2), BlockId(3), BlockId(3)],
+            default: BlockId(1),
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![
+                Inst::Cmp {
+                    width: Width::W32,
+                    lhs: vsrc(0),
+                    rhs: Src::Imm(0),
+                },
+                Inst::Jcc {
+                    cc: CondCode::Eq,
+                    target: Label(BlockId(2)),
+                },
+                Inst::Cmp {
+                    width: Width::W32,
+                    lhs: vsrc(0),
+                    rhs: Src::Imm(1),
+                },
+                Inst::Jcc {
+                    cc: CondCode::Eq,
+                    target: Label(BlockId(3)),
+                },
+                Inst::Cmp {
+                    width: Width::W32,
+                    lhs: vsrc(0),
+                    rhs: Src::Imm(2),
+                },
+                Inst::Jcc {
+                    cc: CondCode::Eq,
+                    target: Label(BlockId(3)),
+                },
+                Inst::Jmp {
+                    target: Label(BlockId(1)),
+                },
+            ])
         );
     }
 
@@ -2483,6 +2919,20 @@ mod tests {
         assert_eq!(lower_obj(&s), Some(vec![Inst::FuncletEpilog]));
     }
 
+    #[test]
+    fn rethrow_lowers_to_the_helper_call_plus_nop() {
+        let s = stmt(StmtKind::Rethrow);
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![
+                Inst::CallHelper {
+                    id: rokajit_ee::enums::CorInfoHelpFunc::RETHROW,
+                },
+                Inst::Nop,
+            ])
+        );
+    }
+
     // --- end-to-end: fib's exact IL bytes → descriptor sequence ---
 
     #[test]
@@ -2945,6 +3395,38 @@ mod tests {
                 src: xsrc(0),
             }])
         );
+    }
+
+    #[test]
+    fn conv_r_un_of_an_i64_lowers_to_the_u64_fixup() {
+        // conv.r.un of a 64-bit operand (unsigned flag + W64 source):
+        // the branchy CvtU64ToF expansion.
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(5),
+            to: Type::Double,
+            overflow: false,
+            unsigned: true,
+            src: Operand::Local(LocalId(4)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::CvtU64ToF {
+                width: FWidth::D,
+                dst: xval(5),
+                src: vsrc(4),
+            }])
+        );
+        // An unsigned 32-bit source matches no rule: the importer
+        // pre-zero-extends u32 operands to Int64, so this shape never
+        // arrives (a signed cvtsi2s* of the low half would be wrong).
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(5),
+            to: Type::Double,
+            overflow: false,
+            unsigned: true,
+            src: Operand::Local(LocalId(2)),
+        });
+        assert_eq!(lower_f(&s), None);
     }
 
     #[test]

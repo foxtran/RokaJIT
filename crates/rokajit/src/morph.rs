@@ -47,6 +47,16 @@ pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
                     certify_expr(value)?;
                 }
                 hir::StmtKind::BlockZero { addr, .. } => certify_expr(addr)?,
+                hir::StmtKind::BlockCopyDyn { dst, src, size } => {
+                    certify_expr(dst)?;
+                    certify_expr(src)?;
+                    certify_expr(size)?;
+                }
+                hir::StmtKind::BlockFillDyn { dst, fill, size } => {
+                    certify_expr(dst)?;
+                    certify_expr(fill)?;
+                    certify_expr(size)?;
+                }
                 hir::StmtKind::BoundsCheck { array, index } => {
                     certify_expr(array)?;
                     certify_expr(index)?;
@@ -62,9 +72,11 @@ pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
             } => certify_expr(value)?,
             hir::Terminator::Throw { exception } => certify_expr(exception)?,
             // The step_10.6 EH terminators carry no expressions: `leave`,
-            // a `CallFinally` step, and `endfinally` reference blocks only.
+            // a `CallFinally` step, `endfinally`, and `rethrow` reference
+            // blocks only (or nothing at all).
             hir::Terminator::Leave { .. }
             | hir::Terminator::CallFinally { .. }
+            | hir::Terminator::Rethrow
             | hir::Terminator::EndFinally => {}
             _ => {}
         }
@@ -86,11 +98,12 @@ fn certify_expr(expr: &hir::Expr) -> CompileResult<()> {
         hir::Expr::Load { addr, .. } => certify_expr(addr)?,
         hir::Expr::FieldAddr { obj, .. } => certify_expr(obj)?,
         hir::Expr::Unary { arg, .. } => certify_expr(arg)?,
-        hir::Expr::Binary { lhs, rhs, .. } => {
+        hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
             certify_expr(lhs)?;
             certify_expr(rhs)?;
         }
         hir::Expr::Conv { arg, .. } => certify_expr(arg)?,
+        hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => certify_expr(arg)?,
         hir::Expr::Call { target, sig, args } => {
             if let CallTarget::Indirect(addr) = target {
                 certify_expr(addr)?;
@@ -112,6 +125,7 @@ fn certify_expr(expr: &hir::Expr) -> CompileResult<()> {
         }
         hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => certify_expr(arg)?,
         hir::Expr::StructVal { addr, .. } => certify_expr(addr)?,
+        hir::Expr::LocAlloc { size } => certify_expr(size)?,
     }
     Ok(())
 }

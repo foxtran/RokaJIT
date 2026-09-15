@@ -288,6 +288,15 @@ pub mod hir {
         /// Zero a block of memory (`initobj`): `size_of(class)` bytes at
         /// `addr` (step_10.9).
         BlockZero { addr: Expr, class: ClassHandle },
+        /// Copy `size` bytes from `src` to `dst` (`cpblk`, 0xFE 17): the
+        /// runtime-sized sibling of the struct block copy — a plain byte
+        /// copy, no null checks (importer.cpp:11110). Fields evaluate in
+        /// IL push order: destination, source, size.
+        BlockCopyDyn { dst: Expr, src: Expr, size: Expr },
+        /// Fill `size` bytes at `dst` with the low byte of `fill`
+        /// (`initblk`, 0xFE 18): the runtime-sized sibling of
+        /// [`StmtKind::BlockZero`].
+        BlockFillDyn { dst: Expr, fill: Expr, size: Expr },
         /// The array bounds check (step_10.8: `ldelem`/`stelem`/`ldelema`):
         /// throws `IndexOutOfRangeException` unless `0 <= index < len`
         /// (unsigned — a negative index is huge); a null array faults on
@@ -320,6 +329,12 @@ pub mod hir {
         Throw {
             exception: Expr,
         },
+        /// `rethrow` (0xFE 1A) — re-raise the in-flight exception: the
+        /// never-returning `CORINFO_HELP_RETHROW` call. Valid only inside
+        /// a catch handler; ends the block like `throw` (IL after it is
+        /// dead — the handler's region-end fallthrough would otherwise
+        /// fabricate an edge into the next region).
+        Rethrow,
         /// `leave` out of a protected region.
         Leave {
             target: BlockId,
@@ -378,12 +393,51 @@ pub mod hir {
             lhs: Box<Expr>,
             rhs: Box<Expr>,
         },
+        /// Checked integer arithmetic (`add.ovf`/`sub.ovf`/`mul.ovf` and
+        /// their `.un` forms): `op` is `Add`/`Sub`/`Mul` only, and
+        /// `unsigned` is the IL `.un` suffix — it selects the overflow
+        /// condition (carry vs. signed overflow), not a different
+        /// operator. Throws `OverflowException` on overflow; the result
+        /// is the promoted operand type. Effectful: a discarded tree
+        /// must still evaluate (it can throw).
+        BinaryOvf {
+            op: BinaryOp,
+            unsigned: bool,
+            lhs: Box<Expr>,
+            rhs: Box<Expr>,
+        },
         /// Numeric conversion (`conv.*`); `overflow`/`unsigned` from the IL
         /// opcode suffixes.
         Conv {
             to: Type,
             overflow: bool,
             unsigned: bool,
+            arg: Box<Expr>,
+        },
+        /// Checked conversion (`conv.ovf.*` and their `.un` forms) from an
+        /// integer source: `arg`, read with `unsigned_src` signedness,
+        /// must fit the target range — `dst_bits` (8/16/32/64) with
+        /// `signed_dst` — or the conversion throws `OverflowException`.
+        /// The eval-stack types normalize the sub-Int32 targets away, so
+        /// the width and target signedness ride the node; `to` is the
+        /// pushed stack type (Int32 for ≤32-bit targets, Int64/NativeInt
+        /// for 64-bit). Float sources never appear here — the importer
+        /// emits the `DBL2*_OVF` helper calls instead (RyuJIT's
+        /// fgCastRequiresHelper split, morph.cpp:413-436). Effectful: a
+        /// discarded tree can still throw.
+        ConvOvf {
+            to: Type,
+            dst_bits: u32,
+            signed_dst: bool,
+            unsigned_src: bool,
+            arg: Box<Expr>,
+        },
+        /// `ckfinite`: `arg` (Float or Double) passes through unchanged,
+        /// but a non-finite value (`±Inf`, NaN — the exponent all ones)
+        /// throws `OverflowException` (RyuJIT's SCK_ARITH_EXCPN helper,
+        /// CORINFO_HELP_OVERFLOW — flowgraph.cpp:3494). Effectful like
+        /// [`Expr::ConvOvf`].
+        CkFinite {
             arg: Box<Expr>,
         },
         /// **A call in HIR is an expression node** (`Expr::Call`) that may
@@ -433,6 +487,14 @@ pub mod hir {
         /// first store of a catch handler's entry block — the funclet's
         /// incoming argument register is not a value anywhere else.
         CatchArg,
+        /// `localloc` (0xFE 0F): `size` bytes of dynamic stack space,
+        /// zero-initialized, its address a `native int` value (RyuJIT's
+        /// TYP_I_IMPL — a ByRef would become a GC-reported interior-
+        /// pointer root; the space holds no tracked roots). Effectful:
+        /// the allocation moves rsp for the rest of the method.
+        LocAlloc {
+            size: Box<Expr>,
+        },
     }
 
     /// An EH region over a contiguous block range (half-open). In the
@@ -533,11 +595,43 @@ pub mod lir {
             lhs: Operand,
             rhs: Operand,
         },
+        /// Checked integer arithmetic (`add.ovf`/`sub.ovf`/`mul.ovf`,
+        /// `.un` forms): like [`StmtKind::Binary`], but `op` is restricted
+        /// to `Add`/`Sub`/`Mul` and an overflowing result throws
+        /// `OverflowException` (the EE's `CORINFO_HELP_OVERFLOW`) instead
+        /// of wrapping. `unsigned` selects the unsigned (carry) overflow
+        /// condition.
+        BinaryOvf {
+            dst: LocalId,
+            op: BinaryOp,
+            unsigned: bool,
+            lhs: Operand,
+            rhs: Operand,
+        },
         Conv {
             dst: LocalId,
             to: Type,
             overflow: bool,
             unsigned: bool,
+            src: Operand,
+        },
+        /// Checked conversion (HIR [`Expr::ConvOvf`]): `src`, read with
+        /// `unsigned_src` signedness, must fit the `dst_bits` (8/16/32/64)
+        /// target range (`signed_dst`) or the statement throws
+        /// `OverflowException` — codegen owns the conditional-throw
+        /// sequence (the [`StmtKind::BinaryOvf`] shape). `dst` is defined
+        /// only on the no-throw edge.
+        ConvOvf {
+            dst: LocalId,
+            dst_bits: u32,
+            signed_dst: bool,
+            unsigned_src: bool,
+            src: Operand,
+        },
+        /// `ckfinite` (HIR [`Expr::CkFinite`]): the float `src` passes to
+        /// `dst` unchanged; a non-finite value throws `OverflowException`.
+        CkFinite {
+            dst: LocalId,
             src: Operand,
         },
         /// Load through a byref operand at a constant offset.
@@ -581,6 +675,15 @@ pub mod lir {
             index: Operand,
             elem: Type,
         },
+        /// `localloc`: allocate `size` bytes of dynamic stack space
+        /// (16-rounded, so call sites keep their alignment), zero it,
+        /// and define `dst` (a NativeInt temp) as its base address. A
+        /// statement — like `Call`, it never nests: it moves rsp and its
+        /// zero-init is a helper call.
+        LocAlloc {
+            dst: LocalId,
+            size: Operand,
+        },
         /// The array bounds check (step_10.8): the length load doubles as
         /// the null check; on failure the RNGCHKFAIL helper throws
         /// `IndexOutOfRangeException`. A statement (no result value).
@@ -617,6 +720,24 @@ pub mod lir {
             dst_addr: Operand,
             class: ClassHandle,
         },
+        /// Copy `size` bytes from `src_addr` to `dst_addr` (`cpblk`) —
+        /// the runtime-sized sibling of [`StmtKind::BlockCopy`]. Codegen
+        /// always emits the `CORINFO_HELP_MEMCPY` call (tier 0: no
+        /// inline-threshold decision on a dynamic size).
+        BlockCopyDyn {
+            dst_addr: Operand,
+            src_addr: Operand,
+            size: Operand,
+        },
+        /// Fill `size` bytes at `dst_addr` with the low byte of `fill`
+        /// (`initblk`) — the runtime-sized sibling of
+        /// [`StmtKind::BlockZero`], always the `CORINFO_HELP_MEMSET`
+        /// call.
+        BlockFillDyn {
+            dst_addr: Operand,
+            fill: Operand,
+            size: Operand,
+        },
         /// `ret` of a register-passed struct value: `addr` is the value's
         /// address (a ByRef operand). The non-register-passed form never
         /// reaches LIR as a struct return — the importer rewrites it to a
@@ -647,6 +768,11 @@ pub mod lir {
         Throw {
             exception: Operand,
         },
+        /// `rethrow` — the never-returning `CORINFO_HELP_RETHROW` helper
+        /// call (no argument: the VM finds the in-flight exception via
+        /// the stack walk). Always the block's last statement, like
+        /// `Throw`.
+        Rethrow,
         Leave {
             target: BlockId,
         },

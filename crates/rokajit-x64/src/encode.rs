@@ -34,6 +34,7 @@
 //! | `CmpF`                | [`Asm::ucomis`]                             |
 //! | `SetccF` / `JccF`     | [`Asm::setcc`] / [`Asm::jcc`] sequences     |
 //! | `CvtIntToF` / `CvtFToInt` / `CvtFToF` | [`Asm::cvtsi2s`] / [`Asm::cvtts2si`] / [`Asm::cvts2s`] |
+//! | `CvtU64ToF`           | codegen's branchy [`Asm::cvtsi2s`] expansion |
 //!
 //! REX/ModRM/SIB selection is table-driven: one generic ModRM/SIB/disp
 //! encoder ([`encode_modrm`]) plus per-group rows ([`AluRow`],
@@ -446,6 +447,9 @@ fn cc_tttn(cc: CondCode) -> u8 {
         CondCode::UGe => 0x3,
         CondCode::Parity => 0xA,
         CondCode::NotParity => 0xB,
+        CondCode::NotSign => 0x9,
+        CondCode::Overflow => 0x0,
+        CondCode::NotOverflow => 0x1,
     }
 }
 
@@ -717,6 +721,15 @@ impl Asm {
         self.emit_sse_enc(0x66, enc, 0x6E);
     }
 
+    /// `movq r64, xmm` (`FWidth::D`) / `movd r32, xmm` (`FWidth::S`) —
+    /// `66 0F 7E /r`, REX.W for the 64-bit form: the reverse crossing,
+    /// bits unchanged (ckfinite's exponent check reads them in a GPR).
+    pub fn mov_xmm_to_gpr(&mut self, width: FWidth, dst: Gpr, src: Xmm) {
+        let w64 = matches!(width, FWidth::D);
+        let enc = encode_modrm(w64, src as u8, Rm::Reg(dst));
+        self.emit_sse_enc(0x66, enc, 0x7E);
+    }
+
     fn alu(&mut self, row: &AluRow, width: Width, dst: Rm, src: Rmi) {
         let wide = matches!(width, Width::W64);
         match (dst, src) {
@@ -768,6 +781,22 @@ impl Asm {
     pub fn idiv(&mut self, width: Width, divisor: Rm) {
         let wide = matches!(width, Width::W64);
         self.emit_modrm_insn(wide, 7, divisor, &[0xF7]);
+    }
+
+    /// `mul src` — the one-operand unsigned multiply (`F7 /4`):
+    /// `rdx:rax := rax * src`; OF=CF=1 iff the upper half (`rdx`) is
+    /// nonzero. No immediate form exists.
+    pub fn mul(&mut self, width: Width, src: Rm) {
+        let wide = matches!(width, Width::W64);
+        self.emit_modrm_insn(wide, 4, src, &[0xF7]);
+    }
+
+    /// `imul src` — the one-operand signed multiply (`F7 /5`):
+    /// `rdx:rax := rax * src`; OF=CF=1 iff the upper half is not the
+    /// sign extension of the low half. No immediate form exists.
+    pub fn imul1(&mut self, width: Width, src: Rm) {
+        let wide = matches!(width, Width::W64);
+        self.emit_modrm_insn(wide, 5, src, &[0xF7]);
     }
 
     /// `cdq` (W32) / `cqo` (W64): sign-extend `rax` into `rdx:rax`.
@@ -1563,6 +1592,25 @@ mod tests {
         );
     }
 
+    // ---- one-operand mul / imul (F7 /4, F7 /5; the checked-mul forms) ----
+
+    #[test]
+    fn mul_one_operand_forms() {
+        // mull %ecx
+        assert_eq!(finish(|a| a.mul(W32, Rm::Reg(Rcx))), [0xF7, 0xE1]);
+        // mulq %rcx
+        assert_eq!(finish(|a| a.mul(W64, Rm::Reg(Rcx))), [0x48, 0xF7, 0xE1]);
+        // mulq %r9 (REX.W+B)
+        assert_eq!(finish(|a| a.mul(W64, Rm::Reg(R9))), [0x49, 0xF7, 0xE1]);
+        // imull %edx
+        assert_eq!(finish(|a| a.imul1(W32, Rm::Reg(Rdx))), [0xF7, 0xEA]);
+        // imulq -16(%rbp) — memory source
+        assert_eq!(
+            finish(|a| a.imul1(W64, Rm::Mem(Mem::base_disp(Rbp, -16)))),
+            [0x48, 0xF7, 0x6D, 0xF0]
+        );
+    }
+
     // ---- prolog/epilog singletons ----
 
     #[test]
@@ -1615,17 +1663,19 @@ mod tests {
     fn jcc_opcode_table_and_negative_rel32() {
         // Every CondCode in one pass: l: jcc l — disp = -6 from the end
         // of each 6-byte instruction; pins the 0F 8x tttn nibble.
-        let cases: [(CondCode, u8); 10] = [
-            (CondCode::Eq, 0x84),  // je
-            (CondCode::Ne, 0x85),  // jne
-            (CondCode::Lt, 0x8C),  // jl
-            (CondCode::Le, 0x8E),  // jle
-            (CondCode::Gt, 0x8F),  // jg
-            (CondCode::Ge, 0x8D),  // jge
-            (CondCode::ULt, 0x82), // jb
-            (CondCode::ULe, 0x86), // jbe
-            (CondCode::UGt, 0x87), // ja
-            (CondCode::UGe, 0x83), // jae
+        let cases: [(CondCode, u8); 12] = [
+            (CondCode::Overflow, 0x80),    // jo
+            (CondCode::NotOverflow, 0x81), // jno
+            (CondCode::Eq, 0x84),          // je
+            (CondCode::Ne, 0x85),          // jne
+            (CondCode::Lt, 0x8C),          // jl
+            (CondCode::Le, 0x8E),          // jle
+            (CondCode::Gt, 0x8F),          // jg
+            (CondCode::Ge, 0x8D),          // jge
+            (CondCode::ULt, 0x82),         // jb
+            (CondCode::ULe, 0x86),         // jbe
+            (CondCode::UGt, 0x87),         // ja
+            (CondCode::UGe, 0x83),         // jae
         ];
         for (cc, opcode) in cases {
             let bytes = finish(|a| {
@@ -2086,6 +2136,25 @@ mod tests {
         assert_eq!(
             finish(|a| a.mov_gpr_to_xmm(D, Xmm10, R9)),
             [0x66, 0x4D, 0x0F, 0x6E, 0xD1]
+        );
+    }
+
+    #[test]
+    fn mov_xmm_to_gpr_forms() {
+        // movq %xmm0, %rax — 66 REX.W 0F 7E.
+        assert_eq!(
+            finish(|a| a.mov_xmm_to_gpr(D, Rax, Xmm0)),
+            [0x66, 0x48, 0x0F, 0x7E, 0xC0]
+        );
+        // movd %xmm1, %eax
+        assert_eq!(
+            finish(|a| a.mov_xmm_to_gpr(S, Rax, Xmm1)),
+            [0x66, 0x0F, 0x7E, 0xC8]
+        );
+        // movq %xmm10, %r9 — REX.W+R+B (the xmm is the reg field).
+        assert_eq!(
+            finish(|a| a.mov_xmm_to_gpr(D, R9, Xmm10)),
+            [0x66, 0x4D, 0x0F, 0x7E, 0xD1]
         );
     }
 

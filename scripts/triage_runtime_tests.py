@@ -719,10 +719,16 @@ PANIC_RE = re.compile(r"rokajit: panic in compileMethod")
 # gate messages are gone; the residual EH rejects are the out-of-scope
 # filter/fault clauses, endfilter and rethrow. step_10.8 landed arrays:
 # the "arrays:" reject is gone; the bucket keeps the residual array-pack
-# gates.)
+# gates. cpblk/initblk landed with named residuals for the remaining
+# deferred opcodes: rethrow and switch landed too, so their rules are
+# gone; the TypedReference ops (mkrefany/refanyval/refanytype) landed,
+# so their rule is gone too; the bucket keeps the named jmp/arglist/
+# tail. rejects.)
 BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"EH filter clauses|EH fault clauses"), "EH filters/faults (out of 10.6 scope)"),
-    (re.compile(r"^rethrow$"), "rethrow (out of 10.6 scope)"),
+    (re.compile(r"tail-call transfer"), "jmp (tail-call transfer)"),
+    (re.compile(r"arglist \(varargs\)"), "arglist/varargs"),
+    (re.compile(r"tail\. prefix"), "tail. prefix (tail calls)"),
     (re.compile(r"newobj of a delegate|call to a delegate member"), "delegates (out of step-11 scope)"),
     (re.compile(r"generic methods"), "generics"),
     (re.compile(r"non-class receiver \(value types\)|initobj/ldobj/stobj/cpobj of a non-value class|struct alignment above 16|SysV descriptor"), "structs & value types"),
@@ -735,7 +741,6 @@ BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"class handle through an indirection cell"), "class handle indirection (IAT_PVALUE/PPVALUE)"),
     (re.compile(r"ldtoken.*(indirection cell|runtime lookup)"), "ldtoken handle embedding (10.10 gates)"),
     (re.compile(r"cast/box|box of Nullable|unbox of Nullable|helper outside the (box|unbox|isinst/castclass) set"), "boxing & casts"),
-    (re.compile(r"switch:"), "switch"),
     (re.compile(r"ldstr through a handle-cell"), "ldstr indirection (IAT_PVALUE/PPVALUE)"),
     (re.compile(r"non-direct call kind"), "non-direct calls (callvirt/calli)"),
     (re.compile(r"non-default calling convention"), "non-default calling conventions"),

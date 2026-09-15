@@ -225,6 +225,16 @@ pub enum CondCode {
     Parity,
     /// `jnp` — parity clear (the ordered case of `ucomis*`).
     NotParity,
+    /// `jns` — sign clear (SF=0). The `CvtU64ToF` expansion branches on
+    /// the source's top bit (`test src, src`).
+    NotSign,
+    /// `jo` — overflow set (OF=1). Read after a checked-arithmetic op
+    /// (HIR `BinaryOvf`): signed overflow of `add`/`sub`, or the
+    /// one-operand `imul`/`mul` "upper half is not the sign extension /
+    /// not zero" report (OF=CF for both).
+    Overflow,
+    /// `jno` — overflow clear: the no-throw edge of a checked op.
+    NotOverflow,
 }
 
 impl CondCode {
@@ -324,6 +334,17 @@ pub enum Inst {
         dst: XmmPlace,
         src: Src,
     },
+    /// u64 → f32/f64 (`conv.r.un` of a 64-bit operand): no SSE2 unsigned
+    /// conversion exists, so codegen emits the branchy fixup expansion
+    /// (codegenxarch.cpp:7007 — without the cmov, which the encoder
+    /// lacks): non-negative sources take a plain signed `cvtsi2s*`;
+    /// negative ones convert `(src >> 1) | (src & 1)` and double the
+    /// result.
+    CvtU64ToF {
+        width: FWidth,
+        dst: XmmPlace,
+        src: Src,
+    },
     /// `cvttss2si`/`cvttsd2si dst, src` — float to integer with truncation
     /// (`conv.i4`/`i8`/`u4` from a float operand). Out-of-range input
     /// yields the "integer indefinite" value (`0x8000…`), matching RyuJIT.
@@ -363,6 +384,53 @@ pub enum Inst {
     /// lowering zeroes `edx` instead of emitting `cdq`). No immediate
     /// form exists.
     Div { width: Width, divisor: Src },
+    /// Checked integer arithmetic (LIR `BinaryOvf`; `op` is `Add`/`Sub`/
+    /// `Mul` only): compute `dst := lhs op rhs`, throwing
+    /// `OverflowException` (the never-returning `CORINFO_HELP_OVERFLOW`)
+    /// when the operation overflows — the signed forms test OF (`jo`),
+    /// the `.un` forms CF (`jc`). `Add`/`Sub` are the destructive
+    /// two-operand forms like [`Inst::Arith`]; `Mul` is the one-operand
+    /// `imul`/`mul` (`F7 /5`, `F7 /4`) through the fixed rdx:rax pair —
+    /// both set OF=CF exactly on overflow, so the same `jo`/`jc` test
+    /// serves. Codegen owns the conditional-throw sequence (the
+    /// [`Inst::BoundsCheck`] shape: spill first, op, `jcc` over the
+    /// helper call, `nop`), writing `dst` only on the no-throw edge.
+    ArithOvf {
+        op: rokajit::ir::BinaryOp,
+        unsigned: bool,
+        width: Width,
+        dst: Place,
+        lhs: Src,
+        rhs: Src,
+    },
+    /// Checked conversion (LIR `ConvOvf`; `conv.ovf.*`, integer sources):
+    /// `src` — read at `width_src` with `unsigned_src` signedness — must
+    /// fit the target range (`width_dst` bits, 8/16/32/64, `signed_dst`)
+    /// or the conversion throws `OverflowException` (the never-returning
+    /// `CORINFO_HELP_OVERFLOW`). Cells whose source range is contained in
+    /// the target's never reach here (the importer emits the plain
+    /// widening/identity instead). Codegen owns the conditional-throw
+    /// sequence (the [`Inst::ArithOvf`] shape: spill first, check, `jcc`
+    /// over the helper call, `nop`), then produces the narrowed/zero- or
+    /// sign-extended result, writing `dst` only on the no-throw edge.
+    ConvOvf {
+        width_src: Width,
+        width_dst: u32,
+        signed_dst: bool,
+        unsigned_src: bool,
+        dst: Place,
+        src: Src,
+    },
+    /// `ckfinite`: throw `OverflowException` (`CORINFO_HELP_OVERFLOW` —
+    /// RyuJIT's SCK_ARITH_EXCPN helper, flowgraph.cpp:3494) when `src`'s
+    /// exponent field is all ones (±Inf/NaN); the value passes to `dst`
+    /// unchanged on the no-throw edge. The check reads the value's bits
+    /// in a GPR and masks the exponent (codegenxarch.cpp:7082-7118).
+    CkFinite {
+        width: FWidth,
+        dst: XmmPlace,
+        src: XmmSrc,
+    },
     /// `shl`/`shr`/`sar dst, count`: the count is an immediate (the `C1`
     /// imm8 form) or a value that codegen places in `cl` (the `D3` form).
     /// Hardware masks the count to 5/6 bits by operand width — ECMA-335's
@@ -502,6 +570,20 @@ pub enum Inst {
     /// `sub rsp, <frame size>` — the size is codegen's frame-layout
     /// result; lowering only declares that a frame exists.
     AllocFrame,
+    /// `localloc` (LIR `LocAlloc`): allocate `size` bytes of dynamic
+    /// stack space — `size` into a scratch, rounded up to 16 plus the
+    /// frame's outgoing-argument area re-reserved below the block
+    /// (RyuJIT's FEATURE_FIXED_OUT_ARGS shape, so the rsp-relative
+    /// outgoing stores stay correct), `sub rsp`, the base (`rsp +
+    /// outgoing_bytes`) into `dst` — then zero the space through the
+    /// EE's `CORINFO_HELP_MEMSET` (unconditional: the same zero-init
+    /// policy the prolog applies to locals; writing every byte upward
+    /// from the lowest address also subsumes RyuJIT's guard-page probe
+    /// loop). The zero-init calls a helper, so the descriptor carries
+    /// the call's fixed-register duties. Main-frame only: a funclet's
+    /// dynamic rsp adjustment would corrupt the inherited parent frame
+    /// (the importer gates localloc out of handler regions).
+    LocAlloc { dst: Place, size: Src },
     // --- step_10.9: the struct ABI and block operations ---
     /// Load `size` bytes (1..=8) from `[addr + disp]` into an ABI-pinned
     /// register, zero-extended (GPR) or as `movss`/`movsd` (XMM). Used at
@@ -529,7 +611,8 @@ pub enum Inst {
     /// `mov [rsp + offset], src` — an outgoing scalar stack argument
     /// (SysV register-pool overflow; step_10.9). `offset` is relative to
     /// `rsp` at the call instruction; the outgoing area is sized into the
-    /// frame.
+    /// frame. A `localloc` re-reserves the area below its block, so the
+    /// rsp-relative form is correct in localloc frames too.
     StoreStackArg { width: Width, offset: u32, src: Src },
     /// The float form of [`Inst::StoreStackArg`] (`movss`/`movsd`).
     StoreStackArgF {
@@ -540,7 +623,8 @@ pub enum Inst {
     /// Copy `size` bytes from `[addr]` to `[rsp + offset]` — an outgoing
     /// stack-passed struct argument (a whole struct that didn't fit the
     /// register pools, or one the EE never classifies for registers).
-    /// Always inline (no helper call mid-argument-setup).
+    /// Always inline (no helper call mid-argument-setup). rsp-relative
+    /// like [`Inst::StoreStackArg`].
     CopyStackArg {
         addr: BlockAddr,
         offset: u32,
@@ -564,6 +648,23 @@ pub enum Inst {
         dst: BlockAddr,
         dst_disp: u32,
         size: u32,
+    },
+    /// `cpblk` (LIR `BlockCopyDyn`): copy a runtime-sized block — always
+    /// the EE's `CORINFO_HELP_MEMCPY(dst, src, size)` call (tier 0: no
+    /// inline-threshold decision on a dynamic size). The call's
+    /// fixed-register duties are declared.
+    BlockCopyDyn {
+        dst: BlockAddr,
+        src: BlockAddr,
+        size: Src,
+    },
+    /// `initblk` (LIR `BlockFillDyn`): fill `size` bytes at `[dst]` with
+    /// the low byte of `fill` — always `CORINFO_HELP_MEMSET(dst,
+    /// fill & 0xFF, size)`.
+    BlockFillDyn {
+        dst: BlockAddr,
+        fill: Src,
+        size: Src,
     },
     /// `leave` (`mov rsp, rbp; pop rbp`) — the frame teardown matching
     /// the [`Inst::Push`] + `mov rbp, rsp` + [`Inst::AllocFrame`] prolog.
@@ -663,6 +764,20 @@ impl Inst {
                 uses: &[Gpr::Rax, Gpr::Rdx],
                 defs: &[Gpr::Rax, Gpr::Rdx],
             },
+            // The one-operand `mul`/`imul` form works in rdx:rax; every
+            // checked op conditionally calls the OVERFLOW helper (the
+            // caller-saved defs).
+            Inst::ArithOvf {
+                op: rokajit::ir::BinaryOp::Mul,
+                ..
+            } => FixedRegs {
+                uses: &[Gpr::Rax],
+                defs: CALL_DEFS,
+            },
+            Inst::ArithOvf { .. } => FixedRegs {
+                uses: &[],
+                defs: CALL_DEFS,
+            },
             // A variable-count shift moves the count into `cl`.
             Inst::Shift { rhs, .. } if !matches!(rhs, Src::Imm(_)) => FixedRegs {
                 uses: &[],
@@ -672,6 +787,16 @@ impl Inst {
             | Inst::CallHelper { .. }
             | Inst::CallLabel { .. }
             | Inst::CallReg { .. } => FixedRegs {
+                uses: &[],
+                defs: CALL_DEFS,
+            },
+            // The zero-init MEMSET call inside the localloc sequence.
+            Inst::LocAlloc { .. } => FixedRegs {
+                uses: &[],
+                defs: CALL_DEFS,
+            },
+            // The cpblk/initblk MEMCPY/MEMSET calls.
+            Inst::BlockCopyDyn { .. } | Inst::BlockFillDyn { .. } => FixedRegs {
                 uses: &[],
                 defs: CALL_DEFS,
             },
@@ -759,5 +884,31 @@ mod tests {
             src: Src::Imm(0),
         };
         assert_eq!(mov.fixed_regs(), NO_FIXED);
+
+        // Checked arithmetic: every form conditionally calls the OVERFLOW
+        // helper (caller-saved defs); the one-operand `mul`/`imul`
+        // additionally reads rax and writes rdx:rax.
+        let add_ovf = Inst::ArithOvf {
+            op: B::Add,
+            unsigned: false,
+            width: Width::W32,
+            dst: Place::Reg(Gpr::Rax),
+            lhs: Src::Imm(1),
+            rhs: Src::Imm(2),
+        }
+        .fixed_regs();
+        assert!(add_ovf.uses.is_empty());
+        assert!(add_ovf.defs.contains(&Gpr::Rax) && add_ovf.defs.contains(&Gpr::Rdx));
+        let mul_ovf = Inst::ArithOvf {
+            op: B::Mul,
+            unsigned: true,
+            width: Width::W64,
+            dst: Place::Reg(Gpr::Rax),
+            lhs: Src::Imm(1),
+            rhs: Src::Imm(2),
+        }
+        .fixed_regs();
+        assert_eq!(mul_ovf.uses, &[Gpr::Rax]);
+        assert!(mul_ovf.defs.contains(&Gpr::Rax) && mul_ovf.defs.contains(&Gpr::Rdx));
     }
 }

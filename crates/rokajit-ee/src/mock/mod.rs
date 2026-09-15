@@ -210,6 +210,10 @@ pub struct MockEe {
     /// the RuntimeTypeHandle/RuntimeMethodHandle/RuntimeFieldHandle
     /// stand-in class.
     pub token_type_class: Option<ClassHandle>,
+    /// Canned `get_builtin_class` answers (the TypedReference ops'
+    /// CLASSID_TYPED_BYREF/CLASSID_TYPE_HANDLE), keyed by the
+    /// `CorInfoClassId`'s raw value; absent ids answer `None`.
+    pub builtin_classes: HashMap<u32, ClassHandle>,
     /// `embed_generic_handle` rejection forms (step_10.10): can a
     /// generic-context runtime lookup or an indirection-cell answer. The
     /// default is a direct, token-deterministic IAT_VALUE handle.
