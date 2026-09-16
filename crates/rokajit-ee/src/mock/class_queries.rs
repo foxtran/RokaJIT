@@ -90,11 +90,11 @@ impl ClassQueries for MockEe {
     }
 
     fn get_class_static_dynamic_info(&self, _cls: ClassHandle) -> Option<NonNull<u8>> {
-        None
+        NonNull::new(self.static_dynamic_info? as *mut u8)
     }
 
     fn get_class_thread_static_dynamic_info(&self, _cls: ClassHandle) -> Option<NonNull<u8>> {
-        None
+        NonNull::new(self.thread_static_dynamic_info? as *mut u8)
     }
 
     fn get_static_base_address(

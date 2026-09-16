@@ -75,15 +75,42 @@ impl FieldQueries for MockEe {
         info.structType = field
             .value_class
             .map_or(std::ptr::null_mut(), |c| c.as_raw());
-        info.accessAllowed = ffi::CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ALLOWED;
+        info.accessAllowed = if field.access_illegal {
+            // The real EE's only non-ALLOWED answer (jitinterface.cpp:
+            // FIELD_ACCESS_EXCEPTION(callerForSecurity, field)).
+            info.accessCalloutHelper.helperNum =
+                crate::enums::CorInfoHelpFunc::FIELD_ACCESS_EXCEPTION.to_raw();
+            info.accessCalloutHelper.numArgs = 2;
+            info.accessCalloutHelper.args[0].argType =
+                ffi::CorInfoAccessAllowedHelperArgType_CORINFO_HELPER_ARG_TYPE_Method;
+            info.accessCalloutHelper.args[0]
+                .__bindgen_anon_1
+                .methodHandle = 0xCA11_E700 as ffi::CORINFO_METHOD_HANDLE;
+            info.accessCalloutHelper.args[1].argType =
+                ffi::CorInfoAccessAllowedHelperArgType_CORINFO_HELPER_ARG_TYPE_Field;
+            info.accessCalloutHelper.args[1]
+                .__bindgen_anon_1
+                .fieldHandle = field.handle.as_raw();
+            ffi::CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ILLEGAL
+        } else {
+            ffi::CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ALLOWED
+        };
         // The helper/offset pair drives the GENERICS_STATIC_HELPER
         // accessor (step_11.3D): the base helper id and the field's
         // offset into the statics block.
         info.helper = field.statics_helper.map_or(0, |h| h.to_raw());
         info.offset = field.offset;
-        info.fieldLookup.accessType = ffi::InfoAccessType_IAT_VALUE;
-        info.fieldLookup.__bindgen_anon_1.addr =
-            (0x57A7_0000usize + field.handle.as_raw() as usize * 8) as *mut std::ffi::c_void;
+        if field.address_via_cell {
+            // IAT_PVALUE: `fieldLookup.addr` is the cell holding the
+            // field's address, not the address itself.
+            info.fieldLookup.accessType = ffi::InfoAccessType_IAT_PVALUE;
+            info.fieldLookup.__bindgen_anon_1.addr =
+                (0xCE11_0000usize + field.handle.as_raw() as usize * 8) as *mut std::ffi::c_void;
+        } else {
+            info.fieldLookup.accessType = ffi::InfoAccessType_IAT_VALUE;
+            info.fieldLookup.__bindgen_anon_1.addr =
+                (0x57A7_0000usize + field.handle.as_raw() as usize * 8) as *mut std::ffi::c_void;
+        }
         info
     }
 
@@ -97,8 +124,12 @@ impl FieldQueries for MockEe {
         ClassHandle(field.0 as ffi::CORINFO_CLASS_HANDLE)
     }
 
-    fn get_thread_local_field_info(&self, _field: FieldHandle, _is_gc_type: bool) -> u32 {
-        0
+    fn get_thread_local_field_info(&self, field: FieldHandle, _is_gc_type: bool) -> u32 {
+        self.fields
+            .values()
+            .find(|f| f.handle == field)
+            .map(|f| f.tls_index)
+            .unwrap_or(0)
     }
 
     fn get_thread_local_static_blocks_info(&self) -> ffi::CORINFO_THREAD_STATIC_BLOCKS_INFO {

@@ -118,6 +118,16 @@ pub struct MockField {
     /// `GENERICS_STATIC_HELPER` accessor (step_11.3D) — e.g.
     /// `GET_GCSTATIC_BASE`; absent cans a zeroed (rejected) helper.
     pub statics_helper: Option<CorInfoHelpFunc>,
+    /// Step_11.7 knobs: the canned `get_thread_local_field_info` index
+    /// (the TLS_MANAGED accessor's helper argument), a forced
+    /// `CORINFO_ACCESS_ILLEGAL` access verdict (the access-callout path —
+    /// the callout desc mirrors the real EE's FIELD_ACCESS_EXCEPTION
+    /// shape), and `fieldLookup` as IAT_PVALUE (the
+    /// address-through-a-cell shape) instead of the default IAT_VALUE
+    /// final address.
+    pub tls_index: u32,
+    pub access_illegal: bool,
+    pub address_via_cell: bool,
 }
 
 /// Canned EE. Every query returns the stored/default value; output sinks
@@ -253,6 +263,15 @@ pub struct MockEe {
     /// with (its metadata token; 0 when the call had no `constrained.`
     /// prefix), in order (step_11.3C).
     pub constrained_seen: RefCell<Vec<u32>>,
+    /// Canned `get_class_static_dynamic_info` /
+    /// `get_class_thread_static_dynamic_info` pointers (step_11.7's
+    /// shared-static-helper argument); `None` = the C++ null.
+    pub static_dynamic_info: Option<usize>,
+    pub thread_static_dynamic_info: Option<usize>,
+    /// Can the string-literal queries' indirection-cell answer
+    /// (IAT_PVALUE — step_11.7); the default is a direct IAT_VALUE
+    /// object reference.
+    pub string_literal_cell: bool,
     /// Sink calls observed, newest last, as "(kind, detail)" strings.
     pub sink_log: RefCell<Vec<String>>,
     /// Buffers handed out by the fake `alloc_mem`/`alloc_gc_info`, kept
@@ -401,6 +420,9 @@ impl MockEe {
                 in_heap: false,
                 accessor: None,
                 statics_helper: None,
+                tls_index: 0,
+                access_illegal: false,
+                address_via_cell: false,
             },
         );
         handle

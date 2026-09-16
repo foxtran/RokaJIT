@@ -485,6 +485,24 @@ enum BlockOpCell {
     Ref,
 }
 
+/// A resolved static-field access (step_11.7): the field, the EE's answer
+/// shape, the class-init trigger argument when the cctor must run, and
+/// the access-callout statement when the verdict was not ALLOWED.
+struct StaticFieldResolution {
+    field: FieldHandle,
+    shape: StaticFieldShape,
+    init_arg: Option<hir::Expr>,
+    callout: Option<hir::StmtKind>,
+}
+
+/// The EE's answer to a static-field query: the address to access
+/// through, or — for the three CoreLib intrinsic fields, GET-only answers
+/// — the field's constant value directly (importer.cpp:9731-9762).
+enum StaticFieldShape {
+    Address(hir::Expr),
+    Value(Type, hir::Expr),
+}
+
 /// The calling-convention gate (entry sig and `call`/`callvirt` callee
 /// sigs). Step_11.3B lifted the generics rejection:
 /// `CORINFO_CALLCONV_GENERIC` without `CORINFO_CALLCONV_PARAMTYPE` is an
@@ -3374,8 +3392,10 @@ impl BlockImport<'_> {
     /// (morph.cpp:6775), and so do we, resolved against the compilation
     /// scope (decisions/2026-09-12-ldstr-and-gc-roots.md). `IAT_VALUE`
     /// hands back the frozen object reference directly: an IR ref
-    /// constant. The handle-cell indirection forms (R2R-style) need load
-    /// and relocation plumbing tier 0 doesn't have — a later step.
+    /// constant. `IAT_PVALUE` is the EE's stringref cell — one deref
+    /// (gtNewIndOfIconHandleNode's TYP_REF indir, gentree.cpp:9471), the
+    /// same cell-load shape as `const_lookup_expr`'s (step_11.7); deeper
+    /// indirection stays out.
     fn ldstr(&mut self, token: u32) -> CompileResult<()> {
         let Some(module) = ModuleHandle::from_raw(self.info.args.scope) else {
             return Err(CompileError::BadIl("ldstr with a null module scope"));
@@ -3393,8 +3413,24 @@ impl BlockImport<'_> {
                     hir::Expr::Const(Const::FrozenRef(ptr.as_ptr() as u64)),
                 )
             }
+            InfoAccessType::PValue => {
+                let Some(cell) = value else {
+                    return Err(CompileError::Internal(
+                        "construct_string_literal: IAT_PVALUE with a null cell",
+                    ));
+                };
+                self.push(
+                    Type::Ref,
+                    hir::Expr::Load {
+                        addr: Box::new(hir::Expr::Const(Const::NativeInt(cell.as_ptr() as isize))),
+                        offset: 0,
+                        ty: Type::Ref,
+                        access: MemAccess::Natural,
+                    },
+                )
+            }
             _ => Err(CompileError::Unsupported(
-                "ldstr through a handle-cell indirection (IAT_PVALUE/PPVALUE)",
+                "ldstr through multiple indirections (IAT_PPVALUE/RELPVALUE)",
             )),
         }
     }
@@ -5136,37 +5172,51 @@ impl BlockImport<'_> {
     }
 
     /// Static-field resolution shared by `ldsfld`/`ldsflda`/`stsfld`
-    /// (step_10.7): one `getFieldInfo` query per opcode (the
-    /// `CORINFO_ACCESS_GET`/`SET`/`ADDRESS` flag is the only difference —
-    /// `flags`, corinfo.h:622). For a plain static the EE answers
-    /// `CORINFO_FIELD_STATIC_ADDRESS` (RVA statics:
-    /// `..._STATIC_RVA_ADDRESS`, the same shape) with `IAT_VALUE`, and
-    /// `fieldLookup.addr` IS the field's final address — the offset into
-    /// the statics block is already baked in (jitinterface.cpp:1492
-    /// `GetStaticAddressHandle`), embedded here as a raw `NativeInt`
-    /// constant with no layout math (the newobj MethodTable* policy).
-    /// A value-class static the EE boxes (`STATIC_IN_HEAP`) instead
-    /// answers the address of the cell holding the frozen box object —
-    /// the field data is one indirection plus the object header away
-    /// (importer.cpp:4417). A shared-generic class's static
-    /// (`CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER`, step_11.3D)
-    /// computes its address as `helper(parent-class handle) + offset`
-    /// (importer.cpp:4199-4223), the parent handle coming through the
-    /// generic-handle path — embedding the resolved hClass directly would
-    /// name the canonical representative's statics, the same silent-wrong
-    /// family as the cast/box operands. Thread statics, the collectible
-    /// shared-static helper, indirection cells, and access callouts stay
-    /// named `Unsupported` (the gates RyuJIT's `CORINFO_FLG_FIELD_STATIC`
-    /// check and R2R paths also take).
+    /// (step_10.7, gates removed in step_11.7): one `getFieldInfo` query
+    /// per opcode (the `CORINFO_ACCESS_GET`/`SET`/`ADDRESS` flag is the
+    /// only difference — `flags`, corinfo.h:622). The EE's answer is
+    /// authoritative; each `fieldAccessor` shape emits faithfully
+    /// (RyuJIT's `impImportStaticFieldAddress`, importer.cpp:4146, and
+    /// the intrinsic substitutions at importer.cpp:9731-9762):
     ///
-    /// Returns the field, the field's address expression, and the
-    /// INITCLASS argument when the class-init trigger fired (see
-    /// [`BlockImport::maybe_init_class`]).
+    /// - `STATIC_ADDRESS`/`STATIC_RVA_ADDRESS`: `fieldLookup` consumed
+    ///   through `const_lookup_expr` — IAT_VALUE's `addr` IS the field's
+    ///   final address (offset baked in, jitinterface.cpp:1492); IAT_PVALUE
+    ///   is the one-deref cell form.
+    /// - `STATIC_IN_HEAP` (boxed value-class statics) wraps any of the
+    ///   address-computing shapes: the cell holds the frozen box object,
+    ///   the field data one indirection plus the object header away
+    ///   (importer.cpp:4417) — RyuJIT applies the wrap to every
+    ///   `impImportStaticFieldAddress` path, and so do we.
+    /// - `GENERICS_STATIC_HELPER`: `helper(runtime-looked-up parent class
+    ///   handle) + offset` (importer.cpp:4199-4223), the parent through
+    ///   the generic-handle path (embedding the resolved hClass directly
+    ///   would name the canonical representative's statics). The
+    ///   thread-static base helpers are equally valid EE answers
+    ///   (importer.cpp:4207).
+    /// - `SHARED_STATIC_HELPER` (collectible classes, plain
+    ///   `[ThreadStatic]`) and `STATIC_TLS_MANAGED` (the optimized TLS
+    ///   forms): `fgGetStaticsCCtorHelper`'s argument table
+    ///   (flowgraph.cpp:717-820) — see [`BlockImport::shared_statics_base`].
+    /// - `STATIC_ADDR_HELPER`/`STATIC_TLS` (EnC-new fields, C++/CLI PE
+    ///   TLS): `helper(embedded field handle)` IS the address — no offset
+    ///   (gtNewRefCOMfield, gentree.cpp:19107; x64 rewrites STATIC_TLS to
+    ///   ADDR_HELPER, importer.cpp:9694).
+    /// - The three CoreLib intrinsic fields (`INTRINSIC_ZERO` =
+    ///   IntPtr/UIntPtr.Zero, `INTRINSIC_EMPTY_STRING` = String.Empty,
+    ///   `INTRINSIC_ISLITTLEENDIAN` = BitConverter.IsLittleEndian —
+    ///   jitinterface.cpp:1109-1131, GET-only answers): the constant
+    ///   value substitutes the access entirely — no address, no cctor.
+    ///
+    /// A non-ALLOWED `accessAllowed` prepends the access-callout helper
+    /// statement (impInsertHelperCall, importer.cpp:4497) and the access
+    /// imports normally after it. Only the R2R-only
+    /// `STATIC_READYTORUN_HELPER` shape stays gated.
     fn resolve_static_field(
         &mut self,
         token: u32,
         flags: u32,
-    ) -> CompileResult<(FieldHandle, hir::Expr, Option<hir::Expr>)> {
+    ) -> CompileResult<StaticFieldResolution> {
         let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
             t.tokenContext = self.info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
             t.tokenScope = self.info.args.scope;
@@ -5183,50 +5233,140 @@ impl BlockImport<'_> {
             // BADCODEs this too (importer.cpp CEE_LDSFLD).
             return Err(CompileError::BadIl("static access on an instance field"));
         }
-        // The GENERICS_STATIC_HELPER accessor (step_11.3D) carries its
-        // statics-base helper id; every other accepted accessor is the
-        // const-address shape.
-        let generics_base_helper = match info.fieldAccessor {
-            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_ADDRESS
-            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_RVA_ADDRESS => None,
-            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS
-            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS_MANAGED => {
-                return Err(CompileError::Unsupported(
-                    "thread-local statics ([ThreadStatic])",
-                ));
+        // A non-ALLOWED verdict prepends the access callout (the EE's
+        // only such answer on CoreCLR is CORINFO_ACCESS_ILLEGAL with
+        // FIELD_ACCESS_EXCEPTION — an unconditional throw); the access
+        // itself still imports normally (impHandleAccessAllowed,
+        // importer.cpp:9620).
+        let callout =
+            if info.accessAllowed != ffi::CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ALLOWED {
+                Some(self.access_callout(&info.accessCalloutHelper)?)
+            } else {
+                None
+            };
+        // The field's address (or — for the intrinsics — value)
+        // expression, plus — for the generics-helper shape — the parent
+        // class handle (which doubles as the INITCLASS argument if the
+        // cctor trigger fires: impInitClass's impParentClassTokenToHandle,
+        // importer.cpp:3908).
+        let mut init_handle = None;
+        let shape = match info.fieldAccessor {
+            // The CoreLib intrinsic fields: the value substitutes the
+            // access (GET-only EE answers, importer.cpp:9731-9762).
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_INTRINSIC_ZERO => {
+                StaticFieldShape::Value(Type::NativeInt, hir::Expr::Const(Const::NativeInt(0)))
+            }
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_INTRINSIC_ISLITTLEENDIAN => {
+                // x64 is little-endian (the only target).
+                StaticFieldShape::Value(Type::Int32, hir::Expr::Const(Const::Int32(1)))
+            }
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_INTRINSIC_EMPTY_STRING => {
+                let expr = match self.ee.empty_string_literal() {
+                    (InfoAccessType::Value, Some(ptr)) => {
+                        hir::Expr::Const(Const::FrozenRef(ptr.as_ptr() as u64))
+                    }
+                    (InfoAccessType::PValue, Some(cell)) => hir::Expr::Load {
+                        addr: Box::new(hir::Expr::Const(Const::NativeInt(cell.as_ptr() as isize))),
+                        offset: 0,
+                        ty: Type::Ref,
+                        access: MemAccess::Natural,
+                    },
+                    (InfoAccessType::PValue | InfoAccessType::Value, None) => {
+                        return Err(CompileError::Internal(
+                            "empty_string_literal answered a null pointer",
+                        ));
+                    }
+                    _ => {
+                        return Err(CompileError::Unsupported(
+                            "empty string through multiple indirections",
+                        ));
+                    }
+                };
+                StaticFieldShape::Value(Type::Ref, expr)
+            }
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_ADDR_HELPER
+            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS => {
+                // gtNewRefCOMfield (gentree.cpp:19107): the helper answers
+                // the field's full address — no offset is added. The
+                // argument is the field handle through the generic-handle
+                // path (impTokenToHandle).
+                let fld = self.embed_handle_expr(&mut resolved, false)?;
+                StaticFieldShape::Address(hir::Expr::Call {
+                    target: CallTarget::Helper(CorInfoHelpFunc::from_raw(info.helper)),
+                    sig: CallSig {
+                        ret: Type::ByRef,
+                        args: vec![Type::NativeInt],
+                        has_this: false,
+                    },
+                    args: vec![fld],
+                })
             }
             ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER => {
                 // RyuJIT's impImportStaticFieldAddress case
                 // (importer.cpp:4199): the statics base is
                 // `helper(runtime-looked-up parent class handle)`, the
-                // field at `pFieldInfo->offset` past it. The thread-
-                // static bases are valid EE answers (importer.cpp:4207)
-                // but stay out of step-11's scope.
+                // field at `pFieldInfo->offset` past it. The thread-static
+                // bases are equally valid answers (importer.cpp:4207).
                 let helper = CorInfoHelpFunc::from_raw(info.helper);
                 match helper {
-                    CorInfoHelpFunc::GET_GCSTATIC_BASE | CorInfoHelpFunc::GET_NONGCSTATIC_BASE => {
-                        Some(helper)
-                    }
-                    CorInfoHelpFunc::GET_GCTHREADSTATIC_BASE
-                    | CorInfoHelpFunc::GET_NONGCTHREADSTATIC_BASE => {
-                        return Err(CompileError::Unsupported(
-                            "thread-local statics of a shared-generic class",
-                        ));
-                    }
+                    CorInfoHelpFunc::GET_GCSTATIC_BASE
+                    | CorInfoHelpFunc::GET_NONGCSTATIC_BASE
+                    | CorInfoHelpFunc::GET_GCTHREADSTATIC_BASE
+                    | CorInfoHelpFunc::GET_NONGCTHREADSTATIC_BASE => {}
                     _ => {
                         return Err(CompileError::Unsupported(
                             "generic statics helper outside the statics-base set",
                         ));
                     }
                 }
+                let parent = self.class_handle_expr(&mut resolved, true, true)?;
+                init_handle = Some(parent.clone());
+                let base = hir::Expr::Call {
+                    target: CallTarget::Helper(helper),
+                    sig: CallSig {
+                        ret: Type::ByRef,
+                        args: vec![Type::NativeInt],
+                        has_this: false,
+                    },
+                    args: vec![parent],
+                };
+                StaticFieldShape::Address(self.boxed_static_addr(
+                    binary(
+                        BinaryOp::Add,
+                        base,
+                        hir::Expr::Const(Const::NativeInt(info.offset as isize)),
+                    ),
+                    info.fieldFlags,
+                    field,
+                ))
             }
-            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_SHARED_STATIC_HELPER => {
-                return Err(CompileError::Unsupported(
-                    "static field of a collectible class (shared static helper)",
-                ));
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_SHARED_STATIC_HELPER
+            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS_MANAGED => {
+                let Some(class) = ClassHandle::from_raw(resolved.hClass) else {
+                    return Err(CompileError::Internal(
+                        "shared-static accessor with a null class handle",
+                    ));
+                };
+                let base =
+                    self.shared_statics_base(field, class, CorInfoHelpFunc::from_raw(info.helper))?;
+                StaticFieldShape::Address(self.boxed_static_addr(
+                    binary(
+                        BinaryOp::Add,
+                        base,
+                        hir::Expr::Const(Const::NativeInt(info.offset as isize)),
+                    ),
+                    info.fieldFlags,
+                    field,
+                ))
             }
-            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_ADDR_HELPER
-            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_READYTORUN_HELPER => {
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_ADDRESS
+            | ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_RVA_ADDRESS => {
+                // IAT_VALUE: the field's final address constant; IAT_PVALUE:
+                // the one-deref cell (const_lookup_expr's shared shape).
+                let addr = const_lookup_expr(&info.fieldLookup)?;
+                StaticFieldShape::Address(self.boxed_static_addr(addr, info.fieldFlags, field))
+            }
+            ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_READYTORUN_HELPER => {
                 return Err(CompileError::Unsupported(
                     "static field through an address helper (R2R)",
                 ));
@@ -5235,67 +5375,6 @@ impl BlockImport<'_> {
                 return Err(CompileError::Unsupported(
                     "static field accessor outside the statics pack",
                 ));
-            }
-        };
-        if info.accessAllowed != ffi::CorInfoIsAccessAllowedResult_CORINFO_ACCESS_ALLOWED {
-            return Err(CompileError::Unsupported(
-                "static field needing an access callout",
-            ));
-        }
-        // The field's address expression, plus — for the generics-helper
-        // shape — the parent class handle (which doubles as the INITCLASS
-        // argument if the cctor trigger fires: impInitClass's
-        // impParentClassTokenToHandle, importer.cpp:3908).
-        let (addr_expr, init_handle) = match generics_base_helper {
-            Some(helper) => {
-                let parent = self.class_handle_expr(&mut resolved, true, true)?;
-                let base = hir::Expr::Call {
-                    target: CallTarget::Helper(helper),
-                    sig: CallSig {
-                        ret: Type::ByRef,
-                        args: vec![Type::NativeInt],
-                        has_this: false,
-                    },
-                    args: vec![parent.clone()],
-                };
-                (
-                    binary(
-                        BinaryOp::Add,
-                        base,
-                        hir::Expr::Const(Const::NativeInt(info.offset as isize)),
-                    ),
-                    Some(parent),
-                )
-            }
-            None => {
-                if info.fieldLookup.accessType != ffi::InfoAccessType_IAT_VALUE {
-                    // The indirection-cell answer is the R2R shape — the
-                    // ldstr/newobj policy: load+relocation plumbing tier 0
-                    // doesn't have.
-                    return Err(CompileError::Unsupported(
-                        "static field address through an indirection cell (IAT_PVALUE/PPVALUE)",
-                    ));
-                }
-                // SAFETY: IAT_VALUE's live union member is `addr`
-                // (corinfo.h's CORINFO_CONST_LOOKUP contract).
-                let addr = unsafe { info.fieldLookup.__bindgen_anon_1.addr };
-                let mut addr_expr = hir::Expr::Const(Const::NativeInt(addr as isize));
-                if info.fieldFlags & ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_STATIC_IN_HEAP != 0
-                {
-                    // A boxed value-class static: the cell holds the frozen box
-                    // object; the field data sits past the object header.
-                    addr_expr = hir::Expr::FieldAddr {
-                        obj: Box::new(hir::Expr::Load {
-                            addr: Box::new(addr_expr),
-                            offset: 0,
-                            ty: Type::Ref,
-                            access: MemAccess::Natural,
-                        }),
-                        field,
-                        offset: 8, // TARGET_POINTER_SIZE
-                    };
-                }
-                (addr_expr, None)
             }
         };
         // The class-init trigger (the semantic core of the pack):
@@ -5323,7 +5402,200 @@ impl BlockImport<'_> {
                 });
             }
         }
-        Ok((field, addr_expr, init_arg))
+        Ok(StaticFieldResolution {
+            field,
+            shape,
+            init_arg,
+            callout,
+        })
+    }
+
+    /// The statics-base helper call for the `SHARED_STATIC_HELPER` and
+    /// `TLS_MANAGED` accessors — `fgGetStaticsCCtorHelper`'s
+    /// argument/return-type table (flowgraph.cpp:717-820): the OPTIMIZED
+    /// threadstatic bases take the field's TLS index
+    /// (`getThreadLocalFieldInfo`, a TYP_INT arg — the GC variant answers
+    /// the GC index), the DYNAMIC/PINNED bases the MethodTable's
+    /// (thread-)statics-info pointer, the legacy bases the embedded class
+    /// handle. The PINNED and OPTIMIZED2 families return TYP_I_IMPL, the
+    /// rest TYP_BYREF. The non-NOCTOR helpers run the cctor themselves —
+    /// the EE never sets INITCLASS on these paths (jitinterface.cpp:1484),
+    /// so [`BlockImport::maybe_init_class`] stays a no-op for them. The
+    /// field's offset past the base is added by the caller.
+    fn shared_statics_base(
+        &mut self,
+        field: FieldHandle,
+        class: ClassHandle,
+        helper: CorInfoHelpFunc,
+    ) -> CompileResult<hir::Expr> {
+        use CorInfoHelpFunc as H;
+        let dynamic_info = |info: Option<std::ptr::NonNull<u8>>| {
+            info.map(|p| hir::Expr::Const(Const::NativeInt(p.as_ptr() as isize)))
+                .ok_or(CompileError::Unsupported(
+                    "shared statics base without a dynamic-info pointer",
+                ))
+        };
+        let (arg_ty, arg, ret) = match helper {
+            H::GETDYNAMIC_GCTHREADSTATIC_BASE_NOCTOR_OPTIMIZED => {
+                let index = self.ee.get_thread_local_field_info(field, true);
+                (
+                    Type::Int32,
+                    hir::Expr::Const(Const::Int32(index as i32)),
+                    Type::ByRef,
+                )
+            }
+            H::GETDYNAMIC_NONGCTHREADSTATIC_BASE_NOCTOR_OPTIMIZED
+            | H::GETDYNAMIC_NONGCTHREADSTATIC_BASE_NOCTOR_OPTIMIZED2
+            | H::GETDYNAMIC_NONGCTHREADSTATIC_BASE_NOCTOR_OPTIMIZED2_NOJITOPT => {
+                let index = self.ee.get_thread_local_field_info(field, false);
+                let ret = if helper == H::GETDYNAMIC_NONGCTHREADSTATIC_BASE_NOCTOR_OPTIMIZED {
+                    Type::ByRef
+                } else {
+                    Type::NativeInt
+                };
+                (
+                    Type::Int32,
+                    hir::Expr::Const(Const::Int32(index as i32)),
+                    ret,
+                )
+            }
+            H::GETDYNAMIC_GCTHREADSTATIC_BASE
+            | H::GETDYNAMIC_GCTHREADSTATIC_BASE_NOCTOR
+            | H::GETDYNAMIC_NONGCTHREADSTATIC_BASE
+            | H::GETDYNAMIC_NONGCTHREADSTATIC_BASE_NOCTOR => (
+                Type::NativeInt,
+                dynamic_info(self.ee.get_class_thread_static_dynamic_info(class))?,
+                Type::ByRef,
+            ),
+            H::GETDYNAMIC_GCSTATIC_BASE
+            | H::GETDYNAMIC_GCSTATIC_BASE_NOCTOR
+            | H::GETDYNAMIC_NONGCSTATIC_BASE
+            | H::GETDYNAMIC_NONGCSTATIC_BASE_NOCTOR => (
+                Type::NativeInt,
+                dynamic_info(self.ee.get_class_static_dynamic_info(class))?,
+                Type::ByRef,
+            ),
+            H::GETPINNED_GCSTATIC_BASE
+            | H::GETPINNED_GCSTATIC_BASE_NOCTOR
+            | H::GETPINNED_NONGCSTATIC_BASE
+            | H::GETPINNED_NONGCSTATIC_BASE_NOCTOR => (
+                Type::NativeInt,
+                dynamic_info(self.ee.get_class_static_dynamic_info(class))?,
+                Type::NativeInt,
+            ),
+            H::GET_GCSTATIC_BASE
+            | H::GET_NONGCSTATIC_BASE
+            | H::GET_GCSTATIC_BASE_NOCTOR
+            | H::GET_NONGCSTATIC_BASE_NOCTOR
+            | H::GET_GCTHREADSTATIC_BASE
+            | H::GET_NONGCTHREADSTATIC_BASE
+            | H::GET_GCTHREADSTATIC_BASE_NOCTOR
+            | H::GET_NONGCTHREADSTATIC_BASE_NOCTOR => {
+                (Type::NativeInt, self.embed_class_const(class)?, Type::ByRef)
+            }
+            _ => {
+                return Err(CompileError::Unsupported(
+                    "statics-base helper outside fgGetStaticsCCtorHelper's table",
+                ));
+            }
+        };
+        Ok(hir::Expr::Call {
+            target: CallTarget::Helper(helper),
+            sig: CallSig {
+                ret,
+                args: vec![arg_ty],
+                has_this: false,
+            },
+            args: vec![arg],
+        })
+    }
+
+    /// The boxed-static wrap (`CORINFO_FLG_FIELD_STATIC_IN_HEAP`,
+    /// importer.cpp:4417): the computed address names the cell holding
+    /// the frozen box object; the field data sits one indirection plus
+    /// the object header (TARGET_POINTER_SIZE) past it. Applied to every
+    /// `impImportStaticFieldAddress` shape — not to the ADDR_HELPER
+    /// answer, which names the field directly.
+    fn boxed_static_addr(
+        &mut self,
+        addr: hir::Expr,
+        field_flags: u32,
+        field: FieldHandle,
+    ) -> hir::Expr {
+        if field_flags & ffi::CORINFO_FIELD_FLAGS_CORINFO_FLG_FIELD_STATIC_IN_HEAP == 0 {
+            return addr;
+        }
+        hir::Expr::FieldAddr {
+            obj: Box::new(hir::Expr::Load {
+                addr: Box::new(addr),
+                offset: 0,
+                ty: Type::Ref,
+                access: MemAccess::Natural,
+            }),
+            field,
+            offset: 8, // TARGET_POINTER_SIZE
+        }
+    }
+
+    /// The access-callout statement for a non-ALLOWED `getFieldInfo`
+    /// verdict (step_11.7): RyuJIT's `impInsertHelperCall`
+    /// (importer.cpp:4497) — a standalone void helper call placed before
+    /// the access. Handle arguments embed raw (gtNewIconEmb*HndNode) with
+    /// the matching mustBeLoaded notification; constants embed as-is.
+    fn access_callout(&mut self, desc: &ffi::CORINFO_HELPER_DESC) -> CompileResult<hir::StmtKind> {
+        let mut args = Vec::with_capacity(desc.numArgs as usize);
+        for arg in desc.args.iter().take(desc.numArgs as usize) {
+            let raw = match arg.argType {
+                ffi::CorInfoAccessAllowedHelperArgType_CORINFO_HELPER_ARG_TYPE_Field => {
+                    // SAFETY: argType selects the union member.
+                    let h = unsafe { arg.__bindgen_anon_1.fieldHandle };
+                    if let Some(field) = FieldHandle::from_raw(h) {
+                        let class = self.ee.get_field_class(field);
+                        self.ee.class_must_be_loaded_before_code_is_run(class);
+                    }
+                    h as isize
+                }
+                ffi::CorInfoAccessAllowedHelperArgType_CORINFO_HELPER_ARG_TYPE_Method => {
+                    // SAFETY: argType selects the union member.
+                    let h = unsafe { arg.__bindgen_anon_1.methodHandle };
+                    if let Some(method) = MethodHandle::from_raw(h) {
+                        self.ee.method_must_be_loaded_before_code_is_run(method);
+                    }
+                    h as isize
+                }
+                ffi::CorInfoAccessAllowedHelperArgType_CORINFO_HELPER_ARG_TYPE_Class => {
+                    // SAFETY: argType selects the union member.
+                    let h = unsafe { arg.__bindgen_anon_1.classHandle };
+                    if let Some(class) = ClassHandle::from_raw(h) {
+                        self.ee.class_must_be_loaded_before_code_is_run(class);
+                    }
+                    h as isize
+                }
+                ffi::CorInfoAccessAllowedHelperArgType_CORINFO_HELPER_ARG_TYPE_Module => {
+                    // SAFETY: argType selects the union member.
+                    unsafe { arg.__bindgen_anon_1.moduleHandle as isize }
+                }
+                ffi::CorInfoAccessAllowedHelperArgType_CORINFO_HELPER_ARG_TYPE_Const => {
+                    // SAFETY: argType selects the union member.
+                    unsafe { arg.__bindgen_anon_1.constant as isize }
+                }
+                _ => {
+                    return Err(CompileError::Unsupported(
+                        "access callout argument outside the handle/constant set",
+                    ));
+                }
+            };
+            args.push(hir::Expr::Const(Const::NativeInt(raw)));
+        }
+        Ok(hir::StmtKind::Eval(hir::Expr::Call {
+            target: CallTarget::Helper(CorInfoHelpFunc::from_raw(desc.helperNum)),
+            sig: CallSig {
+                ret: Type::Void,
+                args: vec![Type::NativeInt; args.len()],
+                has_this: false,
+            },
+            args,
+        }))
     }
 
     /// Emits the static-constructor trigger (`CORINFO_HELP_INITCLASS` of
@@ -5357,18 +5629,29 @@ impl BlockImport<'_> {
     /// (a beforefieldinit class has no explicit cctor to observe, so the
     /// uniform order is spec-conforming for both init modes), then the
     /// load itself — a tree, like `ldfld`'s. A struct-typed static loads
-    /// as its address (the `StructVal` discipline, step_10.9).
+    /// as its address (the `StructVal` discipline, step_10.9). An
+    /// intrinsic-field answer (step_11.7) pushes the constant value
+    /// directly — no address, no cctor.
     fn ldsfld(
         &mut self,
         token: u32,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let (field, addr, init_arg) =
-            self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_GET)?;
-        let (ty, access) = self.field_mem_type(field)?;
+        let res = self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_GET)?;
+        if let Some(callout) = res.callout {
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: callout,
+            });
+        }
+        let (ty, access) = self.field_mem_type(res.field)?;
         self.spill_stack(stmts, il_offset)?;
-        self.maybe_init_class(init_arg, stmts, il_offset);
+        let addr = match res.shape {
+            StaticFieldShape::Value(ty, value) => return self.push(ty, value),
+            StaticFieldShape::Address(addr) => addr,
+        };
+        self.maybe_init_class(res.init_arg, stmts, il_offset);
         if let Type::Struct(class) = ty {
             return self.push(
                 ty,
@@ -5390,17 +5673,30 @@ impl BlockImport<'_> {
     }
 
     /// `ldsflda` (0x7F): the static field's address — type-agnostic, like
-    /// `ldflda`.
+    /// `ldsflda`'s instance sibling. An intrinsic-field answer is a value,
+    /// not an address — the EE produces it for GET only, so reaching one
+    /// here is an EE contract violation.
     fn ldsflda(
         &mut self,
         token: u32,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let (_field, addr, init_arg) =
+        let res =
             self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_ADDRESS)?;
+        if let Some(callout) = res.callout {
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: callout,
+            });
+        }
+        let StaticFieldShape::Address(addr) = res.shape else {
+            return Err(CompileError::Internal(
+                "ldsflda on an intrinsic static field",
+            ));
+        };
         self.spill_stack(stmts, il_offset)?;
-        self.maybe_init_class(init_arg, stmts, il_offset);
+        self.maybe_init_class(res.init_arg, stmts, il_offset);
         self.push(Type::ByRef, addr)
     }
 
@@ -5419,15 +5715,25 @@ impl BlockImport<'_> {
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<()> {
-        let (field, addr, init_arg) =
-            self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_SET)?;
-        let (ty, access) = self.field_mem_type(field)?;
+        let res = self.resolve_static_field(token, ffi::CORINFO_ACCESS_FLAGS_CORINFO_ACCESS_SET)?;
+        let StaticFieldShape::Address(addr) = res.shape else {
+            return Err(CompileError::Internal(
+                "stsfld on an intrinsic static field",
+            ));
+        };
+        let (ty, access) = self.field_mem_type(res.field)?;
         let (vt, value) = self.pop()?;
         if vt != ty {
             return Err(CompileError::BadIl("stsfld value type mismatch"));
         }
+        if let Some(callout) = res.callout {
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: callout,
+            });
+        }
         self.spill_stack(stmts, il_offset)?;
-        let value = if init_arg.is_some() {
+        let value = if res.init_arg.is_some() {
             let t = self.temp(ty);
             stmts.push(hir::Stmt {
                 il_offset,
@@ -5437,7 +5743,7 @@ impl BlockImport<'_> {
         } else {
             value
         };
-        self.maybe_init_class(init_arg, stmts, il_offset);
+        self.maybe_init_class(res.init_arg, stmts, il_offset);
         if let Type::Struct(class) = ty {
             return self.store_struct_through(addr, class, value, stmts, il_offset);
         }
@@ -6325,16 +6631,21 @@ impl BlockImport<'_> {
 
     /// Embeds a class handle as a raw `NativeInt` constant (a MethodTable*
     /// is not an object reference and is never GC-rooted as one — the
-    /// newobj rule); an indirection cell needs load/reloc plumbing tier 0
-    /// doesn't have.
+    /// newobj rule); an indirection cell is the shared one-deref shape
+    /// (`const_lookup_expr`'s IAT_PVALUE form, step_11.7).
     fn embed_class_const(&mut self, class: ClassHandle) -> CompileResult<hir::Expr> {
-        let (embedded, indirection) = self.ee.embed_class_handle(class);
-        let (Some(class), None) = (embedded, indirection) else {
-            return Err(CompileError::Unsupported(
-                "class handle through an indirection cell",
-            ));
-        };
-        Ok(hir::Expr::Const(Const::NativeInt(class.as_raw() as isize)))
+        match self.ee.embed_class_handle(class) {
+            (Some(class), None) => Ok(hir::Expr::Const(Const::NativeInt(class.as_raw() as isize))),
+            (None, Some(cell)) => Ok(hir::Expr::Load {
+                addr: Box::new(hir::Expr::Const(Const::NativeInt(cell.as_ptr() as isize))),
+                offset: 0,
+                ty: Type::NativeInt,
+                access: MemAccess::Natural,
+            }),
+            _ => Err(CompileError::Internal(
+                "embed_class_handle answered neither a handle nor a cell",
+            )),
+        }
     }
 
     /// Pops the object operand of a cast/unbox: a reference (`null`
@@ -8760,7 +9071,7 @@ mod tests {
         assert_eq!(sig.args, [Type::Ref, Type::NativeInt, Type::NativeInt]);
         assert_eq!(args.len(), 4, "this, target, method, pArg3");
         assert!(matches!(args[1], hir::Expr::Const(Const::NullRef)));
-        assert!(matches!(args[3], hir::Expr::Const(Const::NativeInt(v)) if v == 0xABC0 as isize));
+        assert!(matches!(args[3], hir::Expr::Const(Const::NativeInt(v)) if v == 0xABC0_isize));
     }
 
     #[test]
@@ -11775,7 +12086,7 @@ mod tests {
         let hir::Expr::FtnAddr { entry, .. } = return_value(&m, 0) else {
             panic!("expected the FtnAddr provenance wrapper")
         };
-        assert_eq!(as_local(&**entry), dst);
+        assert_eq!(as_local(entry), dst);
         assert_eq!(
             ee.call_info_flags.borrow().as_slice(),
             [CallInfoFlags::CALLVIRT | CallInfoFlags::LDFTN]
@@ -12347,24 +12658,238 @@ mod tests {
     }
 
     #[test]
-    fn statics_gate_instance_fields_and_unsupported_accessors() {
+    fn statics_gate_instance_fields_and_r2r_accessors() {
         // stsfld of an instance field: BadIl (RyuJIT BADCODEs it too).
         let il = [0x16, 0x80, 0x01, 0x00, 0x00, 0x04, 0x16, 0x2A];
         let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
         ee.add_field(FIELD_TOKEN, CorInfoType::Int, 16);
         assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
 
-        // A thread-static accessor is a named Unsupported.
+        // The R2R-only accessor stays a named Unsupported.
         let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
         let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
         ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
         ee.fields.get_mut(&FIELD_TOKEN).unwrap().accessor =
-            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS_MANAGED);
-        let err = import(&info, &ee).err().expect("TLS statics are out");
+            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_READYTORUN_HELPER);
+        let err = import(&info, &ee).err().expect("R2R statics are out");
         assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("ThreadStatic")),
+            matches!(&err, CompileError::Unsupported(m) if m.contains("R2R")),
             "{err:?}"
         );
+    }
+
+    /// The CoreLib intrinsic statics (step_11.7): the EE's constant-value
+    /// answers substitute the access — IntPtr.Zero is a NativeInt 0,
+    /// BitConverter.IsLittleEndian an Int32 1 (x64), String.Empty the
+    /// EE's empty-string object (jitinterface.cpp:1109-1131).
+    #[test]
+    fn intrinsic_statics_import_as_constants() {
+        // ldsfld F; ret
+        let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::NativeInt, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::NativeInt);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().accessor =
+            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_INTRINSIC_ZERO);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_isize(return_value(&m, 0)), 0, "IntPtr.Zero is 0");
+
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Byte);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().accessor =
+            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_INTRINSIC_ISLITTLEENDIAN);
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 1, "x64 is little-endian");
+
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Class, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Class);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().accessor =
+            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_INTRINSIC_EMPTY_STRING);
+        let m = import(&info, &ee).expect("imports");
+        match return_value(&m, 0) {
+            hir::Expr::Const(Const::FrozenRef(ptr)) => {
+                assert_eq!(*ptr, 0x5AFE_E5A0, "the mock's canned empty string")
+            }
+            _ => panic!("expected the empty-string constant"),
+        }
+    }
+
+    /// TLS_MANAGED (step_11.7): the OPTIMIZED threadstatic bases take the
+    /// field's TLS index as an Int32 arg; the field sits at
+    /// `pFieldInfo->offset` past the returned base (importer.cpp:4233).
+    #[test]
+    fn thread_statics_use_the_tls_index_helper() {
+        // ldsfld F; ret
+        let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let field = &mut ee.fields.get_mut(&FIELD_TOKEN).unwrap();
+        field.accessor = Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_TLS_MANAGED);
+        field.statics_helper =
+            Some(CorInfoHelpFunc::GETDYNAMIC_NONGCTHREADSTATIC_BASE_NOCTOR_OPTIMIZED);
+        field.tls_index = 7;
+        field.offset = 24;
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Load { addr, .. } = return_value(&m, 0) else {
+            panic!("expected the field load")
+        };
+        let (op, base, off) = as_binary(addr);
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_isize(off), 24, "the field's offset past the TLS base");
+        let hir::Expr::Call {
+            target,
+            sig: call_sig,
+            args,
+        } = base
+        else {
+            panic!("expected the TLS-base helper call")
+        };
+        assert!(matches!(target, CallTarget::Helper(h)
+                if *h == CorInfoHelpFunc::GETDYNAMIC_NONGCTHREADSTATIC_BASE_NOCTOR_OPTIMIZED));
+        assert_eq!(call_sig.ret, Type::ByRef);
+        assert_eq!(args.len(), 1);
+        assert_eq!(as_i32(&args[0]), 7, "the field's TLS index, TYP_INT");
+    }
+
+    /// SHARED_STATIC_HELPER (step_11.7): the DYNAMIC bases take the
+    /// MethodTable's statics-info pointer as a NativeInt constant
+    /// (fgGetStaticsCCtorHelper, flowgraph.cpp:794-813).
+    #[test]
+    fn shared_static_helper_uses_the_dynamic_info_pointer() {
+        // ldsfld F; ret
+        let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let field = &mut ee.fields.get_mut(&FIELD_TOKEN).unwrap();
+        field.accessor =
+            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_SHARED_STATIC_HELPER);
+        field.statics_helper = Some(CorInfoHelpFunc::GETDYNAMIC_GCSTATIC_BASE);
+        field.offset = 40;
+        ee.static_dynamic_info = Some(0xD1A6_0000);
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Load { addr, .. } = return_value(&m, 0) else {
+            panic!("expected the field load")
+        };
+        let (op, base, off) = as_binary(addr);
+        assert_eq!(op, BinaryOp::Add);
+        assert_eq!(as_isize(off), 40);
+        let hir::Expr::Call {
+            target,
+            sig: call_sig,
+            args,
+        } = base
+        else {
+            panic!("expected the shared-statics helper call")
+        };
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::GETDYNAMIC_GCSTATIC_BASE)
+        );
+        assert_eq!(call_sig.ret, Type::ByRef);
+        assert_eq!(as_isize(&args[0]), 0xD1A6_0000, "the statics-info pointer");
+
+        // A null dynamic-info pointer is a named gate, not a silent 0 arg.
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let field = &mut ee.fields.get_mut(&FIELD_TOKEN).unwrap();
+        field.accessor =
+            Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_SHARED_STATIC_HELPER);
+        field.statics_helper = Some(CorInfoHelpFunc::GETDYNAMIC_GCSTATIC_BASE);
+        let err = import(&info, &ee).err().expect("no dynamic info is a gate");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("dynamic-info")),
+            "{err:?}"
+        );
+    }
+
+    /// STATIC_ADDR_HELPER (step_11.7): `helper(embedded field handle)` IS
+    /// the field's address — no offset add (gtNewRefCOMfield,
+    /// gentree.cpp:19107).
+    #[test]
+    fn address_helper_statics_call_for_the_address() {
+        // ldsfld F; ret
+        let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        let field = &mut ee.fields.get_mut(&FIELD_TOKEN).unwrap();
+        field.accessor = Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_ADDR_HELPER);
+        field.statics_helper = Some(CorInfoHelpFunc::GETSTATICFIELDADDR);
+        field.offset = 96;
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Load { addr, offset, .. } = return_value(&m, 0) else {
+            panic!("expected the field load")
+        };
+        assert_eq!(*offset, 0);
+        let hir::Expr::Call { target, args, .. } = &**addr else {
+            panic!("expected the address-helper call")
+        };
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::GETSTATICFIELDADDR)
+        );
+        assert_eq!(args.len(), 1, "the field handle — and no offset add");
+    }
+
+    /// A non-ALLOWED access verdict prepends the callout helper statement
+    /// and imports the access normally after it (impInsertHelperCall,
+    /// importer.cpp:4497).
+    #[test]
+    fn illegal_static_access_prepends_the_callout() {
+        // ldsfld F; ret
+        let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().access_illegal = true;
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 1, "the callout; the load stays a tree");
+        match &stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) => {
+                assert!(
+                    matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::FIELD_ACCESS_EXCEPTION)
+                );
+                assert_eq!(sig.ret, Type::Void);
+                assert_eq!(args.len(), 2, "callerForSecurity, field");
+                assert_eq!(as_isize(&args[0]), 0xCA11_E700, "the caller handle");
+            }
+            _ => panic!("expected the access-callout helper call"),
+        }
+    }
+
+    /// IAT_PVALUE statics (step_11.7): the field's address is one deref of
+    /// the EE's cell — `const_lookup_expr`'s shared shape.
+    #[test]
+    fn statics_address_through_an_indirection_cell() {
+        // ldsfld F; ret
+        let il = [0x7E, 0x01, 0x00, 0x00, 0x04, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_static_field(FIELD_TOKEN, CorInfoType::Int);
+        ee.fields.get_mut(&FIELD_TOKEN).unwrap().address_via_cell = true;
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Load { addr, .. } = return_value(&m, 0) else {
+            panic!("expected the field load")
+        };
+        let hir::Expr::Load { addr: cell, ty, .. } = &**addr else {
+            panic!("expected the cell deref")
+        };
+        assert_eq!(*ty, Type::NativeInt, "the cell holds the field address");
+        assert_eq!(as_isize(cell), 0xCE11_0000 + 8 * 0x4000, "the mock's cell");
+    }
+
+    /// `ldstr` through the EE's stringref cell (IAT_PVALUE, step_11.7):
+    /// one deref, a Ref load.
+    #[test]
+    fn ldstr_through_an_indirection_cell() {
+        // ldstr "x"; pop; ret
+        let il = [0x72, 0x01, 0x00, 0x00, 0x70, 0x26, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[]);
+        ee.string_literal_cell = true;
+        let m = import(&info, &ee).expect("imports");
+        match &m.blocks[0].stmts[0].kind {
+            hir::StmtKind::Eval(hir::Expr::Load { addr, ty, .. }) => {
+                assert_eq!(*ty, Type::Ref);
+                assert_eq!(as_isize(addr), 0xCE11_5A00 + 0x70000001);
+            }
+            _ => panic!("expected the stringref cell deref"),
+        }
     }
 
     #[test]
@@ -13243,7 +13768,8 @@ mod tests {
             _ => panic!("expected the INITCLASS helper call"),
         }
 
-        // The thread-static base helpers stay gated (step-11 scope).
+        // The thread-static base helpers take the same shape
+        // (importer.cpp:4207; step_11.7).
         let (mut ee, info) = shared_fixture(
             &il,
             &sig(CorInfoType::Int, &[]),
@@ -13254,11 +13780,21 @@ mod tests {
         field.accessor =
             Some(ffi::CORINFO_FIELD_ACCESSOR_CORINFO_FIELD_STATIC_GENERICS_STATIC_HELPER);
         field.statics_helper = Some(CorInfoHelpFunc::GET_GCTHREADSTATIC_BASE);
-        let err = import(&info, &ee).err().expect("thread statics are out");
+        field.offset = 8;
+        ee.embed_lookup = Some(canned_lookup(false));
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Load { addr, .. } = return_value(&m, 0) else {
+            panic!("expected the field load")
+        };
+        let (op, base, _) = as_binary(addr);
+        assert_eq!(op, BinaryOp::Add);
+        let hir::Expr::Call { target, args, .. } = base else {
+            panic!("expected the threadstatics-base helper call")
+        };
         assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("thread-local")),
-            "{err:?}"
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::GET_GCTHREADSTATIC_BASE)
         );
+        assert_context_chain(&args[0]);
     }
 
     /// (f) Runtime_121711's ordering: a callvirt with a side-effecting

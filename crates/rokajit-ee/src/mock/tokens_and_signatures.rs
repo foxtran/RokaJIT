@@ -262,12 +262,25 @@ impl TokensAndSignatures for MockEe {
         // A canned frozen object: deterministic per token (identical
         // literals get identical references, like the real EE's interning),
         // never dereferenced by tests.
+        if self.string_literal_cell {
+            let cell = (0xCE11_5A00usize + meta_tok as usize) as *mut c_void;
+            return (InfoAccessType::PValue, NonNull::new(cell));
+        }
         let ptr = (0x5AFE_0000usize + meta_tok as usize) as *mut c_void;
         (InfoAccessType::Value, NonNull::new(ptr))
     }
 
     fn empty_string_literal(&self) -> (InfoAccessType, Option<NonNull<c_void>>) {
-        (InfoAccessType::Value, None)
+        if self.string_literal_cell {
+            return (
+                InfoAccessType::PValue,
+                NonNull::new(0xCE11_E5A0 as *mut c_void),
+            );
+        }
+        (
+            InfoAccessType::Value,
+            NonNull::new(0x5AFE_E5A0 as *mut c_void),
+        )
     }
 
     fn convert_pinvoke_calli_to_call(

@@ -34,13 +34,13 @@ are counted under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 1072 |
+| MATCH | 1075 |
 | MISMATCH | 9 |
-| CRASH | 1364 |
-| TIMEOUT | 4 |
+| CRASH | 1351 |
+| TIMEOUT | 14 |
 | COMPILE_FAIL | 832 |
 
-Of the MATCHes, 1061 exit 100 (the CoreCLR pass
+Of the MATCHes, 1064 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -55,15 +55,14 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| statics pack gates (10.7: TLS/generic/R2R/accessors) | 1186 | `JIT/CodeGenBringUpTests/ArrayMD1.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD2.cs`<br>`JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>… and 1181 more |
+| EH filters/faults (out of 10.6 scope) | 1183 | `JIT/CodeGenBringUpTests/ArrayMD1.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD2.cs`<br>`JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>… and 1178 more |
 | SIMD hardware intrinsics (real vector semantics — deferred, step_11.10) | 52 | `JIT/HardwareIntrinsics/General/ConstantFolding/ScalarConstantFoldings.cs`<br>`JIT/HardwareIntrinsics/General/HwiOp/CompareVectorWithZero.cs`<br>`JIT/HardwareIntrinsics/General/HwiOp/HwiValueNumbering.cs`<br>`JIT/HardwareIntrinsics/X86/Lzcnt/Lzcnt.cs`<br>`JIT/HardwareIntrinsics/X86/Popcnt/Popcnt.cs`<br>… and 47 more |
 | unsupported (unmapped): EH try region nested inside an enclosing handler | 24 | `JIT/Generics/Exceptions/general_class_instance01.cs`<br>`JIT/Generics/Exceptions/general_class_static01.cs`<br>`JIT/Generics/Exceptions/general_struct_instance01.cs`<br>`JIT/Generics/Exceptions/general_struct_static01.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b11490/b11490.cs`<br>… and 19 more |
-| EH filters/faults (out of 10.6 scope) | 16 | `JIT/HardwareIntrinsics/X86/Lzcnt.X64/Lzcnt.X64.cs`<br>`JIT/HardwareIntrinsics/X86/Popcnt.X64/Popcnt.X64.cs`<br>`JIT/HardwareIntrinsics/X86/Sse42.X64/Crc32.cs`<br>`JIT/Regression_2/Runtime_133120/Runtime_133120.cs`<br>`JIT/Regression_o_1/GitHub_13561.cs`<br>… and 11 more |
 | boxing & casts | 16 | `JIT/Directed/nullabletypes/Desktop/boxunboxvaluetype.cs`<br>`JIT/Directed/nullabletypes/Desktop/nullcomparaison.cs`<br>`JIT/Directed/nullabletypes/gettype.cs`<br>`JIT/Directed/nullabletypes/unboxnullable.cs`<br>`JIT/Generics/Conversions/Boxing/box_isinst_br_nullable.cs`<br>… and 11 more |
-| non-default calling conventions | 13 | `JIT/Directed/StructABI/MisSizedStructs_ArmArch.cs`<br>`JIT/Directed/pinvoke/sysinfo.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b91855/b91855.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b92568/b92568.cs`<br>`JIT/Regression_o_2/Runtime_131377.cs`<br>… and 8 more |
+| non-default calling conventions | 15 | `JIT/Directed/StructABI/MisSizedStructs_ArmArch.cs`<br>`JIT/Directed/pinvoke/sysinfo.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b91855/b91855.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b92568/b92568.cs`<br>`JIT/Regression_2/Runtime_120792/Runtime_120792.cs`<br>… and 10 more |
 | unsupported (unmapped): generic callconv on a calli/ldftn/newobj site (shared generics) | 9 | `JIT/Generics/Instantiation/delegates/Delegate005.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate006.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate011.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate012.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate027.cs`<br>… and 4 more |
-| unsupported (unmapped): field type outside the object pack | 5 | `JIT/Performance/CodeQuality/Span/SpanBench.cs`<br>`JIT/Regression_ro_2/Runtime_56743/Runtime_56743_0.cs`<br>`JIT/SIMD/CircleInConvex.cs`<br>`JIT/opt/Tailcall/ImplicitByrefTailCallsAliasing.cs`<br>`JIT/opt/Vectorization/ReadUtf8.cs` |
-| unsupported (unmapped): newobj of a shared-generic value class | 3 | `JIT/Methodical/delegate/GSDelegate.cs`<br>`JIT/Regression_o_2/Runtime_41100.cs`<br>`JIT/Regression_ro_1/Runtime_45557.cs` |
+| unsupported (unmapped): field type outside the object pack | 6 | `JIT/Performance/CodeQuality/Span/SpanBench.cs`<br>`JIT/Regression_ro_2/Runtime_56743/Runtime_56743_0.cs`<br>`JIT/SIMD/CircleInConvex.cs`<br>`JIT/opt/Tailcall/ImplicitByrefTailCallsAliasing.cs`<br>`JIT/opt/ValueNumbering/ConstStringConstIndexOptimizations.cs`<br>… and 1 more |
+| unsupported (unmapped): newobj of a shared-generic value class | 4 | `JIT/Methodical/delegate/GSDelegate.cs`<br>`JIT/Performance/CodeQuality/Linq/Linq.cs`<br>`JIT/Regression_o_2/Runtime_41100.cs`<br>`JIT/Regression_ro_1/Runtime_45557.cs` |
 | unsupported (unmapped): prolog class-init trigger in shared generic code (INITINSTCLASS) | 2 | `JIT/Regression_2/Runtime_121066/Runtime_121066.cs`<br>`JIT/Regression_o_3/Runtime_87597.cs` |
 | bad IL rejected by importer | 1 | `JIT/Regression_o_1/GitHub_16377.cs` |
 
@@ -97,8 +96,9 @@ entry shapes). Out of scope for triage; listed for the record.
 
 | Which JIT timed out | Tests |
 | --- | ---: |
-| rokajit | 2 |
-| ryujit | 2 |
+| rokajit | 9 |
+| ryujit | 4 |
+| ryujit,rokajit | 1 |
 
 ## Needs investigation
 
@@ -130,13 +130,13 @@ error model didn't classify. Each carries its stderr signature.
 | `JIT/Generics/MemberAccess/interface_class01.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Methodical/Coverage/b433189.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Performance/CodeQuality/Benchstones/BenchI/NDhrystone/NDhrystone.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/Performance/CodeQuality/Linq/Linq.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Performance/CodeQuality/SIMD/RayTracer/RayTracerBench.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b210352/csharptester.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Regression/CLR-x86-JIT/v2.1/b610562/b610562.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Regression/Dev11/External/dev11_154899/DynamicStaticAlignment1.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Regression_2/Runtime_127075/Runtime_127075.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Regression_2/Runtime_70790/Runtime_70790.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_2/Runtime_77968/Runtime_77968.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Regression_do/GitHub_39823.cs` | MISMATCH | ref=100 ours=255 | (no stderr output) |
 | `JIT/Regression_o_1/GitHub_15319.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Regression_o_1/GitHub_19149.cs` | CRASH | SIGSEGV | (no stderr output) |
@@ -152,5 +152,7 @@ error model didn't classify. Each carries its stderr signature.
 | `JIT/opt/Devirtualization/sharedoverride.cs` | CRASH | SIGABRT | Fatal error. |
 | `JIT/opt/Enum/hasflag.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/opt/Inline/tests/args1.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/InstructionCombining/MulToAdd.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/opt/ObjectStackAllocation/Runtime_111922v2.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/opt/ObjectStackAllocation/Runtime_121736.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Vectorization/SpanHelpers_SequenceEqual.cs` | CRASH | SIGSEGV | (no stderr output) |
