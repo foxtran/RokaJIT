@@ -118,7 +118,7 @@ use std::collections::{BTreeSet, HashMap};
 use rokajit_ee::ee_info::{zeroed_out, EeInfo};
 use rokajit_ee::enums::{
     CallInfoFlags, ClassAttribs, CorInfoClassId, CorInfoHelpFunc, CorInfoInitClassResult,
-    CorInfoType, InfoAccessType,
+    CorInfoType, InfoAccessType, MethodAttribs,
 };
 use rokajit_ee::handles::{
     ArgListHandle, ClassHandle, ContextHandle, FieldHandle, MethodHandle, ModuleHandle,
@@ -237,6 +237,7 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         entry_stack: HashMap::new(),
         current_leader: 0,
         stack: Vec::new(),
+        ftn_temps: HashMap::new(),
         clauses,
         catch_entries,
         chains: Vec::new(),
@@ -1958,6 +1959,11 @@ struct BlockImport<'a> {
     /// entry state is already fixed.
     current_leader: u32,
     stack: Vec<(Type, hir::Expr)>,
+    /// ldftn/ldvirtftn provenance for values spilled to a temp or user
+    /// local (step_11.8): the delegate `newobj` needs the target's
+    /// MethodHandle for the EE's `GetDelegateCtor` substitution; the
+    /// direct (unspilled) shape carries it on the `FtnAddr` node itself.
+    ftn_temps: HashMap<LocalId, MethodHandle>,
     /// The method's EH clauses in IL space (step_10.6); empty for the
     /// fib subset.
     clauses: Vec<Clause>,
@@ -2029,6 +2035,7 @@ fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
         hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => references_local(arg, id),
         hir::Expr::StructVal { addr, .. } => references_local(addr, id),
         hir::Expr::LocAlloc { size } => references_local(size, id),
+        hir::Expr::FtnAddr { entry, .. } => references_local(entry, id),
     }
 }
 
@@ -2069,6 +2076,7 @@ fn must_eval(expr: &hir::Expr) -> bool {
         // The allocation moves rsp for the rest of the method — an effect
         // even when the address is discarded.
         hir::Expr::LocAlloc { .. } => true,
+        hir::Expr::FtnAddr { entry, .. } => must_eval(entry),
     }
 }
 
@@ -2466,8 +2474,12 @@ impl BlockImport<'_> {
         }
         stmts.push(hir::Stmt {
             il_offset,
-            kind: hir::StmtKind::Store { dst: id, value },
+            kind: hir::StmtKind::Store {
+                dst: id,
+                value: value.clone(),
+            },
         });
+        self.note_ftn_store(id, &value);
         Ok(())
     }
 
@@ -2491,6 +2503,7 @@ impl BlockImport<'_> {
             }
             value => {
                 let tmp = self.temp(ty);
+                self.note_ftn_store(tmp, &value);
                 stmts.push(hir::Stmt {
                     il_offset,
                     kind: hir::StmtKind::Store { dst: tmp, value },
@@ -2549,6 +2562,7 @@ impl BlockImport<'_> {
                 continue;
             }
             let tmp = self.temp(ty);
+            self.note_ftn_store(tmp, &value);
             stmts.push(hir::Stmt {
                 il_offset,
                 kind: hir::StmtKind::Store { dst: tmp, value },
@@ -2557,6 +2571,29 @@ impl BlockImport<'_> {
             self.stack[i].1 = expr;
         }
         Ok(())
+    }
+
+    /// ldftn/ldvirtftn provenance survives a spill (step_11.8): when an
+    /// `FtnAddr` value is stored into `dst`, remember which method the
+    /// temp holds; a non-FtnAddr store to the same slot clears it (user
+    /// locals can be reassigned; fresh temps can't, but clearing is
+    /// harmless there).
+    fn note_ftn_store(&mut self, dst: LocalId, value: &hir::Expr) {
+        if let hir::Expr::FtnAddr { method, .. } = value {
+            self.ftn_temps.insert(dst, *method);
+        } else {
+            self.ftn_temps.remove(&dst);
+        }
+    }
+
+    /// The delegate-`newobj` target method: direct provenance from an
+    /// `FtnAddr` node, or a temp/user-local read with recorded provenance.
+    fn ftn_method_of(&self, value: &hir::Expr) -> Option<MethodHandle> {
+        match value {
+            hir::Expr::FtnAddr { method, .. } => Some(*method),
+            hir::Expr::Local(id) => self.ftn_temps.get(id).copied(),
+            _ => None,
+        }
     }
 
     /// `ceq`/`cgt`/`cgt.un`/`clt`/`clt.un`: pop two operands, push the
@@ -3751,10 +3788,15 @@ impl BlockImport<'_> {
             }
         };
         check_call_conv(call.sig.callConv)?;
-        // Delegate invocation is out of step-11 scope (construction is
-        // gated in `newobj`): the target's declaring class carrying the
-        // DELEGATE bit means this call dispatches through delegate
-        // machinery (Invoke's stub), which we must not miscompile.
+        // Delegate members (step_11.8): `Invoke` is expanded below into
+        // the delegate-field loads plus an indirect call (RyuJIT's
+        // LowerDelegateInvoke — even tier 0 never calls the runtime's
+        // invoke stub; compiling the IL stub recurses). Other delegate
+        // members stay gated: BeginInvoke/EndInvoke are async delegates
+        // (explicitly out), and the delegate .ctor is only ever called
+        // from `newobj` (a direct `call` to it would be the raw FCall
+        // with an unconstructed receiver).
+        let mut delegate_invoke = false;
         if let Some(target) = MethodHandle::from_raw(call.hMethod) {
             let class = self.ee.get_method_class(target);
             if self
@@ -3762,7 +3804,13 @@ impl BlockImport<'_> {
                 .get_class_attribs(class)
                 .contains(ClassAttribs::DELEGATE)
             {
-                return Err(CompileError::Unsupported("call to a delegate member"));
+                if self.ee.get_method_name_from_metadata(target).as_deref() == Some("Invoke") {
+                    delegate_invoke = true;
+                } else {
+                    return Err(CompileError::Unsupported(
+                        "delegate member outside Invoke (async/multicast)",
+                    ));
+                }
             }
         }
         let has_this = call.sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_HASTHIS != 0;
@@ -3846,6 +3894,44 @@ impl BlockImport<'_> {
             // check included) into its own temp; the call then reads
             // temps only.
             self.spill_args_before_receiver_check(&mut args, &arg_types, stmts, il_offset)?;
+        }
+        if delegate_invoke {
+            // The delegate-invoke expansion (RyuJIT's LowerDelegateInvoke,
+            // lower.cpp:6475): the call target is
+            // [delegate + offsetOfDelegateFirstTarget] (the methodPtr —
+            // the runtime's shuffle thunk or the entry itself) and the
+            // receiver becomes [delegate + offsetOfDelegateInstance] (the
+            // bound target). The construction path owns every bind shape
+            // (closed static, instance, virtual-dispatch, multicast); the
+            // delegate's fields are the runtime's layout, read at the
+            // EE-supplied offsets, never written. The callvirt null check
+            // already fired; a null delegate faults on these loads as the
+            // NRE (the 10.4 trap model).
+            let ee_info = self.ee.get_ee_info();
+            let t_del = self.spill_receiver(&mut args, stmts, il_offset)?;
+            args[0] = hir::Expr::Load {
+                addr: Box::new(hir::Expr::Local(t_del)),
+                offset: ee_info.offsetOfDelegateInstance,
+                ty: Type::Ref,
+                access: MemAccess::Natural,
+            };
+            let target = hir::Expr::Load {
+                addr: Box::new(hir::Expr::Local(t_del)),
+                offset: ee_info.offsetOfDelegateFirstTarget,
+                ty: Type::NativeInt,
+                access: MemAccess::Natural,
+            };
+            return self.finish_call(
+                CallTarget::Indirect(Box::new(target)),
+                CallSig {
+                    ret,
+                    args: arg_types,
+                    has_this: true,
+                },
+                args,
+                stmts,
+                il_offset,
+            );
         }
         // CORINFO_CALL_CODE_POINTER: hMethod is not valid
         // (corinfo.h:1343) — the indirect target comes from the
@@ -4251,14 +4337,24 @@ impl BlockImport<'_> {
     /// path). The `System.Runtime.Intrinsics` vector classes themselves
     /// (Vector64/128/256/512, Vector) are NOT matched: several of their
     /// members carry compilable software fallbacks.
+    /// Whether `method` is a leaf hardware intrinsic: the [Intrinsic] bit
+    /// plus a declaring class in the `System.Runtime.Intrinsics.X86` tree
+    /// (Sse through Avx512, Aes, Bmi*, Fma, Lzcnt, Popcnt, Pclmulqdq,
+    /// X86Base — every one a self-recursive IL body with no software
+    /// path; the `IsSupported` getters included — Lzcnt.X64's recursed
+    /// into itself). Nested classes answer an empty namespace from the
+    /// class query, so the namespace comes from the method query's
+    /// enclosing-class walk (jitinterface.cpp:6378). The vector classes
+    /// directly under `System.Runtime.Intrinsics` (Vector64/128/256/512,
+    /// Vector) are NOT matched: several of their members carry compilable
+    /// software fallbacks.
     fn is_hw_intrinsic_leaf(&self, method: MethodHandle) -> bool {
         if !self.ee.is_intrinsic(method) {
             return false;
         }
-        let class = self.ee.get_method_class(method);
-        match self.ee.get_class_name_from_metadata(class) {
-            Some((_, Some(ns))) => ns.starts_with("System.Runtime.Intrinsics.X86"),
-            _ => false,
+        match self.ee.get_method_declaring_namespace(method) {
+            Some(ns) => ns.starts_with("System.Runtime.Intrinsics.X86"),
+            None => false,
         }
     }
 
@@ -4673,47 +4769,55 @@ impl BlockImport<'_> {
         let Some(method) = MethodHandle::from_raw(call.hMethod) else {
             return Err(CompileError::BadIl("ldftn token did not resolve"));
         };
-        let entry = self.entry_point_expr(method)?;
-        self.push(Type::NativeInt, entry)
+        let entry = self.fixed_entry_point_expr(method, true)?;
+        self.push(
+            Type::NativeInt,
+            hir::Expr::FtnAddr {
+                entry: Box::new(entry),
+                method,
+            },
+        )
     }
 
-    /// A method's entry point as a NativeInt expr: the
-    /// `getFunctionEntryPoint` verdict — direct address constant
-    /// (IAT_VALUE) or a load through the EE's slot (IAT_PVALUE); deeper
-    /// indirection is out (the step_07 call-emission policy).
-    fn entry_point_expr(&mut self, method: MethodHandle) -> CompileResult<hir::Expr> {
-        let lookup = self.ee.get_function_entry_point(method);
+    /// A method's entry point as a NativeInt constant:
+    /// `getFunctionFixedEntryPoint` — always IAT_VALUE, the stable
+    /// multi-callable address (RyuJIT resolves GT_FTN_ADDR identically,
+    /// morph.cpp:6800): callable, valid across tiering, and
+    /// reverse-mappable to the MethodDesc (delegate construction needs
+    /// that — the IAT_PVALUE slot form's content can be a forwarder
+    /// interior the VM can't map back, Delegate009's crash).
+    /// `is_unsafe` is RyuJIT's `isUnsafeFunctionPointer`: true for a raw
+    /// function pointer (the ldftn default), false for a delegate-bound
+    /// one (the EE does its own preparation).
+    fn fixed_entry_point_expr(
+        &mut self,
+        method: MethodHandle,
+        is_unsafe: bool,
+    ) -> CompileResult<hir::Expr> {
+        let lookup = self.ee.get_function_fixed_entry_point(method, is_unsafe);
         match InfoAccessType::from_raw(lookup.accessType) {
             Some(InfoAccessType::Value) => {
                 let addr = unsafe { lookup.__bindgen_anon_1.addr };
                 Ok(hir::Expr::Const(Const::NativeInt(addr as isize)))
             }
-            Some(InfoAccessType::PValue) => {
-                let cell = unsafe { lookup.__bindgen_anon_1.addr };
-                Ok(hir::Expr::Load {
-                    addr: Box::new(hir::Expr::Const(Const::NativeInt(cell as isize))),
-                    offset: 0,
-                    ty: Type::NativeInt,
-                    access: MemAccess::Natural,
-                })
-            }
             _ => Err(CompileError::Unsupported(
-                "function entry point through multiple indirections (IAT_PPVALUE/IAT_RELPVALUE)",
+                "fixed function entry point through an indirection (IAT_PVALUE)",
             )),
         }
     }
 
     /// `ldvirtftn` (0xFE 07): the dispatch target of a method *for the
-    /// object on the stack* — the vtable lookup at runtime
-    /// (`CORINFO_VIRTUALCALL_VTABLE` verdict, same emission as
-    /// callvirt's), the `VIRTUAL_FUNC_PTR` helper for the interface
-    /// (STUB) / generic-virtual (LDVIRTFTN) verdicts, or plain `ldftn`
-    /// when the EE reports the method isn't virtual after all
-    /// (CORINFO_CALL — RyuJIT's DO_LDFTN degrade, importer.cpp:8921). The
-    /// value materializes at the `ldvirtftn` (a temp store), so a null
-    /// receiver traps here — through the explicit check on the vtable
-    /// path (the 10.4 trap model) or inside the helper
-    /// (jithelpers.cpp:704) — never at a later `calli`.
+    /// object on the stack*. The EE answers CORINFO_CALL for every
+    /// ldftn-family token (jitinterface.cpp:5239 forces directCall), so
+    /// the split is keyed on the method's attribute bits (RyuJIT,
+    /// importer.cpp:8921): a genuine virtual goes through the
+    /// `VIRTUAL_FUNC_PTR` helper (impImportLdvirtftn, importer.cpp:2762 —
+    /// resolves the override at runtime, class and interface dispatch
+    /// alike); a final/static/non-virtual method degrades to plain
+    /// `ldftn` (the DO_LDFTN path). The value materializes at the
+    /// `ldvirtftn` (a temp store), so a null receiver traps HERE — inside
+    /// the helper (jithelpers.cpp:704) or the explicit check — never at a
+    /// later `calli`. Shared-generic verdicts (CODE_POINTER) stay gated.
     fn ldvirtftn(
         &mut self,
         token: u32,
@@ -4737,69 +4841,73 @@ impl BlockImport<'_> {
         if !matches!(ty, Type::Ref | Type::ByRef) {
             return Err(CompileError::BadIl("ldvirtftn operand must be a reference"));
         }
-        match call.kind {
-            ffi::CORINFO_CALL_KIND_CORINFO_CALL => {
-                // Not actually virtual: evaluate the object for its
-                // effects (the IL pushed it), then the ldftn constant.
-                // Shared generic code (PARAMTYPE) is the ldftn rule.
-                check_no_generics_call_conv(call.sig.callConv)?;
-                let Some(method) = MethodHandle::from_raw(call.hMethod) else {
-                    return Err(CompileError::BadIl("ldvirtftn token did not resolve"));
-                };
-                let entry = self.entry_point_expr(method)?;
-                if must_eval(&obj) {
-                    self.spill_stack(stmts, il_offset)?;
-                    stmts.push(hir::Stmt {
-                        il_offset,
-                        kind: hir::StmtKind::Eval(obj),
-                    });
-                }
-                self.push(Type::NativeInt, entry)
-            }
-            ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_VTABLE => {
-                let Some(method) = MethodHandle::from_raw(call.hMethod) else {
-                    return Err(CompileError::BadIl("ldvirtftn token did not resolve"));
-                };
-                self.spill_stack(stmts, il_offset)?;
-                let t = self.temp(Type::NativeInt);
-                let target =
-                    self.vtable_target(method, hir::Expr::NullCheck { arg: Box::new(obj) })?;
-                stmts.push(hir::Stmt {
-                    il_offset,
-                    kind: hir::StmtKind::Store {
-                        dst: t,
-                        value: target,
-                    },
-                });
-                self.push(Type::NativeInt, hir::Expr::Local(t))
-            }
-            ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_STUB
-            | ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_LDVIRTFTN => {
-                let meth = self.embed_handle_expr(&mut resolved, false)?;
-                let class = self.embed_handle_expr(&mut resolved, true)?;
-                self.spill_stack(stmts, il_offset)?;
-                let t_obj = self.temp(Type::Ref);
-                stmts.push(hir::Stmt {
-                    il_offset,
-                    kind: hir::StmtKind::Store {
-                        dst: t_obj,
-                        value: hir::Expr::NullCheck { arg: Box::new(obj) },
-                    },
-                });
-                let t = self.temp(Type::NativeInt);
-                stmts.push(hir::Stmt {
-                    il_offset,
-                    kind: hir::StmtKind::Store {
-                        dst: t,
-                        value: virtual_func_ptr_call(hir::Expr::Local(t_obj), class, meth),
-                    },
-                });
-                self.push(Type::NativeInt, hir::Expr::Local(t))
-            }
-            _ => Err(CompileError::Unsupported(
+        if call.kind == ffi::CORINFO_CALL_KIND_CORINFO_CALL_CODE_POINTER {
+            return Err(CompileError::Unsupported(
                 "ldvirtftn with a non-direct call kind (shared generics)",
-            )),
+            ));
         }
+        let Some(method) = MethodHandle::from_raw(call.hMethod) else {
+            return Err(CompileError::BadIl("ldvirtftn token did not resolve"));
+        };
+        // RyuJIT's split (importer.cpp:8921): the DEGRADE to plain ldftn
+        // is keyed on the method's attribute bits — the EE answers
+        // CORINFO_CALL for every ldftn/ldvirtftn (jitinterface.cpp:5239
+        // forces directCall), so the call kind says nothing. A genuine
+        // virtual goes through the VIRTUAL_FUNC_PTR helper
+        // (impImportLdvirtftn, importer.cpp:2762), which resolves the
+        // override at runtime for class AND interface dispatch; anything
+        // final/static/non-virtual degrades to the static entry point.
+        let attribs = self.ee.get_method_attribs(method);
+        if attribs.contains(MethodAttribs::VIRTUAL)
+            && !attribs.contains(MethodAttribs::FINAL)
+            && !attribs.contains(MethodAttribs::STATIC)
+        {
+            let meth = self.embed_handle_expr(&mut resolved, false)?;
+            let class = self.embed_handle_expr(&mut resolved, true)?;
+            self.spill_stack(stmts, il_offset)?;
+            let t_obj = self.temp(Type::Ref);
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Store {
+                    dst: t_obj,
+                    value: hir::Expr::NullCheck { arg: Box::new(obj) },
+                },
+            });
+            let t = self.temp(Type::NativeInt);
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Store {
+                    dst: t,
+                    value: virtual_func_ptr_call(hir::Expr::Local(t_obj), class, meth),
+                },
+            });
+            return self.push(
+                Type::NativeInt,
+                hir::Expr::FtnAddr {
+                    entry: Box::new(hir::Expr::Local(t)),
+                    method,
+                },
+            );
+        }
+        // Not actually virtual: evaluate the object for its effects (the
+        // IL pushed it), then the ldftn constant. Shared generic code
+        // (PARAMTYPE) is the ldftn rule.
+        check_no_generics_call_conv(call.sig.callConv)?;
+        let entry = self.fixed_entry_point_expr(method, true)?;
+        if must_eval(&obj) {
+            self.spill_stack(stmts, il_offset)?;
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Eval(obj),
+            });
+        }
+        self.push(
+            Type::NativeInt,
+            hir::Expr::FtnAddr {
+                entry: Box::new(entry),
+                method,
+            },
+        )
     }
 
     /// Field-token resolution shared by `ldfld`/`stfld`/`ldflda`
@@ -5874,28 +5982,27 @@ impl BlockImport<'_> {
                 "newobj token did not resolve to a class",
             ));
         };
-        // Delegates are out of step-11 scope: their construction and
-        // invocation are special-cased by the EE/runtime (the constructor
-        // is an FCall pair with the function pointer; Invoke dispatches
-        // through the invoke stub). Gate construction here and invocation
-        // in `call` — silently miscompiling them crashes the process
-        // (surfaced by step_11.2's join support: the csc delegate-cache
-        // shape carries a value across a join, which used to reject the
-        // method before the delegate path ever ran).
-        if self
-            .ee
-            .get_class_attribs(class)
-            .contains(ClassAttribs::DELEGATE)
-        {
-            return Err(CompileError::Unsupported("newobj of a delegate"));
-        }
+        // Delegates (step_11.8): construction is the ordinary newobj
+        // shape — the allocation helper plus a direct call to the
+        // runtime-provided .ctor (an FCall with an ordinary managed-conv
+        // entry point; the EE's getCallInfo/getFunctionEntryPoint answer
+        // it like any method). Invocation is callvirt on Invoke, handled
+        // in `call`.
+        let attribs = self.ee.get_class_attribs(class);
+        let is_delegate = attribs.contains(ClassAttribs::DELEGATE);
+        // Variable-sized classes (only String — corinfo.h:773): the JIT
+        // never allocates; the internalcall .ctor redirects to the
+        // allocating static `Ctor` method, which takes no `this` and
+        // RETURNS the object (RyuJIT's `newObjThisPtr = nullptr`,
+        // importer.cpp:9056-9060).
+        let is_varobjsize = attribs.contains(ClassAttribs::VAROBJSIZE);
+        let is_value_class = self.ee.is_value_class(class);
         // `newobj` of a value class (step_10.10): no allocation — csc's
         // `new S(args)` is in-place construction (RyuJIT's impImportNewObj
         // valuetype path): a fresh struct temp, zero-initialized (initobj
         // semantics — a conforming constructor overwrites every field),
         // the constructor called on the temp's address, and the temp
         // itself pushed as the value.
-        let is_value_class = self.ee.is_value_class(class);
 
         // The static-constructor trigger: RyuJIT's newobj import queries
         // initClass with no field (not a field-trigger query), the method
@@ -5951,8 +6058,16 @@ impl BlockImport<'_> {
         // The value-class construction target, or the reference
         // allocation, prepared before the constructor's arguments pop.
         // `this_arg` is the constructor's receiver; `result` is the
-        // value the `newobj` pushes.
-        let (this_arg, result, result_ty) = if is_value_class {
+        // value the `newobj` pushes. A variable-sized class allocates
+        // nothing — the "constructor" call below is the whole
+        // construction (the dummies are never used).
+        let (this_arg, result, result_ty) = if is_varobjsize {
+            (
+                hir::Expr::Const(Const::NullRef),
+                hir::Expr::Const(Const::NullRef),
+                Type::Ref,
+            )
+        } else if is_value_class {
             if let Some((scalar_ty, _)) = self.scalar_value_class_cell(class) {
                 // A primitive-typed value class (IntPtr, an enum): its
                 // value IS the scalar (RyuJIT's TypeHandleToVarType — the
@@ -6075,23 +6190,108 @@ impl BlockImport<'_> {
             args.push(value);
         }
         args.reverse();
+        // Delegate construction (step_11.8): the delegate .ctor is an
+        // FCall pair, and the EE substitutes a fast-path runtime ctor for
+        // it when the bind shape allows — `GetDelegateCtor` (RyuJIT's
+        // fgMorphDelegateCtor, flowgraph.cpp:1197) takes the ldftn'd
+        // target MethodDesc directly, so the entry-point→MethodDesc
+        // reverse map the FCall path needs (NonVirtualEntry2MethodDesc)
+        // never runs. The substitute takes extra trailing arguments,
+        // delivered as raw pointer constants in the out-args. RyuJIT's
+        // pattern is the ldftn node feeding the newobj; ours is the
+        // FtnAddr provenance, direct or through a spill temp.
+        let mut ctor_extra: Vec<hir::Expr> = Vec::new();
+        let mut ctor = None;
+        if is_varobjsize {
+            // The internalcall .ctor redirects to the allocating static
+            // `Ctor` (the ecall table): no `this`, and the call's return
+            // IS the object (RyuJIT's `newObjThisPtr = nullptr`,
+            // importer.cpp:9056-9060). The metadata sig says void/this —
+            // the runtime's redirect is what makes it string-returning.
+            let Some(ctor) = MethodHandle::from_raw(call.hMethod) else {
+                return Err(CompileError::BadIl(
+                    "get_call_info returned a null method handle",
+                ));
+            };
+            return self.push(
+                Type::Ref,
+                hir::Expr::Call {
+                    target: CallTarget::Direct(ctor),
+                    sig: CallSig {
+                        ret: Type::Ref,
+                        args: arg_types,
+                        has_this: false,
+                    },
+                    args,
+                },
+            );
+        }
+        if is_delegate {
+            if args.len() != 2 {
+                return Err(CompileError::Unsupported(
+                    "delegate construction with a non-standard .ctor shape",
+                ));
+            }
+            let Some(target_method) = self.ftn_method_of(&args[1]) else {
+                return Err(CompileError::Unsupported(
+                    "delegate construction with an untracked function pointer",
+                ));
+            };
+            // The ctor receives the plain entry-point value; the wrapper
+            // was provenance only.
+            if let hir::Expr::FtnAddr { entry, .. } = &args[1] {
+                args[1] = (**entry).clone();
+            }
+            let Some(resolved_ctor) = MethodHandle::from_raw(call.hMethod) else {
+                return Err(CompileError::BadIl(
+                    "get_call_info returned a null method handle",
+                ));
+            };
+            let mut ctor_data = ffi::DelegateCtorArgs {
+                pMethod: self.info.ftn.as_raw() as *mut std::ffi::c_void,
+                pArg3: std::ptr::null_mut(),
+                pArg4: std::ptr::null_mut(),
+                pArg5: std::ptr::null_mut(),
+            };
+            let Some(alternate) =
+                self.ee
+                    .get_delegate_ctor(resolved_ctor, class, target_method, &mut ctor_data)
+            else {
+                return Err(CompileError::Unsupported(
+                    "delegate construction rejected by the EE",
+                ));
+            };
+            if alternate != resolved_ctor {
+                for p in [ctor_data.pArg3, ctor_data.pArg4, ctor_data.pArg5] {
+                    if !p.is_null() {
+                        ctor_extra.push(hir::Expr::Const(Const::NativeInt(p as isize)));
+                    }
+                }
+                ctor = Some(alternate);
+            }
+        }
         // The constructor: a direct instance call whose `this` is the
         // fresh object/temp, not a stack value (importer.cpp CEE_NEWOBJ's
         // newObjThisPtr). No null check wraps it: JIT_New* never returns
         // null, and a fresh struct temp is never null.
         args.insert(0, this_arg);
-        let Some(ctor) = MethodHandle::from_raw(call.hMethod) else {
-            return Err(CompileError::BadIl(
+        let extra_args = ctor_extra.len();
+        args.extend(ctor_extra);
+        let ctor = match ctor {
+            Some(alt) => alt,
+            None => MethodHandle::from_raw(call.hMethod).ok_or(CompileError::BadIl(
                 "get_call_info returned a null method handle",
-            ));
+            ))?,
         };
+        let mut sig_args = arg_types;
+        sig_args.extend(std::iter::repeat_n(Type::NativeInt, extra_args));
         stmts.push(hir::Stmt {
             il_offset,
             kind: hir::StmtKind::Eval(hir::Expr::Call {
                 target: CallTarget::Direct(ctor),
                 sig: CallSig {
                     ret: Type::Void,
-                    args: arg_types,
+                    args: sig_args,
                     has_this: true,
                 },
                 args,
@@ -8490,12 +8690,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn delegates_are_gated_not_miscompiled() {
-        // Delegates are out of step-11 scope; the delegate-cache shape
-        // (dup; brtrue over the cached field) used to hide behind the
-        // join rejection — gate construction and invocation explicitly
-        // (step_11.2: ungated, the latent path segfaulted).
+    /// A delegate fixture: the class carries the DELEGATE bit, the .ctor
+    /// token is `(object, native int) -> void`, and the ldftn'd target
+    /// (FIB_TOKEN) has a canned entry point.
+    fn delegate_ee() -> (MockEe, ClassHandle) {
         let (mut ee, c) = struct_ee(0, &[], None);
         ee.class_attribs = ClassAttribs::DELEGATE;
         ee.add_method(
@@ -8509,8 +8707,70 @@ mod tests {
             },
         );
         ee.class_tokens.insert(0x0600_0004, c);
+        let target = ee.add_method(FIB_TOKEN, sig(CorInfoType::Int, &[CorInfoType::Int]));
+        ee.entry_points.insert(target.as_raw() as usize, 0x5150);
+        (ee, c)
+    }
+
+    #[test]
+    fn newobj_of_a_delegate_uses_the_ee_substituted_ctor() {
+        // ldnull; ldftn fib; newobj D::.ctor; pop; ret — the EE answers
+        // GetDelegateCtor with an alternate ctor and one extra arg
+        // (pArg3): the call goes to the alternate with the constant
+        // appended (RyuJIT's fgMorphDelegateCtor, flowgraph.cpp:1197).
+        let (mut ee, _c) = delegate_ee();
+        let alternate = ee.add_method(
+            0x0600_0099,
+            MockSig {
+                ret: CorInfoType::Void,
+                args: vec![
+                    CorInfoType::Class,
+                    CorInfoType::NativeInt,
+                    CorInfoType::NativeInt,
+                ],
+                has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
+            },
+        );
+        ee.delegate_ctor = Some((alternate, [0xABC0, 0, 0]));
         let entry = sig(CorInfoType::Void, &[]);
-        // ldnull; ldc.i4.0; conv.i; newobj CTOR; pop; ret
+        let info = struct_info(
+            &mut ee,
+            &[
+                0x14, 0xFE, 0x06, 0x01, 0x00, 0x00, 0x06, 0x73, 0x04, 0x00, 0x00, 0x06, 0x26, 0x2A,
+            ],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("delegate newobj imports");
+        let call_stmt = m.blocks[0]
+            .stmts
+            .iter()
+            .find(|s| matches!(s.kind, hir::StmtKind::Eval(hir::Expr::Call { .. })))
+            .expect("the ctor call");
+        let hir::StmtKind::Eval(hir::Expr::Call { target, sig, args }) = &call_stmt.kind else {
+            unreachable!()
+        };
+        assert!(
+            matches!(target, CallTarget::Direct(h) if *h == alternate),
+            "the EE's alternate ctor"
+        );
+        assert_eq!(sig.args, [Type::Ref, Type::NativeInt, Type::NativeInt]);
+        assert_eq!(args.len(), 4, "this, target, method, pArg3");
+        assert!(matches!(args[1], hir::Expr::Const(Const::NullRef)));
+        assert!(matches!(args[3], hir::Expr::Const(Const::NativeInt(v)) if v == 0xABC0 as isize));
+    }
+
+    #[test]
+    fn newobj_of_a_delegate_without_ftn_provenance_is_a_named_gate() {
+        // ldnull; ldc.i4.0; conv.i; newobj D::.ctor — the function pointer
+        // didn't come from ldftn/ldvirtftn, so GetDelegateCtor has no
+        // target MethodDesc to bind (RyuJIT's pattern match likewise
+        // fails over to the FCall path).
+        let (mut ee, _c) = delegate_ee();
+        let entry = sig(CorInfoType::Void, &[]);
         let info = struct_info(
             &mut ee,
             &[0x14, 0x16, 0xD3, 0x73, 0x04, 0x00, 0x00, 0x06, 0x26, 0x2A],
@@ -8518,20 +8778,75 @@ mod tests {
             &[],
             &[],
         );
-        let err = import(&info, &ee).err().expect("newobj of a delegate");
+        let err = import(&info, &ee).err().expect("untracked fnptr newobj");
         assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("delegate")),
+            matches!(&err, CompileError::Unsupported(m) if m.contains("untracked function pointer")),
             "{err:?}"
         );
-        // callvirt on a delegate member (Invoke): the target's declaring
-        // class carries the DELEGATE bit.
+    }
+
+    #[test]
+    fn delegate_invoke_imports_and_async_members_stay_gated() {
+        // callvirt D::Invoke — allowed: expanded to the delegate-field
+        // loads plus an indirect call (LowerDelegateInvoke's shape).
         let (mut ee, info) = object_fixture(&[0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A]);
         ee.class_attribs = ClassAttribs::DELEGATE;
-        let err = import(&info, &ee).err().expect("callvirt on a delegate");
+        ee.method_name = Some("Invoke".into());
+        import(&info, &ee).expect("callvirt Invoke imports");
+        // BeginInvoke/EndInvoke are async delegates — explicitly out.
+        let (mut ee, info) = object_fixture(&[0x02, 0x03, 0x6F, 0x03, 0x00, 0x00, 0x06, 0x2A]);
+        ee.class_attribs = ClassAttribs::DELEGATE;
+        ee.method_name = Some("BeginInvoke".into());
+        let err = import(&info, &ee).err().expect("BeginInvoke gated");
         assert!(
             matches!(&err, CompileError::Unsupported(m) if m.contains("delegate")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn newobj_of_a_variable_sized_class_calls_the_allocating_ctor() {
+        // String (CORINFO_FLG_VAROBJSIZE): no JIT allocation, no `this` —
+        // the internalcall .ctor's entry redirects to the static
+        // allocating `Ctor`, whose return is the pushed value
+        // (importer.cpp:9056-9060).
+        let (mut ee, c) = struct_ee(0, &[], None);
+        ee.class_attribs = ClassAttribs::VAROBJSIZE;
+        ee.add_method(
+            CTOR_TOKEN,
+            MockSig {
+                ret: CorInfoType::Void,
+                args: vec![CorInfoType::Int],
+                has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
+            },
+        );
+        ee.class_tokens.insert(0x0600_0004, c);
+        let entry = sig(CorInfoType::Class, &[]);
+        // ldc.i4.s 42; newobj CTOR; ret
+        let info = struct_info(
+            &mut ee,
+            &[0x1F, 0x2A, 0x73, 0x04, 0x00, 0x00, 0x06, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("varobjsize newobj imports");
+        assert!(
+            m.blocks[0]
+                .stmts
+                .iter()
+                .all(|s| !matches!(s.kind, hir::StmtKind::Eval(_))),
+            "no allocation, no ctor side statement"
+        );
+        let hir::Expr::Call { sig, args, .. } = return_value(&m, 0) else {
+            panic!("the pushed value is the allocating call")
+        };
+        assert!(!sig.has_this, "the redirected static Ctor takes no this");
+        assert_eq!(sig.ret, Type::Ref, "its return is the object");
+        assert_eq!(args.len(), 1);
+        assert_eq!(as_i32(&args[0]), 42);
     }
 
     #[test]
@@ -11384,10 +11699,14 @@ mod tests {
         ee.entry_points
             .insert(handle.as_raw() as usize, 0x1122_3344);
         let m = import(&info, &ee).expect("imports");
-        let hir::Expr::Const(Const::NativeInt(v)) = return_value(&m, 0) else {
+        let hir::Expr::FtnAddr { entry, method } = return_value(&m, 0) else {
+            panic!("expected the FtnAddr provenance wrapper")
+        };
+        let hir::Expr::Const(Const::NativeInt(v)) = &**entry else {
             panic!("expected a NativeInt constant")
         };
         assert_eq!(*v, 0x1122_3344);
+        assert_eq!(*method, handle, "the ldftn method is the provenance");
         assert_eq!(
             ee.call_info_flags.borrow().as_slice(),
             [CallInfoFlags::LDFTN]
@@ -11395,32 +11714,39 @@ mod tests {
     }
 
     #[test]
-    fn ldftn_loads_through_the_entry_point_slot() {
-        // IAT_PVALUE (the not-yet-compiled target): a load through the
-        // EE's slot, exactly the call-emission form (07.7).
+    fn ldftn_uses_the_fixed_entry_point() {
+        // step_11.8: ldftn resolves through `getFunctionFixedEntryPoint`
+        // (IAT_VALUE, the stable multi-callable address — reverse-mappable
+        // to the MethodDesc, which delegate construction requires). The
+        // IAT_PVALUE slot form is gone: its content can be a forwarder
+        // interior the VM can't map back (Delegate009).
         let il = [0xFE, 0x06, 0x01, 0x00, 0x00, 0x06, 0x2A];
         let (mut ee, info) = fixture(&il, &sig(CorInfoType::NativeInt, &[]), &[]);
         let handle = ee.methods[&FIB_TOKEN].handle;
         ee.entry_point_slots
             .insert(handle.as_raw() as usize, 0x5000);
         let m = import(&info, &ee).expect("imports");
-        let hir::Expr::Load {
-            addr, offset: 0, ..
-        } = return_value(&m, 0)
-        else {
-            panic!("expected a load through the slot")
+        let hir::Expr::FtnAddr { entry, .. } = return_value(&m, 0) else {
+            panic!("expected the FtnAddr provenance wrapper")
         };
-        let hir::Expr::Const(Const::NativeInt(cell)) = &**addr else {
-            panic!("expected the slot's constant address")
-        };
-        assert_eq!(*cell, 0x5000);
+        // The mock answers the fixed-entry query from `entry_points`;
+        // the canned slot went unanswered and the value is the null
+        // fixed entry — never a load through the slot.
+        assert!(
+            matches!(&**entry, hir::Expr::Const(Const::NativeInt(0))),
+            "fixed entry point, not the slot load"
+        );
     }
 
     #[test]
-    fn ldvirtftn_does_the_vtable_lookup_at_the_opcode() {
-        // native int f(this): ldarg.0; ldvirtftn inst; ret — the lookup
-        // result materializes in a temp at the ldvirtftn (a null receiver
-        // traps HERE, not at a later calli).
+    fn ldvirtftn_of_a_virtual_calls_the_virtual_func_ptr_helper() {
+        // native int f(this): ldarg.0; ldvirtftn inst; ret — with the
+        // VIRTUAL attribute bit (the EE answers CORINFO_CALL for every
+        // ldftn-family token, so the kind says nothing): the
+        // VIRTUAL_FUNC_PTR helper does the runtime dispatch
+        // (impImportLdvirtftn, importer.cpp:2762). The lookup result
+        // materializes in a temp at the ldvirtftn (a null receiver traps
+        // HERE, not at a later calli).
         let il = [0x02, 0xFE, 0x07, 0x03, 0x00, 0x00, 0x06, 0x2A];
         let entry = MockSig {
             ret: CorInfoType::NativeInt,
@@ -11430,27 +11756,26 @@ mod tests {
             arg_classes: Vec::new(),
         };
         let (mut ee, info) = fixture(&il, &entry, &[]);
-        ee.non_direct_calls.insert(INST_TOKEN);
+        ee.method_attribs = MethodAttribs::VIRTUAL;
         let m = import(&info, &ee).expect("imports");
-        let (dst, value) = store(&m.blocks[0].stmts[0]);
-        let hir::Expr::Load {
-            addr: vtable,
-            offset: 0x28,
+        // this spills (null-checked) to a Ref temp, then the helper call
+        // lands in a NativeInt temp the pushed FtnAddr reads.
+        let (t_obj, checked) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(as_local(as_null_check(checked)), LocalId(0));
+        let (dst, value) = store(&m.blocks[0].stmts[1]);
+        let hir::Expr::Call {
+            target: CallTarget::Helper(CorInfoHelpFunc::VIRTUAL_FUNC_PTR),
+            args: helper_args,
             ..
         } = value
         else {
-            panic!("expected the slot load")
+            panic!("expected the VIRTUAL_FUNC_PTR helper call")
         };
-        let hir::Expr::Load {
-            addr: this,
-            offset: 0,
-            ..
-        } = &**vtable
-        else {
-            panic!("expected the vtable-pointer load")
+        assert_eq!(as_local(&helper_args[0]), t_obj);
+        let hir::Expr::FtnAddr { entry, .. } = return_value(&m, 0) else {
+            panic!("expected the FtnAddr provenance wrapper")
         };
-        assert_eq!(as_local(as_null_check(this)), LocalId(0));
-        assert_eq!(as_local(return_value(&m, 0)), dst);
+        assert_eq!(as_local(&**entry), dst);
         assert_eq!(
             ee.call_info_flags.borrow().as_slice(),
             [CallInfoFlags::CALLVIRT | CallInfoFlags::LDFTN]
@@ -11474,7 +11799,10 @@ mod tests {
         let handle = ee.methods[&INST_TOKEN].handle;
         ee.entry_points.insert(handle.as_raw() as usize, 0x9999);
         let m = import(&info, &ee).expect("imports");
-        let hir::Expr::Const(Const::NativeInt(v)) = return_value(&m, 0) else {
+        let hir::Expr::FtnAddr { entry, .. } = return_value(&m, 0) else {
+            panic!("expected the FtnAddr provenance wrapper")
+        };
+        let hir::Expr::Const(Const::NativeInt(v)) = &**entry else {
             panic!("expected the entry-point constant")
         };
         assert_eq!(*v, 0x9999);
@@ -11508,7 +11836,10 @@ mod tests {
         let CallTarget::Indirect(fnptr) = target else {
             panic!("expected an indirect target")
         };
-        let hir::Expr::Const(Const::NativeInt(v)) = &**fnptr else {
+        let hir::Expr::FtnAddr { entry, .. } = &**fnptr else {
+            panic!("expected the FtnAddr provenance wrapper")
+        };
+        let hir::Expr::Const(Const::NativeInt(v)) = &**entry else {
             panic!("expected the ldftn constant")
         };
         assert_eq!(*v, 0x7777);
@@ -13136,9 +13467,12 @@ mod tests {
         };
         let handle = ee.add_method(0x0600_0033, sse_sig);
         ee.method_name = Some("Add".into());
-        ee.class_names.insert(
+        // The nested-class case (Sse.X64 & co.): the class query's
+        // namespace is empty for nested types; the gate reads the method
+        // query's enclosing-walk namespace.
+        ee.method_namespaces.insert(
             handle.as_raw() as usize,
-            ("Sse".into(), Some("System.Runtime.Intrinsics.X86".into())),
+            "System.Runtime.Intrinsics.X86".into(),
         );
         ee.intrinsic_methods.insert(handle.as_raw() as usize);
         let info = MethodInfo {
@@ -13171,10 +13505,8 @@ mod tests {
             },
         );
         ee.method_name = Some("Add".into());
-        ee.class_names.insert(
-            handle.as_raw() as usize,
-            ("Vector128".into(), Some("System.Runtime.Intrinsics".into())),
-        );
+        ee.method_namespaces
+            .insert(handle.as_raw() as usize, "System.Runtime.Intrinsics".into());
         ee.intrinsic_methods.insert(handle.as_raw() as usize);
         let _ = c;
         let info = MethodInfo {

@@ -49,6 +49,15 @@ pub trait MethodQueries {
     /// the class/namespace/enclosing-class out-params are passed null slots.
     fn get_method_name_from_metadata(&self, ftn: MethodHandle) -> Option<String>;
 
+    /// The declaring type's namespace from the same C++ query
+    /// (corinfo.h:3228), with the enclosing-class walk for nested types:
+    /// a nested type's own namespace is the empty string, so the C++ walk
+    /// (jitinterface.cpp:6378) answers the outermost enclosing namespace
+    /// (`Sse.X64` → `System.Runtime.Intrinsics.X86`). Step_11.8's
+    /// HW-intrinsic gate needs the namespace of exactly those nested
+    /// classes. `None` when the method has no metadata.
+    fn get_method_declaring_namespace(&self, ftn: MethodHandle) -> Option<String>;
+
     /// C++ `ICorStaticInfo::isIntrinsic` (corinfo.h:2140). Fast equivalent of
     /// testing the `CORINFO_FLG_INTRINSIC` bit of `get_method_attribs`.
     fn is_intrinsic(&self, ftn: MethodHandle) -> bool;
@@ -460,6 +469,33 @@ impl MethodQueries for GasketEeInfo {
         // EE-lifetime storage: copy, nothing to free.
         Some(
             unsafe { std::ffi::CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    fn get_method_declaring_namespace(&self, ftn: MethodHandle) -> Option<String> {
+        let mut ns: *const std::ffi::c_char = std::ptr::null();
+        let mut enclosing: [*const std::ffi::c_char; 1] = [std::ptr::null()];
+        let name = unsafe {
+            rokajit_ee_get_method_name_from_metadata(
+                self.comp_raw(),
+                ftn.as_raw(),
+                std::ptr::null_mut(),
+                &mut ns,
+                enclosing.as_mut_ptr(),
+                enclosing.len(),
+            )
+        };
+        if name.is_null() {
+            return None;
+        }
+        if ns.is_null() {
+            return Some(String::new());
+        }
+        // EE-lifetime storage: copy, nothing to free.
+        Some(
+            unsafe { std::ffi::CStr::from_ptr(ns) }
                 .to_string_lossy()
                 .into_owned(),
         )

@@ -649,6 +649,10 @@ impl Flatten<'_> {
             hir::Expr::Const(k) => Ok(lir::Operand::Const(*k)),
             hir::Expr::Local(id) => Ok(lir::Operand::Local(*id)),
             hir::Expr::LocalAddr(id) => Ok(lir::Operand::AddrOf(*id)),
+            // The FtnAddr wrapper is import-time provenance only (delegate
+            // newobj's GetDelegateCtor lookup); the value is the entry
+            // expression (step_11.8).
+            hir::Expr::FtnAddr { entry, .. } => self.flatten_expr(entry, out, il),
             // The importer builds CatchArg only as the value of a catch
             // handler's synthesized entry store, handled in `lower_block`.
             hir::Expr::CatchArg => Err(CompileError::Internal(

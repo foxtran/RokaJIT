@@ -745,8 +745,13 @@ flag_set!(
     // answers about it describe the canonical representative.
     GENERIC_TYPE_VARIABLE => CorInfoFlag_CORINFO_FLG_GENERIC_TYPE_VARIABLE,
     // A delegate class (corinfo.h:775): delegate construction/invocation
-    // is special-cased by the EE — gated in the importer (step_11 scope).
+    // is special-cased by the EE — handled in the importer (step_11.8).
     DELEGATE => CorInfoFlag_CORINFO_FLG_DELEGATE,
+    // A variable-sized class (only String today — corinfo.h:773): the JIT
+    // never allocates it; `newobj` calls the internalcall .ctor with no
+    // `this`, and the runtime redirects to the allocating static `Ctor`
+    // whose return is the object (importer.cpp:9056).
+    VAROBJSIZE => CorInfoFlag_CORINFO_FLG_VAROBJSIZE,
 );
 
 flag_set!(

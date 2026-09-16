@@ -729,7 +729,7 @@ BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"tail-call transfer"), "jmp (tail-call transfer)"),
     (re.compile(r"arglist \(varargs\)"), "arglist/varargs"),
     (re.compile(r"tail\. prefix"), "tail. prefix (tail calls)"),
-    (re.compile(r"newobj of a delegate|call to a delegate member"), "delegates (out of step-11 scope)"),
+    (re.compile(r"newobj of a delegate|call to a delegate member|delegate member outside Invoke|delegate construction"), "delegates (residual binds/async, step_11.8)"),
     (re.compile(r"generic methods"), "generics"),
     (re.compile(r"hardware intrinsics \(SIMD"), "SIMD hardware intrinsics (real vector semantics — deferred, step_11.10)"),
     (re.compile(r"non-class receiver \(value types\)|initobj/ldobj/stobj/cpobj of a non-value class|struct alignment above 16|SysV descriptor"), "structs & value types"),

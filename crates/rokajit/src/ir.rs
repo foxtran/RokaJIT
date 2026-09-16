@@ -495,6 +495,16 @@ pub mod hir {
         LocAlloc {
             size: Box<Expr>,
         },
+        /// A function pointer with its method (step_11.8): the value form
+        /// of `ldftn`/`ldvirtftn` — a NativeInt. The wrapper is the
+        /// provenance a delegate `newobj` needs for the EE's
+        /// `GetDelegateCtor` substitution (RyuJIT's GT_FTN_ADDR carries
+        /// the MethodDesc for the same reason); lowering is the inner
+        /// entry expression. Never reaches LIR.
+        FtnAddr {
+            entry: Box<Expr>,
+            method: MethodHandle,
+        },
     }
 
     /// An EH region over a contiguous block range (half-open). In the

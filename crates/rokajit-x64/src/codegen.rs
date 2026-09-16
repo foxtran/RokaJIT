@@ -987,7 +987,20 @@ impl<'a> Emitter<'a> {
     /// so the scratch allocation can't evict a register the sibling read
     /// already captured.
     fn wide_imm(&mut self, width: Width, src: Src, exclude: &[PhysReg]) -> CompileResult<Rmi> {
-        if let Src::Imm(i) = src {
+        // The immediate payload: direct, or a value-machine read of a
+        // lazily const-tracked temp (a constant that has only ever been
+        // copied between temps — step_11.8's callimixed: the ldftn fixed
+        // entry point reached a local store through a temp chain and the
+        // `mov [mem], imm32` encoding silently truncated it).
+        let imm = match src {
+            Src::Imm(i) => Some(i),
+            Src::Val(v) => match self.vs.read(v.0) {
+                ReadSrc::Imm(i) => Some(i),
+                _ => None,
+            },
+            Src::Reg(_) => None,
+        };
+        if let Some(i) = imm {
             if matches!(width, Width::W64) && i32::try_from(i).is_err() {
                 let exclude = &self.scratch_exclude(exclude);
                 let (p, moves) = self.vs.take_scratch(exclude);
@@ -2054,6 +2067,19 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_inst(&mut self, inst: &Inst) -> CompileResult<()> {
+        if std::env::var_os("ROKAJIT_DEBUG_CODEGEN").is_some() {
+            let before = self.asm.offset();
+            let r = self.emit_inst_inner(inst);
+            eprintln!(
+                "rokajit-x64: {inst:?} => {:02x?}",
+                self.asm.bytes_since(before)
+            );
+            return r;
+        }
+        self.emit_inst_inner(inst)
+    }
+
+    fn emit_inst_inner(&mut self, inst: &Inst) -> CompileResult<()> {
         match *inst {
             Inst::Mov { width, dst, src } => self.emit_mov(width, dst, src),
             Inst::Lea { dst, addr } => self.emit_lea(dst, addr),
@@ -5905,6 +5931,56 @@ mod tests {
                     stmt(StmtKind::Copy {
                         dst: LocalId(0),
                         src: Operand::Const(Const::Int64(BIG)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(0))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0xC7, 0x45, 0xF8, 0, 0, 0, 0, // movq $0, -8(%rbp) — zero-init
+            0x48, 0xB8, 0xE0, 0xE6, 0x4A, 0x6A, 0x74, 0, 0, 0, // movabsq $BIG, %rax
+            0x48, 0x89, 0x45, 0xF8, // movq %rax, -8(%rbp)
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// The temp-chain form (step_11.8's callimixed): a lazily
+    /// const-tracked temp copied to an IL local. The store's `wide_imm`
+    /// sees a `Src::Val` whose read resolves to the constant — without the
+    /// read-through check the `mov qword [mem], imm32` truncated the
+    /// ldftn fixed entry point and the calli jumped into hyperspace.
+    #[test]
+    fn wide_imm_store_of_a_const_tracked_temp_materializes_the_constant() {
+        const BIG: i64 = 499_999_500_000;
+        let m = method(
+            vec![
+                local(Type::NativeInt, LocalKind::IlLocal(0)),
+                local(Type::NativeInt, LocalKind::Temp),
+            ],
+            0,
+            1,
+            vec![block(
+                0,
+                vec![
+                    // The temp's definition: lazily const-tracked, no code.
+                    stmt(StmtKind::Copy {
+                        dst: LocalId(1),
+                        src: Operand::Const(Const::NativeInt(BIG as isize)),
+                    }),
+                    // The local store reads the temp: the constant
+                    // materializes via movabs, never imm32.
+                    stmt(StmtKind::Copy {
+                        dst: LocalId(0),
+                        src: Operand::Temp(LocalId(1)),
                     }),
                     stmt(StmtKind::Return {
                         value: Some(Operand::Local(LocalId(0))),

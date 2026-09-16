@@ -126,6 +126,7 @@ fn certify_expr(expr: &hir::Expr) -> CompileResult<()> {
         hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => certify_expr(arg)?,
         hir::Expr::StructVal { addr, .. } => certify_expr(addr)?,
         hir::Expr::LocAlloc { size } => certify_expr(size)?,
+        hir::Expr::FtnAddr { entry, .. } => certify_expr(entry)?,
     }
     Ok(())
 }

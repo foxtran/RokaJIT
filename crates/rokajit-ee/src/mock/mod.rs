@@ -238,9 +238,17 @@ pub struct MockEe {
     /// Canned [Intrinsic] methods (the GetMethodTable fixtures), keyed by
     /// the method handle's raw value; `is_intrinsic` answers true for them.
     pub intrinsic_methods: std::collections::HashSet<usize>,
+    /// Canned `get_delegate_ctor` answer (step_11.8): the alternate ctor
+    /// plus the pArg3/4/5 values the EE writes back. `None` = no usable
+    /// delegate ctor (the C++ null return).
+    pub delegate_ctor: Option<(MethodHandle, [usize; 3])>,
     /// Canned `get_class_name_from_metadata` answers — (name, namespace) —
     /// keyed by the class handle's raw value; absent handles answer `None`.
     pub class_names: HashMap<usize, (String, Option<String>)>,
+    /// Canned `get_method_declaring_namespace` answers (step_11.8),
+    /// keyed by the method handle's raw value; absent handles answer
+    /// `None`.
+    pub method_namespaces: HashMap<usize, String>,
     /// The constrained-token operand each `get_call_info` call arrived
     /// with (its metadata token; 0 when the call had no `constrained.`
     /// prefix), in order (step_11.3C).

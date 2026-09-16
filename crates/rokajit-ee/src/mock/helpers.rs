@@ -126,10 +126,14 @@ impl Helpers for MockEe {
 
     fn get_function_fixed_entry_point(
         &self,
-        _ftn: MethodHandle,
+        ftn: MethodHandle,
         _is_unsafe_function_pointer: bool,
     ) -> ffi::CORINFO_CONST_LOOKUP {
-        unsafe { std::mem::zeroed() }
+        let mut lookup: ffi::CORINFO_CONST_LOOKUP = crate::ee_info::wrap::zeroed_out(|_| ());
+        if let Some(&addr) = self.entry_points.get(&(ftn.as_raw() as usize)) {
+            lookup.__bindgen_anon_1.addr = addr as *mut c_void;
+        }
+        lookup
     }
 
     fn get_address_of_p_invoke_target(&self, _method: MethodHandle) -> ffi::CORINFO_CONST_LOOKUP {
@@ -141,10 +145,15 @@ impl Helpers for MockEe {
         _meth: MethodHandle,
         _cls: ClassHandle,
         _target_method: MethodHandle,
-        _ctor_data: &ffi::DelegateCtorArgs,
+        ctor_data: &mut ffi::DelegateCtorArgs,
     ) -> Option<MethodHandle> {
-        // Canned EE: no usable delegate ctor.
-        None
+        // Canned EE: `delegate_ctor` holds the alternate ctor plus the
+        // extra argument slots (pArg3/4/5) a test wants the EE to fill.
+        let (ctor, args) = self.delegate_ctor.as_ref()?;
+        ctor_data.pArg3 = args[0] as *mut std::ffi::c_void;
+        ctor_data.pArg4 = args[1] as *mut std::ffi::c_void;
+        ctor_data.pArg5 = args[2] as *mut std::ffi::c_void;
+        Some(*ctor)
     }
 
     fn notify_instruction_set_usage(

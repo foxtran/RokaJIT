@@ -127,14 +127,17 @@ pub trait Helpers {
     /// The result may be a fixup area for late-bound PInvoke calls.
     fn get_address_of_p_invoke_target(&self, method: MethodHandle) -> CORINFO_CONST_LOOKUP;
 
-    /// C++ `ICorDynamicInfo::GetDelegateCtor` (corinfo.h:3502). `None` when
-    /// the EE finds no usable delegate ctor (the C++ null return).
+    /// C++ `ICorDynamicInfo::GetDelegateCtor` (corinfo.h:3502). The EE may
+    /// substitute a fast-path constructor and fills `ctor_data`'s extra
+    /// argument slots (pArg3/4/5) for it — they are OUT parameters, so the
+    /// caller's struct is passed mutably. `None` when the EE finds no
+    /// usable delegate ctor (the C++ null return).
     fn get_delegate_ctor(
         &self,
         meth: MethodHandle,
         cls: ClassHandle,
         target_method: MethodHandle,
-        ctor_data: &DelegateCtorArgs,
+        ctor_data: &mut DelegateCtorArgs,
     ) -> Option<MethodHandle>;
 
     /// C++ `ICorDynamicInfo::notifyInstructionSetUsage` (corinfo.h:3545):
@@ -434,18 +437,15 @@ impl Helpers for GasketEeInfo {
         meth: MethodHandle,
         cls: ClassHandle,
         target_method: MethodHandle,
-        ctor_data: &DelegateCtorArgs,
+        ctor_data: &mut DelegateCtorArgs,
     ) -> Option<MethodHandle> {
-        // The C++ parameter is non-const; copy the caller's struct so an EE
-        // that writes back into it cannot mutate shared state.
-        let mut ctor_data = *ctor_data;
         let ctor = unsafe {
             rokajit_ee_get_delegate_ctor(
                 self.comp_raw(),
                 meth.as_raw(),
                 cls.as_raw(),
                 target_method.as_raw(),
-                &mut ctor_data,
+                ctor_data,
             )
         };
         MethodHandle::from_raw(ctor)

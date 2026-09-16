@@ -57,6 +57,14 @@ impl MethodQueries for MockEe {
         self.method_name.clone()
     }
 
+    fn get_method_declaring_namespace(&self, ftn: MethodHandle) -> Option<String> {
+        // Canned per-method answer; `None` for unknown handles (the C++
+        // no-metadata null).
+        self.method_namespaces
+            .get(&(ftn.as_raw() as usize))
+            .cloned()
+    }
+
     fn is_intrinsic(&self, ftn: MethodHandle) -> bool {
         // Canned [Intrinsic] methods (the GetMethodTable fixtures),
         // keyed by the method handle's raw value; default false.

@@ -482,6 +482,11 @@ impl Asm {
         self.buf.len() as u32
     }
 
+    /// The bytes emitted since `off` (debug dumps).
+    pub fn bytes_since(&self, off: u32) -> &[u8] {
+        &self.buf[off as usize..]
+    }
+
     /// Bind a label at the current position. Rebinding is an internal
     /// bug (codegen binds each block label once).
     pub fn bind(&mut self, label: Label) {
