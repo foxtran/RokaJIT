@@ -1058,6 +1058,20 @@ rokajit::lower_rules! {
     rule end_finally: EndFinally
         => |_| vec![Inst::FuncletEpilog];
 
+    /// `endfilter` (step_11.11) — the filter's verdict into eax (the
+    /// 32-bit move zero-extends: the VM's CallFilterFunclet compares the
+    /// full rax against exactly 1), then the funclet epilog.
+    rule end_filter: EndFilter { value }
+        if let Some(s) = operand_src(*value)
+        => |_| vec![
+            Inst::Mov {
+                width: Width::W32,
+                dst: Place::Reg(Gpr::Rax),
+                src: s,
+            },
+            Inst::FuncletEpilog,
+        ];
+
     /// A struct block copy (`cpobj`/`stobj`, struct `stloc`/`starg`/
     /// `stfld`, the hidden-retbuf copy; step_10.9): one descriptor; the
     /// size comes from the layout side table. GC-barriered copies are
@@ -2922,6 +2936,26 @@ mod tests {
     fn end_finally_lowers_to_the_funclet_epilog() {
         let s = stmt(StmtKind::EndFinally);
         assert_eq!(lower_obj(&s), Some(vec![Inst::FuncletEpilog]));
+    }
+
+    #[test]
+    fn end_filter_lowers_to_the_eax_verdict_and_epilog() {
+        // The verdict moves to eax (zero-extending to the full rax the
+        // VM compares against exactly 1), then the funclet epilog.
+        let s = stmt(StmtKind::EndFilter {
+            value: Operand::Local(LocalId(1)),
+        });
+        assert_eq!(
+            lower_obj(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Reg(Gpr::Rax),
+                    src: vsrc(1),
+                },
+                Inst::FuncletEpilog,
+            ])
+        );
     }
 
     #[test]

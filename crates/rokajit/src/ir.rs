@@ -347,8 +347,15 @@ pub mod hir {
             funclet: BlockId,
             continuation: BlockId,
         },
-        /// `endfinally` / `endfilter` at the end of a funclet.
+        /// `endfinally` at the end of a finally/fault funclet.
         EndFinally,
+        /// `endfilter` (0xFE 11) at the end of a filter funclet
+        /// (step_11.11): the filter's verdict — an Int32, materialized
+        /// into rax by the backend; the VM's `CallFilterFunclet` executes
+        /// the handler iff rax == 1 (anything else continues the search).
+        EndFilter {
+            value: Expr,
+        },
     }
 
     /// HIR expression: a typed tree. Children evaluate depth-first in
@@ -508,18 +515,29 @@ pub mod hir {
     }
 
     /// An EH region over a contiguous block range (half-open). In the
-    /// importer's layout (step_10.6) the main-area blocks come first in
-    /// IL order — with synthetic `CallFinally` step blocks spliced in —
-    /// and each clause's handler blocks form one contiguous group at the
-    /// tail. A try range IL-containing a nested handler maps to just its
-    /// main blocks: `try_start..try_end` is that run, the handler having
-    /// moved to the tail.
+    /// importer's layout (step_10.6/11.11) the main-area blocks come first
+    /// in IL order — with synthetic `CallFinally` step blocks spliced in —
+    /// then each clause's blocks form one contiguous group at the tail
+    /// (a filter clause's filter group immediately before its handler
+    /// group). A try range IL-containing a nested handler maps to just
+    /// its own blocks: `try_start..try_end` is that run, the nested
+    /// handler having moved to the tail. A try nested INSIDE a handler
+    /// (step_11.11) maps to its run inside the enclosing handler's group.
     pub struct EhRegion {
         pub kind: EhRegionKind,
         pub try_start: BlockId,
         pub try_end: BlockId,
         pub handler_start: BlockId,
         pub handler_end: BlockId,
+        /// The try region's IL span (step_11.11) — pure identity cargo
+        /// for the SAMETRY marking: nested tries can collapse onto the
+        /// same NATIVE range (a try whose only content is a nested
+        /// construct reports the inner try's bytes), and the VM's
+        /// collided-unwind/rethrow skip keys on the flag, not the
+        /// offsets (genReportEHClauses, codegencommon.cpp:2826-2840 —
+        /// SAMETRY means same IL try, not same offsets).
+        pub il_try_start: u32,
+        pub il_try_end: u32,
     }
 
     pub enum EhRegionKind {
@@ -800,6 +818,11 @@ pub mod lir {
             continuation: BlockId,
         },
         EndFinally,
+        /// `endfilter` (step_11.11): the filter funclet's verdict — an
+        /// Int32 that codegen moves to rax before the funclet epilog.
+        EndFilter {
+            value: Operand,
+        },
     }
 
     impl StmtKind {
@@ -840,6 +863,7 @@ pub mod lir {
                 StmtKind::CatchArg { .. } => "CatchArg",
                 StmtKind::CallFinally { .. } => "CallFinally",
                 StmtKind::EndFinally => "EndFinally",
+                StmtKind::EndFilter { .. } => "EndFilter",
             }
         }
     }

@@ -1157,6 +1157,13 @@ impl Flatten<'_> {
             hir::Terminator::EndFinally => {
                 Self::push(out, IL_OFFSET_NONE, lir::StmtKind::EndFinally);
             }
+            hir::Terminator::EndFilter { value } => {
+                // The verdict tree flattens like a branch condition; the
+                // EndFilter consumes the operand (the backend moves it to
+                // rax before the funclet epilog).
+                let value = self.flatten_expr(value, out, IL_OFFSET_NONE)?;
+                Self::push(out, IL_OFFSET_NONE, lir::StmtKind::EndFilter { value });
+            }
             hir::Terminator::Rethrow => {
                 Self::push(out, IL_OFFSET_NONE, lir::StmtKind::Rethrow);
             }
@@ -2194,6 +2201,8 @@ mod tests {
             try_end: BlockId(1),
             handler_start: BlockId(3),
             handler_end: BlockId(4),
+            il_try_start: 0,
+            il_try_end: 0,
         });
         let m = lower_ok(m);
         assert_eq!(m.eh_regions.len(), 1, "the region table carries over");

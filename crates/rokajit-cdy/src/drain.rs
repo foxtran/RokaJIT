@@ -145,6 +145,17 @@ pub fn drain(
     if !artifact.eh_clauses.is_empty() {
         ee.set_eh_count(artifact.eh_clauses.len() as u32);
         for (index, clause) in artifact.eh_clauses.iter().enumerate() {
+            if std::env::var_os("ROKAJIT_DEBUG_EH").is_some() {
+                eprintln!(
+                    "rokajit: eh[{index}] flags={:?} try=[{}, {}) handler=[{}, {}) class_or_filter={:?}",
+                    clause.flags,
+                    clause.try_offset,
+                    clause.try_end,
+                    clause.handler_offset,
+                    clause.handler_end,
+                    clause.class_or_filter,
+                );
+            }
             ee.set_eh_info(index as u32, &to_corinfo(clause));
         }
     }

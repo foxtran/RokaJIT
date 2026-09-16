@@ -147,6 +147,10 @@ fn compile_method(
     };
     match pipeline::compile(&method_info, ee, &X64Target, Tier::Tier0) {
         Ok(artifact) => {
+            if std::env::var_os("ROKAJIT_LOG_OK").is_some() {
+                let name = rokajit_ee::ee_info::MethodQueries::print_method_name(ee, ftn);
+                eprintln!("rokajit: compiled ok: {name}");
+            }
             let (entry, size) = match drain::drain(&artifact, ftn, ee) {
                 Ok(drained) => drained,
                 Err(error) => {

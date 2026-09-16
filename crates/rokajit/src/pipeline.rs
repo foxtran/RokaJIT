@@ -136,7 +136,8 @@ pub struct FuncletInfo {
     pub prolog_len: u8,
     /// Bytes the funclet prolog subtracts from rsp (8-aligned, ≥ 8).
     pub sp_delta: u32,
-    /// Always [`CorJitFuncKind::Handler`] today (filters are Unsupported).
+    /// [`CorJitFuncKind::Filter`] for a filter funclet (step_11.11),
+    /// `Handler` for catch/finally/fault funclets.
     pub kind: CorJitFuncKind,
 }
 

@@ -71,6 +71,7 @@ pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
                 value: Some(value), ..
             } => certify_expr(value)?,
             hir::Terminator::Throw { exception } => certify_expr(exception)?,
+            hir::Terminator::EndFilter { value } => certify_expr(value)?,
             // The step_10.6 EH terminators carry no expressions: `leave`,
             // a `CallFinally` step, `endfinally`, and `rethrow` reference
             // blocks only (or nothing at all).

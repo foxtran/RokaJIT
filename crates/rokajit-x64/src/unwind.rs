@@ -394,6 +394,28 @@ mod tests {
         assert_eq!(blobs[2].bytes[4..6], [4, (3 << 4) | UWOP_ALLOC_SMALL]);
     }
 
+    /// A filter funclet (step_11.11): the same standalone ALLOC-only
+    /// blob — only the funcKind the EE sees differs (the EE uses it for
+    /// debug overlap asserts; the VM learns filter-ness from the EH
+    /// clause's FilterOffset).
+    #[test]
+    fn filter_funclet_blob_keeps_the_filter_kind() {
+        let mut i = input(32);
+        let mut f = funclet(73, 105, 4, 16);
+        f.kind = CorJitFuncKind::Filter;
+        i.funclets.push(f);
+        let blobs = encode(&i).expect("encodes");
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs[1].func_kind, CorJitFuncKind::Filter);
+        // The blob shape is byte-identical to a handler funclet's.
+        let mut h = funclet(73, 105, 4, 16);
+        h.kind = CorJitFuncKind::Handler;
+        let mut j = input(32);
+        j.funclets.push(h);
+        let handler_blobs = encode(&j).expect("encodes");
+        assert_eq!(blobs[1].bytes, handler_blobs[1].bytes);
+    }
+
     /// The funclet contract: `sub rsp, N` with N 8-aligned and ≥ 8.
     #[test]
     fn bad_funclet_sp_delta_is_an_internal_error() {

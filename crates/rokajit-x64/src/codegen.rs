@@ -442,20 +442,33 @@ impl FrameLayout {
     }
 }
 
-/// One planned funclet (step_10.6): the handler block span of an EH
-/// region (a contiguous run in the layout tail), the stack adjustment
-/// its prolog/epilog apply, and the region kind (a catch funclet
-/// receives the throwable in rdi).
+/// The funclet flavor of a planned funclet (step_10.6/11.11): a catch
+/// funclet (incl. a filter clause's handler) receives the throwable in
+/// rdi and `leave`s via the resume-address return; a filter funclet
+/// (step_11.11) also receives the throwable in rdi but answers the
+/// pass-1 verdict in rax (`endfilter`); a finally/fault funclet takes
+/// no argument and plain-`ret`s.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum FuncletKind {
+    Catch,
+    Finally,
+    Filter,
+}
+
+/// One planned funclet (step_10.6): a handler or filter block span of an
+/// EH region (a contiguous run in the layout tail), the stack adjustment
+/// its prolog/epilog apply, and its flavor.
 struct FuncletPlan {
     start_block: usize,
     end_block: usize,
     sp_delta: u32,
-    is_catch: bool,
+    kind: FuncletKind,
 }
 
-/// The funclets of an EH method (one per region's handler range), sorted
-/// by start block — emission order, since the importer lays the handler
-/// groups out at the tail. The stack adjustment is `align16(max
+/// The funclets of an EH method (one per region's handler range, plus the
+/// filter range of a filter clause — the layout tail interleaves it
+/// immediately before its handler), sorted by start block — emission
+/// order. The stack adjustment is `align16(max
 /// outgoing-argument bytes over the funclet's calls) + 8`: the VM's
 /// funclet call enters with rsp ≡ 8 (mod 16), so a ≡ 8 (mod 16)
 /// adjustment re-aligns the funclet's own call sites.
@@ -473,28 +486,40 @@ fn plan_funclets(method: &lir::Method) -> CompileResult<Vec<FuncletPlan>> {
         }
     }
     let mut plans = Vec::with_capacity(method.eh_regions.len());
-    for r in &method.eh_regions {
-        let (hs, he) = (r.handler_start.0 as usize, r.handler_end.0 as usize);
-        let is_catch = match r.kind {
-            hir::EhRegionKind::Catch { .. } => true,
-            hir::EhRegionKind::Finally => false,
-            _ => {
-                return Err(CompileError::Internal(
-                    "filter/fault EH region survived the importer",
-                ));
-            }
-        };
-        if hs >= he || he > method.blocks.len() {
+    let push = |start: usize, end: usize, kind: FuncletKind, plans: &mut Vec<FuncletPlan>| {
+        if start >= end || end > method.blocks.len() {
             return Err(CompileError::Internal(
-                "EH handler range outside the block layout",
+                "EH funclet range outside the block layout",
             ));
         }
         plans.push(FuncletPlan {
-            start_block: hs,
-            end_block: he,
+            start_block: start,
+            end_block: end,
             sp_delta: 0,
-            is_catch,
+            kind,
         });
+        Ok(())
+    };
+    for r in &method.eh_regions {
+        let (hs, he) = (r.handler_start.0 as usize, r.handler_end.0 as usize);
+        match r.kind {
+            hir::EhRegionKind::Catch { .. } => push(hs, he, FuncletKind::Catch, &mut plans)?,
+            hir::EhRegionKind::Finally | hir::EhRegionKind::Fault => {
+                push(hs, he, FuncletKind::Finally, &mut plans)?
+            }
+            hir::EhRegionKind::Filter {
+                filter_start,
+                filter_end,
+            } => {
+                push(
+                    filter_start.0 as usize,
+                    filter_end.0 as usize,
+                    FuncletKind::Filter,
+                    &mut plans,
+                )?;
+                push(hs, he, FuncletKind::Catch, &mut plans)?;
+            }
+        }
     }
     plans.sort_by_key(|p| p.start_block);
     for w in plans.windows(2) {
@@ -504,13 +529,24 @@ fn plan_funclets(method: &lir::Method) -> CompileResult<Vec<FuncletPlan>> {
             ));
         }
     }
-    // Try ranges live in the main area: each must end at or before the
-    // first handler block.
-    let main_end = plans[0].start_block;
+    // A try range lives entirely in one area — the main body or exactly
+    // one funclet (the importer's ownership model): never straddling a
+    // funclet boundary.
     for r in &method.eh_regions {
         let (ts, te) = (r.try_start.0 as usize, r.try_end.0 as usize);
-        if ts >= te || te > main_end {
-            return Err(CompileError::Internal("EH try range outside the main area"));
+        if ts >= te || te > method.blocks.len() {
+            return Err(CompileError::Internal(
+                "EH try range outside the block layout",
+            ));
+        }
+        for p in &plans {
+            let inside = ts >= p.start_block && te <= p.end_block;
+            let outside = te <= p.start_block || ts >= p.end_block;
+            if !inside && !outside {
+                return Err(CompileError::Internal(
+                    "EH try range straddles a funclet boundary",
+                ));
+            }
         }
     }
     for p in &mut plans {
@@ -532,7 +568,10 @@ fn plan_funclets(method: &lir::Method) -> CompileResult<Vec<FuncletPlan>> {
 /// first (a nested try starts later: try offset DESC, then try end ASC;
 /// genReportEH, codegencommon.cpp:2727-2789). Same-try clauses stay
 /// contiguous in EE order (the sort is stable) with SAMETRY added to
-/// the flags of the 2nd+ of each run.
+/// the flags of the 2nd+ of each run — same IL try (step_11.11: nested
+/// tries can collapse onto the same native range, and the VM's
+/// unwind-resume skip keys on the flag, so offset equality must NOT
+/// set it).
 fn build_eh_clauses(
     method: &lir::Method,
     block_offsets: &[u32],
@@ -540,6 +579,7 @@ fn build_eh_clauses(
     plans: &[FuncletPlan],
 ) -> CompileResult<Vec<EhClause>> {
     let mut clauses = Vec::with_capacity(method.eh_regions.len());
+    let mut il_tries = Vec::with_capacity(method.eh_regions.len());
     for r in &method.eh_regions {
         let fi = plans
             .iter()
@@ -550,15 +590,29 @@ fn build_eh_clauses(
                 EhClauseFlags::EMPTY,
                 ClassTokenOrFilter::ClassToken(class_token),
             ),
-            // A finally's ClassToken is unused; RyuJIT passes 0
-            // (`hndTyp = ebdTyp`, set for catches only).
+            // A finally's/fault's ClassToken is unused; RyuJIT passes 0
+            // (`hndTyp = ebdTyp`, set for catches only). FINALLY and FAULT
+            // both dispatch as pass-2 finally calls; only the flag differs
+            // (exceptionhandling.cpp:3669-3678).
             hir::EhRegionKind::Finally => {
                 (EhClauseFlags::FINALLY, ClassTokenOrFilter::ClassToken(0))
             }
-            _ => {
-                return Err(CompileError::Internal(
-                    "filter/fault EH region survived the importer",
-                ));
+            hir::EhRegionKind::Fault => (EhClauseFlags::FAULT, ClassTokenOrFilter::ClassToken(0)),
+            // A filter clause: ClassTokenOrFilter carries the filter
+            // funclet's native start (genReportEH, codegencommon.cpp:
+            // 2763-2766) — the VM matches it against the funclet's
+            // RUNTIME_FUNCTION to learn filter-ness (IsFilterFunclet).
+            hir::EhRegionKind::Filter { filter_start, .. } => {
+                let fi = plans
+                    .iter()
+                    .position(|p| {
+                        p.start_block == filter_start.0 as usize && p.kind == FuncletKind::Filter
+                    })
+                    .ok_or(CompileError::Internal("EH filter region has no funclet"))?;
+                (
+                    EhClauseFlags::FILTER,
+                    ClassTokenOrFilter::FilterOffset(funclets[fi].start_offset),
+                )
             }
         };
         clauses.push(EhClause {
@@ -569,6 +623,7 @@ fn build_eh_clauses(
             handler_end: funclets[fi].end_offset,
             class_or_filter,
         });
+        il_tries.push((r.il_try_start, r.il_try_end));
     }
     let mut order: Vec<usize> = (0..clauses.len()).collect();
     order.sort_by(|&a, &b| {
@@ -578,13 +633,13 @@ fn build_eh_clauses(
             .then(clauses[a].try_end.cmp(&clauses[b].try_end))
     });
     let mut out: Vec<EhClause> = Vec::with_capacity(clauses.len());
+    let mut prev_il_try: Option<(u32, u32)> = None;
     for i in order {
         let mut c = clauses[i];
-        if let Some(prev) = out.last() {
-            if (prev.try_offset, prev.try_end) == (c.try_offset, c.try_end) {
-                c.flags = c.flags | EhClauseFlags::SAMETRY;
-            }
+        if prev_il_try == Some(il_tries[i]) {
+            c.flags = c.flags | EhClauseFlags::SAMETRY;
         }
+        prev_il_try = Some(il_tries[i]);
         out.push(c);
     }
     Ok(out)
@@ -661,7 +716,10 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
                 end_offset: 0, // patched at the next boundary / after the loop
                 prolog_len,
                 sp_delta: plan.sp_delta,
-                kind: CorJitFuncKind::Handler,
+                kind: match plan.kind {
+                    FuncletKind::Filter => CorJitFuncKind::Filter,
+                    _ => CorJitFuncKind::Handler,
+                },
             });
             next_plan += 1;
         } else {
@@ -669,17 +727,17 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
             block_offsets.push(em.asm.offset());
         }
         em.vs.reset();
-        let in_catch = block_funclet[bi].is_some_and(|fi| plans[fi].is_catch);
+        let in_catch = block_funclet[bi].is_some_and(|fi| plans[fi].kind == FuncletKind::Catch);
         for (si, stmt) in block.stmts.iter().enumerate() {
             // EH shape guards (an importer-contract violation is an
             // Internal error, not silent miscode):
             if let StmtKind::CatchArg { .. } = &stmt.kind {
                 let ok = si == 0
                     && matches!(block_funclet[bi],
-                        Some(fi) if plans[fi].is_catch && plans[fi].start_block == bi);
+                        Some(fi) if matches!(plans[fi].kind, FuncletKind::Catch | FuncletKind::Filter) && plans[fi].start_block == bi);
                 if !ok {
                     return Err(CompileError::Internal(
-                        "CatchArg outside a catch funclet's entry statement",
+                        "CatchArg outside a catch/filter funclet's entry statement",
                     ));
                 }
             }
@@ -753,13 +811,15 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
         // elision) still ends in an edge: the successor must see the same
         // frame-resident state. After a `Return` there is no edge — nor
         // after the EH terminals (Throw and Rethrow never return;
-        // EndFinally and the catch-Leave return out of the funclet).
+        // EndFinally/EndFilter and the catch-Leave return out of the
+        // funclet).
         let terminal = match block.stmts.last().map(|s| &s.kind) {
             Some(
                 StmtKind::Return { .. }
                 | StmtKind::Throw { .. }
                 | StmtKind::Rethrow
-                | StmtKind::EndFinally,
+                | StmtKind::EndFinally
+                | StmtKind::EndFilter { .. },
             ) => true,
             Some(StmtKind::Leave { .. }) => in_catch,
             _ => false,
@@ -1447,12 +1507,22 @@ impl<'a> Emitter<'a> {
         let abi = classify_call(&sig, self.layouts)?;
         // Incoming argument registers hold live values until their spill:
         // scratch allocation (struct eightbyte shifts, stack-struct
-        // copies) must stay clear of the ones not yet spilled.
+        // copies) must stay clear of the ones not yet spilled. Only GPRs
+        // can collide with the GPR scratch pool — an XMM-classified
+        // argument register is not in it (excluding those too could
+        // "exhaust" the pool on wide signatures: 6 int + 8 xmm SysV
+        // argument registers > 9 pool GPRs).
         self.fixed_dests = abi
             .args
             .iter()
             .flat_map(|loc| match loc {
-                ArgLocation::Reg(p) => vec![*p],
+                ArgLocation::Reg(p) => {
+                    if Gpr::from_phys(*p).is_some() {
+                        vec![*p]
+                    } else {
+                        vec![]
+                    }
+                }
                 ArgLocation::StructRegs { regs, count, .. } => regs[..*count as usize]
                     .iter()
                     .copied()
@@ -6533,6 +6603,8 @@ mod tests {
             try_end: BlockId(1),
             handler_start: BlockId(2),
             handler_end: BlockId(3),
+            il_try_start: 0,
+            il_try_end: 0,
         });
         let out = emit(&m, &MockEe::default());
         #[rustfmt::skip]
@@ -6580,6 +6652,189 @@ mod tests {
         assert_eq!(c.class_or_filter, ClassTokenOrFilter::ClassToken(0));
         // The funclet call is internal: no relocation, no call site.
         assert!(out.relocations.is_empty() && out.call_sites.is_empty());
+    }
+
+    /// A filter clause (step_11.11): TWO funclets — the filter (throwable
+    /// in rdi, verdict in eax via `endfilter`) immediately before its
+    /// handler (an ordinary catch funclet). The clause reports Flags =
+    /// FILTER and FilterOffset = the filter funclet's native start (the
+    /// VM learns filter-ness by matching that against the funclet's
+    /// RUNTIME_FUNCTION).
+    #[test]
+    fn filter_funclet_method_bytes() {
+        let mut m = method(
+            vec![
+                local(Type::Int32, LocalKind::IlLocal(0)),
+                local(Type::Ref, LocalKind::Temp),
+            ],
+            0,
+            1,
+            vec![
+                block(
+                    0,
+                    vec![
+                        stmt(StmtKind::Copy {
+                            dst: LocalId(0),
+                            src: Operand::Const(Const::Int32(2)),
+                        }),
+                        stmt(StmtKind::Leave { target: BlockId(1) }),
+                    ],
+                ),
+                block(
+                    1,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(0))),
+                    })],
+                ),
+                // The filter funclet: catch arg, verdict 1.
+                block(
+                    2,
+                    vec![
+                        stmt(StmtKind::CatchArg { dst: LocalId(1) }),
+                        stmt(StmtKind::EndFilter {
+                            value: Operand::Const(Const::Int32(1)),
+                        }),
+                    ],
+                ),
+                // The handler funclet: catch arg, leave (the catch's
+                // lea-resume return).
+                block(
+                    3,
+                    vec![
+                        stmt(StmtKind::CatchArg { dst: LocalId(1) }),
+                        stmt(StmtKind::Leave { target: BlockId(1) }),
+                    ],
+                ),
+            ],
+        );
+        m.eh_regions.push(EhRegion {
+            kind: EhRegionKind::Filter {
+                filter_start: BlockId(2),
+                filter_end: BlockId(3),
+            },
+            try_start: BlockId(0),
+            try_end: BlockId(1),
+            handler_start: BlockId(3),
+            handler_end: BlockId(4),
+            il_try_start: 0,
+            il_try_end: 0,
+        });
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0xC7, 0x45, 0xFC, 0, 0, 0, 0, // movl $0, -4(%rbp)   — loc0
+            0x48, 0xC7, 0x45, 0xF0, 0, 0, 0, 0, // movq $0, -16(%rbp) — Ref temp
+            // B0 (offset 23): the try body
+            0xC7, 0x45, 0xFC, 0x02, 0, 0, 0, // movl $2, -4(%rbp)
+            0xE9, 0x00, 0x00, 0x00, 0x00, // jmp +0 — the leave to B1
+            // B1 (offset 35): return loc0
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax
+            0xC9, 0xC3, // leave; ret
+            // B2 (offset 40): the FILTER funclet
+            0x48, 0x83, 0xEC, 0x08, // subq $8, %rsp
+            0x48, 0x89, 0x7D, 0xF0, // movq %rdi, -16(%rbp)  — the throwable
+            0xB8, 0x01, 0x00, 0x00, 0x00, // movl $1, %eax   — the verdict
+            0x48, 0x83, 0xC4, 0x08, // addq $8, %rsp
+            0xC3, // ret — rax = 1: execute the handler
+            // B3 (offset 58): the HANDLER funclet
+            0x48, 0x83, 0xEC, 0x08, // subq $8, %rsp
+            0x48, 0x89, 0x7D, 0xF0, // movq %rdi, -16(%rbp)
+            0x48, 0x8D, 0x05, 0xDA, 0xFF, 0xFF, 0xFF, // leaq -38(%rip), %rax — B1 at 35
+            0x48, 0x83, 0xC4, 0x08, // addq $8, %rsp
+            0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+
+        // Two funclets — filter [40, 58) then handler [58, 78), the kind
+        // flowing to the EE's allocUnwindInfo funcKind.
+        assert_eq!(
+            out.funclets,
+            vec![
+                FuncletInfo {
+                    start_offset: 40,
+                    end_offset: 58,
+                    prolog_len: 4,
+                    sp_delta: 8,
+                    kind: CorJitFuncKind::Filter,
+                },
+                FuncletInfo {
+                    start_offset: 58,
+                    end_offset: 78,
+                    prolog_len: 4,
+                    sp_delta: 8,
+                    kind: CorJitFuncKind::Handler,
+                },
+            ]
+        );
+        // Interruptible ranges: main body and both funclet bodies —
+        // prologs/epilogs excluded.
+        assert_eq!(out.interruptible_ranges, vec![(8, 38), (44, 53), (62, 73)]);
+        // The clause: try = B0's bytes, handler = the second funclet,
+        // FilterOffset = the filter funclet's start.
+        assert_eq!(out.eh_clauses.len(), 1);
+        let c = out.eh_clauses[0];
+        assert_eq!(c.flags, EhClauseFlags::FILTER);
+        assert_eq!((c.try_offset, c.try_end), (23, 35));
+        assert_eq!((c.handler_offset, c.handler_end), (58, 78));
+        assert_eq!(c.class_or_filter, ClassTokenOrFilter::FilterOffset(40));
+    }
+
+    /// A fault clause reports Flags = FAULT with a zero ClassToken and
+    /// lowers like a finally funclet (plain `ret` epilog, no throwable).
+    #[test]
+    fn fault_clause_reports_the_fault_flag() {
+        let mut m = method(
+            vec![local(Type::Int32, LocalKind::IlLocal(0))],
+            0,
+            1,
+            vec![
+                block(
+                    0,
+                    vec![
+                        stmt(StmtKind::Copy {
+                            dst: LocalId(0),
+                            src: Operand::Const(Const::Int32(2)),
+                        }),
+                        stmt(StmtKind::Leave { target: BlockId(1) }),
+                    ],
+                ),
+                block(
+                    1,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(0))),
+                    })],
+                ),
+                block(
+                    2,
+                    vec![
+                        stmt(StmtKind::Copy {
+                            dst: LocalId(0),
+                            src: Operand::Const(Const::Int32(5)),
+                        }),
+                        stmt(StmtKind::EndFinally),
+                    ],
+                ),
+            ],
+        );
+        m.eh_regions.push(EhRegion {
+            kind: EhRegionKind::Fault,
+            try_start: BlockId(0),
+            try_end: BlockId(1),
+            handler_start: BlockId(2),
+            handler_end: BlockId(3),
+            il_try_start: 0,
+            il_try_end: 0,
+        });
+        let out = emit(&m, &MockEe::default());
+        assert_eq!(out.eh_clauses.len(), 1);
+        let c = out.eh_clauses[0];
+        assert_eq!(c.flags, EhClauseFlags::FAULT);
+        assert_eq!(c.class_or_filter, ClassTokenOrFilter::ClassToken(0));
+        assert_eq!(out.funclets.len(), 1);
+        assert_eq!(out.funclets[0].kind, CorJitFuncKind::Handler);
     }
 
     /// `try { x = 2; Thrower(); x = 3 } catch { x = 4 } return x` — the
@@ -6650,6 +6905,8 @@ mod tests {
             try_end: BlockId(1),
             handler_start: BlockId(2),
             handler_end: BlockId(3),
+            il_try_start: 0,
+            il_try_end: 0,
         });
         let out = emit(&m, &ee);
         #[rustfmt::skip]
@@ -7226,12 +7483,15 @@ mod tests {
     }
     #[test]
     fn eh_clauses_order_innermost_first_with_sametry() {
-        // EE order: outer catch A, same-try catch B, inner catch C.
+        // EE order: outer catch A, same-try catch B, inner catch C, and
+        // (step_11.11) D — a DIFFERENT IL try that collapses onto C's
+        // native range (a try whose only content is a nested construct).
         let mut m = method(vec![], 0, 0, vec![]);
-        for (token, ts, te, hs) in [
-            (0x0200_000Au32, 0u32, 4u32, 5u32), // A: outer try [0,4)
-            (0x0200_000B, 0, 4, 6),             // B: same try
-            (0x0200_000C, 1, 3, 7),             // C: nested inner [1,3)
+        for (token, ts, te, hs, il_ts, il_te) in [
+            (0x0200_000Au32, 0u32, 4u32, 6u32, 0u32, 4u32), // A: outer try [0,4)
+            (0x0200_000B, 0, 4, 7, 0, 4),                   // B: same IL try
+            (0x0200_000C, 1, 3, 8, 1, 3),                   // C: nested inner [1,3)
+            (0x0200_000D, 1, 3, 9, 2, 3), // D: same NATIVE range as C, other IL try
         ] {
             m.eh_regions.push(EhRegion {
                 kind: EhRegionKind::Catch { class_token: token },
@@ -7239,19 +7499,21 @@ mod tests {
                 try_end: BlockId(te),
                 handler_start: BlockId(hs),
                 handler_end: BlockId(hs + 1),
+                il_try_start: il_ts,
+                il_try_end: il_te,
             });
         }
-        let block_offsets: Vec<u32> = (0..8).map(|i| i * 10).collect();
-        let plans: Vec<FuncletPlan> = [5, 6, 7]
+        let block_offsets: Vec<u32> = (0..10).map(|i| i * 10).collect();
+        let plans: Vec<FuncletPlan> = [6, 7, 8, 9]
             .into_iter()
             .map(|b| FuncletPlan {
                 start_block: b,
                 end_block: b + 1,
                 sp_delta: 8,
-                is_catch: true,
+                kind: FuncletKind::Catch,
             })
             .collect();
-        let funclets: Vec<FuncletInfo> = [(100, 120), (120, 140), (140, 160)]
+        let funclets: Vec<FuncletInfo> = [(100, 120), (120, 140), (140, 160), (160, 180)]
             .into_iter()
             .map(|(start_offset, end_offset)| FuncletInfo {
                 start_offset,
@@ -7262,7 +7524,8 @@ mod tests {
             })
             .collect();
         let clauses = build_eh_clauses(&m, &block_offsets, &funclets, &plans).expect("clauses");
-        // C (inner) first, then A, then B with SAMETRY.
+        // C, D (inner, EE order — the collapse does NOT earn SAMETRY),
+        // then A, then B with SAMETRY.
         let tokens: Vec<u32> = clauses
             .iter()
             .map(|c| match c.class_or_filter {
@@ -7270,11 +7533,15 @@ mod tests {
                 _ => panic!("catch clauses carry tokens"),
             })
             .collect();
-        assert_eq!(tokens, vec![0x0200_000C, 0x0200_000A, 0x0200_000B]);
+        assert_eq!(
+            tokens,
+            vec![0x0200_000C, 0x0200_000D, 0x0200_000A, 0x0200_000B]
+        );
         assert_eq!(clauses[0].flags, EhClauseFlags::EMPTY);
         assert_eq!(clauses[1].flags, EhClauseFlags::EMPTY);
+        assert_eq!(clauses[2].flags, EhClauseFlags::EMPTY);
         assert_eq!(
-            clauses[2].flags,
+            clauses[3].flags,
             EhClauseFlags::EMPTY | EhClauseFlags::SAMETRY
         );
         // Native ranges: try offsets from the block table, handler ranges
@@ -7284,9 +7551,14 @@ mod tests {
             (clauses[0].handler_offset, clauses[0].handler_end),
             (140, 160)
         );
-        assert_eq!((clauses[1].try_offset, clauses[1].try_end), (0, 40));
+        assert_eq!((clauses[1].try_offset, clauses[1].try_end), (10, 30));
         assert_eq!(
-            (clauses[2].handler_offset, clauses[2].handler_end),
+            (clauses[1].handler_offset, clauses[1].handler_end),
+            (160, 180)
+        );
+        assert_eq!((clauses[2].try_offset, clauses[2].try_end), (0, 40));
+        assert_eq!(
+            (clauses[3].handler_offset, clauses[3].handler_end),
             (120, 140)
         );
     }
@@ -7343,6 +7615,8 @@ mod tests {
             try_end: BlockId(1),
             handler_start: BlockId(2),
             handler_end: BlockId(3),
+            il_try_start: 0,
+            il_try_end: 0,
         });
         let out = emit(&m, &ee);
         #[rustfmt::skip]
@@ -7415,6 +7689,8 @@ mod tests {
             try_end: BlockId(1),
             handler_start: BlockId(1),
             handler_end: BlockId(1),
+            il_try_start: 0,
+            il_try_end: 0,
         });
         assert!(matches!(
             emit_tier0(&m, &MockEe::default()),
@@ -7449,6 +7725,8 @@ mod tests {
             try_end: BlockId(1),
             handler_start: BlockId(2),
             handler_end: BlockId(3),
+            il_try_start: 0,
+            il_try_end: 0,
         });
         assert!(matches!(
             emit_tier0(&m, &MockEe::default()),

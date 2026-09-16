@@ -211,18 +211,28 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
 
     let insns = decode(&info.il)?;
     let clauses = fetch_clauses(info, ee)?;
-    validate_clauses(&clauses, &insns, info.il.len() as u32)?;
+    validate_clauses(&clauses, info.il.len() as u32)?;
     let leaders = find_leaders(&info.il, &insns, &clauses)?;
     let block_of = leaders
         .iter()
         .enumerate()
         .map(|(i, &offset)| (offset, i as u32))
         .collect();
-    let catch_entries: BTreeSet<u32> = clauses
+    // Entries the VM enters with the throwable in rdi (the CatchArg
+    // mechanism): catch handler entries (incl. a filter clause's
+    // handler — an ordinary catch from the VM's side) and filter region
+    // entries (CallEHFilterFunclet's identical contract,
+    // asmhelpers.S:410-430).
+    let mut catch_entries: BTreeSet<u32> = clauses
         .iter()
-        .filter(|c| matches!(c.kind, ClauseKind::Catch { .. }))
+        .filter(|c| matches!(c.kind, ClauseKind::Catch { .. } | ClauseKind::Filter { .. }))
         .map(|c| c.handler_start)
         .collect();
+    for c in &clauses {
+        if let ClauseKind::Filter { filter_start, .. } = c.kind {
+            catch_entries.insert(filter_start);
+        }
+    }
     let mut importer = BlockImport {
         ee,
         info,
@@ -776,6 +786,9 @@ enum Op {
     },
     /// `endfinally` — return from a finally funclet.
     EndFinally,
+    /// `endfilter` (0xFE 11) — end a filter funclet, answering the
+    /// pass-1 verdict (pops an int32; 1 = execute the handler).
+    EndFilter,
     /// `rethrow` (0xFE 1A) — re-raise the in-flight exception: a void
     /// no-arg `CORINFO_HELP_RETHROW` helper call (importer.cpp:11072).
     /// Valid only inside a catch handler; the call never returns, so it
@@ -1296,9 +1309,7 @@ fn decode(il: &[u8]) -> CompileResult<Vec<Insn>> {
                 0x0D => Op::LdLoca(r.u16()?),
                 0x0E => Op::StLoc(r.u16()?),
                 0x0F => Op::LocAlloc,
-                0x11 => {
-                    return Err(CompileError::Unsupported("endfilter (EH filter clauses)"));
-                }
+                0x11 => Op::EndFilter,
                 0x12 => {
                     // `unaligned.` — advisory on x64 (the step_10.13 model:
                     // consume and record, emit nothing different).
@@ -1476,12 +1487,21 @@ fn find_leaders(il: &[u8], insns: &[Insn], clauses: &[Clause]) -> CompileResult<
 
     let mut leaders: BTreeSet<u32> = BTreeSet::from([0]);
     for clause in clauses {
-        for boundary in [
+        let mut boundaries = vec![
             clause.try_start,
             clause.try_end,
             clause.handler_start,
             clause.handler_end,
-        ] {
+        ];
+        if let ClauseKind::Filter {
+            filter_start,
+            filter_end,
+        } = clause.kind
+        {
+            boundaries.push(filter_start);
+            boundaries.push(filter_end);
+        }
+        for boundary in boundaries {
             // A region end at the very end of the method starts no block.
             if boundary as usize == il.len() {
                 continue;
@@ -1554,22 +1574,31 @@ enum ClauseKind {
         class_token: u32,
     },
     Finally,
+    /// A fault handler (step_11.11): a finally that runs ONLY on the
+    /// exceptional path — the VM dispatches both through the same
+    /// pass-2 CallFinallyFunclet shape (finally and fault both map to
+    /// RH_EH_CLAUSE_FAULT, exceptionhandling.cpp:3669-3678); only the
+    /// reported flag differs.
+    Fault,
+    /// A filter clause (step_11.11): the filter region runs in pass 1
+    /// (nothing unwound, the throwing frame live below) and answers the
+    /// verdict via `endfilter`; the handler region is an ordinary catch
+    /// handler (entered with the throwable in rdi). ECMA-335: the filter
+    /// ends where the handler begins.
+    Filter {
+        filter_start: u32,
+        filter_end: u32,
+    },
 }
 
-/// The method's EH clauses from `get_eh_info` (step_10.6). Only typed
-/// catches and finallys are in scope; filters and faults are named
-/// Unsupported.
+/// The method's EH clauses from `get_eh_info` (step_10.6; filters and
+/// faults joined in step_11.11). A FILTER clause's FilterOffset is the
+/// filter region's IL start; the region ends at the handler's start.
 fn fetch_clauses(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<Vec<Clause>> {
     let mut clauses = Vec::with_capacity(info.eh_count as usize);
     for i in 0..info.eh_count {
         let raw = ee.get_eh_info(info.ftn, i);
         let flags = raw.Flags;
-        if flags & ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FILTER != 0 {
-            return Err(CompileError::Unsupported("EH filter clauses"));
-        }
-        if flags & ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FAULT != 0 {
-            return Err(CompileError::Unsupported("EH fault clauses"));
-        }
         // SAMETRY is a JIT→EE table flag the EE never reports here.
         let kind = match flags & !ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_SAMETRY {
             ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_NONE => ClauseKind::Catch {
@@ -1577,6 +1606,12 @@ fn fetch_clauses(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<Vec<Clause
                 class_token: unsafe { raw.__bindgen_anon_1.ClassToken },
             },
             ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FINALLY => ClauseKind::Finally,
+            ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FAULT => ClauseKind::Fault,
+            ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FILTER => ClauseKind::Filter {
+                // SAFETY: a FILTER clause's union member is FilterOffset.
+                filter_start: unsafe { raw.__bindgen_anon_1.FilterOffset },
+                filter_end: raw.HandlerOffset,
+            },
             _ => return Err(CompileError::BadIl("unknown EH clause flags")),
         };
         let bounds = |start: u32, len: u32| {
@@ -1595,13 +1630,16 @@ fn fetch_clauses(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<Vec<Clause
     Ok(clauses)
 }
 
-/// The EH well-formedness the importer relies on (step_10.6): regions
-/// are non-empty and in-bounds, a clause's handler is disjoint from its
-/// own try, and every pair of try/handler ranges is disjoint, nested, or
-/// — for try ranges only — equal (multiple catch clauses on one try).
-/// Each try must also protect at least one instruction that no handler
-/// covers (the layout rebuild maps a try to its *main* blocks).
-fn validate_clauses(clauses: &[Clause], insns: &[Insn], il_len: u32) -> CompileResult<()> {
+/// The EH well-formedness the importer relies on (step_10.6/11.11):
+/// regions are non-empty and in-bounds, a clause's handler (and filter)
+/// is disjoint from its own try, and every pair of try/handler/filter
+/// ranges is disjoint, nested, or — for try ranges only — equal
+/// (multiple catch clauses on one try). A try nested inside an
+/// enclosing clause's HANDLER is valid IL (step_11.11): its blocks live
+/// in the enclosing handler's funclet, and the clause reports with
+/// ordinary method-relative native offsets (the VM's clause table is a
+/// flat stream — there is no per-funclet scoping).
+fn validate_clauses(clauses: &[Clause], il_len: u32) -> CompileResult<()> {
     for c in clauses {
         if c.try_start >= c.try_end || c.handler_start >= c.handler_end {
             return Err(CompileError::BadIl("empty EH region"));
@@ -1612,30 +1650,33 @@ fn validate_clauses(clauses: &[Clause], insns: &[Insn], il_len: u32) -> CompileR
         if c.handler_start < c.try_end && c.try_start < c.handler_end {
             return Err(CompileError::BadIl("EH handler overlaps its own try"));
         }
-        let protects_something = insns.iter().any(|insn| {
-            insn.offset >= c.try_start
-                && insn.offset < c.try_end
-                && !clauses
-                    .iter()
-                    .any(|h| insn.offset >= h.handler_start && insn.offset < h.handler_end)
-        });
-        if !protects_something {
-            // Valid IL (RyuJIT accepts): the try's whole body lies inside
-            // an *enclosing* clause's handler — `try { } finally { try {
-            // } catch { } }`. Our layout model assigns a block to its
-            // innermost handler, which leaves such a try no main-area
-            // blocks; expressing it needs the outer clause's region to
-            // cover the funclet (the EH table's per-funclet duplicate
-            // entries). A named limitation, not bad IL.
-            return Err(CompileError::Unsupported(
-                "EH try region nested inside an enclosing handler",
-            ));
+        if let ClauseKind::Filter {
+            filter_start,
+            filter_end,
+        } = c.kind
+        {
+            // ECMA-335: the filter region abuts the handler (fetch set
+            // filter_end = handler_start); it must be non-empty (the
+            // endfilter has to live somewhere) and disjoint from the try.
+            if filter_start >= filter_end || filter_end != c.handler_start {
+                return Err(CompileError::BadIl("malformed EH filter region"));
+            }
+            if filter_start < c.try_end && c.try_start < filter_end {
+                return Err(CompileError::BadIl("EH filter overlaps its own try"));
+            }
         }
     }
-    let mut regions = Vec::with_capacity(clauses.len() * 2);
+    let mut regions = Vec::with_capacity(clauses.len() * 3);
     for c in clauses {
         regions.push((c.try_start, c.try_end, true));
         regions.push((c.handler_start, c.handler_end, false));
+        if let ClauseKind::Filter {
+            filter_start,
+            filter_end,
+        } = c.kind
+        {
+            regions.push((filter_start, filter_end, false));
+        }
     }
     for (i, &(s1, e1, try1)) in regions.iter().enumerate() {
         for &(s2, e2, try2) in &regions[i + 1..] {
@@ -1649,6 +1690,17 @@ fn validate_clauses(clauses: &[Clause], insns: &[Insn], il_len: u32) -> CompileR
         }
     }
     Ok(())
+}
+
+/// Is `offset` inside a FILTER clause's filter region (step_11.11)?
+/// Control leaves a filter only via `endfilter` (ECMA-335 §III.4.16;
+/// RyuJIT BADCODEs branch/leave out of a filter, importer.cpp's
+/// CEE_ENDFILTER block checks).
+fn inside_filter(clauses: &[Clause], offset: u32) -> bool {
+    clauses.iter().any(|c| {
+        matches!(c.kind, ClauseKind::Filter { filter_start, filter_end }
+            if offset >= filter_start && offset < filter_end)
+    })
 }
 
 /// The clause whose HANDLER region is the innermost containing `offset`
@@ -1666,7 +1718,9 @@ fn innermost_handler(clauses: &[Clause], offset: u32) -> Option<usize> {
 
 /// The finally clauses a `leave` at `site` must invoke to reach `target`
 /// (step_10.6): every finally clause whose try region contains the site
-/// but not the target, innermost first.
+/// but not the target, innermost first. FAULT clauses are deliberately
+/// excluded (step_11.11): a fault handler runs only on the exceptional
+/// path, never on a `leave`.
 fn finally_chain(clauses: &[Clause], site: u32, target: u32) -> Vec<usize> {
     let mut chain: Vec<usize> = clauses
         .iter()
@@ -1716,14 +1770,14 @@ struct Step {
     hop: usize,
 }
 
-/// Rebuilds the block list for an EH method (step_10.6): main-area
-/// blocks in IL order (a block is main-area iff its IL range lies
-/// outside every handler region) with the leave chains' step blocks
-/// spliced after their anchor blocks, then the handler blocks grouped
-/// per clause at the tail (groups in handler IL order, IL order within a
-/// group). BlockIds are renumbered to layout order, every terminator
-/// target is remapped, and the `eh_regions` table is computed over the
-/// new order.
+/// Rebuilds the block list for an EH method (step_10.6, generalized in
+/// step_11.11): main-area blocks in IL order (a block is main-area iff
+/// its IL range lies outside every handler AND filter region) with the
+/// leave chains' step blocks spliced after their anchor blocks, then per
+/// clause the filter group (if any) and the handler group at the tail
+/// (groups in handler IL order, IL order within a group). BlockIds are
+/// renumbered to layout order, every terminator target is remapped, and
+/// the `eh_regions` table is computed over the new order.
 fn rebuild_blocks(
     mut blocks: Vec<hir::Block>,
     ranges: &[(u32, u32)],
@@ -1732,25 +1786,54 @@ fn rebuild_blocks(
     block_of: &HashMap<u32, u32>,
 ) -> CompileResult<(Vec<hir::Block>, Vec<hir::EhRegion>)> {
     let n = blocks.len();
-    // EH region boundaries are leaders, so a block lies entirely inside
-    // or outside each handler range.
-    let handler_of: Vec<Option<usize>> = ranges
+    // Block ownership (step_10.6, generalized in 11.11): EH region
+    // boundaries are leaders, so a block lies entirely inside or outside
+    // each region. A block's owner is its innermost filter range, else
+    // its innermost handler range, else the main area. A try's own
+    // blocks are those owned by the area the try sits in — main, or an
+    // enclosing handler's funclet (the nested-try-in-handler case).
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum Area {
+        Handler(usize),
+        Filter(usize),
+    }
+    let owner_of: Vec<Option<Area>> = ranges
         .iter()
         .map(|&(start, _)| {
+            if let Some(c) = clauses.iter().position(|c| {
+                matches!(c.kind, ClauseKind::Filter { filter_start, filter_end }
+                    if start >= filter_start && start < filter_end)
+            }) {
+                return Some(Area::Filter(c));
+            }
             clauses
                 .iter()
-                .position(|c| start >= c.handler_start && start < c.handler_end)
+                .enumerate()
+                .filter(|(_, c)| start >= c.handler_start && start < c.handler_end)
+                .min_by_key(|(_, c)| c.handler_end - c.handler_start)
+                .map(|(i, _)| Area::Handler(i))
         })
         .collect();
-    let is_main = |i: usize| handler_of[i].is_none();
+    let is_main = |i: usize| owner_of[i].is_none();
     let in_try = |i: usize, c: &Clause| ranges[i].0 >= c.try_start && ranges[i].0 < c.try_end;
-    // The anchor a step block splices after: the last main block of the
-    // try being exited. Validation guarantees the try protects at least
-    // one non-handler instruction, so the block exists.
+    // The area a try's own blocks belong to: the innermost handler
+    // containing the try (nested try-in-handler), else the main area.
+    let try_owner = |c: &Clause| -> Option<Area> {
+        clauses
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| c.try_start >= h.handler_start && c.try_start < h.handler_end)
+            .min_by_key(|(_, h)| h.handler_end - h.handler_start)
+            .map(|(i, _)| Area::Handler(i))
+    };
+    // The anchor a step block splices after: the last of the try's own
+    // blocks. Every try has at least one (a nested clause's try — not
+    // its handler — stays in the enclosing area).
     let anchor_of = |c: &Clause| -> CompileResult<usize> {
+        let owner = try_owner(c);
         (0..n)
-            .rfind(|&i| is_main(i) && in_try(i, c))
-            .ok_or(CompileError::Internal("EH try region has no main blocks"))
+            .rfind(|&i| owner_of[i] == owner && in_try(i, c))
+            .ok_or(CompileError::Internal("EH try region has no own blocks"))
     };
 
     let mut steps: Vec<Step> = Vec::new();
@@ -1776,26 +1859,35 @@ fn rebuild_blocks(
         });
     }
 
-    // The new order: mains, with each anchor's steps right after it
-    // (innermost-exiting first), then the handler groups.
+    // The new order: the main area, then per clause (handler IL order)
+    // the filter group immediately before the handler group (RyuJIT's
+    // interleave, flowgraph.cpp:3220-3225) — with each anchor's steps
+    // spliced right after it wherever the anchor lives (innermost-
+    // exiting first).
     enum Item {
         Orig(usize),
         Step(usize, usize),
     }
-    let mut order: Vec<Item> = Vec::with_capacity(n + steps.len());
+    let mut seq: Vec<usize> = Vec::with_capacity(n);
     for i in 0..n {
-        if !is_main(i) {
-            continue;
+        if is_main(i) {
+            seq.push(i);
         }
-        order.push(Item::Orig(i));
-        let mut here: Vec<&Step> = steps.iter().filter(|s| s.anchor == i).collect();
-        here.sort_by_key(|s| (s.exit_span, s.chain, s.hop));
-        order.extend(here.iter().map(|s| Item::Step(s.chain, s.hop)));
     }
     let mut clause_order: Vec<usize> = (0..clauses.len()).collect();
     clause_order.sort_by_key(|&c| clauses[c].handler_start);
     for &c in &clause_order {
-        order.extend((0..n).filter(|&i| handler_of[i] == Some(c)).map(Item::Orig));
+        if matches!(clauses[c].kind, ClauseKind::Filter { .. }) {
+            seq.extend((0..n).filter(|&i| owner_of[i] == Some(Area::Filter(c))));
+        }
+        seq.extend((0..n).filter(|&i| owner_of[i] == Some(Area::Handler(c))));
+    }
+    let mut order: Vec<Item> = Vec::with_capacity(n + steps.len());
+    for i in seq {
+        order.push(Item::Orig(i));
+        let mut here: Vec<&Step> = steps.iter().filter(|s| s.anchor == i).collect();
+        here.sort_by_key(|s| (s.exit_span, s.chain, s.hop));
+        order.extend(here.iter().map(|s| Item::Step(s.chain, s.hop)));
     }
 
     // Renumber: originals and steps get their layout position as the id.
@@ -1837,7 +1929,8 @@ fn rebuild_blocks(
                     hir::Terminator::Return { .. }
                     | hir::Terminator::Throw { .. }
                     | hir::Terminator::Rethrow
-                    | hir::Terminator::EndFinally => {}
+                    | hir::Terminator::EndFinally
+                    | hir::Terminator::EndFilter { .. } => {}
                     hir::Terminator::CallFinally { .. } => {
                         return Err(CompileError::Internal(
                             "CallFinally on an imported (non-step) block",
@@ -1885,20 +1978,21 @@ fn rebuild_blocks(
         };
     }
 
-    // The region table over the new layout. A try range maps to its run
-    // of main blocks — a nested handler's IL moved to the tail — extended
-    // over any step blocks trailing its last main block whose hop exits a
-    // STRICTLY INNER try (the coincident-try-end case: the call exiting
-    // the inner try must still sit inside this region).
+    // The region table over the new layout. A try range maps to the run
+    // of its own blocks — a nested handler's IL moved to the tail —
+    // extended over any step blocks trailing its last own block whose
+    // hop exits a STRICTLY INNER try (the coincident-try-end case: the
+    // call exiting the inner try must still sit inside this region).
     let mut regions = Vec::with_capacity(clauses.len());
     for (ci, c) in clauses.iter().enumerate() {
+        let owner = try_owner(c);
         let try_start = (0..n)
-            .filter(|&i| is_main(i) && in_try(i, c))
+            .filter(|&i| owner_of[i] == owner && in_try(i, c))
             .map(|i| new_id[i])
             .min()
-            .ok_or(CompileError::Internal("EH try region has no main blocks"))?;
+            .ok_or(CompileError::Internal("EH try region has no own blocks"))?;
         let mut try_end = (0..n)
-            .filter(|&i| is_main(i) && in_try(i, c))
+            .filter(|&i| owner_of[i] == owner && in_try(i, c))
             .map(|i| new_id[i])
             .max()
             .expect("non-empty above")
@@ -1916,26 +2010,41 @@ fn rebuild_blocks(
             }
             try_end += 1;
         }
-        let handler_start = (0..n)
-            .filter(|&i| handler_of[i] == Some(ci))
-            .map(|i| new_id[i])
-            .min()
-            .ok_or(CompileError::Internal("EH handler region has no blocks"))?;
-        let handler_end = (0..n)
-            .filter(|&i| handler_of[i] == Some(ci))
-            .map(|i| new_id[i])
-            .max()
-            .expect("non-empty above")
-            + 1;
+        let area_run = |area: Area| -> CompileResult<(u32, u32)> {
+            let start = (0..n)
+                .filter(|&i| owner_of[i] == Some(area))
+                .map(|i| new_id[i])
+                .min()
+                .ok_or(CompileError::Internal("EH region group has no blocks"))?;
+            let end = (0..n)
+                .filter(|&i| owner_of[i] == Some(area))
+                .map(|i| new_id[i])
+                .max()
+                .expect("non-empty above")
+                + 1;
+            Ok((start, end))
+        };
+        let (handler_start, handler_end) = area_run(Area::Handler(ci))?;
+        let kind = match clauses[ci].kind {
+            ClauseKind::Catch { class_token } => hir::EhRegionKind::Catch { class_token },
+            ClauseKind::Finally => hir::EhRegionKind::Finally,
+            ClauseKind::Fault => hir::EhRegionKind::Fault,
+            ClauseKind::Filter { .. } => {
+                let (filter_start, filter_end) = area_run(Area::Filter(ci))?;
+                hir::EhRegionKind::Filter {
+                    filter_start: BlockId(filter_start),
+                    filter_end: BlockId(filter_end),
+                }
+            }
+        };
         regions.push(hir::EhRegion {
-            kind: match clauses[ci].kind {
-                ClauseKind::Catch { class_token } => hir::EhRegionKind::Catch { class_token },
-                ClauseKind::Finally => hir::EhRegionKind::Finally,
-            },
+            kind,
             try_start: BlockId(try_start),
             try_end: BlockId(try_end),
             handler_start: BlockId(handler_start),
             handler_end: BlockId(handler_end),
+            il_try_start: c.try_start,
+            il_try_end: c.try_end,
         });
     }
     Ok((out, regions))
@@ -2766,7 +2875,11 @@ impl BlockImport<'_> {
         il_offset: IlOffset,
     ) -> CompileResult<hir::Terminator> {
         match innermost_handler(&self.clauses, il_offset.0) {
-            Some(c) if matches!(self.clauses[c].kind, ClauseKind::Catch { .. }) => {}
+            Some(c)
+                if matches!(
+                    self.clauses[c].kind,
+                    ClauseKind::Catch { .. } | ClauseKind::Filter { .. }
+                ) => {}
             _ => return Err(CompileError::BadIl("rethrow outside a catch handler")),
         }
         self.spill_stack(stmts, il_offset)?;
@@ -3352,11 +3465,16 @@ impl BlockImport<'_> {
         self.spill_stack(stmts, il_offset)?;
         self.stack.clear();
         self.record_exit(target, stmts, il_offset)?;
+        // A filter region is left only by `endfilter` (ECMA-335
+        // §III.4.16); `leave` out of one is invalid IL.
+        if inside_filter(&self.clauses, il_offset.0) {
+            return Err(CompileError::BadIl("leave out of an EH filter"));
+        }
         let hops = finally_chain(&self.clauses, il_offset.0, target);
         if !hops.is_empty() {
             let from_catch = matches!(
                 innermost_handler(&self.clauses, il_offset.0),
-                Some(c) if matches!(self.clauses[c].kind, ClauseKind::Catch { .. })
+                Some(c) if matches!(self.clauses[c].kind, ClauseKind::Catch { .. } | ClauseKind::Filter { .. })
             );
             self.chains.push(LeaveChain {
                 source: b,
@@ -3370,21 +3488,49 @@ impl BlockImport<'_> {
         })
     }
 
-    /// `endfinally` (0xDC, step_10.6): valid only inside a finally
-    /// handler — the funclet's plain return. The stack resets, with
-    /// pending trees evaluated first for their side effects.
+    /// `endfinally` (0xDC, step_10.6): valid only inside a finally or
+    /// fault handler (step_11.11 — the VM invokes both identically) —
+    /// the funclet's plain return. The stack resets, with pending trees
+    /// evaluated first for their side effects.
     fn endfinally(
         &mut self,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
     ) -> CompileResult<hir::Terminator> {
         match innermost_handler(&self.clauses, il_offset.0) {
-            Some(c) if matches!(self.clauses[c].kind, ClauseKind::Finally) => {}
+            Some(c)
+                if matches!(
+                    self.clauses[c].kind,
+                    ClauseKind::Finally | ClauseKind::Fault
+                ) => {}
             _ => return Err(CompileError::BadIl("endfinally outside a finally handler")),
         }
         self.spill_stack(stmts, il_offset)?;
         self.stack.clear();
         Ok(hir::Terminator::EndFinally)
+    }
+
+    /// `endfilter` (0xFE 11, step_11.11): ends a filter funclet, popping
+    /// the Int32 verdict (1 = execute the handler; ECMA-335 §III.4.16
+    /// limits the value to 0/1, and the VM force-continues the search on
+    /// any other value — `CallFilterFunclet` executes only on exactly 1,
+    /// exceptionhandling.cpp:3576 — so no JIT-side range check is needed;
+    /// RyuJIT only asserts TYP_INT, importer.cpp:7258). Pending trees
+    /// evaluate first, as for `throw`.
+    fn endfilter(
+        &mut self,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<hir::Terminator> {
+        if !inside_filter(&self.clauses, il_offset.0) {
+            return Err(CompileError::BadIl("endfilter outside a filter"));
+        }
+        self.spill_stack(stmts, il_offset)?;
+        let (ty, value) = self.pop()?;
+        if ty != Type::Int32 {
+            return Err(CompileError::BadIl("endfilter operand must be an int32"));
+        }
+        Ok(hir::Terminator::EndFilter { value })
     }
 
     /// `ldstr` (0x72): the EE constructs and interns the literal — RyuJIT's
@@ -7309,11 +7455,11 @@ impl BlockImport<'_> {
                 // the evaluation stack is invalid IL (ECMA-335 §III: EH
                 // region entries see an empty stack) — a clean rejection,
                 // never silently miscompiled.
-                if self
-                    .clauses
-                    .iter()
-                    .any(|c| c.try_start == start || c.handler_start == start)
-                {
+                if self.clauses.iter().any(|c| {
+                    c.try_start == start
+                        || c.handler_start == start
+                        || matches!(c.kind, ClauseKind::Filter { filter_start, .. } if filter_start == start)
+                }) {
                     return Err(CompileError::BadIl(
                         "non-empty evaluation stack at an EH region entry",
                     ));
@@ -7593,6 +7739,9 @@ impl BlockImport<'_> {
                 }
                 Op::EndFinally => {
                     terminator = Some(self.endfinally(&mut stmts, il_offset)?);
+                }
+                Op::EndFilter => {
+                    terminator = Some(self.endfilter(&mut stmts, il_offset)?);
                 }
             }
         }
@@ -9602,12 +9751,120 @@ mod tests {
     }
 
     #[test]
-    fn endfilter_stays_unsupported() {
+    fn endfilter_outside_a_filter_is_bad_il() {
         let err = import_ii(&[0xFE, 0x11]).err().expect("endfilter");
         assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("filter")),
+            matches!(&err, CompileError::BadIl(m) if m.contains("endfilter outside a filter")),
             "{err:?}"
         );
+    }
+
+    /// A canned FILTER clause (the filter region ends where the handler
+    /// begins, per ECMA-335).
+    fn filter_clause(
+        try_start: u32,
+        try_len: u32,
+        filter_start: u32,
+        handler_start: u32,
+        handler_len: u32,
+    ) -> ffi::CORINFO_EH_CLAUSE {
+        let mut clause = catch_clause(try_start, try_len, handler_start, handler_len, 0);
+        clause.Flags = ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FILTER;
+        clause.__bindgen_anon_1.FilterOffset = filter_start;
+        clause
+    }
+
+    /// A canned FAULT clause.
+    fn fault_clause(
+        try_start: u32,
+        try_len: u32,
+        handler_start: u32,
+        handler_len: u32,
+    ) -> ffi::CORINFO_EH_CLAUSE {
+        let mut clause = catch_clause(try_start, try_len, handler_start, handler_len, 0);
+        clause.Flags = ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FAULT;
+        clause
+    }
+
+    #[test]
+    fn filter_clause_builds_filter_and_handler_funclets() {
+        // 0: nop; 1: leave.s +7 (-> 10); | 3: pop; 4: ldc.i4.1; 5:
+        // endfilter; | 7: pop; 8: leave.s +0 (-> 10); | 10: ret — try
+        // [0,3), filter [3,7), handler [7,10).
+        let il = [
+            0x00, 0xDE, 0x07, 0x26, 0x17, 0xFE, 0x11, 0x26, 0xDE, 0x00, 0x2A,
+        ];
+        let (ee, info) = eh_fixture(&il, &[], &[filter_clause(0, 3, 3, 7, 3)]);
+        let m = import(&info, &ee).expect("imports");
+        // Layout: [b0 (try), b1 (ret), F (filter), H (handler)] — the
+        // filter group immediately before its handler group.
+        assert_eq!(m.blocks.len(), 4);
+        assert_eq!(as_leave(&m.blocks[0].terminator), BlockId(1));
+        // The filter funclet's entry: the throwable arrives in rdi like a
+        // catch (the VM's CallEHFilterFunclet contract) — CatchArg store,
+        // then the IL's pop drops the temp read (pure — vanishes).
+        let filter = &m.blocks[2];
+        let (_, value) = store(&filter.stmts[0]);
+        assert!(matches!(value, hir::Expr::CatchArg));
+        match &filter.terminator {
+            hir::Terminator::EndFilter { value } => {
+                assert_eq!(as_i32(value), 1, "the filter's verdict")
+            }
+            _ => panic!("expected Terminator::EndFilter"),
+        }
+        // The handler is an ordinary catch: throwable store, then the
+        // leave (the funclet's resume-address return form).
+        let handler = &m.blocks[3];
+        let (_, value) = store(&handler.stmts[0]);
+        assert!(matches!(value, hir::Expr::CatchArg));
+        assert_eq!(as_leave(&handler.terminator), BlockId(1));
+        assert_eq!(m.eh_regions.len(), 1);
+        let region = &m.eh_regions[0];
+        match region.kind {
+            hir::EhRegionKind::Filter {
+                filter_start,
+                filter_end,
+            } => {
+                assert_eq!((filter_start, filter_end), (BlockId(2), BlockId(3)));
+            }
+            _ => panic!("expected a Filter region"),
+        }
+        assert_eq!((region.try_start, region.try_end), (BlockId(0), BlockId(1)));
+        assert_eq!(
+            (region.handler_start, region.handler_end),
+            (BlockId(3), BlockId(4))
+        );
+    }
+
+    #[test]
+    fn endfilter_of_a_non_int32_is_bad_il() {
+        // The same filter shape but the verdict is ldnull (a Ref).
+        let il = [
+            0x00, 0xDE, 0x07, 0x26, 0x14, 0xFE, 0x11, 0x26, 0xDE, 0x00, 0x2A,
+        ];
+        let (ee, info) = eh_fixture(&il, &[], &[filter_clause(0, 3, 3, 7, 3)]);
+        let err = import(&info, &ee).err().expect("non-int verdict");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("int32")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn fault_clause_lowers_like_a_finally_but_runs_no_step() {
+        // TRY_FINALLY_IL with a FAULT clause: the leave on the normal
+        // path must NOT route through the handler (a fault runs only on
+        // the exceptional path), and endfinally terminates the funclet.
+        let (ee, info) = eh_fixture(&TRY_FINALLY_IL, &[], &[fault_clause(0, 3, 3, 1)]);
+        let m = import(&info, &ee).expect("imports");
+        // [b0 (try), b1 (ret), H (fault handler)] — no step blocks.
+        assert_eq!(m.blocks.len(), 3);
+        assert_eq!(as_leave(&m.blocks[0].terminator), BlockId(1));
+        assert!(matches!(
+            m.blocks[2].terminator,
+            hir::Terminator::EndFinally
+        ));
+        assert!(matches!(m.eh_regions[0].kind, hir::EhRegionKind::Fault));
     }
 
     #[test]
@@ -9911,22 +10168,60 @@ mod tests {
     }
 
     #[test]
-    fn filter_and_fault_clauses_are_named_unsupported() {
-        let mut filter = catch_clause(0, 3, 3, 1, 0);
-        filter.Flags = ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FILTER;
-        let (ee, info) = eh_fixture(&TRY_FINALLY_IL, &[], &[filter]);
-        let err = import(&info, &ee).err().expect("filter clause");
-        assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("EH filter clauses")),
-            "{err:?}"
+    fn nested_try_inside_a_handler_imports() {
+        // step_11.11: try { nop; leave } finally { try { nop; leave }
+        // catch { pop; leave } ... endfinally } — a catch clause nested
+        // inside a finally's handler. IL:
+        // 0: nop; 1: leave.s +10 (-> 13); | 3: nop; 4: leave.s +5
+        // (-> 11); | 6: pop; 7: leave.s +2 (-> 11); | 9: nop; 10: nop;
+        // 11: nop; 12: endfinally; | 13: ret.
+        let il = [
+            0x00, 0xDE, 0x0A, 0x00, 0xDE, 0x05, 0x26, 0xDE, 0x02, 0x00, 0x00, 0x00, 0xDC, 0x2A,
+        ];
+        let (ee, info) = eh_fixture(
+            &il,
+            &[],
+            &[
+                catch_clause(3, 3, 6, 3, 0x0200_0042), // inner: try [3,6), catch [6,9)
+                finally_clause(0, 3, 3, 10),           // outer: try [0,3), finally [3,13)
+            ],
         );
-        let mut fault = catch_clause(0, 3, 3, 1, 0);
-        fault.Flags = ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FAULT;
-        let (ee, info) = eh_fixture(&TRY_FINALLY_IL, &[], &[fault]);
-        let err = import(&info, &ee).err().expect("fault clause");
-        assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("EH fault clauses")),
-            "{err:?}"
+        let m = import(&info, &ee).expect("imports");
+        // Layout: [b0 (outer try), S (CallFinally), S (Leave), ret, then
+        // the OUTER finally group (which contains the nested try), then
+        // the inner catch group].
+        assert_eq!(m.blocks.len(), 8);
+        let (funclet, continuation) = as_call_finally(&m.blocks[1].terminator);
+        assert_eq!(funclet, BlockId(4), "the outer finally group");
+        assert_eq!(continuation, BlockId(2));
+        assert_eq!(as_leave(&m.blocks[2].terminator), BlockId(3));
+        // The inner catch entry block sits in its own tail funclet and
+        // receives the throwable; its leave resumes inside the outer
+        // finally's body (block 6 — the leave target at IL 11).
+        let (_, value) = store(&m.blocks[7].stmts[0]);
+        assert!(matches!(value, hir::Expr::CatchArg));
+        assert_eq!(as_leave(&m.blocks[7].terminator), BlockId(6));
+        assert!(matches!(
+            m.blocks[6].terminator,
+            hir::Terminator::EndFinally
+        ));
+        // The region table: the nested try's range lives INSIDE the
+        // outer funclet's block run.
+        let (inner, outer) = (&m.eh_regions[0], &m.eh_regions[1]);
+        match inner.kind {
+            hir::EhRegionKind::Catch { class_token } => assert_eq!(class_token, 0x0200_0042),
+            _ => panic!("expected Catch"),
+        }
+        assert_eq!((inner.try_start, inner.try_end), (BlockId(4), BlockId(5)));
+        assert_eq!(
+            (inner.handler_start, inner.handler_end),
+            (BlockId(7), BlockId(8))
+        );
+        assert!(matches!(outer.kind, hir::EhRegionKind::Finally));
+        assert_eq!((outer.try_start, outer.try_end), (BlockId(0), BlockId(1)));
+        assert_eq!(
+            (outer.handler_start, outer.handler_end),
+            (BlockId(4), BlockId(7))
         );
     }
 
@@ -9969,20 +10264,13 @@ mod tests {
             matches!(&err, CompileError::BadIl(m) if m.contains("empty EH region")),
             "{err:?}"
         );
-        // A try nested inside an enclosing handler: valid IL our layout
-        // model can't express — Unsupported, not BadIl (step_11.2 audit).
-        let il = [0x00, 0x00, 0xDC, 0xDC, 0x2A];
-        let (ee, info) = eh_fixture(
-            &il,
-            &[],
-            &[
-                finally_clause(0, 2, 2, 1), // inner: try [0,2), handler [2,3)
-                finally_clause(2, 1, 3, 1), // outer: try [2,3), handler [3,4)
-            ],
-        );
-        let err = import(&info, &ee).err().expect("try of pure handler IL");
+        // A malformed filter region (empty — the filter abuts the handler
+        // by construction, so an empty one is the reachable malformed
+        // case).
+        let (ee, info) = eh_fixture(&TRY_FINALLY_IL, &[], &[filter_clause(0, 3, 3, 3, 1)]);
+        let err = import(&info, &ee).err().expect("empty filter region");
         assert!(
-            matches!(&err, CompileError::Unsupported(m) if m.contains("nested inside an enclosing handler")),
+            matches!(&err, CompileError::BadIl(m) if m.contains("filter")),
             "{err:?}"
         );
     }

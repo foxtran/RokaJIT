@@ -872,6 +872,37 @@ mod tests {
         assert!(blob.len() * 8 - r.bit < 8, "only padding remains");
     }
 
+    /// A filter method (step_11.11): the GC blob needs nothing
+    /// filter-specific — one more interruptible range for the filter
+    /// funclet's body, in the same unified method-relative offsets (the
+    /// VM derives filter-ness from the clause's FilterOffset matching
+    /// the funclet's RUNTIME_FUNCTION, codeman.cpp:1372). This pins the
+    /// three-range round-trip.
+    #[test]
+    fn filter_funclet_adds_an_interruptible_range() {
+        let mut i = eh_input();
+        i.code_len = 130;
+        i.interruptible_ranges.push((105, 121)); // the filter funclet body
+        let blob = encode(&i).expect("encodes");
+        let mut r = Reader {
+            bytes: &blob,
+            bit: 0,
+        };
+        assert_eq!(r.read(1), 1, "fat header");
+        assert_eq!(r.read(10), 0xC0, "SBR | WANTS_REPORT_ONLY_LEAF");
+        assert_eq!(r.read_varl_u(CODE_LENGTH_ENCBASE), 130, "TOTAL code length");
+        assert_eq!(r.read_varl_u(STACK_BASE_REGISTER_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(SIZE_OF_STACK_AREA_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(NUM_SAFE_POINTS_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(NUM_INTERRUPTIBLE_RANGES_ENCBASE), 3);
+        let first = read_range(&mut r, 0);
+        assert_eq!(first, (8, 73), "the main body range");
+        let second = read_range(&mut r, first.1);
+        assert_eq!(second, (84, 96), "the handler funclet body");
+        let third = read_range(&mut r, second.1);
+        assert_eq!(third, (105, 121), "the filter funclet body");
+    }
+
     /// Contract violations in the ranges are upstream bugs, not encodings.
     #[test]
     fn bad_ranges_are_internal_errors() {

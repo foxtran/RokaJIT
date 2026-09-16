@@ -34,13 +34,13 @@ are counted under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 1075 |
+| MATCH | 1096 |
 | MISMATCH | 9 |
-| CRASH | 1351 |
-| TIMEOUT | 14 |
+| CRASH | 1331 |
+| TIMEOUT | 13 |
 | COMPILE_FAIL | 832 |
 
-Of the MATCHes, 1064 exit 100 (the CoreCLR pass
+Of the MATCHes, 1085 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died
@@ -55,9 +55,7 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| EH filters/faults (out of 10.6 scope) | 1183 | `JIT/CodeGenBringUpTests/ArrayMD1.cs`<br>`JIT/CodeGenBringUpTests/ArrayMD2.cs`<br>`JIT/CodeGenBringUpTests/Call1.cs`<br>`JIT/CodeGenBringUpTests/DblAdd.cs`<br>`JIT/CodeGenBringUpTests/DblAddConst.cs`<br>… and 1178 more |
-| SIMD hardware intrinsics (real vector semantics — deferred, step_11.10) | 52 | `JIT/HardwareIntrinsics/General/ConstantFolding/ScalarConstantFoldings.cs`<br>`JIT/HardwareIntrinsics/General/HwiOp/CompareVectorWithZero.cs`<br>`JIT/HardwareIntrinsics/General/HwiOp/HwiValueNumbering.cs`<br>`JIT/HardwareIntrinsics/X86/Lzcnt/Lzcnt.cs`<br>`JIT/HardwareIntrinsics/X86/Popcnt/Popcnt.cs`<br>… and 47 more |
-| unsupported (unmapped): EH try region nested inside an enclosing handler | 24 | `JIT/Generics/Exceptions/general_class_instance01.cs`<br>`JIT/Generics/Exceptions/general_class_static01.cs`<br>`JIT/Generics/Exceptions/general_struct_instance01.cs`<br>`JIT/Generics/Exceptions/general_struct_static01.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b11490/b11490.cs`<br>… and 19 more |
+| SIMD hardware intrinsics (real vector semantics — deferred, step_11.10) | 55 | `JIT/HardwareIntrinsics/General/ConstantFolding/ScalarConstantFoldings.cs`<br>`JIT/HardwareIntrinsics/General/HwiOp/CompareVectorWithZero.cs`<br>`JIT/HardwareIntrinsics/General/HwiOp/HwiValueNumbering.cs`<br>`JIT/HardwareIntrinsics/X86/Lzcnt.X64/Lzcnt.X64.cs`<br>`JIT/HardwareIntrinsics/X86/Lzcnt/Lzcnt.cs`<br>… and 50 more |
 | boxing & casts | 16 | `JIT/Directed/nullabletypes/Desktop/boxunboxvaluetype.cs`<br>`JIT/Directed/nullabletypes/Desktop/nullcomparaison.cs`<br>`JIT/Directed/nullabletypes/gettype.cs`<br>`JIT/Directed/nullabletypes/unboxnullable.cs`<br>`JIT/Generics/Conversions/Boxing/box_isinst_br_nullable.cs`<br>… and 11 more |
 | non-default calling conventions | 15 | `JIT/Directed/StructABI/MisSizedStructs_ArmArch.cs`<br>`JIT/Directed/pinvoke/sysinfo.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b91855/b91855.cs`<br>`JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b92568/b92568.cs`<br>`JIT/Regression_2/Runtime_120792/Runtime_120792.cs`<br>… and 10 more |
 | unsupported (unmapped): generic callconv on a calli/ldftn/newobj site (shared generics) | 9 | `JIT/Generics/Instantiation/delegates/Delegate005.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate006.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate011.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate012.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate027.cs`<br>… and 4 more |
@@ -96,7 +94,7 @@ entry shapes). Out of scope for triage; listed for the record.
 
 | Which JIT timed out | Tests |
 | --- | ---: |
-| rokajit | 9 |
+| rokajit | 8 |
 | ryujit | 4 |
 | ryujit,rokajit | 1 |
 
@@ -108,51 +106,1235 @@ error model didn't classify. Each carries its stderr signature.
 
 | Test | Category | Detail | Stderr signature |
 | --- | --- | --- | --- |
+| `JIT/CodeGenBringUpTests/ArrayMD1.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/CodeGenBringUpTests/ArrayMD2.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/CodeGenBringUpTests/Call1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblAdd.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblAddConst.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblArea.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblArray.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblAvg2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblAvg6.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblCall1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblCall2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblDist.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblDiv.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblDivConst.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblFillArray.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblMul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblMulConst.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblNeg.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblRem.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblRoots.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblSub.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblSubConst.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/DblVar.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPAdd.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPAddConst.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPArea.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPArray.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPAvg2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPAvg6.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPCall1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPCall2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPConvDbl2Lng.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPConvF2F.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPConvF2I.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPConvF2Lng.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPConvI2F.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPDist.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPDiv.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPDivConst.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPError.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPFillArray.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPMath.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPMul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPMulConst.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPNeg.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPRem.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPRoots.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPSmall.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPSub.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPSubConst.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FPVar.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/FactorialRec.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/Gcd.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/IntConv.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/LngConv.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/Localloc.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/RecursiveTailCall.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/StaticCalls.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/StructReturn.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/Swap.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/div2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/CodeGenBringUpTests/struct16args.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/Arrays/complex1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/Arrays/complex2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/Arrays/simple1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/Arrays/simple2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/BitTest/BitTest.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Base_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Base_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Base_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Base_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Base_6.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Peer_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Peer_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Peer_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Peer_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Directed/CheckedCtor/Generic_Test_CSharp_Peer_6.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Directed/CheckedCtor/Test_CSharp_Base_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Test_CSharp_Base_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Test_CSharp_Base_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Test_CSharp_Base_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Test_CSharp_Peer_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Test_CSharp_Peer_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Test_CSharp_Peer_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/CheckedCtor/Test_CSharp_Peer_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/Convert/out_of_range_fp_to_int_conversions.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/Convert/value_numbering_checked_casts_of_constants.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/Misc/Concat/ConcatTest.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/Misc/gettype/gettypetypeofmatrix.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/PREFIX/PrimitiveVT/callconv1.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/PREFIX/PrimitiveVT/callconv2.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/RVAInit/simplearg.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StrAccess/straccess1.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/StrAccess/straccess2.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/StrAccess/straccess3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SP1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SP1a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SP1a2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SP1b.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SP1c.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SP1d.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SP2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SP2a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SP2b.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SP2c.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SpAddr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/StructPromote/SpAddrAT.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/UnrollLoop/Dev10_846218.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/UnrollLoop/loop1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/UnrollLoop/loop2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/UnrollLoop/loop4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/UnrollLoop/loop6.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/VectorABI/VectorMgdMgd.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/VectorABI/VectorMgdMgdArray.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/VectorABI/VectorMgdMgdStatic.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Bool_And_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Bool_No_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Bool_Or_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Bool_Xor_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Double_And_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Double_No_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Double_Or_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Double_Xor_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Float_And_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Float_No_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Float_Or_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Float_Xor_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Int_And_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Int_No_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Int_Or_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/cmov/Int_Xor_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/coverage/flowgraph/gcpoll.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/coverage/flowgraph/xaddmuly.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/coverage/oldtests/33objref.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/coverage/oldtests/cse1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/coverage/oldtests/cse2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'JitTest_Directed_coverage_oldtests_cse2.testout1' threw an exception. |
+| `JIT/Directed/coverage/oldtests/lclfldadd.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/coverage/oldtests/lclflddiv.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/coverage/oldtests/lclfldmul.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/coverage/oldtests/lclfldrem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/coverage/oldtests/lclfldsub.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/forceinlining/LargeNumberOfArgs.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/forceinlining/NoMetaData.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/forceinlining/Recursion.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/gettypetypeof/gettypetypeofmatrix.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/intrinsic/interlocked/IntrinsicTest_Overflow.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/intrinsic/interlocked/regalloc1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/intrinsic/interlocked/regalloc2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/intrinsic/pow/pow0.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/intrinsic/pow/pow1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/intrinsic/pow/pow2.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/intrinsic/pow/pow3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/lifetime/lifetime1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/localloc/localloc3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/newarr/newarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/perffix/commutativecse/CCSE.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/perffix/primitivevt/mixed1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'JitTest_Directed_perffix_primitivevt_mixed1.testout1' threw an exception. |
+| `JIT/Directed/perffix/primitivevt/mixed2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'JitTest_Directed_perffix_primitivevt_mixed2.testout1' threw an exception. |
+| `JIT/Directed/physicalpromotion/readbackbeforeqmark.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/shift/int16.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/shift/int32.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/shift/int64.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/shift/uint16.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/shift/uint32.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/shift/uint64.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/shift/uint64Opt.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Directed/shift/uint8.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/Struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/Struct01_instance.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/class01_instance.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/class01_static.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/class02.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/class03.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/class04.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/class05.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/class06.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/class07.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/struc01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/struct01_static.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/struct02.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/struct03.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/struct04.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/struct05.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/struct06.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/Jagged/struct07.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/ConstructedTypes/MultiDim/class01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Arrays/ConstructedTypes/MultiDim/class01_Instance.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Arrays/ConstructedTypes/MultiDim/class01_static.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'JitTest_Generics_Arrays_ConstructedTypes_MultiDim_class01_static.ArrayHolder' |
+| `JIT/Generics/Arrays/ConstructedTypes/MultiDim/struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Arrays/ConstructedTypes/MultiDim/struct01_Instance.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Arrays/ConstructedTypes/MultiDim/struct01_static.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'JitTest_Generics_Arrays_ConstructedTypes_MultiDim_struct01_static.ArrayHolder |
 | `JIT/Generics/Arrays/TypeParameters/Jagged/class01.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Arrays/TypeParameters/Jagged/struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Arrays/TypeParameters/MultiDim/class01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Arrays/TypeParameters/MultiDim/struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
 | `JIT/Generics/ConstrainedCall/class1.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Generics/ConstrainedCall/class2.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/ConstrainedCall/vt1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/ConstrainedCall/vt2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/ConstrainedCall/vt3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/ConstrainedCall/vt4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Constraints/Call_instance01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Constraints/Call_static01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Constraints/Convert_instance01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Constraints/Convert_static01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Generics/Constraints/Transitive_instance01.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Constraints/Transitive_static01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Conversions/Boxing/box_unbox01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
 | `JIT/Generics/Conversions/Reference/GenToGen01.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Generics/Conversions/Reference/GenToGen02.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Generics/Conversions/Reference/GenToGen03.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Generics/Conversions/Reference/GenToNonGen01.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Generics/Conversions/Reference/GenToNonGen02.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Conversions/Reference/GenToNonGen03.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Generics/Conversions/Reference/NonGenToGen01.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Generics/Conversions/Reference/NonGenToGen02.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Generics/Conversions/Reference/NonGenToGen03.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Coverage/chaos55915408cs.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Coverage/chaos56200037cs.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Coverage/chaos65204782cs.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Exceptions/general_class_instance01.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Exceptions/general_class_static01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Exceptions/general_struct_instance01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Exceptions/general_struct_static01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Generics/Exceptions/specific_class_instance01.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/Generics/Exceptions/specific_class_instance02.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Exceptions/specific_class_static01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Exceptions/specific_class_static02.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Exceptions/specific_struct_instance01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Exceptions/specific_struct_instance02.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Exceptions/specific_struct_static01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Exceptions/specific_struct_static02.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Fields/instance_assignment_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Fields/instance_assignment_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Fields/instance_equalnull_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Fields/instance_equalnull_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Fields/instance_passing_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Fields/instance_passing_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Generics/Fields/static_assignment_class01.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Fields/static_assignment_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Generics/Fields/static_equalnull_class01.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Fields/static_equalnull_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Generics/Fields/static_passing_class01.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Fields/static_passing_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/Classes/BaseClass01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Classes/BaseClass02.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Classes/BaseClass03.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Classes/Baseclass04.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Classes/Baseclass05.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Classes/class01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Classes/class02.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Classes/class03.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Interfaces/Class01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Interfaces/Class02.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Interfaces/Class03.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Interfaces/Class04.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Interfaces/Class05.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Interfaces/Struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Interfaces/Struct02.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Interfaces/Struct03.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Interfaces/Struct04.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Interfaces/Struct05.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Instantiation/Structs/struct02.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/Structs/struct03.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate001.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate002.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate003.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate004.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate007.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate008.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate009.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate010.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate013.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate014.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate015.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate016.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate017.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate018.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate019.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate020.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate021.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate022.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate023.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate024.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate025.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate026.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate029.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Instantiation/delegates/Delegate030.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/instance_assignment_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/instance_assignment_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/instance_equalnull_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/instance_equalnull_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/instance_passing_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/instance_passing_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/static_assignment_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/static_assignment_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/static_equalnull_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/static_equalnull_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/static_passing_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Locals/static_passing_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/MemberAccess/class_instance01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Generics/MemberAccess/interface_class01.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Generics/Parameters/instance_assignment_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/instance_assignment_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/instance_equalnull_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/instance_equalnull_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/instance_passing_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/instance_passing_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/static_assignment_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/static_assignment_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/static_equalnull_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/static_equalnull_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/static_passing_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Parameters/static_passing_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/TypeParameters/default_class01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/TypeParameters/default_struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Typeof/Struct02.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Typeof/class01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Typeof/class02.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Typeof/class03.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Typeof/dynamicTypes.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Typeof/objectBoxing.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Typeof/refTypesdynamic.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Typeof/struct01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Generics/Typeof/struct03.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/Typeof/valueTypeBoxing.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Generics/VirtualMethods/generic_virtual_methods.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/HardwareIntrinsics/Arm/ArmBase/Yield.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.PlatformNotSupportedException |
+| `JIT/HardwareIntrinsics/X86/Sse2/AlignVector128.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/HardwareIntrinsics/X86/X86Base.X64/BigMul.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.NullReferenceException |
+| `JIT/IL_Conformance/Convert/TestConvertFromIntegral.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/lcs/lcs.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/lcs/lcs2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/lcs/lcsbas.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/lcs/lcsbox.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/lcs/lcsmax.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/lcs/lcsmixed.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/lcs/lcsval.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/lcs/lcsvalbox.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/misc/arrres.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/misc/gcarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Arrays/misc/selfref.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/AsgOp/i4/i4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/AsgOp/i4/i4flat.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/AsgOp/i8/i8.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/AsgOp/i8/i8flat.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/AsgOp/r4/r4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/AsgOp/r4/r4flat.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/AsgOp/r8/r8.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/AsgOp/r8/r8flat.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Boxing/callconv/instance.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Boxing/functional/fibo.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Boxing/functional/sin.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Boxing/misc/enum.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Boxing/misc/nestval.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Boxing/misc/tailjump.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Boxing/morph/sin.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Boxing/seh/try.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Methodical/Coverage/b433189.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Methodical/FPtrunc/convr4a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/FPtrunc/convr8a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Invoke/25params/25param1a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Invoke/25params/25param2a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Invoke/25params/25param3a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Invoke/SEH/catchfinally.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Invoke/SEH/catchfinally_tail.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Invoke/callvirt/test1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Invoke/ctor/val_ctor.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Invoke/deep/deep.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Invoke/fptr/recurse.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Invoke/implicit/obj.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/GaussJordan/classarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/GaussJordan/jaggedarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/GaussJordan/plainarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/GaussJordan/structarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/InnerProd/classarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/InnerProd/doublearr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/InnerProd/intarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/InnerProd/jaggedarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/InnerProd/stringarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/InnerProd/structarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/basics/classarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/basics/doublearr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/basics/jaggedarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/basics/stringarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/MDArray/basics/structarr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/NaN/arithm32.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/NaN/arithm64.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/NaN/intrinsic.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/NaN/r4NaNadd.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/NaN/r4NaNdiv.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/NaN/r4NaNmul.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/NaN/r4NaNrem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/NaN/r4NaNsub.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/NaN/r8NaNadd.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/NaN/r8NaNdiv.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/NaN/r8NaNmul.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/NaN/r8NaNrem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/NaN/r8NaNsub.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/Overflow/FloatInfinitiesToInt.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/Overflow/FloatOvfToInt2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/VT/callconv/jumps.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/VT/etc/knight.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/VT/port/lcs.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/SEH/cast_throw.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/SEH/throw.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/coverage/castclass_call.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/coverage/castclass_ldarg.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/coverage/castclass_ldloc.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/coverage/castclass_newobj.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/coverage/isinst_call.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/coverage/isinst_ldarg.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/coverage/isinst_ldloc.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/coverage/isinst_newobj.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/iface/iface1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/casts/ilseq/commonBase.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/cctor/misc/Desktop/throw.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/cctor/misc/throw.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/cctor/simple/precise1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/cctor/simple/precise1b.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/cctor/simple/precise2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/cctor/simple/precise4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/cctor/xassem/xprecise1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/cctor/xassem/xprecise1b.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/cctor/xassem/xprecise2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/cctor/xassem/xprecise4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/divrem/div/decimaldiv.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/div/i4div.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/div/i8div.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/div/negSignedMod.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/divrem/div/overlddiv.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/div/r4div.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/div/r8div.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/div/u4div.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/div/u8div.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/rem/decimalrem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/rem/i4rem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/rem/i8rem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/rem/overldrem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/rem/r4rem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/rem/r8rem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/rem/u4rem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/divrem/rem/u8rem.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/eh/interactions/volatileFromFinally.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/explicit/basic/refarg_f4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/explicit/basic/refarg_o.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/explicit/basic/refarg_s.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/explicit/misc/explicit1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/explicit/misc/explicit2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/explicit/misc/explicit4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/explicit/misc/explicit5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/explicit/misc/explicit6.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/explicit/misc/explicit7.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/flowgraph/bug614098/intToByte.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/flowgraph/bug619534/finallyclone.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/flowgraph/bug619534/moduleHandleCache.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/flowgraph/bug621705/ptuple_lost.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/flowgraph/bug647189/ssa_tuIsAddr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/flowgraph/dev10_bug675304/arrayDim.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/flowgraph/dev10_bug679008/GCOverReporting.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/flowgraph/dev10_bug679008/castClassEH.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/flowgraph/dev10_bug679008/sealedCastVariance.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/fp/apps/BouncingBall.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/fp/exgen/1000w1d.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'Test_1000w1d.testout1' threw an exception. |
+| `JIT/Methodical/fp/exgen/10w250d.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'Test_10w250d.testout1' threw an exception. |
+| `JIT/Methodical/fp/exgen/10w5d.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/fp/exgen/200w1d-01.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/fp/exgen/200w1d-02.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'Test_200w1d_02.testout1' threw an exception. |
+| `JIT/Methodical/fp/exgen/3w1d-01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/fp/exgen/3w1d-02.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'Test_3w1d_02.testout1' threw an exception. |
+| `JIT/Methodical/fp/exgen/5w1d-01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'Test_5w1d_01.testout1' threw an exception. |
+| `JIT/Methodical/fp/exgen/5w1d-02.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/fp/exgen/5w1d-03.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/fp/exgen/5w1d-04.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/fp/exgen/5w1d-05.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/fp/exgen/5w1d-06.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'Test_5w1d_06.testout1' threw an exception. |
+| `JIT/Methodical/int64/arrays/lcs_long.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/arrays/lcs_ulong.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/misc/binop.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/misc/box.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/signed/s_addsub.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/signed/s_ldc_div.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/signed/s_ldc_mul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/signed/s_ldc_mulovf.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/signed/s_ldfld_mul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/signed/s_ldfld_mulovf.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/signed/s_ldsfld_mul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/signed/s_ldsfld_mulovf.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/signed/s_muldiv.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/superlong/superlong.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/unsigned/addsub.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/unsigned/ldc_mul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/unsigned/ldc_mulovf.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/unsigned/ldfld_mul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/unsigned/ldfld_mulovf.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/unsigned/ldsfld_mul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/unsigned/ldsfld_mulovf.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/int64/unsigned/muldiv.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/jitinterface/bug603649.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/largeframes/basic/bigframes.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/largeframes/skip/skippage.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/largeframes/skip2/skippage2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/largeframes/skip3/skippage3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/largeframes/skip4/skippage4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/largeframes/skip4/skippage4_save.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/largeframes/skip5/skippage5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/largeframes/skip6/skippage6.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/largeframes/skip7/skippage7.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/nonvirtualcall/classic.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/nonvirtualcall/delegate.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/nonvirtualcall/generics.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/nonvirtualcall/generics2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/nonvirtualcall/tailcall.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/nonvirtualcall/valuetype.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/refany/array1.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/refany/array2.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/refany/lcs.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/refany/stress3-64bit.cs` | MISMATCH | ref=100 ours=1 | (no stderr output) |
+| `JIT/Methodical/stringintern/b207621.cs` | MISMATCH | ref=100 ours=231 | (no stderr output) |
+| `JIT/Methodical/structs/StructStackParams.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/tailcall/widen.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/tailcall_v4/delegateParamCallTarget.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Methodical/unsafecsharp/unsafe-0.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/unsafecsharp/unsafe-1.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/unsafecsharp/unsafe-2.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/unsafecsharp/unsafe-3.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/unsafecsharp/unsafe-4.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/unsafecsharp/unsafe-5.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/unsafecsharp/unsafe-6.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Methodical/xxobj/sizeof/sizeof.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Performance/CodeQuality/BenchmarksGame/binarytrees/binarytrees-2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Performance/CodeQuality/BenchmarksGame/fannkuch-redux/fannkuch-redux-2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Performance/CodeQuality/BenchmarksGame/fannkuch-redux/fannkuch-redux-5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Performance/CodeQuality/BenchmarksGame/fannkuch-redux/fannkuch-redux-9.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Performance/CodeQuality/BenchmarksGame/fasta/fasta-2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Performance/CodeQuality/BenchmarksGame/mandelbrot/mandelbrot-2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Performance/CodeQuality/BenchmarksGame/n-body/n-body-3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Performance/CodeQuality/BenchmarksGame/spectralnorm/spectralnorm-1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Performance/CodeQuality/Benchstones/BenchF/Adams/Adams.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Performance/CodeQuality/Benchstones/BenchI/NDhrystone/NDhrystone.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchF/MDInProd/MDInProd.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchF/MDInvMt/MDInvMt.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchF/MDLLoops/MDLLoops.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchF/MDRomber/MDRomber.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchF/MDSqMtx/MDSqMtx.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchI/MDAddArray2/MDAddArray2.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchI/MDArray2/MDArray2.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchI/MDLogicArray/MDLogicArray.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchI/MDMidpoint/MDMidpoint.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchI/MDMulMatrix/MDMulMatrix.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchI/MDNDhrystone/MDNDhrystone.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchI/MDPuzzle/MDPuzzle.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/Benchstones/MDBenchI/MDXposMatrix/MDXposMatrix.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Performance/CodeQuality/SIMD/ConsoleMandel/ConsoleMandel.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Performance/CodeQuality/SIMD/RayTracer/RayTracerBench.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Performance/CodeQuality/Span/Indexer.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Performance/CodeQuality/V8/Richards/Richards.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-EJIT/V1-M09.5-PDC/b12008/b12008.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-EJIT/V1-M09.5-PDC/b14426/b14426.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-EJIT/V1-M11-Beta1/b40138/b40138.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-EJIT/V1-M11-Beta1/b45679/b45679.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-EJIT/V1-M12-Beta2/b46847/b46847.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b11490/b11490.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b12053/b12053.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b12399/b12399.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b12795/b12795.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b13569/b13569.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b14066/b14066.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b14077/b14077.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b15203/b15203.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b15728/b15728.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b16345/b16345.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b25882/b25882.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b28776/b28776.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b28787/b28787.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b29068/b29068.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b29456/b29456.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'Tests.Operators' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b30126/b30126.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b30128/b30128.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b31150/b31150.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b32303/b32303.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b32801/b32801.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b13178/b13178.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b13621/b13621.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b13647/b13647.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14057/b14057.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14059/b14059.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14228/b14228.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14277/b14277.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14396/b14396.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14428/b14428.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14443/b14443.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14475/b14475.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14616/b14616.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14640/b14640.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14673/b14673.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b14779/b14779.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b15468/b15468.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b15526/b15526.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b15783/b15783.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b15786/b15786.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b15797/b15797.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b15864/b15864.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b02051/b02051.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b02076/b02076.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b02352/b02352.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b06464/b06464.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b06680/b06680.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b06811/b06811.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b06812/b06812.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b06859/b06859.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b06924/b06924.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b07483/b07483.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b08172/b08172.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b08944/b08944a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b08944/b08944b.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b09246/b09246.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b09287/b09287.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M10/b09452/b09452.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1-M11-Beta1/b30586/b30586.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M11-Beta1/b36332/b36332.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M11-Beta1/b40216/b40216.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M11-Beta1/b41234/b41234.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b11553/b11553.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b31182/b31182.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b38269/b38269.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b47975/b47975.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b50145/b50145.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b50145/b50145a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b50145/b50145b.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b50145/b50145c.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b51565/b51565.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b52838/b52838.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b56772/b56772.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b59297/b59297.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b60600/b60600.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b61515/b61515.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b64579/b64579.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b66533/b66533.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b68361/b68361.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b71231/b71231.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b72164/b72164.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b72422/b72422.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b72687/b72687.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b72932/b72932.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b72986/b72986.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b72996/b72996.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'b72996.testout1' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b74182/b74182.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b75509/b75509.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b76267/b76267.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b76511/b76511.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b76590/b76590.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b76717/b76717.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b78392/b78392.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b78694/b78694.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b79642/b79642.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b80764/b80764.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b81618/b81618.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b83702/b83702.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b91377/b91377.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b113239/b113239.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b87284/b87284.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'b87284.test1' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b87285/b87285.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b89506/b89506.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b89600/b89600.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b89797/b89797.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1-M13-RTM/b91230/b91230.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1-M14-SP1/b119538/b119538a.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1-M14-SP1/b119538/b119538b.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1-M15-SP2/b124443/b124443.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.IndexOutOfRangeException |
+| `JIT/Regression/CLR-x86-JIT/V1.1-M1-Beta1/b119294/b119294.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.1-M1-Beta1/b130333/byteshift.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.1-M1-Beta1/b140711/b140711.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'b140711.BadMath' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.1-M1-Beta1/b140902/b140902.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b102879/dblinf.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b103058/b103058.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b124232/genisinst.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b169333/b169333.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b178119/hugemthfrm.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b180381/constrained1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b210352/csharptester.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b219940/struct01_gen.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M01/b02345/b02345.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M01/b02762/b02762.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M01/b07211/byteshift.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M01/b07900/rpPasses.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M01/b08020/bbHndIndex.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M01/b11762/b11762.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M01/b16399/gtIsValid64RsltMul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M01/b16570/pState.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M02/b00719/b00719.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M02/b19171/jmp2blk.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M02/b30251/b578931.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V1.2-M02/b31398/cs1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-Beta2/b102533/DeadBlock.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-Beta2/b320147/1086745236.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-Beta2/b321799/repro.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-Beta2/b405223/b405223.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-Beta2/b416667/b416667.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'b416667.Gen`1' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-Beta2/b423721/b423721.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-Beta2/b448208/Desktop/b448208.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-Beta2/b449827/b449827.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-RTM/b369916/b369916.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-RTM/b491215/b491215.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/V2.0-RTM/b604247/b604247.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/dev10/b400791/b400971.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/dev11/DevDiv_376412/DevDiv_376412.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/DDB/b121938/ConstToString.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/DDB/b151497/NullCheckBoxedValuetypeReturn.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/DDB/b170362/b170362.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/DDB/b188478/b188478.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/DDB/b19679/b19679.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/DDB/b33183/b33183.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/DDB/b49778/b49778.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b152292/b152292.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b561129/b561129.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b565808/b565808.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'b565808.ContentType' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b569942/b569942.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b589202/b589202.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b598649/b598649.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b602004/Inline_Vars2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b608066/b608066.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b608198/b608198.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b609280/b609280.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
 | `JIT/Regression/CLR-x86-JIT/v2.1/b610562/b610562.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression/CLR-x86-JIT/v2.1/b611219/b611219.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/CLR-x86-JIT/v2.2/ddb/ddb188478/DDB188478.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/Dev11_457559/Dev11_457559.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/Dev11_5437/Dev11_5437.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/Dev11_617302/Dev11_617302.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/Dev11_646049/Dev11_646049.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/DevDiv2_8863/DevDiv2_8863.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/External/Dev11_243742/app.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/External/dev11_111914/BadMax1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/External/dev11_131317/BadBox1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/External/dev11_135245/R3Trasher1.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression/Dev11/External/dev11_149090/GcHole1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression/Dev11/External/dev11_154899/DynamicStaticAlignment1.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression/Dev11/External/dev11_239804/ShowLocallocAlignment.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/External/dev11_27971/UninitializedHighWord.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/External/dev11_91048/UseTrashedVfp1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/dev10_94677/loopvt.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/dev11_165544/seqpts.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/dev11_4421/Dev11_4421.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/Dev11/dev11_76013/Dev11_76013.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/M00/b103846/d.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/M00/b111130/makework.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/M00/b111192/strswitch2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/M00/b113493/bad.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/M00/b115253/hello2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/M00/b119026/bug.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/M00/b119026/charbug.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/M00/b141358/test.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/M00/b99219/b99219.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-Beta1/b102615/test1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-Beta1/b102860/structret1_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-Beta1/b124409/ericcprop3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-Beta1/b302509/_5mvazhg.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-Beta1/b91074/pack8.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-M02/b10828/redundant.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-M02/b15539/simple.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-M02/b19394/stringArray114.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-M02/b21015/test.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-M02/b26496/_1d6bgof.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-M02/b27980/struct1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-M02/b28077/struct5_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-M02/b28141/structret1_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V1.2-M02/b29343/test.hfa12.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V2.0-Beta2/b184799/b184799.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V2.0-Beta2/b302558/_aopst1l.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V2.0-Beta2/b309539/_ba6c0ou.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V2.0-Beta2/b309548/_hngh669.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V2.0-Beta2/b360587/repro.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/VS-ia64-JIT/V2.0-RTM/b539509/b539509.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/clr-x64-JIT/v2.1/b601838/b601838.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/clr-x64-JIT/v4.0/DevDiv34372/overRepLocalOpt.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression/clr-x64-JIT/v4.0/devdiv374539/DevDiv_374539.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_2/Runtime_112848/Runtime_112848.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression_2/Runtime_127075/Runtime_127075.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_2/Runtime_33972/Runtime_33972.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_2/Runtime_4781/Runtime_4781_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression_2/Runtime_70790/Runtime_70790.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_2/Runtime_72363/Runtime_72363.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_2/Runtime_72775/Runtime_72775.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_2/Runtime_75607/Runtime_75607.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression_2/Runtime_77968/Runtime_77968.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_2/Runtime_78891/Runtime_78891.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.NullReferenceException |
+| `JIT/Regression_2/Runtime_95315/Runtime_95315.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.IndexOutOfRangeException |
+| `JIT/Regression_3/DevDiv_754566/test.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_3/GitHub_11408/GitHub_11408.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_3/GitHub_13910/GitHub_13910.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_3/GitHub_17777/GitHub_17777.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_3/GitHub_23199/GitHub_23199_Target_32Bit.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_3/GitHub_23199/GitHub_23199_Target_64Bit.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_3/GitHub_36614/GitHub_36614.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_9/GitHub_6238.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_9/Runtime_67331.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression_NoOptimize_d/GitHub_16892.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_NoOptimize_r_1/GitHub_19361.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_PdbOnly_ro/GitHub_7907.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_do/Bool_And_Op.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_do/GitHub_19197.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_do/GitHub_19272.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression_do/GitHub_39823.cs` | MISMATCH | ref=100 ours=255 | (no stderr output) |
+| `JIT/Regression_o_1/DevDiv_1206929.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_142976.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_150265.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_168744.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_200492.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_278375.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_288222.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_541653.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_543057.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_543057a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_545504.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/DevDiv_718151.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_11814.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_12037.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_12949/GitHub_12949_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_12949/GitHub_12949_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_12949/GitHub_12949_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_12949/GitHub_12949_5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_12949/GitHub_12949_6.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_12949/GitHub_12949_7.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_12949/GitHub_12949_8.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_1296.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_13057.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_1323.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_13561.cs` | CRASH | SIGABRT | Unhandled exception. System.BadImageFormatException: An attempt was made to load a program with an incorrect format. |
+| `JIT/Regression_o_1/GitHub_15077.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_15237.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression_o_1/GitHub_15319.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_o_1/GitHub_15718.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression_o_1/GitHub_16210/GitHub_16210_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_16210/GitHub_16210_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_16210/GitHub_16210_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_16254.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_17329.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_18232.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'GitHub_18232.Program' threw an exception. |
+| `JIT/Regression_o_1/GitHub_18259.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_18408.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_18672.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_18887.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_19022.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression_o_1/GitHub_19149.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_o_1/GitHub_19397.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression_o_1/GitHub_19438.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Regression_o_1/GitHub_19444.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_20651.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression_o_1/GitHub_20838.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_21231/GitHub_21231a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_21231/GitHub_21231b.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_23545.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_24159.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_24657.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_2580.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_2610.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_4115.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_5047.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_5696.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_6239.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/GitHub_8220.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_1/Github_12398.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression_o_1/Runtime_101175.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression_o_1/Runtime_103888.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression_o_1/Vector3Test.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_2/Runtime_111617.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_2/Runtime_113320.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'Runtime_113320.Runtime_113320' threw an exception. |
+| `JIT/Regression_o_2/Runtime_114571.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.NullReferenceException |
+| `JIT/Regression_o_2/Runtime_114573.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_2/Runtime_114895.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_2/Runtime_115495.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_2/Runtime_116457.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.IndexOutOfRangeException |
+| `JIT/Regression_o_2/Runtime_116814.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_2/Runtime_116823.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: expected 32767, got -32768 |
+| `JIT/Regression_o_2/Runtime_1241.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_2/Runtime_35724.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_2/Runtime_40440.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression_o_2/Runtime_61074.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_63905.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_66089.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_66254.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_68049_0.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_70333/Runtime_70333.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_70333/Runtime_70333_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_71939.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_73559.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_73681.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_75249.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_75828.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_76346.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_77710.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_83242.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_85645.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_85920.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_88168.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/Regression_o_3/Runtime_91062.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Regression_o_3/Runtime_91576.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.NullReferenceException |
+| `JIT/Regression_o_3/Runtime_91855.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.DivideByZeroException |
+| `JIT/Regression_o_3/Runtime_95043.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_o_3/Runtime_95226.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.IndexOutOfRangeException |
+| `JIT/Regression_o_3/Runtime_96623.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.IndexOutOfRangeException |
+| `JIT/Regression_ro_1/DevDiv_359736.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/DevDiv_653853.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/DevDiv_794115.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/DevDiv_794631.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/DevDiv_815940.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/DevDiv_816617.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/DevDiv_876169.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/DevDiv_911875.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_18144.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_18238.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_19256.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_19537.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_19674.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_20040.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_20211/GitHub_20211.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_20260.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_20499.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_22330.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_22556.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_22820.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_23861.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_23885.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_25134.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_26417.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_27279.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/GitHub_37666.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/Github_21915.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/Runtime_1104.cs` | MISMATCH | ref=100 ours=101 | (no stderr output) |
+| `JIT/Regression_ro_1/Runtime_120270.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/Runtime_120903.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/Runtime_124510.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/Runtime_125124.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: expected True |
+| `JIT/Regression_ro_1/Runtime_125327.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/Runtime_31615.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/Runtime_38920.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/Runtime_44895.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/b106272.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/b402658.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/b402701.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/b598034.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/b610750/32vs64.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/b610750/b610750.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/dev11_20929.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_1/devdiv_174983.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_126060.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.ArgumentOutOfRangeException |
+| `JIT/Regression_ro_2/Runtime_128062.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.ArgumentOutOfRangeException |
+| `JIT/Regression_ro_2/Runtime_130216.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.IndexOutOfRangeException |
+| `JIT/Regression_ro_2/Runtime_130431.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.OverflowException |
+| `JIT/Regression_ro_2/Runtime_131459.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression_ro_2/Runtime_133271.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.IndexOutOfRangeException |
+| `JIT/Regression_ro_2/Runtime_46529.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_54100.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_54118/Runtime_54118.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_55129.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression_ro_2/Runtime_57282/Runtime_57282_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_57282/Runtime_57282_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_57364.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_58083.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'Runtime_58083.Program' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_58293.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_60035.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_60957.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression_ro_2/Runtime_61037.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Regression_ro_2/Runtime_620.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_75832.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.DivideByZeroException |
+| `JIT/Regression_ro_2/Runtime_764.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Regression_ro_2/Runtime_95349.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/SIMD/Matrix4x4.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/SIMD/ShiftOperations.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/Stress/ABI/Program.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/eh/basics/loopEH.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/148343.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/9_and_alloca2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/9param.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/eh1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/fgtest1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/fgtest2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/gc-pinned-code-motion.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/ret_struct_test1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/ret_struct_test4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/simple1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct1_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct1_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct1_5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct2_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct2_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct2_5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct2_5_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct3_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct3_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct3_5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct4_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct4_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct4_5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct5_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct5_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct5_5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct6.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct6_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct6_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct6_5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct7_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct8.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct9.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/struct9_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp1_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp1_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp1_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp1_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp1_5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp1_6.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp2_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp2_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp2_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp2_4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp3_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp4_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp5_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfp6_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfpseh5_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structfpseh6_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structref1_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret1_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret1_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret1_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret2_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret2_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret2_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret3_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret3_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret3_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret4_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret4_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret4_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret5_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret5_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret5_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret6_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret6_2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structret6_3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/structva1_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/test1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/test2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/test3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/test_noalloca.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/misc/vbil.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/regress/vswhidbey/143837.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/gc/regress/vswhidbey/339415.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cg/CGRecurse/CGRecurseAAA.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cg/CGRecurse/CGRecurseAAC.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cg/CGRecurse/CGRecurseACA.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cg/CGRecurse/CGRecurseACC.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cg/cgstress/CgStress1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cg/cgstress/CgStress2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cg/cgstress/CgStress3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cprop/cprop001.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cprop/implicitDownConv.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/arrayexpr1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/arrayexpr2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/fieldExprUnchecked1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/fieldexpr1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/fieldexpr1_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/fieldexpr2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/simpleexpr1_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/simpleexpr2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/staticFieldExpr1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/staticFieldExpr1_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/staticFieldExprUnchecked1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/volatilefield.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/cse/volatilestaticfield.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/inl/caninline.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/osr/osr001.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/rngchk/ArrayBound.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/rngchk/ArrayWith2Loops.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/rngchk/ArrayWithFunc.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/rngchk/BadMatrixMul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/rngchk/JaggedArray.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/rngchk/RngchkStress1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/rngchk/RngchkStress2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/opt/rngchk/SimpleArray_01.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/asurt/143616/foo.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'bar' threw an exception. |
+| `JIT/jit64/regress/ddb/87766/ddb87766.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/ndpw/21015/interior_pointer.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/102964/test.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/329169/test.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/471729/test.cs` | MISMATCH | ref=100 ours=100 | (no stderr output) |
+| `JIT/jit64/regress/vsw/517867/test.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/524070/test1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/524070/test2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/528315/simple-repro.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/539509/test1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/543229/test.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/549880/test.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/560402/opadd.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/560402/opmul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/560402/opsub.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/601425/stret.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/regress/vsw/610378/BigFrame.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow01_add.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow01_mul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow01_sub.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow02_add.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow02_mul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow02_sub.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow03_add.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow03_div.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow03_mul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow03_sub.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow04_add.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow04_div.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow04_mul.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/jit64/rtchecks/overflow/overflow04_sub.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/And/Regressions/Regression1_And.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/opt/AssertionPropagation/ConstantProp.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/AssertionPropagation/CopyProp.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/AssertionPropagation/NullCheckAssertion1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/AssertionPropagation/NullCheckAssertion2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/AssertionPropagation/NullCheckAssertion3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/AssertionPropagation/NullCheckAssertion4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/AssertionPropagation/NullCheckAssertion5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/AssertionPropagation/NullCheckAssertion6.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/AssertionPropagation/NullCheckAssertion7.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/AssertionPropagation/TypeOfAssertion.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/AssertionPropagation/regression/dev10/bug573840/bug573840.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/CSE/GitHub_16065a.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/CSE/GitHub_16065b.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/CSE/NarrowStore.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Casts/shared.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Casts/shared2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Cloning/DownCounted.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Cloning/Runtime_61040_1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Cloning/Runtime_70802.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Compares/compareAndTestChains.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/opt/Devirtualization/GDV_GenericInterface.cs` | CRASH | SIGABRT | Fatal error. |
 | `JIT/opt/Devirtualization/GitHub_10311.cs` | CRASH | SIGSEGV | (no stderr output) |
 | `JIT/opt/Devirtualization/GitHub_51918.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Devirtualization/MultipleCanonicallyCompatibleImplementations.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Devirtualization/box1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Devirtualization/contravariance.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/opt/Devirtualization/exact1.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
 | `JIT/opt/Devirtualization/exact2.cs` | CRASH | SIGABRT | Fatal error. |
+| `JIT/opt/Devirtualization/exacttype.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/opt/Devirtualization/generic.cs` | CRASH | SIGABRT | Fatal error. |
+| `JIT/opt/Devirtualization/inlinedevirt.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/opt/Devirtualization/sharedoverride.cs` | CRASH | SIGABRT | Fatal error. |
+| `JIT/opt/Devirtualization/spilledreturn.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/opt/Enum/hasflag.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/ForwardSub/andnotcontained.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/ForwardSub/callArgInterference2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/ForwardSub/callArgInterference3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'ForwardSubCallArgInterference3' threw an exception. |
+| `JIT/opt/ForwardSub/modOpt.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/regression/bug584219/inliningVars.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/regression/bug595776/bug595776.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/GenericStructs.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_DelegateStruct.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_GenericMethods.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_Many.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_MultipleReturn.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_NewObj.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_NormalizeStack.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_Recursion.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_RecursiveMethod.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_RecursiveMethod21.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_STARG.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_SideAffects.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_Vars.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inline_handler.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/Inlinethrow.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/LotsOfInlines.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/ReturnStruct_Method.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/StructAsParam_Method.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/opt/Inline/tests/args1.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Inline/tests/fact.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/mathfunc.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/Inline/tests/struct_opcodes.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/InstructionCombining/ArrayLengthArithmetic.cs` | CRASH | SIGABRT | Unhandled exception. System.DivideByZeroException: Attempted to divide by zero. |
+| `JIT/opt/InstructionCombining/CheckedBitOps.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.OverflowException |
 | `JIT/opt/InstructionCombining/MulToAdd.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/opt/Loops/TripCountOverflow.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: wrong exception type: System.Exception |
+| `JIT/opt/MDArray/MDArrayIntrinsicExpansion.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/opt/OSR/addressexposedlocal.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/example.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/exposure1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/exposure2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/genericmethodpatchpoint.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/handlerloop.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/integersumloop.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/mainlooptry.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/mainlooptry2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/mainlooptry3.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/mainlooptry4.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/nesteddoloops.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/originalstackalloc.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/osrcontainstry.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/pinnedlocal.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/shadowparam.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/synchronized.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/tailrecurse.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/tailrecursetry.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OSR/tailrecursetry2.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/ObjectStackAllocation/Delegates.cs` | MISMATCH | ref=100 ours=255 | (no stderr output) |
+| `JIT/opt/ObjectStackAllocation/Fields.cs` | MISMATCH | ref=100 ours=255 | (no stderr output) |
 | `JIT/opt/ObjectStackAllocation/Runtime_111922v2.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/ObjectStackAllocation/Runtime_115831.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/ObjectStackAllocation/Runtime_115832.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/opt/ObjectStackAllocation/Runtime_121736.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/ObjectStackAllocation/Runtime_122879.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/OptimizeBools/optboolsreturn.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/RedundantBranch/RedundantBranchAnd.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/RedundantBranch/RedundantBranchOr.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/RedundantBranch/RedundantBranchUnsigned2.cs` | CRASH | SIGABRT | Unhandled exception. System.IndexOutOfRangeException: Index was outside the bounds of the array. |
+| `JIT/opt/Regressions/Regression5.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'Program' threw an exception. |
+| `JIT/opt/Tailcall/ImplicitByrefTailCalls.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/ThrowHelper/ThrowHelper.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/ValueNumbering/TypeTestFolding.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
 | `JIT/opt/Vectorization/SpanHelpers_SequenceEqual.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/opt/Vectorization/StringEquals_Vectorization.cs` | CRASH | SIGABRT | Unhandled exception. System.Reflection.TargetInvocationException: Exception has been thrown by the target of an invocation. |
+| `JIT/opt/perf/doublealign/locals.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/perf/doublenegate/doublenegate.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/virtualstubdispatch/bigvtbl/bigvtbl.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/virtualstubdispatch/hashcode/ctest1.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/virtualstubdispatch/manyintf/ctest.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/opt/virtualstubdispatch/mixed/mixed.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
+| `JIT/superpmi/superpmicollect.cs` | CRASH | SIGABRT | Unhandled exception. System.TypeInitializationException: The type initializer for 'System.ConsolePal' threw an exception. |
