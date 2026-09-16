@@ -543,8 +543,13 @@ pub mod hir {
     pub enum EhRegionKind {
         /// A typed catch; `class_token` is the raw mdToken from the EE's
         /// `getEHinfo`, passed through to the artifact untouched (the VM
-        /// resolves and type-tests it — no JIT-side handle query exists
-        /// for it). step_10.6.
+        /// resolves and type-tests it). Only context-free clause types
+        /// reach this form: the importer probes `embed_generic_handle`
+        /// for every catch clause, and a runtime-lookup answer (shared
+        /// generic code) converts the clause to a synthesized
+        /// [`EhRegionKind::Filter`] instead (RyuJIT's
+        /// fgCreateFiltersForGenericExceptions, jiteh.cpp:2596).
+        /// step_10.6.
         Catch {
             class_token: u32,
         },

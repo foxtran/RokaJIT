@@ -455,6 +455,112 @@ enum FuncletKind {
     Filter,
 }
 
+/// The address-taken slots (step_11.13): an `AddrOf` operand anywhere in
+/// the method means the slot can be written invisibly to the value
+/// tracker — a call through the escaped byref, a store through the
+/// computed pointer — so a temp copy of it must materialize into its own
+/// slot, never alias (`emit_define_temp`'s `Loc::Local` path would read
+/// the slot's NEW value; the Interlocked.Exchange repro — `l ^
+/// Interlocked.Exchange(ref l, 5)` — snapshotted nothing and read `l`
+/// post-exchange).
+fn addr_taken_slots(method: &lir::Method) -> Vec<bool> {
+    fn mark(op: &lir::Operand, taken: &mut [bool]) {
+        if let lir::Operand::AddrOf(id) = op {
+            taken[id.0 as usize] = true;
+        }
+    }
+    let mut taken = vec![false; method.locals.len()];
+    for block in &method.blocks {
+        for stmt in &block.stmts {
+            match &stmt.kind {
+                StmtKind::Copy { src, .. }
+                | StmtKind::Unary { src, .. }
+                | StmtKind::Conv { src, .. }
+                | StmtKind::ConvOvf { src, .. }
+                | StmtKind::CkFinite { src, .. }
+                | StmtKind::Cast { src, .. }
+                | StmtKind::Box { src, .. } => mark(src, &mut taken),
+                StmtKind::Binary { lhs, rhs, .. } | StmtKind::BinaryOvf { lhs, rhs, .. } => {
+                    mark(lhs, &mut taken);
+                    mark(rhs, &mut taken);
+                }
+                StmtKind::Load { addr, .. } => mark(addr, &mut taken),
+                StmtKind::Store { addr, src, .. } => {
+                    mark(addr, &mut taken);
+                    mark(src, &mut taken);
+                }
+                StmtKind::Call { target, args, .. } => {
+                    if let rokajit::ir::CallTarget::Indirect(op) = target {
+                        mark(op, &mut taken);
+                    }
+                    for arg in args {
+                        mark(arg, &mut taken);
+                    }
+                }
+                StmtKind::ArrLen { array, .. }
+                | StmtKind::LocAlloc { size: array, .. }
+                | StmtKind::NullCheck { arg: array }
+                | StmtKind::BlockZero {
+                    dst_addr: array, ..
+                }
+                | StmtKind::ReturnStruct { addr: array, .. } => mark(array, &mut taken),
+                StmtKind::ArrElemAddr { array, index, .. }
+                | StmtKind::BoundsCheck { array, index } => {
+                    mark(array, &mut taken);
+                    mark(index, &mut taken);
+                }
+                StmtKind::BlockCopy {
+                    dst_addr, src_addr, ..
+                } => {
+                    mark(dst_addr, &mut taken);
+                    mark(src_addr, &mut taken);
+                }
+                StmtKind::BlockCopyDyn {
+                    dst_addr,
+                    src_addr,
+                    size,
+                } => {
+                    mark(dst_addr, &mut taken);
+                    mark(src_addr, &mut taken);
+                    mark(size, &mut taken);
+                }
+                StmtKind::BlockFillDyn {
+                    dst_addr,
+                    fill,
+                    size,
+                } => {
+                    mark(dst_addr, &mut taken);
+                    mark(fill, &mut taken);
+                    mark(size, &mut taken);
+                }
+                StmtKind::Branch { cond, .. } => match cond {
+                    lir::BranchCond::True(op) | lir::BranchCond::False(op) => mark(op, &mut taken),
+                    lir::BranchCond::Cmp { lhs, rhs, .. } => {
+                        mark(lhs, &mut taken);
+                        mark(rhs, &mut taken);
+                    }
+                },
+                StmtKind::Switch { value, .. } | StmtKind::EndFilter { value } => {
+                    mark(value, &mut taken)
+                }
+                StmtKind::Return { value } => {
+                    if let Some(op) = value {
+                        mark(op, &mut taken);
+                    }
+                }
+                StmtKind::Throw { exception } => mark(exception, &mut taken),
+                StmtKind::Rethrow
+                | StmtKind::Leave { .. }
+                | StmtKind::CatchArg { .. }
+                | StmtKind::CallFinally { .. }
+                | StmtKind::EndFinally
+                | StmtKind::Jump { .. } => {}
+            }
+        }
+    }
+    taken
+}
+
 /// One planned funclet (step_10.6): a handler or filter block span of an
 /// EH region (a contiguous run in the layout tail), the stack adjustment
 /// its prolog/epilog apply, and its flavor.
@@ -894,6 +1000,11 @@ struct Emitter<'a> {
     /// `num_args + num_il_locals`: ids below this are IL args/locals
     /// (their slots are written on copy), above it temps (tag-tracked).
     num_frame_fixed: usize,
+    /// Slots whose address escapes (`addr_taken_slots`): temp copies of
+    /// them materialize, never alias — a call through the escaped byref
+    /// or a store through the pointer writes the slot invisibly to the
+    /// value tracker (step_11.13).
+    addr_taken: Vec<bool>,
     ee: &'a dyn EeInfo,
     /// The signature of the call statement currently being emitted (for
     /// the call-site record).
@@ -940,6 +1051,7 @@ impl<'a> Emitter<'a> {
             layouts: &method.struct_layouts,
             num_args: method.num_args as usize,
             num_frame_fixed: (method.num_args + method.num_il_locals) as usize,
+            addr_taken: addr_taken_slots(method),
             ee,
             call_sig: None,
             call_sites: Vec::new(),
@@ -2126,6 +2238,17 @@ impl<'a> Emitter<'a> {
         let g2 = gpr_of(p)?;
         self.asm
             .lea(g2, Mem::base_disp(regs::STACK_POINTER, outgoing as i32));
+        // A zero size yields the null pointer, RyuJIT's `test; je`
+        // bail-out (codegenxarch.cpp:2862's "return null in targetReg")
+        // — a store through it NREs (the Localloc `stackalloc byte[0]`
+        // test). The original size sits in rdx until the MEMSET call
+        // below.
+        self.asm
+            .test(Width::W64, Rm::Reg(Gpr::Rdx), Rmi::Reg(Gpr::Rdx));
+        let nonzero = self.synthetic_label();
+        self.asm.jcc(CondCode::Ne, nonzero);
+        self.asm.mov(Width::W64, Rm::Reg(g2), Rmi::Imm(0));
+        self.asm.bind(nonzero);
         self.define_temp_reg(t.0, g2)?;
         // memset(rdi = rsp + outgoing, rsi = 0, rdx = size).
         self.asm.lea(
@@ -2481,9 +2604,24 @@ impl<'a> Emitter<'a> {
             Src::Reg(g) => self.define_temp_reg(id, g),
             Src::Val(v) => {
                 // Copy of an IL local/arg: alias its slot (invalidated on
-                // writes to it). Zero instructions.
+                // writes to it). Zero instructions — UNLESS the slot's
+                // address escapes (`addr_taken`): then a call through the
+                // escaped byref or a store through the pointer writes it
+                // invisibly to the tracker, and an alias would read the
+                // NEW value (step_11.13). Materialize a real copy into
+                // the temp's own slot.
                 if (v.0 .0 as usize) < self.num_frame_fixed {
-                    return self.define_loc(id, Loc::Local(v.0));
+                    if !self.addr_taken[v.0 .0 as usize] {
+                        return self.define_loc(id, Loc::Local(v.0));
+                    }
+                    let (p, moves) = self.vs.take_scratch(&[]);
+                    self.apply(moves)?;
+                    let g = gpr_of(p)?;
+                    self.asm
+                        .mov(width, Rm::Reg(g), Rmi::Mem(self.own_slot(v.0)));
+                    self.asm.mov(width, Rm::Mem(self.own_slot(id)), Rmi::Reg(g));
+                    let slot = self.vs.slot_of(id);
+                    return self.define_loc(id, Loc::Mem(slot));
                 }
                 match self.vs.read(v.0) {
                     // Copy of a spilled temp: alias the (immutable) slot.
@@ -3126,11 +3264,21 @@ impl<'a> Emitter<'a> {
         // importer turns the rest into no-check identities. A wider
         // source always checks.
         match (width_dst, signed_dst, width_src, unsigned_src) {
-            (8 | 16, true, _, _) => {
+            (8 | 16, true, _, false) => {
                 let bias = 1i64 << (width_dst - 1);
                 let span = (1i64 << width_dst) - 1;
                 self.asm.add(width_src, Rm::Reg(gs), Rmi::Imm(bias));
                 self.asm.cmp(width_src, Rm::Reg(gs), Rmi::Imm(span));
+                self.asm.jcc(CondCode::ULe, ok);
+            }
+            (8 | 16, true, _, true) => {
+                // An unsigned source into a signed narrow target: the raw
+                // value must fit the positive half — a plain unsigned
+                // compare against the max. The bias-add form would read a
+                // negative bit pattern as in-range (the
+                // TestConvertFromIntegral `conv.ovf.i1.un` of -1 repro).
+                let max = (1i64 << (width_dst - 1)) - 1;
+                self.asm.cmp(width_src, Rm::Reg(gs), Rmi::Imm(max));
                 self.asm.jcc(CondCode::ULe, ok);
             }
             (8 | 16, false, _, _) => {
@@ -5001,6 +5149,9 @@ mod tests {
             0x48, 0x83, 0xE0, 0xF0, // andq $-16, %rax
             0x48, 0x29, 0xC4, // subq %rax, %rsp — the allocation
             0x48, 0x8D, 0x0C, 0x24, // leaq (%rsp), %rcx — dst := the base
+            0x48, 0x85, 0xD2, // testq %rdx, %rdx — zero size ⇒ null
+            0x0F, 0x85, 0x07, 0, 0, 0, // jne +7
+            0x48, 0xC7, 0xC1, 0, 0, 0, 0, // movq $0, %rcx
             0x48, 0x8D, 0x3C, 0x24, // leaq (%rsp), %rdi — memset dst
             0xBE, 0, 0, 0, 0, // movl $0, %esi — memset fill
             0x48, 0x89, 0x4D, 0xF8, // movq %rcx, -8(%rbp) — call spill
@@ -5064,6 +5215,9 @@ mod tests {
             0x48, 0x83, 0xC0, 0x10, // addq $16, %rax — outgoing re-reserve
             0x48, 0x29, 0xC4, // subq %rax, %rsp
             0x48, 0x8D, 0x4C, 0x24, 0x10, // leaq 16(%rsp), %rcx — the base
+            0x48, 0x85, 0xD2, // testq %rdx, %rdx — zero size ⇒ null
+            0x0F, 0x85, 0x07, 0, 0, 0, // jne +7
+            0x48, 0xC7, 0xC1, 0, 0, 0, 0, // movq $0, %rcx
             0x48, 0x8D, 0x7C, 0x24, 0x10, // leaq 16(%rsp), %rdi — memset dst
             0xBE, 0, 0, 0, 0, // movl $0, %esi
             0x48, 0x89, 0x4D, 0xF8, // movq %rcx, -8(%rbp) — spill
@@ -6448,6 +6602,74 @@ mod tests {
     /// to a `Loc::Const` tag, and the box helper call takes the temp's
     /// ADDRESS (`AddrOf`) — the `lea` must first materialize the 7 into
     /// the slot, or the helper copies stale slot bytes.
+    /// The escaped-slot copy rule (step_11.13): a temp copy of an IL
+    /// local whose address escapes (`AddrOf` anywhere — here the call's
+    /// byref arg) must materialize a real slot-to-slot copy: an alias
+    /// would read the slot's NEW value after the call writes it
+    /// invisibly to the tracker (`l ^ Interlocked.Exchange(ref l, 5)`).
+    /// The copy of a non-escaped local stays the zero-instruction alias.
+    #[test]
+    fn copy_of_an_address_taken_local_materializes() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let locals = || {
+            vec![
+                local(Type::Int64, LocalKind::IlLocal(0)),
+                local(Type::Int64, LocalKind::IlLocal(1)),
+                local(Type::Int64, LocalKind::Temp),
+            ]
+        };
+        let call = |arg: Operand| {
+            stmt(StmtKind::Call {
+                dst: None,
+                target: rokajit::ir::CallTarget::Direct(f),
+                sig: CallSig {
+                    ret: Type::Void,
+                    args: vec![Type::ByRef],
+                    has_this: false,
+                },
+                args: vec![arg],
+            })
+        };
+        let copy = || {
+            stmt(StmtKind::Copy {
+                dst: LocalId(2),
+                src: Operand::Local(LocalId(0)),
+            })
+        };
+        // Identical but for WHICH local the call gets the byref of: the
+        // copied one (escaped — the copy materializes) vs another
+        // (the copy stays the zero-instruction alias).
+        let escaped = method(
+            locals(),
+            0,
+            2,
+            vec![block(0, vec![copy(), call(Operand::AddrOf(LocalId(0)))])],
+        );
+        let control = method(
+            locals(),
+            0,
+            2,
+            vec![block(0, vec![copy(), call(Operand::AddrOf(LocalId(1)))])],
+        );
+        let out_escaped = emit(&escaped, &ee);
+        let _ = emit(&control, &ee);
+        // The copy is a slot read + slot write; the call is `call rel32`.
+        // Pre-fix the copy aliased the local's slot — zero bytes — and
+        // the temp's next read served the post-call value.
+        let b = &out_escaped.code.hot.bytes;
+        let find = |pat: &[u8]| {
+            b.windows(pat.len())
+                .position(|w| w == pat)
+                .expect("pattern present")
+        };
+        assert!(
+            find(&[0x48, 0x8b, 0x45, 0xf8]) < find(&[0xe8]),
+            "the snapshot mov precedes the call"
+        );
+    }
+
     #[test]
     fn lea_of_a_deferred_const_temp_materializes_the_value_first() {
         let mut ee = MockEe::default();
@@ -7385,6 +7607,55 @@ mod tests {
             0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax
             0xC1, 0xE0, 0x18, // shll $24, %eax
             0xC1, 0xE8, 0x18, // shrl $24, %eax — zero-extended u1
+            0x89, 0x45, 0xF8, // movl %eax, -8(%rbp) — the return's clobber spill
+            0x8B, 0x45, 0xF8, // movl -8(%rbp), %eax
+            0xC9, 0xC3, // leave; ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `sbyte f(int a) { return checked((sbyte)(uint)a); }` —
+    /// `conv.ovf.i1.un` of an i32 (the TestConvertFromIntegral repro):
+    /// the raw value must fit the signed target's positive half — one
+    /// unsigned compare against 127, NOT the bias-add form (whose wrap
+    /// reads a negative bit pattern as in-range).
+    #[test]
+    fn conv_ovf_i1_un_of_i32_method_bytes() {
+        let m = method(
+            vec![int_arg(0), int_temp()],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::ConvOvf {
+                        dst: LocalId(1),
+                        dst_bits: 8,
+                        signed_dst: true,
+                        unsigned_src: true,
+                        src: Operand::Local(LocalId(0)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(1))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp) — arg a
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax — the source copy
+            0x83, 0xF8, 0x7F, // cmpl $127, %eax — unsigned (imm8 form)
+            0x0F, 0x86, 0x06, 0, 0, 0, // jbe over the throw call (+6)
+            0xE8, 0, 0, 0, 0, // call CORINFO_HELP_OVERFLOW
+            0x90, // nop
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax
+            0xC1, 0xE0, 0x18, // shll $24, %eax
+            0xC1, 0xF8, 0x18, // sarl $24, %eax — sign-extended i1
             0x89, 0x45, 0xF8, // movl %eax, -8(%rbp) — the return's clobber spill
             0x8B, 0x45, 0xF8, // movl -8(%rbp), %eax
             0xC9, 0xC3, // leave; ret

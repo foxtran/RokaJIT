@@ -745,10 +745,34 @@ BUCKET_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"ldstr through a handle-cell|ldstr through multiple indirections"), "ldstr indirection (IAT_PVALUE/PPVALUE)"),
     (re.compile(r"non-direct call kind"), "non-direct calls (callvirt/calli)"),
     (re.compile(r"non-default calling convention"), "non-default calling conventions"),
+    (re.compile(r"synchronized methods"), "synchronized methods (Monitor enter/exit wrapping)"),
     (re.compile(r"evaluation-stack values crossing"), "eval-stack values across block boundaries"),
     (re.compile(r"local's type has no register class"), "locals without a register class"),
     (re.compile(r"opcode outside the supported set|0xFE-prefixed opcode"), "unsupported IL opcode (importer)"),
 ]
+
+
+# Per-test known-artifact annotations (step_11.13, Class C): tests whose
+# RokaJIT and RyuJIT runs can never honestly byte-match on stdout, though
+# both pass with the same exit code. Each entry was hand-verified: exit
+# codes equal, and the stdout diff is exactly the reason given. This is
+# an explicit reasoned list, NOT a stdout normalizer — adding a test here
+# without the verification is a regression, not a fix.
+KNOWN_ARTIFACTS: dict[str, str] = {
+    "JIT/Methodical/cctor/misc/throw.cs": "exception stack-trace text differs (frame-list formatting); both PASSED, exit 100",
+    "JIT/Methodical/cctor/misc/Desktop/throw.cs": "exception stack-trace text differs (frame-list formatting); both PASSED, exit 100",
+    "JIT/Directed/coverage/oldtests/cse2.cs": "exception stack-trace text differs (frame-list formatting); both PASSED, exit 100",
+    "JIT/Directed/perffix/primitivevt/mixed1.cs": "per-check lines identical after sorting; print ordering differs; both exit 100",
+    "JIT/Methodical/fp/exgen/10w5d.cs": "time-seeded subtest selection; each executed check matches its own expectation; both exit 100",
+    "JIT/Performance/CodeQuality/Benchstones/BenchF/Adams/Adams.cs": "timing values in output; both exit 100",
+    "JIT/Performance/CodeQuality/V8/Richards/Richards.cs": "timing values in output; both exit 100",
+    "JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b59297/b59297.cs": "timing values in output; both exit 100",
+    "JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b103058/b103058.cs": "stack addresses printed; both exit 100",
+    "JIT/Regression/Dev11/External/dev11_239804/ShowLocallocAlignment.cs": "stack addresses printed; both exit 100",
+    "JIT/Regression/VS-ia64-JIT/M00/b113493/bad.cs": "thread-scheduling interleave of counter prints; both exit 100",
+    "JIT/opt/OSR/example.cs": "timing values in output; both exit 100",
+    "JIT/opt/OSR/integersumloop.cs": "timing values in output; both exit 100",
+}
 
 
 def extract_reason(stderr: str) -> tuple[str, str]:
@@ -843,6 +867,14 @@ async def triage_one(candidate: dict, coreroots: dict[str, Path], timeout: int) 
     elif ref["exit_code"] == ours["exit_code"] and ref["stdout"] == ours["stdout"]:
         record["category"] = "MATCH"
         record["detail"] = str(ref["exit_code"])
+    elif rel_path in KNOWN_ARTIFACTS and ours["exit_code"] == ref["exit_code"]:
+        # A hand-verified text artifact (Class C, step_11.13): same pass
+        # verdict by construction; the annotation is the reason. An exit
+        # mismatch falls through to the normal classification — an
+        # annotation must never hide a regression.
+        record["category"] = "ARTIFACT"
+        record["detail"] = KNOWN_ARTIFACTS[rel_path]
+        record["stderr_tail"] = ours["stderr"][-1000:]
     else:
         bucket, detail = extract_reason(ours["stderr"])
         record["bucket"] = bucket
@@ -850,6 +882,12 @@ async def triage_one(candidate: dict, coreroots: dict[str, Path], timeout: int) 
         if ours["exit_code"] is not None and ours["exit_code"] < 0:
             record["category"] = "CRASH"
             record["detail"] = signal_name(ours["exit_code"])
+        elif bucket != "needs investigation":
+            # Class B (step_11.13): ours ran but died later at a NAMED
+            # Unsupported gate (the InvalidProgramException shape) — not a
+            # bug, a missing feature; counted in its feature bucket.
+            record["category"] = "GATED"
+            record["detail"] = f"ref={ref['exit_code']} ours={ours['exit_code']}"
         else:
             record["category"] = "MISMATCH"
             record["detail"] = f"ref={ref['exit_code']} ours={ours['exit_code']}"
@@ -946,7 +984,7 @@ def render_report(records: dict[str, dict], scanned: int, candidates: list[dict]
         "| Category | Tests |",
         "| --- | ---: |",
     ]
-    for cat in ("MATCH", "MISMATCH", "CRASH", "TIMEOUT", "COMPILE_FAIL"):
+    for cat in ("MATCH", "MISMATCH", "CRASH", "GATED", "ARTIFACT", "TIMEOUT", "COMPILE_FAIL"):
         if cats.get(cat):
             lines.append(f"| {cat} | {cats[cat]} |")
     lines += [
@@ -954,13 +992,17 @@ def render_report(records: dict[str, dict], scanned: int, candidates: list[dict]
         f"Of the MATCHes, {convention_pass} exit 100 (the CoreCLR pass",
         "convention). Categories: COMPILE_FAIL = csc can't build it",
         "standalone; MATCH = same exit code and stdout under both JITs;",
-        "MISMATCH = both ran, results differ; CRASH = RokaJIT-side run died",
+        "MISMATCH = both ran, results differ, no named gate in stderr;",
+        "GATED = both ran, but RokaJIT died later at a named Unsupported",
+        "marker (a missing feature, not a bug — counted in its feature",
+        "bucket); ARTIFACT = both pass but stdout differs by construction",
+        "(hand-annotated per test); CRASH = RokaJIT-side run died",
         "on a signal (SIGABRT = the EE rejecting RokaJIT's",
         "CORJIT_IMPLLIMITATION); TIMEOUT = 10s per-test limit hit.",
         "",
         "## Feature buckets — the ordered backlog for step_08.1+",
         "",
-        "Every CRASH/MISMATCH whose RokaJIT stderr carries a `CompileError`",
+        "Every CRASH/MISMATCH/GATED whose RokaJIT stderr carries a `CompileError`",
         "marker, bucketed by the missing feature the marker names. Ordered by",
         "test count, descending.",
         "",
@@ -971,6 +1013,27 @@ def render_report(records: dict[str, dict], scanned: int, candidates: list[dict]
         if bucket == "needs investigation":
             continue
         lines.append(f"| {bucket} | {len(tests)} | {fmt_examples(tests)} |")
+    artifacts = sorted(
+        (r for r in recs if r["category"] == "ARTIFACT"),
+        key=lambda r: r["test"],
+    )
+    if artifacts:
+        lines += [
+            "",
+            "## Known artifacts (Class C)",
+            "",
+            "Both runs pass with the same exit code but stdout differs by",
+            "construction — never honestly a MATCH under a byte-exact",
+            "compare, and never a bug to fix. Each row was hand-verified",
+            "(exit codes equal, the diff exactly the stated reason). The",
+            "list is explicit per test; adding a row without that",
+            "verification is a regression, not a fix.",
+            "",
+            "| Test | Reason |",
+            "| --- | --- |",
+        ]
+        for r in artifacts:
+            lines.append(f"| `{r['test']}` | {r['detail']} |")
     lines += [
         "",
         "## COMPILE_FAIL by csc error class",

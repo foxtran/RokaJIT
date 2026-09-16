@@ -163,6 +163,33 @@ impl Flatten<'_> {
         id
     }
 
+    /// Read a deferred `Local` operand NOW (a Copy to a fresh temp) when a
+    /// later sibling subtree carries an effect — see [`tree_has_effect`].
+    /// Anything else (temps, constants, addresses) already holds its value.
+    fn freeze_local(
+        &mut self,
+        operand: lir::Operand,
+        out: &mut Vec<lir::Stmt>,
+        il: IlOffset,
+    ) -> lir::Operand {
+        match operand {
+            lir::Operand::Local(id) => {
+                let ty = self.locals[id.0 as usize].ty;
+                let dst = self.temp(ty);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::Copy {
+                        dst,
+                        src: lir::Operand::Local(id),
+                    },
+                );
+                lir::Operand::Temp(dst)
+            }
+            other => other,
+        }
+    }
+
     /// The type an operand carries, from the locals table or the
     /// constant itself. `Internal` on use: the importer guarantees
     /// in-table locals, so `None` here is an upstream bug.
@@ -441,7 +468,14 @@ impl Flatten<'_> {
                     // Store through a byref at a constant offset (`stfld`).
                     // Address first, then the value — the IL push order the
                     // importer encoded (`stfld`: obj pushed before value).
+                    // The freeze rule: the address is read before the
+                    // value's effects (tree_has_effect).
                     let addr = self.flatten_expr(addr, &mut stmts, stmt.il_offset)?;
+                    let addr = if tree_has_effect(value) {
+                        self.freeze_local(addr, &mut stmts, stmt.il_offset)
+                    } else {
+                        addr
+                    };
                     let src = self.flatten_expr(value, &mut stmts, stmt.il_offset)?;
                     if let Some(class) = struct_class_of(value) {
                         // A struct store through a computed address
@@ -490,8 +524,20 @@ impl Flatten<'_> {
                 hir::StmtKind::BlockCopyDyn { dst, src, size } => {
                     // `cpblk`: IL push order is dst, src, size; the
                     // addresses get the block-op const-materialization.
+                    // The freeze rule (tree_has_effect) keeps each
+                    // operand's read ahead of the next operand's effects.
                     let dst = self.flatten_expr(dst, &mut stmts, stmt.il_offset)?;
+                    let dst = if tree_has_effect(src) || tree_has_effect(size) {
+                        self.freeze_local(dst, &mut stmts, stmt.il_offset)
+                    } else {
+                        dst
+                    };
                     let src = self.flatten_expr(src, &mut stmts, stmt.il_offset)?;
+                    let src = if tree_has_effect(size) {
+                        self.freeze_local(src, &mut stmts, stmt.il_offset)
+                    } else {
+                        src
+                    };
                     let size = self.flatten_expr(size, &mut stmts, stmt.il_offset)?;
                     let dst = self.block_addr_value(dst, &mut stmts, stmt.il_offset);
                     let src = self.block_addr_value(src, &mut stmts, stmt.il_offset);
@@ -508,7 +554,17 @@ impl Flatten<'_> {
                 hir::StmtKind::BlockFillDyn { dst, fill, size } => {
                     // `initblk`: IL push order is dst, fill, size.
                     let dst = self.flatten_expr(dst, &mut stmts, stmt.il_offset)?;
+                    let dst = if tree_has_effect(fill) || tree_has_effect(size) {
+                        self.freeze_local(dst, &mut stmts, stmt.il_offset)
+                    } else {
+                        dst
+                    };
                     let fill = self.flatten_expr(fill, &mut stmts, stmt.il_offset)?;
+                    let fill = if tree_has_effect(size) {
+                        self.freeze_local(fill, &mut stmts, stmt.il_offset)
+                    } else {
+                        fill
+                    };
                     let size = self.flatten_expr(size, &mut stmts, stmt.il_offset)?;
                     let dst = self.block_addr_value(dst, &mut stmts, stmt.il_offset);
                     Self::push(
@@ -523,8 +579,15 @@ impl Flatten<'_> {
                 }
                 hir::StmtKind::BoundsCheck { array, index } => {
                     // The bounds check (step_10.8): a statement consuming
-                    // the array and index operands (IL order: array first).
+                    // the array and index operands (IL order: array first;
+                    // the freeze rule keeps that order across an effectful
+                    // index — tree_has_effect).
                     let array = self.flatten_expr(array, &mut stmts, stmt.il_offset)?;
+                    let array = if tree_has_effect(index) {
+                        self.freeze_local(array, &mut stmts, stmt.il_offset)
+                    } else {
+                        array
+                    };
                     let index = self.flatten_expr(index, &mut stmts, stmt.il_offset)?;
                     Self::push(
                         &mut stmts,
@@ -546,7 +609,13 @@ impl Flatten<'_> {
 
     /// `Eval` of a void call lowers to a `Call` statement with no
     /// destination; any other discarded expression still flattens (its
-    /// side effects — calls inside the tree — must survive).
+    /// side effects — calls inside the tree — must survive). A bare
+    /// `StructVal` is special: the value is an ADDRESS — flattening it
+    /// alone reads nothing, so the `ldobj`/`cpobj`'s implicit null check
+    /// would vanish with the discarded value (the GitHub_39823 repro:
+    /// `IntsWrapped s = *ps;` — csc emits `ldobj; pop` — RyuJIT keeps
+    /// `cmp byte ptr [rax], al`). The read still happens, as a block
+    /// copy into a scratch struct temp.
     fn flatten_eval(
         &mut self,
         expr: &hir::Expr,
@@ -555,6 +624,20 @@ impl Flatten<'_> {
     ) -> CompileResult<()> {
         if let hir::Expr::Call { target, sig, args } = expr {
             self.flatten_call(target, sig, args, out, il)?;
+        } else if let hir::Expr::StructVal { addr, class } = expr {
+            let src = self.flatten_expr(addr, out, il)?;
+            let src = self.block_addr_value(src, out, il);
+            let dst = self.temp(Type::Struct(*class));
+            Self::push(
+                out,
+                il,
+                lir::StmtKind::BlockCopy {
+                    dst_addr: lir::Operand::AddrOf(dst),
+                    dst_offset: 0,
+                    src_addr: src,
+                    class: *class,
+                },
+            );
         } else {
             self.flatten_expr(expr, out, il)?;
         }
@@ -660,6 +743,13 @@ impl Flatten<'_> {
             )),
             hir::Expr::Binary { op, lhs, rhs } => {
                 let lhs = self.flatten_expr(lhs, out, il)?;
+                // IL order reads the left operand before the right's
+                // effects (the freeze rule — tree_has_effect).
+                let lhs = if tree_has_effect(rhs) {
+                    self.freeze_local(lhs, out, il)
+                } else {
+                    lhs
+                };
                 let rhs = self.flatten_expr(rhs, out, il)?;
                 let lhs = self.value_operand(lhs, out, il);
                 let rhs = self.value_operand(rhs, out, il);
@@ -695,6 +785,11 @@ impl Flatten<'_> {
                 // conditional OVERFLOW helper call). The result has the
                 // (integer) operands' promoted type, like `Binary`.
                 let lhs = self.flatten_expr(lhs, out, il)?;
+                let lhs = if tree_has_effect(rhs) {
+                    self.freeze_local(lhs, out, il)
+                } else {
+                    lhs
+                };
                 let rhs = self.flatten_expr(rhs, out, il)?;
                 let lhs = self.value_operand(lhs, out, il);
                 let rhs = self.value_operand(rhs, out, il);
@@ -999,8 +1094,22 @@ impl Flatten<'_> {
             ));
         }
         let mut operands = Vec::with_capacity(args.len());
-        for arg in args {
-            operands.push(self.flatten_expr(arg, out, il)?);
+        // A deferred `Local` read must not cross a later argument's (or
+        // the indirect target's — it flattens last, its IL position)
+        // effects: freeze at the operand's own position
+        // (tree_has_effect; step_11.13).
+        let target_has_effect = match target {
+            CallTarget::Indirect(addr) => tree_has_effect(addr),
+            _ => false,
+        };
+        for (i, arg) in args.iter().enumerate() {
+            let operand = self.flatten_expr(arg, out, il)?;
+            let crossed = target_has_effect || args[i + 1..].iter().any(tree_has_effect);
+            operands.push(if crossed {
+                self.freeze_local(operand, out, il)
+            } else {
+                operand
+            });
         }
         let target = match target {
             CallTarget::Direct(m) => CallTarget::Direct(*m),
@@ -1205,6 +1314,42 @@ fn struct_class_of(expr: &hir::Expr) -> Option<rokajit_ee::handles::ClassHandle>
     }
 }
 
+/// True when the tree flattens to at least one side-effecting statement
+/// of its own (a call; a localloc — its zeroing helper is one): a bare
+/// `Local` operand flattened before such a sibling is read when the
+/// ENCLOSING statement emits — after the sibling's effects — while IL
+/// order reads it first (step_11.13: `l ^ Interlocked.Exchange(ref l, 5)`
+/// read `l` after the exchange wrote it through the escaped byref).
+/// Temps freeze their values by construction; `Local` is the only
+/// deferred read. (`Cast`/`Box` are counted too: currently Unsupported
+/// here, but call-shaped when they land.)
+fn tree_has_effect(expr: &hir::Expr) -> bool {
+    match expr {
+        hir::Expr::Call { .. } | hir::Expr::LocAlloc { .. } => true,
+        hir::Expr::Cast { .. } | hir::Expr::Box { .. } => true,
+        hir::Expr::Const(_)
+        | hir::Expr::Local(_)
+        | hir::Expr::LocalAddr(_)
+        | hir::Expr::StaticFieldAddr { .. }
+        | hir::Expr::CatchArg => false,
+        hir::Expr::Load { addr, .. } => tree_has_effect(addr),
+        hir::Expr::FieldAddr { obj, .. } => tree_has_effect(obj),
+        hir::Expr::Unary { arg, .. } | hir::Expr::Conv { arg, .. } => tree_has_effect(arg),
+        hir::Expr::ConvOvf { arg, .. } => tree_has_effect(arg),
+        hir::Expr::CkFinite { arg } => tree_has_effect(arg),
+        hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
+            tree_has_effect(lhs) || tree_has_effect(rhs)
+        }
+        hir::Expr::NullCheck { arg, .. } => tree_has_effect(arg),
+        hir::Expr::ArrLen { array } => tree_has_effect(array),
+        hir::Expr::ArrElemAddr { array, index, .. } => {
+            tree_has_effect(array) || tree_has_effect(index)
+        }
+        hir::Expr::StructVal { addr, .. } => tree_has_effect(addr),
+        hir::Expr::FtnAddr { entry, .. } => tree_has_effect(entry),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1289,6 +1434,119 @@ mod tests {
 
     fn lower_ok(m: hir::Method) -> lir::Method {
         lower(m, &MockTarget).expect("lowers")
+    }
+
+    /// The dead struct copy keeps its read (step_11.13, GitHub_39823):
+    /// `IntsWrapped s = *ps` — csc emits `ldobj; pop` for the unused
+    /// value — must still read the source (the ldobj's implicit null
+    /// check). The Eval of the bare StructVal lowers to a BlockCopy
+    /// (into a scratch temp), not to nothing.
+    #[test]
+    fn eval_of_a_discarded_struct_value_keeps_its_read() {
+        // ldarg.0; ldobj C; pop; ldc.i4.s 100; ret
+        let mut ee = MockEe::default();
+        let class = ee.add_class(16, 8, &[], None);
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::Ptr],
+            has_this: false,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        let info = crate::pipeline::MethodInfo {
+            ftn: rokajit_ee::handles::MethodHandle::from_raw(1usize as ffi::CORINFO_METHOD_HANDLE)
+                .unwrap(),
+            il: vec![0x02, 0x71, 0x04, 0x00, 0x00, 0x02, 0x26, 0x1F, 0x64, 0x2A],
+            max_stack: 8,
+            eh_count: 0,
+            init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
+            args: ee.make_method_sig(&entry),
+            locals: ee.make_locals_sig_with_classes(&[], &[]),
+        };
+        ee.class_tokens.insert(0x0200_0004, class);
+        let m = crate::import::import(&info, &ee).expect("imports");
+        let l = lower(m, &MockTarget).expect("lowers");
+        assert!(
+            l.blocks[0]
+                .stmts
+                .iter()
+                .any(|st| matches!(st.kind, lir::StmtKind::BlockCopy { .. })),
+            "the discarded struct value is still read (a BlockCopy)"
+        );
+    }
+
+    /// The freeze rule (step_11.13): `arg0 ^ f()` — the call can write
+    /// the arg through an escaped byref, so the arg's read is a Copy
+    /// BEFORE the call statement; without the rule the Binary read it
+    /// after (the Interlocked.Exchange repro). A local/local pair keeps
+    /// the un-frozen shape (no effect to cross).
+    #[test]
+    fn a_local_operand_freezes_before_a_sibling_call() {
+        let f = MethodHandle::from_raw(0x9999 as ffi::CORINFO_METHOD_HANDLE).unwrap();
+        let call = hir::Expr::Call {
+            target: crate::ir::CallTarget::Direct(f),
+            sig: CallSig {
+                ret: Type::Int32,
+                args: vec![],
+                has_this: false,
+            },
+            args: vec![],
+        };
+        let m = method_with(block(
+            0,
+            vec![],
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Binary {
+                    op: BinaryOp::Xor,
+                    lhs: Box::new(hir::Expr::Local(LocalId(0))),
+                    rhs: Box::new(call),
+                }),
+            },
+        ));
+        let m = lower_ok(m);
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 4, "copy, call, binary, return");
+        assert!(
+            matches!(
+                &stmts[0].kind,
+                lir::StmtKind::Copy {
+                    src: lir::Operand::Local(id),
+                    ..
+                } if *id == LocalId(0)
+            ),
+            "the arg's read materializes before the call"
+        );
+        assert!(matches!(&stmts[1].kind, lir::StmtKind::Call { .. }));
+        let lir::StmtKind::Binary { lhs, .. } = &stmts[2].kind else {
+            panic!("the xor")
+        };
+        assert!(
+            matches!(lhs, lir::Operand::Temp(_)),
+            "reads the frozen temp"
+        );
+
+        // No effect anywhere: the plain shape is unchanged.
+        let m = method_with(block(
+            0,
+            vec![],
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Binary {
+                    op: BinaryOp::Xor,
+                    lhs: Box::new(hir::Expr::Local(LocalId(0))),
+                    rhs: Box::new(hir::Expr::Local(LocalId(0))),
+                }),
+            },
+        ));
+        let m = lower_ok(m);
+        assert!(
+            m.blocks[0]
+                .stmts
+                .iter()
+                .all(|s| !matches!(s.kind, lir::StmtKind::Copy { .. })),
+            "no freeze without an effect"
+        );
     }
 
     #[test]

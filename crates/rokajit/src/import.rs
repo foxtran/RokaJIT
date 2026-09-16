@@ -54,8 +54,12 @@
 //! exception object ([`hir::Expr::CatchArg`]), and a `leave` that crosses
 //! finally handlers becomes a chain of step blocks ending in
 //! [`hir::Terminator::CallFinally`] hops. `rethrow` (catch handlers only)
-//! is a `CORINFO_HELP_RETHROW` helper call; filter and fault clauses and
-//! `endfilter` stay Unsupported. The step_10.10 pack adds
+//! is a `CORINFO_HELP_RETHROW` helper call. Step_11.11 adds filter and
+//! fault clauses with `endfilter`, and a typed catch whose clause type
+//! needs a runtime lookup (shared generic code) converts to a
+//! synthesized one-block filter funclet — CatchArg spill, runtime lookup
+//! of the clause type, `CORINFO_HELP_ISINSTANCEOF_EXCEPTION`, EndFilter
+//! (RyuJIT's fgCreateFiltersForGenericExceptions, jiteh.cpp:2596). The step_10.10 pack adds
 //! `ldtoken` (the token's raw handle embedded via `embed_generic_handle`
 //! — IAT_VALUE only — and converted to the RuntimeTypeHandle/
 //! RuntimeMethodHandle/RuntimeFieldHandle struct through the
@@ -139,6 +143,20 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         return Err(CompileError::BadIl("empty IL stream"));
     }
     check_call_conv(info.args.callConv)?;
+    // Synchronized methods ([MethodImpl(Synchronized)]): RyuJIT wraps the
+    // body in Monitor.Enter + a Monitor.Exit finally
+    // (fgAddSyncMethodEnterExit). Compiling the body without the lock is
+    // silently wrong (the synchronized.cs failure shape), so it's a named
+    // gate — the feature is the EH-wrapping step's, not an approximation
+    // here.
+    if ee
+        .get_method_attribs(info.ftn)
+        .contains(MethodAttribs::SYNCH)
+    {
+        return Err(CompileError::Unsupported(
+            "synchronized methods (Monitor enter/exit wrapping)",
+        ));
+    }
 
     // The locals table: IL args (with `this` first when present), then the
     // IL locals from the locals signature. The importer appends its own
@@ -204,8 +222,14 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
     } else {
         None
     };
+    // The narrow-cell table: IL arg/local slots whose metadata type is
+    // narrower than Int32, indexed by LocalId (Natural everywhere else —
+    // this/retbuf/context slots and, by bounds, importer temps).
+    let mut narrow_access = vec![MemAccess::Natural; local_types.len()];
+    narrow_access.extend(sig_arg_accesses(&info.args, ee)?);
     local_types.extend(sig_arg_types(&info.args, ee, &mut struct_layouts)?);
     let num_args = local_types.len() as u32;
+    narrow_access.extend(sig_arg_accesses(&info.locals, ee)?);
     local_types.extend(sig_arg_types(&info.locals, ee, &mut struct_layouts)?);
     let num_il_locals = local_types.len() as u32 - num_args;
 
@@ -220,12 +244,20 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         .collect();
     // Entries the VM enters with the throwable in rdi (the CatchArg
     // mechanism): catch handler entries (incl. a filter clause's
-    // handler — an ordinary catch from the VM's side) and filter region
-    // entries (CallEHFilterFunclet's identical contract,
+    // handler — an ordinary catch from the VM's side — and a synthesized
+    // generic-catch filter's handler) and filter region entries
+    // (CallEHFilterFunclet's identical contract,
     // asmhelpers.S:410-430).
     let mut catch_entries: BTreeSet<u32> = clauses
         .iter()
-        .filter(|c| matches!(c.kind, ClauseKind::Catch { .. } | ClauseKind::Filter { .. }))
+        .filter(|c| {
+            matches!(
+                c.kind,
+                ClauseKind::Catch { .. }
+                    | ClauseKind::Filter { .. }
+                    | ClauseKind::FilterSynthesized { .. }
+            )
+        })
         .map(|c| c.handler_start)
         .collect();
     for c in &clauses {
@@ -237,6 +269,7 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         ee,
         info,
         local_types,
+        narrow_access,
         num_args,
         num_il_locals,
         ret_ty,
@@ -260,6 +293,56 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
     // checks every edge against the target's recorded state (depth and
     // types), and `import_block` checked the entry state each block was
     // imported with (step_11.2).
+
+    // The synthesized filter funclets (RyuJIT's
+    // fgCreateFiltersForGenericExceptions, jiteh.cpp:2623-2666): one
+    // statement-less-IL block per converted clause — spill the throwable
+    // (the funclet's CatchArg, evaluated first), compute the clause type
+    // handle through the generic-context-seeded runtime lookup, and
+    // answer the ISINSTANCEOF_EXCEPTION verdict via EndFilter (the VM's
+    // CallFilterFunclet runs the handler iff rax == 1). The block joins
+    // the layout tail as its clause's filter group in `rebuild_blocks`.
+    // The statement's IL offset is the handler's start — RyuJIT gives
+    // the synthesized block the handler's debug info
+    // (filterBb->bbCodeOffs = handlerBb->bbCodeOffs); no IL map entry
+    // consumes it either way (codegen records no per-statement offsets).
+    let mut synth_filters: Vec<(usize, hir::Block)> = Vec::new();
+    for ci in 0..importer.clauses.len() {
+        let lookup = match &importer.clauses[ci].kind {
+            ClauseKind::FilterSynthesized { lookup } => *lookup,
+            _ => continue,
+        };
+        let il_offset = IlOffset(importer.clauses[ci].handler_start);
+        let exc = importer.temp(Type::Ref);
+        let type_handle = importer.runtime_lookup_expr(&lookup)?;
+        // JIT_IsInstanceOfException(typeHandle, exceptionObject) → BOOL
+        // (jithelpers.cpp:499; gtNewHelperCallNode's argument order,
+        // jiteh.cpp:2648).
+        let verdict = hir::Expr::Call {
+            target: CallTarget::Helper(CorInfoHelpFunc::ISINSTANCEOF_EXCEPTION),
+            sig: CallSig {
+                ret: Type::Int32,
+                args: vec![Type::NativeInt, Type::Ref],
+                has_this: false,
+            },
+            args: vec![type_handle, hir::Expr::Local(exc)],
+        };
+        synth_filters.push((
+            ci,
+            hir::Block {
+                // Renumbered by the layout rebuild.
+                id: BlockId(0),
+                stmts: vec![hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store {
+                        dst: exc,
+                        value: hir::Expr::CatchArg,
+                    },
+                }],
+                terminator: hir::Terminator::EndFilter { value: verdict },
+            },
+        ));
+    }
 
     let locals = importer
         .local_types
@@ -301,6 +384,7 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
             &importer.clauses,
             &importer.chains,
             &importer.block_of,
+            synth_filters,
         )?
     };
     // The per-method class-init trigger (RyuJIT's morph.cpp:50
@@ -603,6 +687,33 @@ fn sig_arg_types(
         cursor = ee.get_arg_next(arg);
     }
     Ok(types)
+}
+
+/// The per-element memory access of a signature, for the IL arg/local
+/// slots only (step_11.13): a narrow integer element reads back
+/// sign/zero-extended from the low bytes of its slot — the only shape
+/// that stays exact when the slot is mutated through a pointer alias
+/// (`stind` through `ldloca`, the Runtime_620 repro). Call-site
+/// arguments never consult this: the evaluation stack normalizes to
+/// Int32 (ECMA-335 §III.1.1.1).
+fn sig_arg_accesses(sig: &ffi::CORINFO_SIG_INFO, ee: &dyn EeInfo) -> CompileResult<Vec<MemAccess>> {
+    let mut accesses = Vec::with_capacity(sig.numArgs() as usize);
+    let mut cursor = ArgListHandle::from_raw(sig.args);
+    for _ in 0..sig.numArgs() {
+        let Some(arg) = cursor else {
+            return Err(CompileError::BadIl("sig arg list shorter than numArgs"));
+        };
+        let (ty, _) = ee.get_arg_type(sig, arg);
+        accesses.push(match ty {
+            CorInfoType::Bool | CorInfoType::UByte => MemAccess::U8,
+            CorInfoType::Byte => MemAccess::I8,
+            CorInfoType::Short => MemAccess::I16,
+            CorInfoType::Char | CorInfoType::UShort => MemAccess::U16,
+            _ => MemAccess::Natural,
+        });
+        cursor = ee.get_arg_next(arg);
+    }
+    Ok(accesses)
 }
 
 /// One decoded instruction — pass 1 output, pass 2 input.
@@ -1604,10 +1715,24 @@ struct Clause {
 }
 
 enum ClauseKind {
-    /// A typed catch; the raw mdToken from the EE, passed through to the
-    /// artifact (the VM resolves and type-tests it).
+    /// A typed catch whose clause type embeds WITHOUT a runtime lookup;
+    /// the raw mdToken from the EE, passed through to the artifact (the
+    /// VM resolves and type-tests it).
     Catch {
         class_token: u32,
+    },
+    /// A typed catch whose clause type needs a RUNTIME LOOKUP (shared
+    /// generic code — the type mentions a type variable): RyuJIT's
+    /// `fgCreateFiltersForGenericExceptions` (jiteh.cpp:2596). The VM
+    /// resolves a reported ClassToken with the canonical context, which
+    /// an exact-instantiation thrown object never matches, so the clause
+    /// converts to a FILTER clause whose one-block filter funclet the
+    /// importer synthesizes (CatchArg spill, the runtime lookup of the
+    /// clause type, `CORINFO_HELP_ISINSTANCEOF_EXCEPTION`, EndFilter).
+    /// `lookup` is the EE's `embed_generic_handle` answer (embed_parent
+    /// = true, the clause type's own class).
+    FilterSynthesized {
+        lookup: ffi::CORINFO_LOOKUP,
     },
     Finally,
     /// A fault handler (step_11.11): a finally that runs ONLY on the
@@ -1630,6 +1755,10 @@ enum ClauseKind {
 /// The method's EH clauses from `get_eh_info` (step_10.6; filters and
 /// faults joined in step_11.11). A FILTER clause's FilterOffset is the
 /// filter region's IL start; the region ends at the handler's start.
+/// Every typed-catch clause is probed through `resolve_token` +
+/// `embed_generic_handle` (RyuJIT's fgCreateFiltersForGenericExceptions):
+/// a clause type that needs a runtime lookup converts to
+/// [`ClauseKind::FilterSynthesized`].
 fn fetch_clauses(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<Vec<Clause>> {
     let mut clauses = Vec::with_capacity(info.eh_count as usize);
     for i in 0..info.eh_count {
@@ -1637,10 +1766,33 @@ fn fetch_clauses(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<Vec<Clause
         let flags = raw.Flags;
         // SAMETRY is a JIT→EE table flag the EE never reports here.
         let kind = match flags & !ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_SAMETRY {
-            ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_NONE => ClauseKind::Catch {
+            ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_NONE => {
                 // SAFETY: a NONE clause's union member is ClassToken.
-                class_token: unsafe { raw.__bindgen_anon_1.ClassToken },
-            },
+                let class_token = unsafe { raw.__bindgen_anon_1.ClassToken };
+                // RyuJIT's fgCreateFiltersForGenericExceptions
+                // (jiteh.cpp:2608-2621): resolve the clause type in the
+                // current method's token context and embed it; only a
+                // compile-time answer keeps the typed clause. A runtime
+                // lookup means the type mentions a type variable — the
+                // VM's canonical-context token resolution could never
+                // match the exact instantiation — so the clause converts
+                // to a synthesized filter.
+                let mut resolved = zeroed_out(|t: &mut ffi::CORINFO_RESOLVED_TOKEN| {
+                    t.tokenContext = info.ftn.as_raw() as ffi::CORINFO_CONTEXT_HANDLE;
+                    t.tokenScope = info.args.scope;
+                    t.token = class_token;
+                    t.tokenType = ffi::CorInfoTokenKind_CORINFO_TOKENKIND_Casting;
+                });
+                ee.resolve_token(&mut resolved);
+                let result = ee.embed_generic_handle(&mut resolved, true, info.ftn);
+                if result.lookup.lookupKind.needsRuntimeLookup {
+                    ClauseKind::FilterSynthesized {
+                        lookup: result.lookup,
+                    }
+                } else {
+                    ClauseKind::Catch { class_token }
+                }
+            }
             ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FINALLY => ClauseKind::Finally,
             ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FAULT => ClauseKind::Fault,
             ffi::CORINFO_EH_CLAUSE_FLAGS_CORINFO_EH_CLAUSE_FILTER => ClauseKind::Filter {
@@ -1811,7 +1963,11 @@ struct Step {
 /// its IL range lies outside every handler AND filter region) with the
 /// leave chains' step blocks spliced after their anchor blocks, then per
 /// clause the filter group (if any) and the handler group at the tail
-/// (groups in handler IL order, IL order within a group). BlockIds are
+/// (groups in handler IL order, IL order within a group). A
+/// [`ClauseKind::FilterSynthesized`] clause has no IL filter region: its
+/// filter group is the one synthesized block from `synth_filters`
+/// (keyed by clause index), placed where an IL filter's group would sit.
+/// BlockIds are
 /// renumbered to layout order, every terminator target is remapped, and
 /// the `eh_regions` table is computed over the new order.
 fn rebuild_blocks(
@@ -1820,6 +1976,7 @@ fn rebuild_blocks(
     clauses: &[Clause],
     chains: &[LeaveChain],
     block_of: &HashMap<u32, u32>,
+    synth_filters: Vec<(usize, hir::Block)>,
 ) -> CompileResult<(Vec<hir::Block>, Vec<hir::EhRegion>)> {
     let n = blocks.len();
     // Block ownership (step_10.6, generalized in 11.11): EH region
@@ -1899,48 +2056,83 @@ fn rebuild_blocks(
     // the filter group immediately before the handler group (RyuJIT's
     // interleave, flowgraph.cpp:3220-3225) — with each anchor's steps
     // spliced right after it wherever the anchor lives (innermost-
-    // exiting first).
+    // exiting first). A FilterSynthesized clause's filter group is its
+    // one synthesized block.
     enum Item {
         Orig(usize),
         Step(usize, usize),
+        /// An index into `synth_filters`.
+        Synth(usize),
     }
-    let mut seq: Vec<usize> = Vec::with_capacity(n);
+    let mut seq: Vec<Item> = Vec::with_capacity(n + synth_filters.len());
     for i in 0..n {
         if is_main(i) {
-            seq.push(i);
+            seq.push(Item::Orig(i));
         }
     }
     let mut clause_order: Vec<usize> = (0..clauses.len()).collect();
     clause_order.sort_by_key(|&c| clauses[c].handler_start);
     for &c in &clause_order {
-        if matches!(clauses[c].kind, ClauseKind::Filter { .. }) {
-            seq.extend((0..n).filter(|&i| owner_of[i] == Some(Area::Filter(c))));
+        match clauses[c].kind {
+            ClauseKind::Filter { .. } => {
+                seq.extend(
+                    (0..n)
+                        .filter(|&i| owner_of[i] == Some(Area::Filter(c)))
+                        .map(Item::Orig),
+                );
+            }
+            ClauseKind::FilterSynthesized { .. } => {
+                let si = synth_filters.iter().position(|&(ci, _)| ci == c).ok_or(
+                    CompileError::Internal("synthesized-filter clause without a filter block"),
+                )?;
+                seq.push(Item::Synth(si));
+            }
+            _ => {}
         }
-        seq.extend((0..n).filter(|&i| owner_of[i] == Some(Area::Handler(c))));
+        seq.extend(
+            (0..n)
+                .filter(|&i| owner_of[i] == Some(Area::Handler(c)))
+                .map(Item::Orig),
+        );
     }
-    let mut order: Vec<Item> = Vec::with_capacity(n + steps.len());
-    for i in seq {
-        order.push(Item::Orig(i));
-        let mut here: Vec<&Step> = steps.iter().filter(|s| s.anchor == i).collect();
-        here.sort_by_key(|s| (s.exit_span, s.chain, s.hop));
-        order.extend(here.iter().map(|s| Item::Step(s.chain, s.hop)));
+    let mut order: Vec<Item> = Vec::with_capacity(n + steps.len() + synth_filters.len());
+    for item in seq {
+        if let Item::Orig(i) = item {
+            order.push(Item::Orig(i));
+            let mut here: Vec<&Step> = steps.iter().filter(|s| s.anchor == i).collect();
+            here.sort_by_key(|s| (s.exit_span, s.chain, s.hop));
+            order.extend(here.iter().map(|s| Item::Step(s.chain, s.hop)));
+        } else {
+            order.push(item);
+        }
     }
 
-    // Renumber: originals and steps get their layout position as the id.
+    // Renumber: originals, steps, and synthesized filters get their
+    // layout position as the id.
     let mut new_id = vec![0u32; n];
     let mut step_id: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut synth_id = vec![0u32; synth_filters.len()];
     for (pos, item) in order.iter().enumerate() {
         match *item {
             Item::Orig(i) => new_id[i] = pos as u32,
             Item::Step(ch, hop) => {
                 step_id.insert((ch, hop), pos as u32);
             }
+            Item::Synth(si) => synth_id[si] = pos as u32,
         }
     }
     let remap = |id: &mut BlockId, new_id: &[u32]| *id = BlockId(new_id[id.0 as usize]);
 
     let mut out: Vec<hir::Block> = Vec::with_capacity(order.len());
     let mut blocks: Vec<Option<hir::Block>> = blocks.drain(..).map(Some).collect();
+    // Clause index → `synth_filters` slot (FilterSynthesized clauses
+    // only); the region table keys the filter range off it.
+    let mut synth_filters_pos: Vec<Option<usize>> = vec![None; clauses.len()];
+    for (si, &(ci, _)) in synth_filters.iter().enumerate() {
+        synth_filters_pos[ci] = Some(si);
+    }
+    let mut synth_filters: Vec<Option<hir::Block>> =
+        synth_filters.into_iter().map(|(_, b)| Some(b)).collect();
     for (pos, item) in order.iter().enumerate() {
         match *item {
             Item::Orig(i) => {
@@ -1998,6 +2190,14 @@ fn rebuild_blocks(
                     stmts: Vec::new(),
                     terminator,
                 });
+            }
+            // The synthesized filter block: no targets to remap (its
+            // EndFilter terminator has none, and no edge ever enters a
+            // filter — the VM calls the funclet).
+            Item::Synth(si) => {
+                let mut block = synth_filters[si].take().expect("one slot per filter");
+                block.id = BlockId(pos as u32);
+                out.push(block);
             }
         }
     }
@@ -2072,6 +2272,18 @@ fn rebuild_blocks(
                     filter_end: BlockId(filter_end),
                 }
             }
+            // The synthesized filter is its clause's one-block filter
+            // group, placed immediately before the handler group.
+            ClauseKind::FilterSynthesized { .. } => {
+                let si = synth_filters_pos[ci].ok_or(CompileError::Internal(
+                    "synthesized-filter clause without a filter block",
+                ))?;
+                let filter_start = synth_id[si];
+                hir::EhRegionKind::Filter {
+                    filter_start: BlockId(filter_start),
+                    filter_end: BlockId(filter_start + 1),
+                }
+            }
         };
         regions.push(hir::EhRegion {
             kind,
@@ -2094,6 +2306,12 @@ struct BlockImport<'a> {
     /// Types of the flat locals namespace (args, IL locals, then importer
     /// temps — grown by [`BlockImport::temp`]).
     local_types: Vec<Type>,
+    /// The narrow-cell table (step_11.13), indexed by LocalId for IL
+    /// args/locals: the sign/zero-extending memory access a read of a
+    /// sub-Int32 slot uses, so a slot mutated through a pointer alias
+    /// (`stind` via `ldloca`) reads back exactly. Natural = full width
+    /// (and, by bounds, every importer temp).
+    narrow_access: Vec<MemAccess>,
     num_args: u32,
     num_il_locals: u32,
     ret_ty: Type,
@@ -2165,6 +2383,29 @@ fn md_array_dims_class() -> ClassHandle {
 fn ptr_class_eq(a: Type, b: Type) -> bool {
     let p = |t: Type| matches!(t, Type::ByRef | Type::NativeInt);
     a == b || (p(a) && p(b))
+}
+
+/// Call-argument compatibility (the `call`/`callvirt`/`calli`/`newobj`
+/// argument lists): `ptr_class_eq` plus the coercions of RyuJIT's
+/// `impCheckImplicitArgumentCoercion` (importer.cpp:666-741) — with
+/// x64's `TYP_I_IMPL` a #define for `TYP_LONG` (vartype.h:39): a
+/// native-int slot takes any integer (the IL_STUB_InstantiatingStub
+/// shape, `ldc.i8 <context>; call nint`), a long slot takes a native
+/// int, a byref slot also takes an object reference (the
+/// ldarg.0-this;call(byref) tolerance), and an int slot takes any 64-bit
+/// integer (impImplicitIorI4Cast's widening/narrowing). Store and return
+/// boundaries keep the narrower rule (`store_compatible`).
+fn call_arg_eq(a: Type, b: Type) -> bool {
+    ptr_class_eq(a, b)
+        || matches!(
+            (a, b),
+            (Type::Int64, Type::NativeInt)
+                | (Type::NativeInt, Type::Int64)
+                | (Type::Int64, Type::Int32)
+                | (Type::NativeInt, Type::Int32)
+                | (Type::Int32, Type::NativeInt)
+                | (Type::Ref, Type::ByRef)
+        )
 }
 
 /// Store-boundary compatibility (`stloc`/`starg`/`stfld`): the pointer
@@ -2247,7 +2488,15 @@ fn must_eval(expr: &hir::Expr) -> bool {
         // Not built by the importer yet, but a cast can throw and a box
         // allocates — both observable.
         hir::Expr::Cast { .. } | hir::Expr::Box { .. } => true,
-        hir::Expr::StructVal { addr, .. } => must_eval(addr),
+        // The struct value IS a memory read (an `ldobj`/`cpobj`'s load):
+        // discarding it keeps the implicit null check (the GitHub_39823
+        // repro — RyuJIT's dead-copy `cmp byte ptr [rax], al`; our read
+        // is the block copy the value stands for, same fault). A frame
+        // or static slot address can't fault, so those stay free.
+        hir::Expr::StructVal { addr, .. } => !matches!(
+            **addr,
+            hir::Expr::LocalAddr(_) | hir::Expr::StaticFieldAddr { .. }
+        ),
         // The allocation moves rsp for the rest of the method — an effect
         // even when the address is discarded.
         hir::Expr::LocAlloc { .. } => true,
@@ -2599,9 +2848,30 @@ impl BlockImport<'_> {
 
     /// The expression a read of local `id` yields: a struct-typed slot
     /// reads as its address (`StructVal` — struct values are memory-backed,
-    /// step_10.9), everything else is the plain local read.
+    /// step_10.9), a sub-Int32 IL arg/local reads sign/zero-extended from
+    /// the low bytes of its slot (the narrow-cell rule — exact under
+    /// pointer-alias stores, step_11.13), everything else is the plain
+    /// local read.
     fn local_value_expr(&self, id: LocalId) -> (Type, hir::Expr) {
         let ty = self.local_types[id.0 as usize];
+        if ty == Type::Int32 {
+            let access = self
+                .narrow_access
+                .get(id.0 as usize)
+                .copied()
+                .unwrap_or(MemAccess::Natural);
+            if access != MemAccess::Natural {
+                return (
+                    Type::Int32,
+                    hir::Expr::Load {
+                        addr: Box::new(hir::Expr::LocalAddr(id)),
+                        offset: 0,
+                        ty: Type::Int32,
+                        access,
+                    },
+                );
+            }
+        }
         let expr = match ty {
             Type::Struct(class) => hir::Expr::StructVal {
                 addr: Box::new(hir::Expr::LocalAddr(id)),
@@ -2926,7 +3196,9 @@ impl BlockImport<'_> {
             Some(c)
                 if matches!(
                     self.clauses[c].kind,
-                    ClauseKind::Catch { .. } | ClauseKind::Filter { .. }
+                    ClauseKind::Catch { .. }
+                        | ClauseKind::Filter { .. }
+                        | ClauseKind::FilterSynthesized { .. }
                 ) => {}
             _ => return Err(CompileError::BadIl("rethrow outside a catch handler")),
         }
@@ -3522,7 +3794,10 @@ impl BlockImport<'_> {
         if !hops.is_empty() {
             let from_catch = matches!(
                 innermost_handler(&self.clauses, il_offset.0),
-                Some(c) if matches!(self.clauses[c].kind, ClauseKind::Catch { .. } | ClauseKind::Filter { .. })
+                Some(c) if matches!(self.clauses[c].kind,
+                    ClauseKind::Catch { .. }
+                        | ClauseKind::Filter { .. }
+                        | ClauseKind::FilterSynthesized { .. })
             );
             self.chains.push(LeaveChain {
                 source: b,
@@ -4058,7 +4333,7 @@ impl BlockImport<'_> {
         let mut args = Vec::with_capacity(arg_types.len() + usize::from(has_this));
         for &expected in arg_types.iter().rev() {
             let (ty, value) = self.pop()?;
-            if !ptr_class_eq(ty, expected) {
+            if !call_arg_eq(ty, expected) {
                 return Err(CompileError::BadIl("call argument type mismatch"));
             }
             args.push(value);
@@ -4981,7 +5256,7 @@ impl BlockImport<'_> {
         let mut args = Vec::with_capacity(arg_types.len() + usize::from(has_this));
         for &expected in arg_types.iter().rev() {
             let (ty, value) = self.pop()?;
-            if !ptr_class_eq(ty, expected) {
+            if !call_arg_eq(ty, expected) {
                 return Err(CompileError::BadIl("calli argument type mismatch"));
             }
             args.push(value);
@@ -6732,7 +7007,7 @@ impl BlockImport<'_> {
         let mut args = Vec::with_capacity(arg_types.len() + 1);
         for &expected in arg_types.iter().rev() {
             let (ty, value) = self.pop()?;
-            if !ptr_class_eq(ty, expected) {
+            if !call_arg_eq(ty, expected) {
                 return Err(CompileError::BadIl("call argument type mismatch"));
             }
             args.push(value);
@@ -8301,6 +8576,57 @@ mod tests {
             assert_eq!(dst, LocalId(6));
             assert_eq!(as_local(value), LocalId(5));
         }
+    }
+
+    /// The narrow-cell rule (step_11.13, Runtime_620): a sub-Int32 IL
+    /// local/arg reads back sign/zero-extended from its slot's low
+    /// bytes, so an alias store (`stind.u1` through `ldloca`) is exact.
+    #[test]
+    fn narrow_locals_and_args_read_through_their_low_bytes() {
+        // ldc.i4.0; stloc.0; ldloc.0; ret — an sbyte local: full-width
+        // store (the write side is never narrowed), I8-extending read.
+        let il = [0x16, 0x0A, 0x06, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::Byte]);
+        let m = import(&info, &ee).expect("imports");
+        let (dst, _) = store(&m.blocks[0].stmts[0]);
+        assert_eq!(dst, LocalId(0), "the store is the plain full-width store");
+        let hir::Expr::Load {
+            addr,
+            offset,
+            ty,
+            access,
+        } = return_value(&m, 0)
+        else {
+            panic!("the narrow read is a Load through the slot address")
+        };
+        assert_eq!((*offset, *ty, *access), (0, Type::Int32, MemAccess::I8));
+        assert!(
+            matches!(**addr, hir::Expr::LocalAddr(l) if l == LocalId(0)),
+            "through the local's own slot"
+        );
+
+        // A char (U2) local zero-extends; an sbyte ARG reads narrow too.
+        let il = [0x06, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[CorInfoType::Char]);
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Load { access, .. } = return_value(&m, 0) else {
+            panic!("the char read is a Load")
+        };
+        assert_eq!(*access, MemAccess::U16);
+
+        let il = [0x02, 0x2A];
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Byte]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::Load { access, .. } = return_value(&m, 0) else {
+            panic!("the sbyte arg reads narrow")
+        };
+        assert_eq!(*access, MemAccess::I8);
+
+        // An Int local stays a plain Local read (no regression to the
+        // common case).
+        let (ee, info) = fixture(&il, &sig(CorInfoType::Int, &[CorInfoType::Int]), &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(matches!(return_value(&m, 0), hir::Expr::Local(_)));
     }
 
     #[test]
@@ -10355,6 +10681,131 @@ mod tests {
             (region.handler_start, region.handler_end),
             (BlockId(2), BlockId(3))
         );
+    }
+
+    /// An EH fixture on a has-this entry signature (the generic-catch
+    /// filter synthesis seeds a THISOBJ lookup from the MethodTable of
+    /// `this`); same canned-clause shape as [`eh_fixture`].
+    fn eh_fixture_this(
+        il: &[u8],
+        locals: &[CorInfoType],
+        clauses: &[ffi::CORINFO_EH_CLAUSE],
+    ) -> (MockEe, MethodInfo) {
+        let entry = MockSig {
+            ret: CorInfoType::Void,
+            args: Vec::new(),
+            has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        let (mut ee, mut info) = fixture_full(il, &entry, locals, 8, clauses.len() as u32);
+        ee.eh_clauses = clauses.to_vec();
+        info.eh_count = clauses.len() as u32;
+        (ee, info)
+    }
+
+    #[test]
+    fn typed_catch_needing_a_runtime_lookup_becomes_a_synthesized_filter() {
+        // The try_catch shape with a clause type the EE can only answer
+        // as a runtime lookup (shared generic code —
+        // fgCreateFiltersForGenericExceptions, jiteh.cpp:2596): the
+        // clause converts to a FILTER clause whose one-block filter
+        // funclet the importer synthesizes.
+        let il = [0x00, 0xDE, 0x03, 0x0A, 0xDE, 0x00, 0x2A];
+        let (mut ee, info) = eh_fixture_this(
+            &il,
+            &[CorInfoType::Class],
+            &[catch_clause(0, 3, 3, 3, 0x0200_0042)],
+        );
+        // A THISOBJ-seeded deref chain (offsets {0x18, 0x10}, two
+        // indirections): the clause type handle comes out of the
+        // dictionary on the MethodTable of `this`.
+        let mut lookup = canned_lookup(false);
+        lookup.lookupKind.runtimeLookupKind =
+            ffi::CORINFO_RUNTIME_LOOKUP_KIND_CORINFO_LOOKUP_THISOBJ;
+        ee.embed_lookup = Some(lookup);
+        let m = import(&info, &ee).expect("imports");
+        // Layout: [b0 (try), b1 (ret), F (synthesized filter), H
+        // (handler)] — the filter group immediately before its handler
+        // group, exactly an IL filter's interleave.
+        assert_eq!(m.blocks.len(), 4);
+        assert_eq!(as_leave(&m.blocks[0].terminator), BlockId(1));
+        let filter = &m.blocks[2];
+        // The CatchArg spill comes first (RyuJIT: "it should be the
+        // first thing evaluated"), tagged with the handler's IL offset.
+        assert_eq!(filter.stmts.len(), 1);
+        let (dst, value) = store(&filter.stmts[0]);
+        assert!(matches!(value, hir::Expr::CatchArg));
+        assert_eq!(m.locals[dst.0 as usize].ty, Type::Ref);
+        assert_eq!(filter.stmts[0].il_offset, IlOffset(3));
+        // The verdict: ISINSTANCEOF_EXCEPTION(typeHandle, catchArg) —
+        // the type handle via the runtime lookup chain off the
+        // MethodTable of `this` — answered via EndFilter.
+        let hir::Terminator::EndFilter { value } = &filter.terminator else {
+            panic!("expected Terminator::EndFilter")
+        };
+        let hir::Expr::Call { target, sig, args } = value else {
+            panic!("expected the ISINSTANCEOF_EXCEPTION call")
+        };
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::ISINSTANCEOF_EXCEPTION)
+        );
+        assert_eq!(sig.ret, Type::Int32);
+        assert_eq!(sig.args, [Type::NativeInt, Type::Ref]);
+        assert!(!sig.has_this);
+        assert_eq!(as_local(&args[1]), dst, "the spilled throwable");
+        let (op1, base1, off1) = as_binary(as_load(&args[0]));
+        assert_eq!(op1, BinaryOp::Add);
+        assert_eq!(as_isize(off1), 0x10);
+        let (op0, base0, off0) = as_binary(as_load(base1));
+        assert_eq!(op0, BinaryOp::Add);
+        assert_eq!(as_isize(off0), 0x18);
+        assert_eq!(as_local(as_load(base0)), LocalId(0), "the MethodTable load");
+        // The handler stays an ordinary catch (its own CatchArg store).
+        let handler = &m.blocks[3];
+        let (_, value) = store(&handler.stmts[0]);
+        assert!(matches!(value, hir::Expr::CatchArg));
+        assert_eq!(as_leave(&handler.terminator), BlockId(1));
+        // The region reports as a FILTER clause: the synthesized block
+        // is the one-block filter range.
+        assert_eq!(m.eh_regions.len(), 1);
+        let region = &m.eh_regions[0];
+        match region.kind {
+            hir::EhRegionKind::Filter {
+                filter_start,
+                filter_end,
+            } => {
+                assert_eq!((filter_start, filter_end), (BlockId(2), BlockId(3)));
+            }
+            _ => panic!("expected a Filter region"),
+        }
+        assert_eq!((region.try_start, region.try_end), (BlockId(0), BlockId(1)));
+        assert_eq!(
+            (region.handler_start, region.handler_end),
+            (BlockId(3), BlockId(4))
+        );
+    }
+
+    #[test]
+    fn typed_catch_with_a_compile_time_embed_stays_typed() {
+        // The decision fires ONLY on needsRuntimeLookup: a compile-time
+        // embed answer (here the IAT_PVALUE indirection form) keeps the
+        // typed clause with its raw mdToken passthrough.
+        let il = [0x00, 0xDE, 0x03, 0x0A, 0xDE, 0x00, 0x2A];
+        let (mut ee, info) = eh_fixture(
+            &il,
+            &[CorInfoType::Class],
+            &[catch_clause(0, 3, 3, 3, 0x0200_0042)],
+        );
+        ee.embed_indirection = true;
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(m.blocks.len(), 3);
+        assert!(matches!(
+            m.eh_regions[0].kind,
+            hir::EhRegionKind::Catch {
+                class_token: 0x0200_0042
+            }
+        ));
     }
 
     #[test]
@@ -12825,6 +13276,36 @@ mod tests {
         let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
         ee.add_calli_sig(0x1100_0001, sig(CorInfoType::Int, &[CorInfoType::Int]));
         assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    /// The RyuJIT coercion table (step_11.13, the GitHub_16377 repro):
+    /// the instantiating stub's `ldc.i8 <context>; call <nint>` imports
+    /// (x64's TYP_I_IMPL ≡ TYP_LONG), as does an object reference into a
+    /// byref slot (the ldarg.0-this tolerance).
+    #[test]
+    fn call_args_follow_ryujits_coercion_table() {
+        // ldc.i8 0x12345678; call void M(nint); ldc.i4.0; ret
+        let il = [
+            0x21, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0x28, 0x04, 0x00, 0x00, 0x06,
+            0x16, 0x2A,
+        ];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_method(CTOR_TOKEN, sig(CorInfoType::Void, &[CorInfoType::Ptr]));
+        import(&info, &ee).expect("ldc.i8 into a native-int arg imports");
+
+        // ldarg.0 (a Ref); call void M(&) — the this-into-byref
+        // tolerance (importer.cpp:701-708).
+        let il = [0x02, 0x28, 0x04, 0x00, 0x00, 0x06, 0x16, 0x2A];
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::Int],
+            has_this: true,
+            ret_class: None,
+            arg_classes: Vec::new(),
+        };
+        let (mut ee, info) = fixture(&il, &entry, &[]);
+        ee.add_method(CTOR_TOKEN, sig(CorInfoType::Void, &[CorInfoType::ByRef]));
+        import(&info, &ee).expect("a Ref argument into a byref slot imports");
     }
 
     /// An unmanaged-calli fixture (step_11.12): `ldc.i4.0; conv.i; calli;
