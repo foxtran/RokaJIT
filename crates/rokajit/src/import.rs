@@ -117,8 +117,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use rokajit_ee::ee_info::{zeroed_out, EeInfo};
 use rokajit_ee::enums::{
-    CallInfoFlags, ClassAttribs, CorInfoClassId, CorInfoHelpFunc, CorInfoInitClassResult,
-    CorInfoType, InfoAccessType, MethodAttribs,
+    CallInfoFlags, ClassAttribs, CorInfoCallConvExtension, CorInfoClassId, CorInfoHelpFunc,
+    CorInfoInitClassResult, CorInfoType, InfoAccessType, MethodAttribs,
 };
 use rokajit_ee::handles::{
     ArgListHandle, ClassHandle, ContextHandle, FieldHandle, MethodHandle, ModuleHandle,
@@ -545,6 +545,42 @@ fn check_no_generics_call_conv(call_conv: ffi::CorInfoCallConv) -> CompileResult
         ));
     }
     Ok(())
+}
+
+/// The `calli` unmanaged-callconv validation (step_11.12; RyuJIT's
+/// `impCheckForPInvokeCall` with a null `methHnd`,
+/// importercalls.cpp:7655-7681). The EE's `getUnmanagedCallConv` answers
+/// the actual extension; on x64-Unix every accepted extension lowers to
+/// the SysV AMD64 ABI — identical to the managed call lowering, so
+/// acceptance is validation only. The rejections are named for the
+/// triage buckets: Swift (x64-Unix-relevant), Managed (the sig's
+/// callconv bits said unmanaged but the EE disagrees — investigate
+/// before accepting), and the vararg shapes (`al` = vector-register
+/// count and more — deferred).
+fn check_unmanaged_calli(ee: &dyn EeInfo, sig: &ffi::CORINFO_SIG_INFO) -> CompileResult<()> {
+    // suppressGCTransition (the out-param) is only meaningful for the
+    // inline-P/Invoke optimization we do not do: the marshaling stub
+    // owns the GC transition, and the emitted call is identical either
+    // way.
+    let (ext, _suppress_gc_transition) = ee.get_unmanaged_call_conv(None, Some(sig));
+    match ext {
+        CorInfoCallConvExtension::Thiscall if sig.numArgs() == 0 => {
+            Err(CompileError::BadIl("thiscall with no arguments"))
+        }
+        CorInfoCallConvExtension::C
+        | CorInfoCallConvExtension::Stdcall
+        | CorInfoCallConvExtension::Thiscall
+        | CorInfoCallConvExtension::Fastcall
+        | CorInfoCallConvExtension::CMemberFunction
+        | CorInfoCallConvExtension::StdcallMemberFunction
+        | CorInfoCallConvExtension::FastcallMemberFunction => Ok(()),
+        CorInfoCallConvExtension::Swift => Err(CompileError::Unsupported(
+            "unmanaged calli with the Swift calling convention",
+        )),
+        CorInfoCallConvExtension::Managed => Err(CompileError::Unsupported(
+            "unmanaged-callconv calli the EE answers Managed for",
+        )),
+    }
 }
 
 /// Walks a signature's argument list, bounded by `numArgs` (see the module
@@ -4896,7 +4932,35 @@ impl BlockImport<'_> {
             token,
             Some(ContextHandle::from_method(self.info.ftn)),
         );
-        check_call_conv(sig.callConv)?;
+        // The callconv gate (step_11.12): a managed calli carries
+        // DEFAULT; an unmanaged one (the P/Invoke marshaling stub's
+        // TOKEN_ILSTUB_TARGET_SIG dispatch, a `delegate* unmanaged`
+        // callsite) carries CORINFO_CALLCONV_UNMANAGED (0x9) or a legacy
+        // flavor nibble (0x1..=0x4 — C/Stdcall/Thiscall/Fastcall,
+        // commented out of corinfo.h:647-651 in favor of the extension
+        // enum but still what the stub's dispatch blob carries). Both go
+        // through the EE's extension answer; the vararg shapes and the
+        // non-callable nibbles (FIELD/LOCAL_SIG/PROPERTY/GENERICINST)
+        // stay named rejections.
+        match sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_MASK {
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT => {}
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED | 0x1..=0x4 => {
+                check_unmanaged_calli(self.ee, &sig)?;
+            }
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_VARARG => {
+                return Err(CompileError::Unsupported("managed-vararg calli"));
+            }
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_NATIVEVARARG => {
+                return Err(CompileError::Unsupported(
+                    "native-vararg calli (IL-stub vararg P/Invoke)",
+                ));
+            }
+            _ => {
+                return Err(CompileError::BadIl(
+                    "calli with a non-callable sig callconv nibble",
+                ));
+            }
+        }
         // A callsite sig never carries the generics bits for a supported
         // calli; PARAMTYPE would need the hidden context argument.
         check_no_generics_call_conv(sig.callConv)?;
@@ -12761,6 +12825,101 @@ mod tests {
         let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
         ee.add_calli_sig(0x1100_0001, sig(CorInfoType::Int, &[CorInfoType::Int]));
         assert!(matches!(import(&info, &ee), Err(CompileError::BadIl(_))));
+    }
+
+    /// An unmanaged-calli fixture (step_11.12): `ldc.i4.0; conv.i; calli;
+    /// ret` with the canned sig `int()` under the given low-nibble
+    /// callConv and EE extension answer.
+    fn unmanaged_calli_fixture(
+        call_conv: ffi::CorInfoCallConv,
+        ext: Option<(CorInfoCallConvExtension, bool)>,
+    ) -> (MockEe, MethodInfo) {
+        // ldc.i4.0; conv.i; calli 0x11000001; ret
+        let il = [0x16, 0xD3, 0x29, 0x01, 0x00, 0x00, 0x11, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_calli_sig(0x1100_0001, sig(CorInfoType::Int, &[]));
+        ee.calli_sig_convs.insert(0x1100_0001, call_conv);
+        ee.unmanaged_call_conv = ext;
+        (ee, info)
+    }
+
+    #[test]
+    fn calli_with_an_unmanaged_sig_calls_indirect_like_any_calli() {
+        // The P/Invoke IL-stub dispatch shape (phase 0's finding): the
+        // sig carries the legacy 0x1 (C) nibble and the EE answers C —
+        // on x64-Unix that lowers through the ordinary SysV indirect
+        // call, GC safepoint included (the pinned call_reg byte test).
+        for call_conv in [
+            0x1, // CORINFO_CALLCONV_C (legacy, corinfo.h:647-651)
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED,
+        ] {
+            let (ee, info) =
+                unmanaged_calli_fixture(call_conv, Some((CorInfoCallConvExtension::C, false)));
+            let m = import(&info, &ee).expect("unmanaged calli imports");
+            let hir::Expr::Call { target, sig, .. } = return_value(&m, 0) else {
+                panic!("expected Expr::Call")
+            };
+            assert!(
+                matches!(target, CallTarget::Indirect(_)),
+                "an ordinary indirect call"
+            );
+            assert_eq!(sig.ret, Type::Int32);
+            assert!(sig.args.is_empty());
+        }
+    }
+
+    #[test]
+    fn calli_unmanaged_thiscall_without_arguments_is_bad_il() {
+        // importercalls.cpp:7678-7681's BADCODE.
+        let (ee, info) = unmanaged_calli_fixture(
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED,
+            Some((CorInfoCallConvExtension::Thiscall, false)),
+        );
+        let err = import(&info, &ee).err().expect("thiscall without args");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("thiscall")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn calli_unmanaged_swift_and_managed_are_named_gates() {
+        let (ee, info) = unmanaged_calli_fixture(
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED,
+            Some((CorInfoCallConvExtension::Swift, false)),
+        );
+        let err = import(&info, &ee).err().expect("Swift gates");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("Swift")),
+            "{err:?}"
+        );
+        // The EE answering Managed for an unmanaged-flagged sig: the sig
+        // lied — a named marker, not a silent accept.
+        let (ee, info) =
+            unmanaged_calli_fixture(ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED, None);
+        let err = import(&info, &ee).err().expect("the Managed answer gates");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("Managed")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn calli_vararg_shapes_are_named_gates() {
+        let (ee, info) =
+            unmanaged_calli_fixture(ffi::CorInfoCallConv_CORINFO_CALLCONV_NATIVEVARARG, None);
+        let err = import(&info, &ee).err().expect("native vararg gates");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("native-vararg")),
+            "{err:?}"
+        );
+        let (ee, info) =
+            unmanaged_calli_fixture(ffi::CorInfoCallConv_CORINFO_CALLCONV_VARARG, None);
+        let err = import(&info, &ee).err().expect("managed vararg gates");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("managed-vararg")),
+            "{err:?}"
+        );
     }
 
     #[test]

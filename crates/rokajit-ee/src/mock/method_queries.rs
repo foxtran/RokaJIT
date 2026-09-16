@@ -150,7 +150,8 @@ impl MethodQueries for MockEe {
         _method: Option<MethodHandle>,
         _call_site_sig: Option<&ffi::CORINFO_SIG_INFO>,
     ) -> (CorInfoCallConvExtension, bool) {
-        (CorInfoCallConvExtension::Managed, false)
+        self.unmanaged_call_conv
+            .unwrap_or((CorInfoCallConvExtension::Managed, false))
     }
 
     fn p_invoke_marshaling_required(

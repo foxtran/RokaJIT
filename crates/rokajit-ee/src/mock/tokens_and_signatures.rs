@@ -47,6 +47,10 @@ impl TokensAndSignatures for MockEe {
             } else {
                 ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT
             };
+            let call_conv = self
+                .calli_sig_convs
+                .get(&sig_tok)
+                .map_or(call_conv, |&conv| call_conv | conv);
             return self.build_sig_info(call_conv, sig.ret, sig.ret_class, *arg_list);
         }
         unsafe { std::mem::zeroed() }

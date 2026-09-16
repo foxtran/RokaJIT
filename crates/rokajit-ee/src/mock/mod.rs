@@ -159,6 +159,13 @@ pub struct MockEe {
     /// (step_10.12), registered via [`MockEe::add_calli_sig`]: the
     /// signature body and its arg-list table index.
     calli_sigs: HashMap<u32, (MockSig, usize)>,
+    /// Low-nibble callConv overrides for `calli` callsite sigs (step_11.12:
+    /// the unmanaged flavors), keyed like `calli_sigs`; absent tokens keep
+    /// the DEFAULT/HASTHIS shape derived from the sig.
+    pub calli_sig_convs: HashMap<u32, ffi::CorInfoCallConv>,
+    /// The canned `get_unmanaged_call_conv` answer (step_11.12); `None`
+    /// cans `(Managed, false)` — the EE's "this sig is not unmanaged".
+    pub unmanaged_call_conv: Option<(CorInfoCallConvExtension, bool)>,
     /// The flags each `get_call_info` call arrived with, in order
     /// (step_10.4 tests: `call` passes EMPTY, `callvirt` CALLVIRT).
     pub call_info_flags: RefCell<Vec<CallInfoFlags>>,
