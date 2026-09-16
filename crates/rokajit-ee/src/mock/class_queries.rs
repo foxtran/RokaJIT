@@ -275,7 +275,7 @@ impl ClassQueries for MockEe {
     }
 
     fn get_array_rank(&self, _cls: ClassHandle) -> u32 {
-        0
+        self.array_rank
     }
 
     fn get_array_intrinsic_id(&self, _ftn: MethodHandle) -> CorInfoArrayIntrinsic {

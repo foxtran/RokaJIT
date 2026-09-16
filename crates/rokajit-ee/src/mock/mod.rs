@@ -172,6 +172,10 @@ pub struct MockEe {
     /// (step_10.8's non-SZ-array gate); the default answers the happy
     /// path — every class is an SZ array.
     pub non_sd_arrays: std::collections::HashSet<usize>,
+    /// The canned `get_array_rank` answer (the newobj MD-array branch
+    /// picks `NEW_MDARR_RARE` on rank 1, `NEW_MDARR` otherwise); the
+    /// default 0 answers an ordinary multi-dimensional array.
+    pub array_rank: u32,
     /// The canned `init_class` verdict (step_10.4). `EMPTY` is
     /// `CORINFO_INITCLASS_NOT_REQUIRED` (bit value 0) — the default.
     pub init_class_result: CorInfoInitClassResult,

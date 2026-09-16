@@ -131,7 +131,7 @@ use crate::ir::{
     IlOffset, LocalId, MemAccess, Type, UnaryOp,
 };
 use crate::pipeline::MethodInfo;
-use crate::structs::{layout_of, StructLayouts};
+use crate::structs::{layout_of, StructLayout, StructLayouts, SysVPass};
 
 /// Stage entry point (the body of [`crate::pipeline::import`]).
 pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> {
@@ -2114,6 +2114,18 @@ fn binary(op: BinaryOp, lhs: hir::Expr, rhs: hir::Expr) -> hir::Expr {
 /// (unverifiable but valid IL — RyuJIT checks size compatibility, e.g.
 /// passing a `ref` to a `void*` parameter in `new Span<byte>(ptr, len)`):
 /// a byref and a native int are the same 8-byte slot.
+/// The `struct_layouts` key for the MD-array dims scratch block
+/// ([`BlockImport::newobj_md_array`]) — a sentinel, not an EE class: the
+/// EE never sees it (no query is ever issued against it), and the
+/// address of a RokaJIT-owned static cannot collide with a
+/// `CORINFO_CLASS_HANDLE` (an EE heap pointer). RyuJIT's
+/// `lvaNewObjArrayArgs` likewise has no metadata class.
+fn md_array_dims_class() -> ClassHandle {
+    static SENTINEL: u8 = 0;
+    ClassHandle::from_raw(&SENTINEL as *const u8 as ffi::CORINFO_CLASS_HANDLE)
+        .expect("a static's address is non-null")
+}
+
 fn ptr_class_eq(a: Type, b: Type) -> bool {
     let p = |t: Type| matches!(t, Type::ByRef | Type::NativeInt);
     a == b || (p(a) && p(b))
@@ -4682,10 +4694,11 @@ impl BlockImport<'_> {
     }
 
     /// A `CORINFO_LOOKUP` as an HIR expr (step_11.3B): RyuJIT's
-    /// `impRuntimeLookupToTree` (importer.cpp:1599-1690). The seed is
-    /// `this` for CORINFO_LOOKUP_THISOBJ, our own hidden context
-    /// argument for METHODPARAM/CLASSPARAM (a method with neither is an
-    /// EE contract violation — the lookup cannot be seeded).
+    /// `impRuntimeLookupToTree` (importer.cpp:1599-1690). The seed is the
+    /// MethodTable pointer of `this` for CORINFO_LOOKUP_THISOBJ
+    /// (gtNewMethodTableLookup, importer.cpp:1565-1566), our own hidden
+    /// context argument for METHODPARAM/CLASSPARAM (a method with neither
+    /// is an EE contract violation — the lookup cannot be seeded).
     /// `!needsRuntimeLookup` answers take the ordinary const-lookup
     /// consumption ([`const_lookup_expr`]).
     ///
@@ -4710,7 +4723,16 @@ impl BlockImport<'_> {
                         "THISOBJ runtime lookup in a method without `this`",
                     ));
                 }
-                hir::Expr::Local(LocalId(0))
+                // The seed is the MethodTable pointer of `this`
+                // (RyuJIT's gtNewMethodTableLookup, importer.cpp:1565-1566)
+                // — the offsets the EE hands out are relative to it, not
+                // to the object reference.
+                hir::Expr::Load {
+                    addr: Box::new(hir::Expr::Local(LocalId(0))),
+                    offset: 0,
+                    ty: Type::NativeInt,
+                    access: MemAccess::Natural,
+                }
             }
             ffi::CORINFO_RUNTIME_LOOKUP_KIND_CORINFO_LOOKUP_METHODPARAM
             | ffi::CORINFO_RUNTIME_LOOKUP_KIND_CORINFO_LOOKUP_CLASSPARAM => {
@@ -6633,6 +6655,16 @@ impl BlockImport<'_> {
             return Err(CompileError::BadIl("a constructor must return void"));
         }
         let arg_types = sig_arg_types(&call.sig, self.ee, &mut self.struct_layouts)?;
+        // `newobj` of an array class (importer.cpp:9042-9055's array
+        // branch, `impImportNewObjArray`): arrays carry VAROBJSIZE
+        // (HasComponentSize — jitinterface.cpp getClassAttribs), but the
+        // String redirect below does NOT apply — the array methods the
+        // EE fakes up (.ctor/Get/Set/Address) have no entry point to
+        // call. Multi-dimensional (and rank-1 non-SZ) construction is the
+        // `NEW_MDARR` helper, whose return is the pushed value.
+        if attribs.contains(ClassAttribs::ARRAY) {
+            return self.newobj_md_array(class, &arg_types, class_const(), stmts, il_offset);
+        }
         let mut args = Vec::with_capacity(arg_types.len() + 1);
         for &expected in arg_types.iter().rev() {
             let (ty, value) = self.pop()?;
@@ -6750,6 +6782,107 @@ impl BlockImport<'_> {
             }),
         });
         self.push(result_ty, result)
+    }
+
+    /// The `newobj`-of-an-array-class helper call
+    /// (`impImportNewObjArray`, importer.cpp:3819-3883): pop the int32
+    /// dimensions, stage them in a frame-resident scratch block
+    /// (RyuJIT's `lvaNewObjArrayArgs`), and push the
+    /// `NEW_MDARR(array MethodTable*, numArgs, int32* dims)` result —
+    /// the helper allocates, zero-initializes, and returns the array.
+    /// `NEW_MDARR_RARE` serves rank-1 non-SZ arrays
+    /// (importer.cpp:3872-3873). The class handle is the generic-handle
+    /// embed the caller already computed (a shared body's runtime
+    /// lookup, not the canonical representative).
+    fn newobj_md_array(
+        &mut self,
+        class: ClassHandle,
+        arg_types: &[Type],
+        class_expr: hir::Expr,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let num_args = u32::try_from(arg_types.len())
+            .map_err(|_| CompileError::Internal("an MD-array rank that overflows u32"))?;
+        if num_args == 0 {
+            return Err(CompileError::Internal("an array .ctor with no dimensions"));
+        }
+        // The dims block: a Struct temp whose class is a sentinel the EE
+        // never sees — the layout side table answers every question
+        // (the block is only ever addressed, never moved by value). One
+        // layout per method, grown to the widest rank the method
+        // constructs (importer.cpp:3843's regrow).
+        let size = 4 * num_args;
+        let dims_class = md_array_dims_class();
+        let layout = self
+            .struct_layouts
+            .entry(dims_class)
+            .or_insert_with(|| StructLayout {
+                size,
+                align: 4,
+                gc_cells: Vec::new(),
+                sysv: SysVPass::memory(),
+            });
+        if layout.size < size {
+            layout.size = size;
+        }
+        let dims = self.temp(Type::Struct(dims_class));
+        // The caller spilled the stack before the allocation side
+        // effects, so the popped trees are cheap and store order is
+        // free; dimension i lands at byte offset 4*i
+        // (importer.cpp:3865-3870).
+        let mut dim_values = Vec::with_capacity(arg_types.len());
+        for _ in arg_types {
+            dim_values.push(self.pop()?);
+        }
+        for (i, (ty, value)) in dim_values.into_iter().rev().enumerate() {
+            // RyuJIT's impImplicitIorI4Cast: any integer dimension
+            // narrows to int32 (a long/native-int dimension wraps).
+            let value = match ty {
+                Type::Int32 => value,
+                Type::Int64 | Type::NativeInt => hir::Expr::Conv {
+                    to: Type::Int32,
+                    overflow: false,
+                    unsigned: false,
+                    arg: Box::new(value),
+                },
+                _ => {
+                    return Err(CompileError::BadIl(
+                        "an MD-array dimension must be an integer",
+                    ))
+                }
+            };
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::StoreInd {
+                    addr: hir::Expr::LocalAddr(dims),
+                    offset: 4 * i as u32,
+                    value,
+                    access: MemAccess::Natural,
+                },
+            });
+        }
+        let helper = if self.ee.get_array_rank(class) == 1 {
+            CorInfoHelpFunc::NEW_MDARR_RARE
+        } else {
+            CorInfoHelpFunc::NEW_MDARR
+        };
+        self.push(
+            Type::Ref,
+            hir::Expr::Call {
+                target: CallTarget::Helper(helper),
+                sig: CallSig {
+                    ret: Type::Ref,
+                    args: vec![Type::NativeInt, Type::Int32, Type::NativeInt],
+                    has_this: false,
+                },
+                args: vec![
+                    class_expr,
+                    hir::Expr::Const(Const::Int32(num_args as i32)),
+                    hir::Expr::LocalAddr(dims),
+                ],
+            },
+        )
     }
 
     /// Resolves a class metadata token for the box/cast opcodes. `kind`
@@ -9307,6 +9440,170 @@ mod tests {
         assert_eq!(sig.ret, Type::Ref, "its return is the object");
         assert_eq!(args.len(), 1);
         assert_eq!(as_i32(&args[0]), 42);
+    }
+
+    /// The canned newobj-of-an-array-class setup: `class_attribs` answers
+    /// ARRAY | VAROBJSIZE (jitinterface.cpp getClassAttribs: IsArray plus
+    /// HasComponentSize) and the token resolves to a fake array .ctor.
+    fn md_array_ee(ctor_token: u32, dims: u32) -> (MockEe, ClassHandle) {
+        let (mut ee, c) = struct_ee(0, &[], None);
+        ee.class_attribs = ClassAttribs::ARRAY | ClassAttribs::VAROBJSIZE;
+        ee.add_method(
+            ctor_token,
+            MockSig {
+                ret: CorInfoType::Void,
+                args: vec![CorInfoType::Int; dims as usize],
+                has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
+            },
+        );
+        ee.class_tokens.insert(ctor_token, c);
+        (ee, c)
+    }
+
+    fn as_store_ind(stmt: &hir::Stmt) -> (&hir::Expr, u32, &hir::Expr) {
+        match &stmt.kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset,
+                value,
+                ..
+            } => (addr, *offset, value),
+            _ => panic!("expected StmtKind::StoreInd"),
+        }
+    }
+
+    #[test]
+    fn newobj_of_an_md_array_is_the_new_mdarr_helper() {
+        // ldc.i4.s 2; ldc.i4.s 16; newobj string[0...,0...]::.ctor — the
+        // ConsolePal..cctor shape (`new string[2,16]`): no allocation, no
+        // .ctor call; the dims stage into the scratch block and the
+        // NEW_MDARR helper's return is the pushed value.
+        let (mut ee, _c) = md_array_ee(CTOR_TOKEN, 2);
+        let entry = sig(CorInfoType::Class, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x1F, 0x02, 0x1F, 0x10, 0x73, 0x04, 0x00, 0x00, 0x06, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("MD-array newobj imports");
+        // Two dims stores, in IL push order: dim0 (=2) at offset 0,
+        // dim1 (=16) at offset 4.
+        assert_eq!(m.blocks[0].stmts.len(), 2);
+        let (addr0, off0, val0) = as_store_ind(&m.blocks[0].stmts[0]);
+        let (addr1, off1, val1) = as_store_ind(&m.blocks[0].stmts[1]);
+        assert_eq!((off0, as_i32(val0)), (0, 2));
+        assert_eq!((off1, as_i32(val1)), (4, 16));
+        let hir::Expr::LocalAddr(dims0) = addr0 else {
+            panic!("the dims store addresses the scratch block")
+        };
+        let hir::Expr::LocalAddr(dims1) = addr1 else {
+            panic!("the dims store addresses the scratch block")
+        };
+        assert_eq!(dims0, dims1, "one scratch block per newobj site");
+        // The pushed value: NEW_MDARR(class, numArgs, &dims).
+        let hir::Expr::Call { target, sig, args } = return_value(&m, 0) else {
+            panic!("the pushed value is the helper call")
+        };
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::NEW_MDARR),
+            "the NEW_MDARR helper"
+        );
+        assert_eq!(
+            sig.args,
+            vec![Type::NativeInt, Type::Int32, Type::NativeInt]
+        );
+        assert_eq!(as_i32(&args[1]), 2, "numArgs");
+        assert!(
+            matches!(&args[2], hir::Expr::LocalAddr(l) if l == dims0),
+            "the dims block address is the third argument"
+        );
+        // The scratch block's side-table layout: 8 bytes, 4-aligned, no
+        // GC cells (int32s are never rooted).
+        let layout = &m.struct_layouts[&md_array_dims_class()];
+        assert_eq!(layout.size, 8);
+        assert_eq!(layout.align, 4);
+        assert!(layout.gc_cells.is_empty());
+    }
+
+    #[test]
+    fn newobj_of_a_rank1_non_sz_array_uses_the_rare_helper() {
+        // ldc.i4.s 5; newobj int[0...]::.ctor(int) — a rank-1 array with
+        // bounds is the NEW_MDARR_RARE form (importer.cpp:3872-3873).
+        let (mut ee, _c) = md_array_ee(CTOR_TOKEN, 1);
+        ee.array_rank = 1;
+        let entry = sig(CorInfoType::Class, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x1F, 0x05, 0x73, 0x04, 0x00, 0x00, 0x06, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let m = import(&info, &ee).expect("rank-1 MD newobj imports");
+        let hir::Expr::Call { target, .. } = return_value(&m, 0) else {
+            panic!("the pushed value is the helper call")
+        };
+        assert!(
+            matches!(target, CallTarget::Helper(h) if *h == CorInfoHelpFunc::NEW_MDARR_RARE),
+            "the NEW_MDARR_RARE helper"
+        );
+    }
+
+    #[test]
+    fn newobj_md_array_dims_block_grows_to_the_widest_rank() {
+        // ldc 1; ldc 2; ldc 3; newobj C3; pop; ldc 4; ldc 5; newobj C2;
+        // ret — the rank-3 site sizes the method's dims-block layout; the
+        // rank-2 site reuses it (importer.cpp:3843's regrow).
+        const CTOR3_TOKEN: u32 = 0x0600_0005;
+        let (mut ee, _c) = md_array_ee(CTOR_TOKEN, 2);
+        ee.add_method(
+            CTOR3_TOKEN,
+            MockSig {
+                ret: CorInfoType::Void,
+                args: vec![CorInfoType::Int; 3],
+                has_this: true,
+                ret_class: None,
+                arg_classes: Vec::new(),
+            },
+        );
+        ee.class_tokens
+            .insert(CTOR3_TOKEN, ee.class_tokens[&CTOR_TOKEN]);
+        let entry = sig(CorInfoType::Class, &[]);
+        #[rustfmt::skip]
+        let il: &[u8] = &[
+            0x17, 0x18, 0x19, // ldc.i4.1/2/3
+            0x73, 0x05, 0x00, 0x00, 0x06, // newobj C3
+            0x26, // pop
+            0x1F, 0x04, 0x1F, 0x05, // ldc.i4.s 4/5
+            0x73, 0x04, 0x00, 0x00, 0x06, // newobj C2
+            0x2A, // ret
+        ];
+        let info = struct_info(&mut ee, il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("two MD newobjs import");
+        assert_eq!(m.struct_layouts[&md_array_dims_class()].size, 12);
+    }
+
+    #[test]
+    fn newobj_of_an_md_array_rejects_a_non_integer_dimension() {
+        // ldnull; ldc.i4.s 2; newobj C2 — a Ref dimension is bad IL.
+        let (mut ee, _c) = md_array_ee(CTOR_TOKEN, 2);
+        let entry = sig(CorInfoType::Class, &[]);
+        let info = struct_info(
+            &mut ee,
+            &[0x14, 0x1F, 0x02, 0x73, 0x04, 0x00, 0x00, 0x06, 0x2A],
+            &entry,
+            &[],
+            &[],
+        );
+        let err = import(&info, &ee).err().expect("a Ref dimension rejects");
+        assert!(
+            matches!(&err, CompileError::BadIl(m) if m.contains("dimension")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -12254,7 +12551,8 @@ mod tests {
         ee.call_kinds
             .insert(INST_TOKEN, ffi::CORINFO_CALL_KIND_CORINFO_VIRTUALCALL_STUB);
         // A THISOBJ-seeded deref chain (offsets {0x18, 0x10}, two
-        // indirections): the handles come out of the dictionary on `this`.
+        // indirections): the handles come out of the dictionary on the
+        // MethodTable of `this`.
         let mut lookup = canned_lookup(false);
         lookup.lookupKind.runtimeLookupKind =
             ffi::CORINFO_RUNTIME_LOOKUP_KIND_CORINFO_LOOKUP_THISOBJ;
@@ -12276,16 +12574,17 @@ mod tests {
             panic!("expected the VIRTUAL_FUNC_PTR helper call")
         };
         assert_eq!(as_local(&helper_args[0]), t_this);
-        // Both handles are the lookup chain off `this` (LocalId(0)):
-        // Load(Add(Load(Add(this, 0x18)), 0x10)).
+        // Both handles are the lookup chain off the MethodTable of
+        // `this` (gtNewMethodTableLookup, importer.cpp:1565-1566):
+        // Load(Add(Load(Add(Load(this), 0x18)), 0x10)).
         for handle in &helper_args[1..] {
             let (op1, base1, off1) = as_binary(as_load(handle));
             assert_eq!(op1, BinaryOp::Add);
             assert_eq!(as_isize(off1), 0x10);
             let (op0, base0, off0) = as_binary(as_load(base1));
             assert_eq!(op0, BinaryOp::Add);
-            assert_eq!(as_local(base0), LocalId(0));
             assert_eq!(as_isize(off0), 0x18);
+            assert_eq!(as_local(as_load(base0)), LocalId(0), "the MethodTable load");
         }
     }
 

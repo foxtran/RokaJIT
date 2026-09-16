@@ -752,6 +752,12 @@ flag_set!(
     // `this`, and the runtime redirects to the allocating static `Ctor`
     // whose return is the object (importer.cpp:9056).
     VAROBJSIZE => CorInfoFlag_CORINFO_FLG_VAROBJSIZE,
+    // An array class (corinfo.h:774 — "initialized differently"; the EE
+    // sets it on every pMT->IsArray(), jitinterface.cpp getClassAttribs):
+    // its `.ctor`/`Get`/`Set`/`Address` methods are faked up — there is
+    // no entry point to call, so `newobj` on one is the NEW_MDARR helper
+    // (importer.cpp:9042's array branch), never the String redirect.
+    ARRAY => CorInfoFlag_CORINFO_FLG_ARRAY,
 );
 
 flag_set!(
