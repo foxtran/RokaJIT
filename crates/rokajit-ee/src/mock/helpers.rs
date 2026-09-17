@@ -41,7 +41,10 @@ impl Helpers for MockEe {
         }
     }
 
-    fn get_box_helper(&self, _cls: ClassHandle) -> CorInfoHelpFunc {
+    fn get_box_helper(&self, cls: ClassHandle) -> CorInfoHelpFunc {
+        if let Some(&h) = self.box_helpers.get(&(cls.as_raw() as usize)) {
+            return h;
+        }
         self.box_helper.unwrap_or(CorInfoHelpFunc::BOX)
     }
 
@@ -71,7 +74,10 @@ impl Helpers for MockEe {
         cls
     }
 
-    fn get_un_box_helper(&self, _cls: ClassHandle) -> CorInfoHelpFunc {
+    fn get_un_box_helper(&self, cls: ClassHandle) -> CorInfoHelpFunc {
+        if let Some(&h) = self.unbox_helpers.get(&(cls.as_raw() as usize)) {
+            return h;
+        }
         self.unbox_helper.unwrap_or(CorInfoHelpFunc::UNBOX)
     }
 

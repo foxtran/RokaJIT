@@ -246,8 +246,14 @@ impl ValueState {
     /// register value, or alias tag materializes now. (The box-of-a-
     /// scalar path found this gap: `box 7` took the address of a temp
     /// whose `7` was still a `Loc::Const` tag, and the helper copied
-    /// whatever the slot happened to hold.)
-    pub fn materialize(&mut self, id: LocalId) -> Vec<Move> {
+    /// whatever the slot happened to hold.) `exclude` carries the
+    /// emitter's fixed (ABI-pinned) registers: the escape can fire in
+    /// the middle of a call's argument setup (the box helper's
+    /// `(mt, &temp)` — arg0 already in its register), and the
+    /// materialization's scratch must not clobber a live argument
+    /// register (the boxunboxvaluetype SIGSEGV: the deferred copy took
+    /// `%rdi`, which already held the box's MethodTable*).
+    pub fn materialize(&mut self, id: LocalId, exclude: &[PhysReg]) -> Vec<Move> {
         let own = self.slot_of(id);
         let mut moves = Vec::new();
         match self.locs[id.0 as usize] {
@@ -260,7 +266,7 @@ impl ValueState {
                 });
             }
             Some(Loc::Const(imm)) => {
-                let (reg, mut alloc) = self.take_scratch(&[]);
+                let (reg, mut alloc) = self.take_scratch(exclude);
                 moves.append(&mut alloc);
                 moves.push(Move::Remat {
                     imm,
@@ -275,7 +281,7 @@ impl ValueState {
             }
             Some(Loc::Local(l)) => {
                 let src = self.slot_of(l);
-                let (reg, mut alloc) = self.take_scratch(&[]);
+                let (reg, mut alloc) = self.take_scratch(exclude);
                 moves.append(&mut alloc);
                 moves.push(Move::Reload {
                     slot: src,
@@ -291,7 +297,7 @@ impl ValueState {
             // A copy of a spilled temp aliases the source's slot; the
             // escape needs the value in id's OWN slot.
             Some(Loc::Mem(off)) if off != own => {
-                let (reg, mut alloc) = self.take_scratch(&[]);
+                let (reg, mut alloc) = self.take_scratch(exclude);
                 moves.append(&mut alloc);
                 moves.push(Move::Reload {
                     slot: off,
@@ -612,7 +618,7 @@ mod tests {
     fn materialize_flushes_a_deferred_constant_to_its_own_slot() {
         let mut vs = state();
         vs.define(LocalId(1), Loc::Const(7));
-        let moves = vs.materialize(LocalId(1));
+        let moves = vs.materialize(LocalId(1), &[]);
         assert_eq!(
             moves,
             vec![
@@ -631,7 +637,7 @@ mod tests {
     fn materialize_spills_a_register_value_to_its_own_slot() {
         let mut vs = state();
         vs.define(LocalId(2), Loc::Reg(R2));
-        let moves = vs.materialize(LocalId(2));
+        let moves = vs.materialize(LocalId(2), &[]);
         assert_eq!(moves, vec![spill(R2, 12)]);
         assert_eq!(vs.read(LocalId(2)), ReadSrc::Slot(12));
         // The freed register takes the next temp without a re-spill.
@@ -643,7 +649,7 @@ mod tests {
     fn materialize_copies_an_alias_into_its_own_slot() {
         let mut vs = state();
         vs.define(LocalId(2), Loc::Local(LocalId(0)));
-        let moves = vs.materialize(LocalId(2));
+        let moves = vs.materialize(LocalId(2), &[]);
         assert_eq!(
             moves,
             vec![
@@ -661,12 +667,12 @@ mod tests {
     #[test]
     fn materialize_an_already_frame_resident_value_is_a_noop() {
         let mut vs = state();
-        assert_eq!(vs.materialize(LocalId(0)), vec![]);
+        assert_eq!(vs.materialize(LocalId(0), &[]), vec![]);
         // A copy of a spilled temp aliases the source's slot (Loc::Mem
         // naming a slot that is NOT the value's own): the escape still
         // copies it home.
         vs.define(LocalId(3), Loc::Mem(4));
-        let moves = vs.materialize(LocalId(3));
+        let moves = vs.materialize(LocalId(3), &[]);
         assert_eq!(
             moves,
             vec![
@@ -679,6 +685,20 @@ mod tests {
             ]
         );
         assert_eq!(vs.read(LocalId(3)), ReadSrc::Slot(16));
+    }
+
+    /// The escape can fire in the middle of a call's argument setup: the
+    /// materialization's scratch must skip the excluded (ABI-pinned,
+    /// already-written) argument registers — the boxunboxvaluetype
+    /// clobber (the deferred copy took `%rdi`, which held the box's
+    /// MethodTable*).
+    #[test]
+    fn materialize_skips_excluded_registers() {
+        let mut vs = state();
+        vs.define(LocalId(1), Loc::Const(7));
+        let moves = vs.materialize(LocalId(1), &[R0]);
+        assert!(matches!(moves[0], Move::Remat { reg, .. } if reg != R0));
+        assert!(matches!(moves[1], Move::Spill { reg, .. } if reg != R0));
     }
 
     #[test]

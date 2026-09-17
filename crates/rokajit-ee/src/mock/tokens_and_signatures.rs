@@ -199,8 +199,9 @@ impl TokensAndSignatures for MockEe {
     }
 
     fn get_location_of_this_type(&self, _context: MethodHandle) -> ffi::CORINFO_LOOKUP_KIND {
-        // needsRuntimeLookup = false.
-        unsafe { std::mem::zeroed() }
+        // The default cans needsRuntimeLookup = false.
+        self.this_type_lookup
+            .unwrap_or_else(|| unsafe { std::mem::zeroed() })
     }
 
     fn get_cookie_for_interpreter_calli_sig(
@@ -234,6 +235,19 @@ impl TokensAndSignatures for MockEe {
                 ffi::CORINFO_CALL_KIND_CORINFO_CALL
             };
             info.sig = self.method_sig_info(method);
+            // corinfo.h:1343: a CODE_POINTER verdict invalidates hMethod
+            // (the importer's intrinsic name-match then falls back to the
+            // resolved token's method).
+            if info.kind == ffi::CORINFO_CALL_KIND_CORINFO_CALL_CODE_POINTER {
+                info.hMethod = std::ptr::null_mut();
+            }
+        }
+        // A canned one-class method instantiation on the call sig (the
+        // GetArrayDataReference<T> fixture).
+        if let Some(cell) = self.call_meth_inst.get(&token.token) {
+            info.sig.sigInst.methInstCount = 1;
+            info.sig.sigInst.methInst =
+                std::ptr::from_ref::<ffi::CORINFO_CLASS_HANDLE>(cell) as *mut _;
         }
         // Canned constrained-call this transforms (step_11.3C).
         if let Some(&transform) = self.this_transforms.get(&token.token) {

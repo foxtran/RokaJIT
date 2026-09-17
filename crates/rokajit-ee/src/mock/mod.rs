@@ -194,6 +194,11 @@ pub struct MockEe {
     /// `None` cans `CORINFO_HELP_BOX`/`CORINFO_HELP_UNBOX`.
     pub box_helper: Option<CorInfoHelpFunc>,
     pub unbox_helper: Option<CorInfoHelpFunc>,
+    /// Per-class overrides consulted BEFORE `box_helper`/`unbox_helper`
+    /// (step_11.4: one fixture mixing a `Nullable<T>` class with a plain
+    /// one), keyed by the class handle's raw value.
+    pub box_helpers: HashMap<usize, CorInfoHelpFunc>,
+    pub unbox_helpers: HashMap<usize, CorInfoHelpFunc>,
     /// Canned `get_casting_helper` override (step_10.5); `None` cans
     /// CHKCASTANY (throwing) / ISINSTANCEOFANY.
     pub casting_helper: Option<CorInfoHelpFunc>,
@@ -244,6 +249,10 @@ pub struct MockEe {
     /// (step_11.3B: the runtime-lookup emitter's fixture) — returned
     /// verbatim, ahead of the `embed_*` rejection flags.
     pub embed_lookup: Option<ffi::CORINFO_LOOKUP>,
+    /// The canned `get_location_of_this_type` answer (step_11.4: the
+    /// prolog class-init trigger in shared generic code); `None` cans the
+    /// zeroed `!needsRuntimeLookup` verdict (unshared code).
+    pub this_type_lookup: Option<ffi::CORINFO_LOOKUP_KIND>,
     /// Canned `get_call_info` generics-context answers (step_11.3B),
     /// keyed by metadata token: the (tagged) `contextHandle` and
     /// `exactContextNeedsRuntimeLookup`.
@@ -256,6 +265,11 @@ pub struct MockEe {
     /// (step_11.3C), keyed by the call's method metadata token; absent
     /// tokens answer CORINFO_NO_THIS_TRANSFORM (the zeroed default).
     pub this_transforms: HashMap<u32, ffi::CORINFO_THIS_TRANSFORM>,
+    /// A canned one-class method instantiation on the call sig
+    /// (sigInst.methInstCount = 1 — the `GetArrayDataReference<T>`
+    /// intrinsic's element class), keyed by the call's method metadata
+    /// token; the boxed cell keeps the `methInst` pointer stable.
+    pub call_meth_inst: HashMap<u32, Box<ffi::CORINFO_CLASS_HANDLE>>,
     /// Canned [Intrinsic] methods (the GetMethodTable fixtures), keyed by
     /// the method handle's raw value; `is_intrinsic` answers true for them.
     pub intrinsic_methods: std::collections::HashSet<usize>,

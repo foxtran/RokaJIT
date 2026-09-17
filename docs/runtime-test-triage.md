@@ -34,14 +34,13 @@ are counted under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 2280 |
-| CRASH | 129 |
-| GATED | 7 |
-| ARTIFACT | 13 |
-| TIMEOUT | 20 |
+| MATCH | 2403 |
+| CRASH | 5 |
+| ARTIFACT | 8 |
+| TIMEOUT | 33 |
 | COMPILE_FAIL | 832 |
 
-Of the MATCHes, 2263 exit 100 (the CoreCLR pass
+Of the MATCHes, 2310 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ, no named gate in stderr;
@@ -60,15 +59,7 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| SIMD hardware intrinsics (real vector semantics — deferred, step_11.10) | 56 | `JIT/HardwareIntrinsics/General/ConstantFolding/ScalarConstantFoldings.cs`<br>`JIT/HardwareIntrinsics/General/HwiOp/CompareVectorWithZero.cs`<br>`JIT/HardwareIntrinsics/General/HwiOp/HwiValueNumbering.cs`<br>`JIT/HardwareIntrinsics/X86/Lzcnt.X64/Lzcnt.X64.cs`<br>`JIT/HardwareIntrinsics/X86/Lzcnt/Lzcnt.cs`<br>… and 51 more |
-| boxing & casts | 16 | `JIT/Directed/nullabletypes/Desktop/boxunboxvaluetype.cs`<br>`JIT/Directed/nullabletypes/Desktop/nullcomparaison.cs`<br>`JIT/Directed/nullabletypes/gettype.cs`<br>`JIT/Directed/nullabletypes/unboxnullable.cs`<br>`JIT/Generics/Conversions/Boxing/box_isinst_br_nullable.cs`<br>… and 11 more |
-| unsupported (unmapped): generic callconv on a calli/ldftn/newobj site (shared generics) | 13 | `JIT/Generics/Instantiation/delegates/Delegate005.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate006.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate011.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate012.cs`<br>`JIT/Generics/Instantiation/delegates/Delegate027.cs`<br>… and 8 more |
-| unsupported (unmapped): field type outside the object pack | 8 | `JIT/Performance/CodeQuality/Span/Indexer.cs`<br>`JIT/Performance/CodeQuality/Span/SpanBench.cs`<br>`JIT/Regression_o_2/Runtime_1241.cs`<br>`JIT/Regression_ro_2/Runtime_56743/Runtime_56743_0.cs`<br>`JIT/SIMD/CircleInConvex.cs`<br>… and 3 more |
-| unsupported (unmapped): newobj of a shared-generic value class | 7 | `JIT/Methodical/delegate/GSDelegate.cs`<br>`JIT/Performance/CodeQuality/Linq/Linq.cs`<br>`JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b219940/struct01_gen.cs`<br>`JIT/Regression_o_1/GitHub_19149.cs`<br>`JIT/Regression_o_2/Runtime_41100.cs`<br>… and 2 more |
-| bad IL rejected by importer | 6 | `JIT/Performance/CodeQuality/SIMD/RayTracer/RayTracerBench.cs`<br>`JIT/Regression_2/Runtime_120792/Runtime_120792.cs`<br>`JIT/Regression_ro_1/Runtime_120270.cs`<br>`JIT/SIMD/Sums.cs`<br>`JIT/opt/Devirtualization/GDV_GenericInterface.cs`<br>… and 1 more |
-| synchronized methods (Monitor enter/exit wrapping) | 3 | `JIT/Regression_ro_1/GitHub_20499.cs`<br>`JIT/Regression_ro_1/Github_21011.cs`<br>`JIT/opt/OSR/synchronized.cs` |
-| unsupported (unmapped): prolog class-init trigger in shared generic code (INITINSTCLASS) | 2 | `JIT/Regression_2/Runtime_121066/Runtime_121066.cs`<br>`JIT/Regression_o_3/Runtime_87597.cs` |
-| non-direct calls (callvirt/calli) | 1 | `JIT/Generics/VirtualMethods/generic_virtual_methods.cs` |
+| SIMD hardware intrinsics (real vector semantics — deferred, step_11.10) | 3 | `JIT/Methodical/tailcall/Desktop/thread-race.cs`<br>`JIT/Performance/CodeQuality/SIMD/ConsoleMandel/ConsoleMandel.cs`<br>`JIT/Regression_2/Runtime_128895/Runtime_128895.cs` |
 
 ## Known artifacts (Class C)
 
@@ -81,17 +72,12 @@ verification is a regression, not a fix.
 
 | Test | Reason |
 | --- | --- |
-| `JIT/Directed/coverage/oldtests/cse2.cs` | exception stack-trace text differs (frame-list formatting); both PASSED, exit 100 |
-| `JIT/Directed/perffix/primitivevt/mixed1.cs` | per-check lines identical after sorting; print ordering differs; both exit 100 |
-| `JIT/Methodical/cctor/misc/Desktop/throw.cs` | exception stack-trace text differs (frame-list formatting); both PASSED, exit 100 |
-| `JIT/Methodical/cctor/misc/throw.cs` | exception stack-trace text differs (frame-list formatting); both PASSED, exit 100 |
-| `JIT/Methodical/fp/exgen/10w5d.cs` | time-seeded subtest selection; each executed check matches its own expectation; both exit 100 |
 | `JIT/Performance/CodeQuality/Benchstones/BenchF/Adams/Adams.cs` | timing values in output; both exit 100 |
+| `JIT/Performance/CodeQuality/SIMD/SeekUnroll/SeekUnroll.cs` | timing values in output; both exit 100 |
 | `JIT/Performance/CodeQuality/V8/Richards/Richards.cs` | timing values in output; both exit 100 |
 | `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b59297/b59297.cs` | timing values in output; both exit 100 |
 | `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b103058/b103058.cs` | stack addresses printed; both exit 100 |
 | `JIT/Regression/Dev11/External/dev11_239804/ShowLocallocAlignment.cs` | stack addresses printed; both exit 100 |
-| `JIT/Regression/VS-ia64-JIT/M00/b113493/bad.cs` | thread-scheduling interleave of counter prints; both exit 100 |
 | `JIT/opt/OSR/example.cs` | timing values in output; both exit 100 |
 | `JIT/opt/OSR/integersumloop.cs` | timing values in output; both exit 100 |
 
@@ -125,9 +111,7 @@ entry shapes). Out of scope for triage; listed for the record.
 
 | Which JIT timed out | Tests |
 | --- | ---: |
-| rokajit | 15 |
-| ryujit,rokajit | 4 |
-| ryujit | 1 |
+| ryujit,rokajit | 33 |
 
 ## Needs investigation
 
@@ -137,27 +121,5 @@ error model didn't classify. Each carries its stderr signature.
 
 | Test | Category | Detail | Stderr signature |
 | --- | --- | --- | --- |
-| `JIT/Directed/pinvoke/sysinfo.cs` | CRASH | SIGABRT | Unhandled exception. System.DllNotFoundException: Unable to load shared library 'kernel32' or one of its dependencies. In order to help diagnose loading problem |
-| `JIT/Methodical/largeframes/skip6/skippage6.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/Performance/CodeQuality/Benchstones/BenchI/NDhrystone/NDhrystone.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/Performance/CodeQuality/Benchstones/MDBenchI/MDNDhrystone/MDNDhrystone.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b11490/b11490.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/Regression/CLR-x86-JIT/V1-M09/b15864/b15864.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/Regression/CLR-x86-JIT/V1-M10/b02352/b02352.cs` | CRASH | SIGSEGV | Method_Count==12 (12==confirm) !! |
-| `JIT/Regression/VS-ia64-JIT/M00/b115253/hello2.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/Regression/VS-ia64-JIT/M00/b141358/test.cs` | CRASH | SIGABRT | Process terminated. |
-| `JIT/Regression/clr-x64-JIT/v4.0/devdiv374539/DevDiv_374539.cs` | CRASH | SIGABRT | Unhandled exception. System.DllNotFoundException: Unable to load shared library 'kernel32.dll' or one of its dependencies. In order to help diagnose loading pro |
-| `JIT/Regression_2/Runtime_70790/Runtime_70790.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/Regression_2/Runtime_77968/Runtime_77968.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/Regression_o_1/GitHub_19438.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/Regression_o_2/Runtime_116823.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: expected 32767, got -32768 |
-| `JIT/Regression_o_3/Runtime_91062.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/Regression_ro_1/Runtime_120522.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/Regression_ro_1/Runtime_125124.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: expected True |
-| `JIT/Regression_ro_2/Runtime_131459.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/SIMD/Matrix4x4.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/jit64/gc/regress/vswhidbey/143837.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/opt/Inline/tests/args1.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/opt/InstructionCombining/MulToAdd.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/opt/Vectorization/SpanHelpers_SequenceEqual.cs` | CRASH | SIGABRT | Unhandled exception. System.Reflection.TargetInvocationException: Exception has been thrown by the target of an invocation. |
-| `JIT/opt/Vectorization/StringEquals_Vectorization.cs` | CRASH | SIGABRT | Unhandled exception. System.Reflection.TargetInvocationException: Exception has been thrown by the target of an invocation. |
+| `JIT/Performance/CodeQuality/Span/SpanBench.cs` | CRASH | SIGABRT | Unhandled exception. System.Reflection.CustomAttributeFormatException: 'InnerIterationCount' property specified was not found. |
+| `JIT/Regression_ro_1/Runtime_120522.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |

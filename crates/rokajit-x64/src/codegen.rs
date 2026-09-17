@@ -637,7 +637,14 @@ fn plan_funclets(method: &lir::Method) -> CompileResult<Vec<FuncletPlan>> {
     }
     // A try range lives entirely in one area — the main body or exactly
     // one funclet (the importer's ownership model): never straddling a
-    // funclet boundary.
+    // funclet boundary. The one exception is full containment: the
+    // synchronized-method wrap's synthetic fault try spans the whole
+    // original body INCLUDING the out-of-line user handler funclets
+    // (fgAddSyncMethodEnterExit's ebdTryLast is the old last block,
+    // flowgraph.cpp:1554) — the VM matches funclet throws against the
+    // parent's clause table by native offset, so the coverage is the
+    // semantics (an exception escaping a user handler releases the
+    // monitor).
     for r in &method.eh_regions {
         let (ts, te) = (r.try_start.0 as usize, r.try_end.0 as usize);
         if ts >= te || te > method.blocks.len() {
@@ -648,7 +655,8 @@ fn plan_funclets(method: &lir::Method) -> CompileResult<Vec<FuncletPlan>> {
         for p in &plans {
             let inside = ts >= p.start_block && te <= p.end_block;
             let outside = te <= p.start_block || ts >= p.end_block;
-            if !inside && !outside {
+            let contains = ts <= p.start_block && te >= p.end_block;
+            if !inside && !outside && !contains {
                 return Err(CompileError::Internal(
                     "EH try range straddles a funclet boundary",
                 ));
@@ -2646,22 +2654,26 @@ impl<'a> Emitter<'a> {
         // The slot's address escapes through the `lea`: the addressed
         // value must be in its slot NOW (a deferred const/register/alias
         // tag would otherwise leak the slot's stale contents to the
-        // reader — the box-of-a-scalar bug, step_10.5).
-        let moves = self.vs.materialize(l);
+        // reader — the box-of-a-scalar bug, step_10.5). The escape can
+        // fire mid-call-setup (the box helper's `(mt, &temp)`): the
+        // materialization's scratch must exclude the argument registers
+        // already written (the boxunboxvaluetype clobber).
+        let exclude = self.scratch_exclude(&[]);
+        let moves = self.vs.materialize(l, &exclude);
         self.apply(moves)?;
         let mem = self.slot_mem(self.layout.slots[l.0 as usize]);
         match dst {
             // A `lea` into an IL local/arg slot follows the store
             // discipline: aliases of the slot materialize first.
             Place::Val(t) if (t.0 .0 as usize) < self.num_frame_fixed => {
-                let (p, moves) = self.vs.take_scratch(&[]);
+                let (p, moves) = self.vs.take_scratch(&exclude);
                 self.apply(moves)?;
                 let g = gpr_of(p)?;
                 self.asm.lea(g, mem);
                 self.emit_store_to_local(t.0, Width::W64, Src::Reg(g))
             }
             Place::Val(t) => {
-                let (p, moves) = self.vs.take_scratch(&[]);
+                let (p, moves) = self.vs.take_scratch(&exclude);
                 self.apply(moves)?;
                 let g = gpr_of(p)?;
                 self.asm.lea(g, mem);
@@ -3455,7 +3467,15 @@ impl<'a> Emitter<'a> {
         let moves = self.vs.spill_registers();
         self.apply(moves)?;
         let g = Gpr::R11;
-        match self.wide_imm(Width::W64, target, &[g.phys()])? {
+        // A >i32 immediate target materializes into a `wide_imm` scratch
+        // first; the integer argument registers are LIVE here (the
+        // argument setup already emitted), so they join r11 on the
+        // exclude list — the QCall IL stub's six-argument `calli` picked
+        // r9 and clobbered the hidden error-pointer argument.
+        let mut exclude = Vec::with_capacity(regs::INT_ARG_REGS.len() + 1);
+        exclude.push(g.phys());
+        exclude.extend(regs::INT_ARG_REGS.iter().map(|r| r.phys()));
+        match self.wide_imm(Width::W64, target, &exclude)? {
             Rmi::Reg(r) => {
                 if r != g {
                     self.asm.mov(Width::W64, Rm::Reg(g), Rmi::Reg(r));
@@ -4303,6 +4323,77 @@ mod tests {
         assert_eq!(out.call_sites[0].method, None);
         assert_eq!(out.call_sites[0].sig, Some(sig));
         assert!(out.relocations.is_empty());
+    }
+
+    /// The QCall IL stub shape (Linq.cs's GenericHandleWorker stub): a
+    /// six-argument `calli` through a >i32 constant target. The target's
+    /// movabs scratch must spare the integer argument registers — the
+    /// argument setup already emitted — or it clobbers the sixth argument
+    /// in r9 (the `mov r9, imm64` bug).
+    #[test]
+    fn call_reg_wide_imm_target_spares_the_argument_registers() {
+        let sig = rokajit::ir::CallSig {
+            ret: Type::Int32,
+            args: vec![Type::Int32; 6],
+            has_this: false,
+        };
+        let m = method(
+            vec![
+                int_arg(0),
+                int_arg(1),
+                int_arg(2),
+                int_arg(3),
+                int_arg(4),
+                int_arg(5),
+                int_temp(),
+            ],
+            6,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::Call {
+                        dst: Some(LocalId(6)),
+                        target: rokajit::ir::CallTarget::Indirect(Box::new(Operand::Const(
+                            Const::NativeInt(0x1_2345_6789),
+                        ))),
+                        sig: sig.clone(),
+                        args: vec![
+                            Operand::Local(LocalId(0)),
+                            Operand::Local(LocalId(1)),
+                            Operand::Local(LocalId(2)),
+                            Operand::Local(LocalId(3)),
+                            Operand::Local(LocalId(4)),
+                            Operand::Local(LocalId(5)),
+                        ],
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(6))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        let bytes = &out.code.hot.bytes;
+        // movabs (REX.W + B8+r) into any integer argument register would
+        // clobber an already-placed argument.
+        for enc in [
+            [0x48, 0xBF], // rdi
+            [0x48, 0xBE], // rsi
+            [0x48, 0xBA], // rdx
+            [0x48, 0xB9], // rcx
+            [0x49, 0xB8], // r8
+            [0x49, 0xB9], // r9
+        ] {
+            assert!(
+                !bytes.windows(2).any(|w| w == enc),
+                "no movabs into an argument register ({enc:02x?}): {bytes:02x?}"
+            );
+        }
+        assert!(
+            bytes.windows(3).any(|w| w == [0x41, 0xFF, 0xD3]),
+            "the call is `call r11`: {bytes:02x?}"
+        );
     }
 
     /// `t = a + 1; if (a < b) goto B2; B1: return t; B2: return t;` —
@@ -5335,6 +5426,52 @@ mod tests {
             0xC3, // ret
         ];
         assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// A byval struct argument embedding a byref cell (the `Span<T>`
+    /// shape: byref at offset 0, int at 8 — INTEGER_BYREF + INTEGER):
+    /// the prolog homes both eightbytes into the frame slot, and the
+    /// root set reports the cell as an interior pointer (step_11.4).
+    #[test]
+    fn struct_arg_byref_cell_is_a_reported_interior_root() {
+        let (layouts, c) = layouts_for(
+            16,
+            8,
+            vec![GcCell {
+                offset: 0,
+                is_byref: true,
+            }],
+            &[(SysVClass::IntegerByRef, 8), (I, 8)],
+        );
+        let m = struct_method(
+            vec![local(Type::Struct(c), LocalKind::IlArg(0))],
+            1,
+            0,
+            vec![block(0, vec![stmt(StmtKind::Return { value: None })])],
+            layouts,
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            0x48, 0x89, 0x7D, 0xF0, // movq %rdi, -16(%rbp) — eightbyte 0
+            0x48, 0x89, 0x75, 0xF8, // movq %rsi, -8(%rbp)  — eightbyte 1
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        // The 16-byte slot's low byte is 16 below rbp; the byref cell at
+        // struct offset 0 reports at 16 with the interior flag.
+        assert_eq!(
+            out.frame.gc_roots,
+            vec![rokajit::pipeline::GcRootSlot {
+                offset: 16,
+                is_byref: true,
+                pinned: false,
+            }]
+        );
     }
 
     /// A register-passed struct return (TwoDoubles): one `movsd` per
@@ -6769,6 +6906,80 @@ mod tests {
             0xC3, // ret
         ];
         assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// Regression for the boxunboxvaluetype SIGSEGV (step_11.4): the
+    /// `lea` of a deferred temp's slot can fire in the MIDDLE of a call's
+    /// argument setup (the box helper's `(mt, &temp)` shape) — the
+    /// materialization's scratch must skip the argument registers already
+    /// written. Five `AddrOf` args of five const-deferred temps force one
+    /// materialization per argument: pre-fix the third took `%rdx` (which
+    /// the second `lea` had just written), the fourth `%rsi`, the fifth
+    /// `%rdi` — the helper then read its MethodTable* out of a small
+    /// integer and the VM died in `InternalAllocNoChecks(pMT=0x8)`.
+    #[test]
+    fn lea_materialization_during_arg_setup_skips_live_argument_registers() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let imms = [0x11i32, 0x22, 0x33, 0x44, 0x55];
+        let mut stmts: Vec<lir::Stmt> = imms
+            .iter()
+            .enumerate()
+            .map(|(i, &imm)| {
+                stmt(StmtKind::Copy {
+                    dst: LocalId(2 + i as u32),
+                    src: Operand::Const(Const::Int32(imm)),
+                })
+            })
+            .collect();
+        let mut sig_args = vec![Type::NativeInt];
+        let mut args = vec![Operand::Const(Const::NativeInt(0x5000))];
+        for i in 0..5u32 {
+            sig_args.push(Type::ByRef);
+            args.push(Operand::AddrOf(LocalId(2 + i)));
+        }
+        stmts.push(stmt(StmtKind::Call {
+            dst: None,
+            target: rokajit::ir::CallTarget::Direct(f),
+            sig: CallSig {
+                ret: Type::Void,
+                args: sig_args,
+                has_this: false,
+            },
+            args,
+        }));
+        stmts.push(stmt(StmtKind::Return { value: None }));
+        let mut locals = vec![
+            local(Type::Int32, LocalKind::IlLocal(0)),
+            local(Type::Int32, LocalKind::IlLocal(1)),
+        ];
+        locals.extend((0..5).map(|_| local(Type::Int32, LocalKind::Temp)));
+        let m = method(locals, 0, 2, vec![block(0, stmts)]);
+        let out = emit(&m, &ee);
+        let b = &out.code.hot.bytes;
+        // Every materialization immediate must reach a slot through a
+        // register that is NOT one of the already-written argument
+        // registers: forbidden are `movl $imm, %edi/%esi/%edx/%ecx/
+        // %r8d/%r9d` (BF/BE/BA/B9 and 41 B8/41 B9).
+        for &imm in &imms {
+            let imm = imm as u8;
+            for op in [0xBFu8, 0xBE, 0xBA, 0xB9] {
+                // The one-byte `movl $imm, %r32` form — but not when it is
+                // the tail of the two-byte %r10d/%r11d form (41 BA/41 BB).
+                assert!(
+                    !b.windows(6)
+                        .any(|w| w[0] != 0x41 && w[1..] == [op, imm, 0, 0, 0]),
+                    "materialization of {imm:#x} clobbered an argument register (op {op:#x})"
+                );
+            }
+            for op in [0xB8u8, 0xB9] {
+                assert!(
+                    !b.windows(6).any(|w| w == [0x41, op, imm, 0, 0, 0]),
+                    "materialization of {imm:#x} clobbered %r8d/%r9d"
+                );
+            }
+        }
     }
 
     // ---- step_10.6: EH funclets ----

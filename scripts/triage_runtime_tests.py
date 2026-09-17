@@ -772,6 +772,8 @@ KNOWN_ARTIFACTS: dict[str, str] = {
     "JIT/Regression/VS-ia64-JIT/M00/b113493/bad.cs": "thread-scheduling interleave of counter prints; both exit 100",
     "JIT/opt/OSR/example.cs": "timing values in output; both exit 100",
     "JIT/opt/OSR/integersumloop.cs": "timing values in output; both exit 100",
+    "JIT/Performance/CodeQuality/SIMD/SeekUnroll/SeekUnroll.cs": "timing values in output; both exit 100",
+    "JIT/Performance/CodeQuality/SIMD/RayTracer/RayTracerBench.cs": "frames/sec timing value in output; both exit 100",
 }
 
 
