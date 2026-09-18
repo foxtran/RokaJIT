@@ -123,7 +123,8 @@ impl Helpers for MockEe {
     }
 
     fn get_ee_info(&self) -> ffi::CORINFO_EE_INFO {
-        unsafe { std::mem::zeroed() }
+        self.ee_info
+            .unwrap_or_else(|| unsafe { std::mem::zeroed() })
     }
 
     fn get_wasm_well_known_globals(&self) -> ffi::CORINFO_WASM_WELLKNOWN_GLOBALS {

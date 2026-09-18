@@ -10,7 +10,8 @@ use crate::handles::MethodHandle;
 
 impl OutputSinks for MockEe {
     fn get_jit_flags(&self) -> ffi::CORJIT_FLAGS {
-        unsafe { std::mem::zeroed() }
+        self.jit_flags
+            .unwrap_or_else(|| unsafe { std::mem::zeroed() })
     }
 
     fn alloc_mem(&self, request: &[ChunkRequest], xcptns_count: u32) -> Vec<AllocatedChunk> {

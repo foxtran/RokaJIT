@@ -34,10 +34,10 @@ are counted under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 2403 |
-| CRASH | 4 |
+| MATCH | 2405 |
+| CRASH | 1 |
 | ARTIFACT | 16 |
-| TIMEOUT | 26 |
+| TIMEOUT | 27 |
 | COMPILE_FAIL | 832 |
 
 Of the MATCHes, 2386 exit 100 (the CoreCLR pass
@@ -118,7 +118,7 @@ entry shapes). Out of scope for triage; listed for the record.
 
 | Which JIT timed out | Tests |
 | --- | ---: |
-| rokajit | 21 |
+| rokajit | 22 |
 | ryujit,rokajit | 5 |
 
 ## Needs investigation
@@ -129,7 +129,4 @@ error model didn't classify. Each carries its stderr signature.
 
 | Test | Category | Detail | Stderr signature |
 | --- | --- | --- | --- |
-| `JIT/Directed/pinvoke/sysinfo.cs` | CRASH | SIGABRT | Unhandled exception. System.DllNotFoundException: Unable to load shared library 'kernel32' or one of its dependencies. In order to help diagnose loading problem |
 | `JIT/Methodical/largeframes/skip6/skippage6.cs` | CRASH | SIGABRT | Stack overflow. |
-| `JIT/Performance/CodeQuality/SIMD/ConsoleMandel/ConsoleMandel.cs` | CRASH | SIGABRT | Fatal error. |
-| `JIT/Regression/clr-x64-JIT/v4.0/devdiv374539/DevDiv_374539.cs` | CRASH | SIGABRT | Unhandled exception. System.DllNotFoundException: Unable to load shared library 'kernel32.dll' or one of its dependencies. In order to help diagnose loading pro |

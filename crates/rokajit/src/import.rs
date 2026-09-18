@@ -287,6 +287,7 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
         current_leader: 0,
         stack: Vec::new(),
         next_call_generic_context: None,
+        pinvoke_frame_slot: None,
         ftn_temps: HashMap::new(),
         clauses,
         catch_entries,
@@ -750,12 +751,14 @@ fn check_no_generics_call_conv(call_conv: ffi::CorInfoCallConv) -> CompileResult
 /// callconv bits said unmanaged but the EE disagrees — investigate
 /// before accepting), and the vararg shapes (`al` = vector-register
 /// count and more — deferred).
-fn check_unmanaged_calli(ee: &dyn EeInfo, sig: &ffi::CORINFO_SIG_INFO) -> CompileResult<()> {
-    // suppressGCTransition (the out-param) is only meaningful for the
-    // inline-P/Invoke optimization we do not do: the marshaling stub
-    // owns the GC transition, and the emitted call is identical either
-    // way.
-    let (ext, _suppress_gc_transition) = ee.get_unmanaged_call_conv(None, Some(sig));
+///
+/// Returns the EE's `suppressGCTransition` out-param: a suppressed call
+/// runs without the GC transition — no InlinedCallFrame, a plain call
+/// (RyuJIT's `addPInvokePrologEpilog = !call->IsSuppressGCTransition()`,
+/// lower.cpp:7272); anything else gets the BEGIN/END frame treatment of
+/// [`BlockImport::finish_call`] (step_11.16).
+fn check_unmanaged_calli(ee: &dyn EeInfo, sig: &ffi::CORINFO_SIG_INFO) -> CompileResult<bool> {
+    let (ext, suppress_gc_transition) = ee.get_unmanaged_call_conv(None, Some(sig));
     match ext {
         CorInfoCallConvExtension::Thiscall if sig.numArgs() == 0 => {
             Err(CompileError::BadIl("thiscall with no arguments"))
@@ -766,7 +769,7 @@ fn check_unmanaged_calli(ee: &dyn EeInfo, sig: &ffi::CORINFO_SIG_INFO) -> Compil
         | CorInfoCallConvExtension::Fastcall
         | CorInfoCallConvExtension::CMemberFunction
         | CorInfoCallConvExtension::StdcallMemberFunction
-        | CorInfoCallConvExtension::FastcallMemberFunction => Ok(()),
+        | CorInfoCallConvExtension::FastcallMemberFunction => Ok(suppress_gc_transition),
         CorInfoCallConvExtension::Swift => Err(CompileError::Unsupported(
             "unmanaged calli with the Swift calling convention",
         )),
@@ -3049,6 +3052,11 @@ struct BlockImport<'a> {
     /// argument. Cleared at block boundaries and by any intervening
     /// non-intrinsic call — the VM's stub contract is stash → calli.
     next_call_generic_context: Option<LocalId>,
+    /// The method's one InlinedCallFrame slot (RyuJIT's
+    /// `lvaInlinedPInvokeFrameVar`, step_11.16), created lazily by the
+    /// first unmanaged `calli` that needs the GC transition and reused
+    /// by every later one.
+    pinvoke_frame_slot: Option<LocalId>,
     /// ldftn/ldvirtftn provenance for values spilled to a temp or user
     /// local (step_11.8): the delegate `newobj` needs the target's
     /// MethodHandle for the EE's `GetDelegateCtor` substitution; the
@@ -3084,6 +3092,19 @@ fn binary(op: BinaryOp, lhs: hir::Expr, rhs: hir::Expr) -> hir::Expr {
 /// `CORINFO_CLASS_HANDLE` (an EE heap pointer). RyuJIT's
 /// `lvaNewObjArrayArgs` likewise has no metadata class.
 fn md_array_dims_class() -> ClassHandle {
+    static SENTINEL: u8 = 0;
+    ClassHandle::from_raw(&SENTINEL as *const u8 as ffi::CORINFO_CLASS_HANDLE)
+        .expect("a static's address is non-null")
+}
+
+/// The `struct_layouts` key for the per-method InlinedCallFrame slot
+/// ([`BlockImport::pinvoke_frame`], step_11.16) — the same sentinel
+/// convention as [`md_array_dims_class`]: the EE never sees the handle
+/// (its layout comes from `getEEInfo`, not a class query), and a
+/// RokaJIT-owned static's address cannot collide with an EE heap
+/// pointer. RyuJIT's `lvaInlinedPInvokeFrameVar` likewise has no
+/// metadata class (lclvars.cpp's `lvIsBoolean`-less raw block).
+fn pinvoke_frame_class() -> ClassHandle {
     static SENTINEL: u8 = 0;
     ClassHandle::from_raw(&SENTINEL as *const u8 as ffi::CORINFO_CLASS_HANDLE)
         .expect("a static's address is non-null")
@@ -5637,6 +5658,7 @@ impl BlockImport<'_> {
                 args,
                 stmts,
                 il_offset,
+                None,
             );
         }
         // The named intrinsics expand before any dispatch — including
@@ -6108,6 +6130,7 @@ impl BlockImport<'_> {
                 args,
                 stmts,
                 il_offset,
+                None,
             );
         }
         let target = match virtual_kind {
@@ -6156,6 +6179,7 @@ impl BlockImport<'_> {
             args,
             stmts,
             il_offset,
+            None,
         )
     }
 
@@ -9372,10 +9396,103 @@ impl BlockImport<'_> {
         })
     }
 
+    /// The per-method InlinedCallFrame slot (RyuJIT's
+    /// `lvaInlinedPInvokeFrameVar`, grabbed once the import knows the
+    /// method needs one — flowgraph.cpp:2593's
+    /// `lvaGrabTempWithImplicitUse`): ONE address-exposed raw block per
+    /// method, sized and aligned from the EE's
+    /// `getEEInfo().inlinedCallFrameInfo` answer (corinfo.h:1735-1753;
+    /// the live linux-x64 answers are size=56, sizeWithSecretStubArg=64
+    /// — jitinterface.cpp's `InlinedCallFrame::GetEEInfo`, sizeof-bound). The layout side
+    /// table entry is keyed by the [`pinvoke_frame_class`] sentinel and
+    /// carries no GC cells: the VM walks the frame through the Thread's
+    /// Frame chain (it knows the layout), so gcinfo must not track the
+    /// slot.
+    ///
+    /// A zero `size` is a broken EE answer (the mock without the can),
+    /// not a 0-byte frame to accept silently. The
+    /// CORJIT_FLAG_PUBLISH_SECRET_PARAM gate (RyuJIT's
+    /// `compPublishStubParam`): a published secret param arrives in r10
+    /// and must be stored at frame+offsetOfSecretStubArg in the prolog
+    /// (InsertPInvokeMethodProlog, lower.cpp:6810-6841), with the slot
+    /// sized sizeWithSecretStubArg — capturing a raw incoming physical
+    /// register is machinery we do not have, so the shape is a named
+    /// gate.
+    fn pinvoke_frame(&mut self) -> CompileResult<LocalId> {
+        if let Some(id) = self.pinvoke_frame_slot {
+            return Ok(id);
+        }
+        if self.ee.get_jit_flags().corJitFlags
+            & (1 << ffi::CORJIT_FLAGS_CorJitFlag_CORJIT_FLAG_PUBLISH_SECRET_PARAM)
+            != 0
+        {
+            return Err(CompileError::Unsupported(
+                "IL stub with a published secret param",
+            ));
+        }
+        let size = self.ee.get_ee_info().inlinedCallFrameInfo.size;
+        if size == 0 {
+            return Err(CompileError::Internal(
+                "getEEInfo answered a zero InlinedCallFrame size",
+            ));
+        }
+        let class = pinvoke_frame_class();
+        self.struct_layouts.entry(class).or_insert(StructLayout {
+            size,
+            align: 8,
+            gc_cells: Vec::new(),
+            sysv: SysVPass::memory(),
+        });
+        let id = self.temp(Type::Struct(class));
+        self.pinvoke_frame_slot = Some(id);
+        Ok(id)
+    }
+
+    /// A `JIT_PINVOKE_BEGIN`/`JIT_PINVOKE_END` helper call statement on
+    /// the frame slot: the static JITHELPERs (IAT_VALUE direct
+    /// addresses through the ordinary `getHelperFtn` machinery) with
+    /// the R2R sig `void (byref &frame)` (lower.cpp:7016-7024,
+    /// 7157-7162).
+    fn pinvoke_transition_stmt(
+        helper: CorInfoHelpFunc,
+        frame: LocalId,
+        il_offset: IlOffset,
+    ) -> hir::Stmt {
+        hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Helper(helper),
+                sig: CallSig {
+                    ret: Type::Void,
+                    args: vec![Type::ByRef],
+                    has_this: false,
+                },
+                args: vec![hir::Expr::LocalAddr(frame)],
+            }),
+        }
+    }
+
     /// The call tail shared by `call`/`callvirt`/`calli`: the hidden
     /// return buffer for a non-register-passed struct result (step_10.9,
     /// the managed convention), then the call as an `Eval` statement
     /// (void) or a pushed value.
+    ///
+    /// `gc_frame` is the InlinedCallFrame treatment for an unmanaged
+    /// calli that does not suppress the GC transition (step_11.16;
+    /// RyuJIT's helper route, lower.cpp:7003-7025 + 7151-7169): a
+    /// `JIT_PINVOKE_BEGIN(&frame)` statement immediately before the call
+    /// statement and a `JIT_PINVOKE_END(&frame)` immediately after — the
+    /// BEGIN helper writes every frame field and flips the thread to
+    /// preemptive GC mode (vm/amd64/pinvokestubs.S:14-51), so the slot
+    /// gets NO prolog initialization (InsertPInvokeMethodProlog returns
+    /// immediately on this route, lower.cpp:6810-6813). Exactly one pair
+    /// per call site on the normal path and no EH wrapping: the VM's
+    /// exception unwind unlinks/inactivates the frame itself when END is
+    /// skipped (PopExplicitFrames, vm/exceptionhandling.cpp:465-510 —
+    /// below-target frames pop generically at :471-477, an in-target
+    /// active ICF at :480-507). For a non-void call the result
+    /// materializes into a temp statement BEFORE END (END must be a
+    /// statement, not buried in a pending tree), and the temp is pushed.
     fn finish_call(
         &mut self,
         target: CallTarget<hir::Expr>,
@@ -9383,6 +9500,7 @@ impl BlockImport<'_> {
         mut args: Vec<hir::Expr>,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
+        gc_frame: Option<LocalId>,
     ) -> CompileResult<()> {
         if let Type::Struct(class) = sig.ret {
             if !self.struct_layouts[&class].sysv.passed_in_registers {
@@ -9396,6 +9514,13 @@ impl BlockImport<'_> {
                 let t = self.temp(sig.ret);
                 args.insert(usize::from(sig.has_this), hir::Expr::LocalAddr(t));
                 sig.args.insert(0, Type::ByRef);
+                if let Some(frame) = gc_frame {
+                    stmts.push(Self::pinvoke_transition_stmt(
+                        CorInfoHelpFunc::JIT_PINVOKE_BEGIN,
+                        frame,
+                        il_offset,
+                    ));
+                }
                 stmts.push(hir::Stmt {
                     il_offset,
                     kind: hir::StmtKind::Eval(hir::Expr::Call {
@@ -9404,6 +9529,13 @@ impl BlockImport<'_> {
                         args,
                     }),
                 });
+                if let Some(frame) = gc_frame {
+                    stmts.push(Self::pinvoke_transition_stmt(
+                        CorInfoHelpFunc::JIT_PINVOKE_END,
+                        frame,
+                        il_offset,
+                    ));
+                }
                 return self.push(
                     sig.ret,
                     hir::Expr::StructVal {
@@ -9417,10 +9549,46 @@ impl BlockImport<'_> {
         let expr = hir::Expr::Call { target, sig, args };
         if ret == Type::Void {
             self.spill_stack(stmts, il_offset)?;
+            if let Some(frame) = gc_frame {
+                stmts.push(Self::pinvoke_transition_stmt(
+                    CorInfoHelpFunc::JIT_PINVOKE_BEGIN,
+                    frame,
+                    il_offset,
+                ));
+            }
             stmts.push(hir::Stmt {
                 il_offset,
                 kind: hir::StmtKind::Eval(expr),
             });
+            if let Some(frame) = gc_frame {
+                stmts.push(Self::pinvoke_transition_stmt(
+                    CorInfoHelpFunc::JIT_PINVOKE_END,
+                    frame,
+                    il_offset,
+                ));
+            }
+        } else if let Some(frame) = gc_frame {
+            self.spill_stack(stmts, il_offset)?;
+            let t = self.temp(ret);
+            self.note_ftn_store(t, &expr);
+            stmts.push(Self::pinvoke_transition_stmt(
+                CorInfoHelpFunc::JIT_PINVOKE_BEGIN,
+                frame,
+                il_offset,
+            ));
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Store {
+                    dst: t,
+                    value: expr,
+                },
+            });
+            stmts.push(Self::pinvoke_transition_stmt(
+                CorInfoHelpFunc::JIT_PINVOKE_END,
+                frame,
+                il_offset,
+            ));
+            self.push(ret, hir::Expr::Local(t))?;
         } else {
             self.push(ret, expr)?;
         }
@@ -9461,11 +9629,14 @@ impl BlockImport<'_> {
         // enum but still what the stub's dispatch blob carries). Both go
         // through the EE's extension answer; the vararg shapes and the
         // non-callable nibbles (FIELD/LOCAL_SIG/PROPERTY/GENERICINST)
-        // stay named rejections.
-        match sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_MASK {
-            ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT => {}
+        // stay named rejections. For the unmanaged set the EE's
+        // suppressGCTransition out-param (step_11.16) decides between
+        // the InlinedCallFrame treatment below and a plain call.
+        let suppress_gc_transition = match sig.callConv & ffi::CorInfoCallConv_CORINFO_CALLCONV_MASK
+        {
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_DEFAULT => None,
             ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED | 0x1..=0x4 => {
-                check_unmanaged_calli(self.ee, &sig)?;
+                Some(check_unmanaged_calli(self.ee, &sig)?)
             }
             ffi::CorInfoCallConv_CORINFO_CALLCONV_VARARG => {
                 return Err(CompileError::Unsupported("managed-vararg calli"));
@@ -9480,7 +9651,7 @@ impl BlockImport<'_> {
                     "calli with a non-callable sig callconv nibble",
                 ));
             }
-        }
+        };
         // The generics callconv bits (step_11.4): GENERIC alone is an
         // unshared instantiation — RyuJIT ignores the bit everywhere
         // (`CORINFO_CALLCONV_GENERIC` has zero uses in coreclr/jit).
@@ -9514,14 +9685,17 @@ impl BlockImport<'_> {
             ));
         }
         let mut args = Vec::with_capacity(arg_types.len() + usize::from(has_this));
+        let mut arg_value_tys = Vec::with_capacity(args.capacity());
         for &expected in arg_types.iter().rev() {
             let (ty, value) = self.pop()?;
             if !call_arg_eq(ty, expected) {
                 return Err(CompileError::BadIl("calli argument type mismatch"));
             }
+            arg_value_tys.push(ty);
             args.push(value);
         }
         args.reverse();
+        arg_value_tys.reverse();
         if has_this {
             let (ty, this) = self.pop()?;
             // As in `call`: a native int receiver is a raw pointer.
@@ -9529,6 +9703,51 @@ impl BlockImport<'_> {
                 return Err(CompileError::BadIl("`this` must be a reference"));
             }
             args.insert(0, this);
+            arg_value_tys.insert(0, ty);
+        }
+        // The InlinedCallFrame treatment (step_11.16): an unmanaged calli
+        // that does not suppress the GC transition wraps in
+        // JIT_PINVOKE_BEGIN/END on the method's one frame slot
+        // (`finish_call`'s gc_frame; a managed calli — `None` — and a
+        // suppressed one stay plain calls). The argument trees and the
+        // indirect target are spilled to temps first, in IL evaluation
+        // order (the arguments, then the function pointer — it sat on top
+        // of the IL stack), so nothing user-visible evaluates after BEGIN
+        // flips the thread to preemptive GC mode: in RyuJIT's LIR the
+        // inserted prolog call lands before the call node but after its
+        // operand nodes (lower.cpp:6990-6994's insertBefore).
+        let gc_frame = match suppress_gc_transition {
+            Some(false) => Some(self.pinvoke_frame()?),
+            _ => None,
+        };
+        let mut fnptr = fnptr;
+        if gc_frame.is_some() {
+            self.spill_stack(stmts, il_offset)?;
+            for (arg, &ty) in args.iter_mut().zip(arg_value_tys.iter()) {
+                let value = std::mem::replace(arg, hir::Expr::Const(Const::Int32(0)));
+                if matches!(value, hir::Expr::LocalAddr(_) | hir::Expr::Const(_)) {
+                    *arg = value;
+                    continue;
+                }
+                let tmp = self.temp(ty);
+                self.note_ftn_store(tmp, &value);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store { dst: tmp, value },
+                });
+                let (_, expr) = self.local_value_expr(tmp);
+                *arg = expr;
+            }
+            if !matches!(fnptr, hir::Expr::LocalAddr(_) | hir::Expr::Const(_)) {
+                let tmp = self.temp(fty);
+                self.note_ftn_store(tmp, &fnptr);
+                let value = std::mem::replace(&mut fnptr, hir::Expr::Const(Const::Int32(0)));
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store { dst: tmp, value },
+                });
+                fnptr = hir::Expr::Local(tmp);
+            }
         }
         // The pending generic context (checked above) becomes the hidden
         // inst argument ahead of the user args — the 11.3B SysV order
@@ -9536,7 +9755,9 @@ impl BlockImport<'_> {
         // the retbuf immediately before it (at args[has_this] /
         // sig.args[0]), so at THIS point the context goes in at
         // args[has_this] / arg_types[0] regardless of has_retbuf —
-        // exactly the caller-side `call` insertion.
+        // exactly the caller-side `call` insertion. (After the frame
+        // spill: the context is an effect-free `Local` read, safe to
+        // evaluate under the GC transition.)
         if param_type {
             let context = self
                 .next_call_generic_context
@@ -9555,6 +9776,7 @@ impl BlockImport<'_> {
             args,
             stmts,
             il_offset,
+            gc_frame,
         )
     }
 
@@ -18200,7 +18422,9 @@ mod tests {
 
     /// An unmanaged-calli fixture (step_11.12): `ldc.i4.0; conv.i; calli;
     /// ret` with the canned sig `int()` under the given low-nibble
-    /// callConv and EE extension answer.
+    /// callConv and EE extension answer. The `getEEInfo` can carries the
+    /// real linux-x64 InlinedCallFrame layout (step_11.16 — the GC
+    /// transition sizes its frame slot from it).
     fn unmanaged_calli_fixture(
         call_conv: ffi::CorInfoCallConv,
         ext: Option<(CorInfoCallConvExtension, bool)>,
@@ -18211,15 +18435,61 @@ mod tests {
         ee.add_calli_sig(0x1100_0001, sig(CorInfoType::Int, &[]));
         ee.calli_sig_convs.insert(0x1100_0001, call_conv);
         ee.unmanaged_call_conv = ext;
+        ee.ee_info = Some(canned_ee_info());
         (ee, info)
     }
 
+    /// The canned `getEEInfo` answer for the GC-transition tests: the
+    /// real linux-x64 EE's InlinedCallFrame layout
+    /// (`InlinedCallFrame::GetEEInfo`, vm/jitinterface.cpp:10397-10414 —
+    /// sizeof(InlinedCallFrame) = 0x38 per the amd64 asmconstants
+    /// (vm/amd64/asmconstants.h:452-471), +8 with the secret stub arg),
+    /// zeros elsewhere (the helper route consumes only `size`).
+    fn canned_ee_info() -> ffi::CORINFO_EE_INFO {
+        let mut info: ffi::CORINFO_EE_INFO = unsafe { std::mem::zeroed() };
+        info.inlinedCallFrameInfo.size = 0x38;
+        info.inlinedCallFrameInfo.sizeWithSecretStubArg = 0x40;
+        info.inlinedCallFrameInfo.offsetOfFrameLink = 0x8;
+        info.inlinedCallFrameInfo.offsetOfCallTarget = 0x10;
+        info.inlinedCallFrameInfo.offsetOfCallSiteSP = 0x18;
+        info.inlinedCallFrameInfo.offsetOfReturnAddress = 0x20;
+        info.inlinedCallFrameInfo.offsetOfCalleeSavedFP = 0x28;
+        info.inlinedCallFrameInfo.offsetOfSecretStubArg = 0x38;
+        info
+    }
+
+    /// The (helper, frame) pair of a `JIT_PINVOKE_BEGIN`/`JIT_PINVOKE_END`
+    /// Eval statement; `None` for any other statement.
+    fn pinvoke_transition_of(stmt: &hir::Stmt) -> Option<(CorInfoHelpFunc, LocalId)> {
+        let hir::StmtKind::Eval(hir::Expr::Call {
+            target: CallTarget::Helper(h),
+            sig,
+            args,
+        }) = &stmt.kind
+        else {
+            return None;
+        };
+        if *h != CorInfoHelpFunc::JIT_PINVOKE_BEGIN && *h != CorInfoHelpFunc::JIT_PINVOKE_END {
+            return None;
+        }
+        assert_eq!(sig.ret, Type::Void);
+        assert_eq!(sig.args, [Type::ByRef]);
+        let hir::Expr::LocalAddr(frame) = args[0] else {
+            panic!("the transition helper takes the frame's address")
+        };
+        Some((*h, frame))
+    }
+
     #[test]
-    fn calli_with_an_unmanaged_sig_calls_indirect_like_any_calli() {
-        // The P/Invoke IL-stub dispatch shape (phase 0's finding): the
-        // sig carries the legacy 0x1 (C) nibble and the EE answers C —
-        // on x64-Unix that lowers through the ordinary SysV indirect
-        // call, GC safepoint included (the pinned call_reg byte test).
+    fn calli_unmanaged_wraps_in_the_pinvoke_frame_transition() {
+        // step_11.16: the P/Invoke IL-stub dispatch shape (phase 0's
+        // finding): the sig carries the legacy 0x1 (C) nibble or the
+        // UNMANAGED nibble and the EE answers C — on x64-Unix the call
+        // itself lowers through the ordinary SysV indirect call, now
+        // wrapped in the JIT_PINVOKE_BEGIN/END pair on the method's one
+        // InlinedCallFrame slot (RyuJIT's helper route, lower.cpp:
+        // 7003-7025 + 7151-7169). The conv.i function pointer is spilled
+        // ahead of BEGIN (operands evaluate before the transition).
         for call_conv in [
             0x1, // CORINFO_CALLCONV_C (legacy, corinfo.h:647-651)
             ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED,
@@ -18227,7 +18497,14 @@ mod tests {
             let (ee, info) =
                 unmanaged_calli_fixture(call_conv, Some((CorInfoCallConvExtension::C, false)));
             let m = import(&info, &ee).expect("unmanaged calli imports");
-            let hir::Expr::Call { target, sig, .. } = return_value(&m, 0) else {
+            let stmts = &m.blocks[0].stmts;
+            assert_eq!(stmts.len(), 4, "fnptr spill, BEGIN, call store, END");
+            let (t_fnptr, _) = store(&stmts[0]);
+            let (begin, begin_frame) =
+                pinvoke_transition_of(&stmts[1]).expect("statement 1 is BEGIN");
+            assert_eq!(begin, CorInfoHelpFunc::JIT_PINVOKE_BEGIN);
+            let (t_ret, call) = store(&stmts[2]);
+            let hir::Expr::Call { target, sig, .. } = call else {
                 panic!("expected Expr::Call")
             };
             assert!(
@@ -18236,7 +18513,140 @@ mod tests {
             );
             assert_eq!(sig.ret, Type::Int32);
             assert!(sig.args.is_empty());
+            let CallTarget::Indirect(fnptr) = target else {
+                unreachable!()
+            };
+            assert_eq!(as_local(fnptr), t_fnptr, "the spilled target");
+            let (end, end_frame) = pinvoke_transition_of(&stmts[3]).expect("statement 3 is END");
+            assert_eq!(end, CorInfoHelpFunc::JIT_PINVOKE_END);
+            assert_eq!(begin_frame, end_frame, "one frame slot for the pair");
+            assert_eq!(
+                as_local(return_value(&m, 0)),
+                t_ret,
+                "the call result is the temp END follows"
+            );
         }
+    }
+
+    #[test]
+    fn calli_unmanaged_suppressing_the_gc_transition_stays_a_plain_call() {
+        // [SuppressGCTransition]: no InlinedCallFrame, no BEGIN/END —
+        // the pre-11.16 plain-call shape (lower.cpp:7272's
+        // addPInvokePrologEpilog = !IsSuppressGCTransition).
+        let (ee, info) = unmanaged_calli_fixture(
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED,
+            Some((CorInfoCallConvExtension::C, true)),
+        );
+        let m = import(&info, &ee).expect("suppressed calli imports");
+        assert!(
+            m.blocks[0]
+                .stmts
+                .iter()
+                .all(|s| pinvoke_transition_of(s).is_none()),
+            "no transition helpers"
+        );
+        let hir::Expr::Call { target, sig, .. } = return_value(&m, 0) else {
+            panic!("expected the pending Expr::Call")
+        };
+        assert!(matches!(target, CallTarget::Indirect(_)));
+        assert_eq!(sig.ret, Type::Int32);
+    }
+
+    #[test]
+    fn calli_unmanaged_sites_share_the_one_frame_slot() {
+        // ldc.i4.0; conv.i; calli; pop; ldc.i4.0; conv.i; calli; ret —
+        // both unmanaged calli wrap in BEGIN/END on the SAME frame slot
+        // (RyuJIT's per-method lvaInlinedPInvokeFrameVar).
+        let il = [
+            0x16, 0xD3, 0x29, 0x01, 0x00, 0x00, 0x11, 0x26, 0x16, 0xD3, 0x29, 0x01, 0x00, 0x00,
+            0x11, 0x2A,
+        ];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_calli_sig(0x1100_0001, sig(CorInfoType::Int, &[]));
+        ee.calli_sig_convs
+            .insert(0x1100_0001, ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED);
+        ee.unmanaged_call_conv = Some((CorInfoCallConvExtension::C, false));
+        ee.ee_info = Some(canned_ee_info());
+        let m = import(&info, &ee).expect("imports");
+        let transitions: Vec<_> = m.blocks[0]
+            .stmts
+            .iter()
+            .filter_map(pinvoke_transition_of)
+            .collect();
+        assert_eq!(
+            transitions.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            [
+                CorInfoHelpFunc::JIT_PINVOKE_BEGIN,
+                CorInfoHelpFunc::JIT_PINVOKE_END,
+                CorInfoHelpFunc::JIT_PINVOKE_BEGIN,
+                CorInfoHelpFunc::JIT_PINVOKE_END,
+            ],
+            "each calli gets its own BEGIN/END pair"
+        );
+        let frame = transitions[0].1;
+        assert!(
+            transitions.iter().all(|&(_, f)| f == frame),
+            "one frame slot per method"
+        );
+    }
+
+    #[test]
+    fn calli_managed_emits_no_transition() {
+        // The DEFAULT-callconv calli (managed) is untouched by step_11.16.
+        let il = [0x16, 0xD3, 0x29, 0x01, 0x00, 0x00, 0x11, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        ee.add_calli_sig(0x1100_0001, sig(CorInfoType::Int, &[]));
+        let m = import(&info, &ee).expect("managed calli imports");
+        assert!(
+            m.blocks[0]
+                .stmts
+                .iter()
+                .all(|s| pinvoke_transition_of(s).is_none()),
+            "no transition helpers"
+        );
+        assert!(matches!(
+            return_value(&m, 0),
+            hir::Expr::Call {
+                target: CallTarget::Indirect(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn calli_unmanaged_gates_on_a_published_secret_param() {
+        // CORJIT_FLAG_PUBLISH_SECRET_PARAM (RyuJIT's compPublishStubParam):
+        // the secret stub param arrives in r10 for a prolog store at
+        // frame+offsetOfSecretStubArg — machinery RokaJIT does not have;
+        // a named gate.
+        let (mut ee, info) = unmanaged_calli_fixture(
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED,
+            Some((CorInfoCallConvExtension::C, false)),
+        );
+        let mut flags: ffi::CORJIT_FLAGS = unsafe { std::mem::zeroed() };
+        flags.corJitFlags = 1 << ffi::CORJIT_FLAGS_CorJitFlag_CORJIT_FLAG_PUBLISH_SECRET_PARAM;
+        ee.jit_flags = Some(flags);
+        let err = import(&info, &ee).err().expect("the gate fires");
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("published secret param")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn calli_unmanaged_with_a_zero_frame_size_is_a_setup_error() {
+        // The mock without the ee_info can answers zeros; a zero
+        // InlinedCallFrame size is Internal, never a silent 0-byte frame.
+        let (mut ee, info) = unmanaged_calli_fixture(
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_UNMANAGED,
+            Some((CorInfoCallConvExtension::C, false)),
+        );
+        ee.ee_info = None;
+        let err = import(&info, &ee).err().expect("size 0 gates");
+        assert!(
+            matches!(&err, CompileError::Internal(m) if m.contains("zero InlinedCallFrame")),
+            "{err:?}"
+        );
     }
 
     #[test]

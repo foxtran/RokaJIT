@@ -173,6 +173,15 @@ pub struct MockEe {
     /// The canned `get_unmanaged_call_conv` answer (step_11.12); `None`
     /// cans `(Managed, false)` — the EE's "this sig is not unmanaged".
     pub unmanaged_call_conv: Option<(CorInfoCallConvExtension, bool)>,
+    /// The canned `get_ee_info` answer (step_11.16: the unmanaged calli's
+    /// InlinedCallFrame slot sizes from
+    /// `inlinedCallFrameInfo.size`); `None` cans zeros — a zero frame
+    /// size is the named `Internal` test-setup error, so a fixture
+    /// exercising the GC transition must can the real EE's answer.
+    pub ee_info: Option<ffi::CORINFO_EE_INFO>,
+    /// The canned `get_jit_flags` answer (step_11.16: the
+    /// CORJIT_FLAG_PUBLISH_SECRET_PARAM gate); `None` cans zero flags.
+    pub jit_flags: Option<ffi::CORJIT_FLAGS>,
     /// The flags each `get_call_info` call arrived with, in order
     /// (step_10.4 tests: `call` passes EMPTY, `callvirt` CALLVIRT).
     pub call_info_flags: RefCell<Vec<CallInfoFlags>>,
