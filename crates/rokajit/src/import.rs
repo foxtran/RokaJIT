@@ -3159,53 +3159,69 @@ fn store_compatible(value: Type, slot: Type) -> bool {
 /// Does the tree read local `id` anywhere? Drives the stloc interference
 /// spill (`BlockImport::stloc`): a tree on the evaluation stack that
 /// references the store's destination must keep the pre-store value.
+///
+/// Explicit stack (step_11.17): tree depth scales with IL input.
+/// Children push last-first so they pop left-to-right — the recursive
+/// walk's pre-order (the short-circuit `||` visited lhs before rhs).
 fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
-    match expr {
-        hir::Expr::Const(_) | hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => false,
-        hir::Expr::NextCallReturnAddress => false,
-        hir::Expr::Local(l) | hir::Expr::LocalAddr(l) => *l == id,
-        hir::Expr::Load { addr, .. } => references_local(addr, id),
-        hir::Expr::FieldAddr { obj, .. } => references_local(obj, id),
-        hir::Expr::Unary { arg, .. } => references_local(arg, id),
-        hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
-            references_local(lhs, id) || references_local(rhs, id)
+    let mut stack = vec![expr];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            hir::Expr::Const(_) | hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => {}
+            hir::Expr::NextCallReturnAddress => {}
+            hir::Expr::Local(l) | hir::Expr::LocalAddr(l) => {
+                if *l == id {
+                    return true;
+                }
+            }
+            hir::Expr::Load { addr, .. } => stack.push(addr),
+            hir::Expr::FieldAddr { obj, .. } => stack.push(obj),
+            hir::Expr::Unary { arg, .. } => stack.push(arg),
+            hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
+                stack.push(rhs);
+                stack.push(lhs);
+            }
+            hir::Expr::Conv { arg, .. } => stack.push(arg),
+            hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => stack.push(arg),
+            hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => stack.push(arg),
+            hir::Expr::Call { target, args, .. } => {
+                // Target first, then the arguments in list order.
+                for arg in args.iter().rev() {
+                    stack.push(arg);
+                }
+                if let CallTarget::Indirect(addr) = target {
+                    stack.push(addr);
+                }
+            }
+            hir::Expr::NullCheck { arg } => stack.push(arg),
+            hir::Expr::ArrLen { array } => stack.push(array),
+            hir::Expr::ArrElemAddr { array, index, .. } => {
+                stack.push(index);
+                stack.push(array);
+            }
+            hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => stack.push(arg),
+            hir::Expr::StructVal { addr, .. } => stack.push(addr),
+            hir::Expr::AtomicCmpXchg {
+                addr,
+                value,
+                comparand,
+                ..
+            } => {
+                stack.push(comparand);
+                stack.push(value);
+                stack.push(addr);
+            }
+            hir::Expr::AtomicXchg { addr, value, .. }
+            | hir::Expr::AtomicXadd { addr, value, .. } => {
+                stack.push(value);
+                stack.push(addr);
+            }
+            hir::Expr::MemoryFence | hir::Expr::Serialize => {}
+            hir::Expr::LocAlloc { size } => stack.push(size),
+            hir::Expr::FtnAddr { entry, .. } => stack.push(entry),
         }
-        hir::Expr::Conv { arg, .. } => references_local(arg, id),
-        hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => {
-            references_local(arg, id)
-        }
-        hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => references_local(arg, id),
-        hir::Expr::Call { target, args, .. } => {
-            let target_ref = match target {
-                CallTarget::Indirect(addr) => references_local(addr, id),
-                _ => false,
-            };
-            target_ref || args.iter().any(|a| references_local(a, id))
-        }
-        hir::Expr::NullCheck { arg } => references_local(arg, id),
-        hir::Expr::ArrLen { array } => references_local(array, id),
-        hir::Expr::ArrElemAddr { array, index, .. } => {
-            references_local(array, id) || references_local(index, id)
-        }
-        hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => references_local(arg, id),
-        hir::Expr::StructVal { addr, .. } => references_local(addr, id),
-        hir::Expr::AtomicCmpXchg {
-            addr,
-            value,
-            comparand,
-            ..
-        } => {
-            references_local(addr, id)
-                || references_local(value, id)
-                || references_local(comparand, id)
-        }
-        hir::Expr::AtomicXchg { addr, value, .. } | hir::Expr::AtomicXadd { addr, value, .. } => {
-            references_local(addr, id) || references_local(value, id)
-        }
-        hir::Expr::MemoryFence | hir::Expr::Serialize => false,
-        hir::Expr::LocAlloc { size } => references_local(size, id),
-        hir::Expr::FtnAddr { entry, .. } => references_local(entry, id),
     }
+    false
 }
 
 /// Does evaluating the tree have an observable effect beyond producing a
@@ -3213,61 +3229,79 @@ fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
 /// `int.MinValue / -1` overflow are exceptions, so a discarded `x / y`
 /// must still execute)? Drives `pop`: a tree with an effect becomes an
 /// `Eval` statement; anything else is dropped.
+///
+/// Explicit stack (step_11.17), same left-to-right pop order as
+/// [`references_local`].
 fn must_eval(expr: &hir::Expr) -> bool {
-    match expr {
-        hir::Expr::Const(_) | hir::Expr::Local(_) | hir::Expr::LocalAddr(_) => false,
-        hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => false,
-        // A `lea` of a code address — no memory read, no fault, no
-        // ordering (the pending-call-label binding is codegen's concern
-        // only when the value is actually used).
-        hir::Expr::NextCallReturnAddress => false,
-        hir::Expr::Load { .. } => true, // can fault (null byref)
-        hir::Expr::FieldAddr { obj, .. } => must_eval(obj),
-        hir::Expr::Unary { arg, .. } => must_eval(arg),
-        hir::Expr::Binary { op, lhs, rhs } => {
-            matches!(
-                op,
-                BinaryOp::Div | BinaryOp::UDiv | BinaryOp::Rem | BinaryOp::URem
-            ) || must_eval(lhs)
-                || must_eval(rhs)
+    let mut stack = vec![expr];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            hir::Expr::Const(_) | hir::Expr::Local(_) | hir::Expr::LocalAddr(_) => {}
+            hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => {}
+            // A `lea` of a code address — no memory read, no fault, no
+            // ordering (the pending-call-label binding is codegen's concern
+            // only when the value is actually used).
+            hir::Expr::NextCallReturnAddress => {}
+            hir::Expr::Load { .. } => return true, // can fault (null byref)
+            hir::Expr::FieldAddr { obj, .. } => stack.push(obj),
+            hir::Expr::Unary { arg, .. } => stack.push(arg),
+            hir::Expr::Binary { op, lhs, rhs } => {
+                if matches!(
+                    op,
+                    BinaryOp::Div | BinaryOp::UDiv | BinaryOp::Rem | BinaryOp::URem
+                ) {
+                    return true;
+                }
+                stack.push(rhs);
+                stack.push(lhs);
+            }
+            // The checked forms can throw OverflowException — observable
+            // even when the value is discarded.
+            hir::Expr::BinaryOvf { .. } => return true,
+            hir::Expr::Conv { arg, .. } => stack.push(arg),
+            hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => stack.push(arg),
+            // The checked conversion and the finiteness check can throw —
+            // observable even when the value is discarded.
+            hir::Expr::ConvOvf { .. } | hir::Expr::CkFinite { .. } => return true,
+            hir::Expr::Call { .. } => return true,
+            hir::Expr::NullCheck { .. } => return true, // the check itself can fault
+            hir::Expr::ArrLen { .. } => return true,    // faults on a null array
+            hir::Expr::ArrElemAddr { array, index, .. } => {
+                stack.push(index);
+                stack.push(array);
+            }
+            // Not built by the importer yet, but a cast can throw and a
+            // box allocates — both observable.
+            hir::Expr::Cast { .. } | hir::Expr::Box { .. } => return true,
+            // The struct value IS a memory read (an `ldobj`/`cpobj`'s
+            // load): discarding it keeps the implicit null check (the
+            // GitHub_39823 repro — RyuJIT's dead-copy `cmp byte ptr
+            // [rax], al`; our read is the block copy the value stands
+            // for, same fault). A frame or static slot address can't
+            // fault, so those stay free.
+            hir::Expr::StructVal { addr, .. } => {
+                if !matches!(
+                    **addr,
+                    hir::Expr::LocalAddr(_) | hir::Expr::StaticFieldAddr { .. }
+                ) {
+                    return true;
+                }
+            }
+            // An opaque global store that can fault (a null byref) —
+            // always observable (RyuJIT's GTF_ASG on the atomic nodes);
+            // the fence is its own effect.
+            hir::Expr::AtomicCmpXchg { .. }
+            | hir::Expr::AtomicXchg { .. }
+            | hir::Expr::AtomicXadd { .. }
+            | hir::Expr::MemoryFence
+            | hir::Expr::Serialize => return true,
+            // The allocation moves rsp for the rest of the method — an
+            // effect even when the address is discarded.
+            hir::Expr::LocAlloc { .. } => return true,
+            hir::Expr::FtnAddr { entry, .. } => stack.push(entry),
         }
-        // The checked forms can throw OverflowException — observable even
-        // when the value is discarded.
-        hir::Expr::BinaryOvf { .. } => true,
-        hir::Expr::Conv { arg, .. } => must_eval(arg),
-        hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => must_eval(arg),
-        // The checked conversion and the finiteness check can throw —
-        // observable even when the value is discarded.
-        hir::Expr::ConvOvf { .. } | hir::Expr::CkFinite { .. } => true,
-        hir::Expr::Call { .. } => true,
-        hir::Expr::NullCheck { .. } => true, // the check itself can fault
-        hir::Expr::ArrLen { .. } => true,    // faults on a null array
-        hir::Expr::ArrElemAddr { array, index, .. } => must_eval(array) || must_eval(index),
-        // Not built by the importer yet, but a cast can throw and a box
-        // allocates — both observable.
-        hir::Expr::Cast { .. } | hir::Expr::Box { .. } => true,
-        // The struct value IS a memory read (an `ldobj`/`cpobj`'s load):
-        // discarding it keeps the implicit null check (the GitHub_39823
-        // repro — RyuJIT's dead-copy `cmp byte ptr [rax], al`; our read
-        // is the block copy the value stands for, same fault). A frame
-        // or static slot address can't fault, so those stay free.
-        hir::Expr::StructVal { addr, .. } => !matches!(
-            **addr,
-            hir::Expr::LocalAddr(_) | hir::Expr::StaticFieldAddr { .. }
-        ),
-        // An opaque global store that can fault (a null byref) — always
-        // observable (RyuJIT's GTF_ASG on the atomic nodes); the fence is
-        // its own effect.
-        hir::Expr::AtomicCmpXchg { .. }
-        | hir::Expr::AtomicXchg { .. }
-        | hir::Expr::AtomicXadd { .. }
-        | hir::Expr::MemoryFence
-        | hir::Expr::Serialize => true,
-        // The allocation moves rsp for the rest of the method — an effect
-        // even when the address is discarded.
-        hir::Expr::LocAlloc { .. } => true,
-        hir::Expr::FtnAddr { entry, .. } => must_eval(entry),
     }
+    false
 }
 
 /// RyuJIT's `GTF_GLOB_EFFECT` test for a store's value tree
@@ -3276,43 +3310,58 @@ fn must_eval(expr: &hir::Expr) -> bool {
 /// spill in `store_local`/`dup` — pending trees came from earlier IL and
 /// must evaluate before the store's value does (GitHub_19149:
 /// `call f(); call g(); stloc` ran g before f).
+///
+/// Explicit stack (step_11.17), same left-to-right pop order as
+/// [`references_local`].
 fn has_global_effect(expr: &hir::Expr) -> bool {
-    match expr {
-        hir::Expr::Const(_) | hir::Expr::Local(_) | hir::Expr::LocalAddr(_) => false,
-        // An address by itself reads nothing; the consumer does.
-        hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => false,
-        // A `lea` of a code address — no memory read, no effect.
-        hir::Expr::NextCallReturnAddress => false,
-        hir::Expr::Load { .. } => true,
-        hir::Expr::FieldAddr { obj, .. } => has_global_effect(obj),
-        hir::Expr::Unary { arg, .. } => has_global_effect(arg),
-        hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
-            has_global_effect(lhs) || has_global_effect(rhs)
+    let mut stack = vec![expr];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            hir::Expr::Const(_) | hir::Expr::Local(_) | hir::Expr::LocalAddr(_) => {}
+            // An address by itself reads nothing; the consumer does.
+            hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => {}
+            // A `lea` of a code address — no memory read, no effect.
+            hir::Expr::NextCallReturnAddress => {}
+            hir::Expr::Load { .. } => return true,
+            hir::Expr::FieldAddr { obj, .. } => stack.push(obj),
+            hir::Expr::Unary { arg, .. } => stack.push(arg),
+            hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
+                stack.push(rhs);
+                stack.push(lhs);
+            }
+            hir::Expr::Conv { arg, .. } => stack.push(arg),
+            hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => stack.push(arg),
+            hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => stack.push(arg),
+            hir::Expr::Call { .. } => return true,
+            hir::Expr::NullCheck { arg } => stack.push(arg),
+            // The length read dereferences the array header.
+            hir::Expr::ArrLen { .. } => return true,
+            hir::Expr::ArrElemAddr { array, index, .. } => {
+                stack.push(index);
+                stack.push(array);
+            }
+            // Both expand to helper calls.
+            hir::Expr::Cast { .. } | hir::Expr::Box { .. } => return true,
+            // The struct value IS a memory read; only a frame slot is
+            // local.
+            hir::Expr::StructVal { addr, .. } => {
+                if !matches!(**addr, hir::Expr::LocalAddr(_)) {
+                    return true;
+                }
+            }
+            // An opaque global store (GTF_ASG); the fence is its own
+            // effect.
+            hir::Expr::AtomicCmpXchg { .. }
+            | hir::Expr::AtomicXchg { .. }
+            | hir::Expr::AtomicXadd { .. }
+            | hir::Expr::MemoryFence
+            | hir::Expr::Serialize => return true,
+            // The allocation moves rsp for the rest of the method.
+            hir::Expr::LocAlloc { .. } => return true,
+            hir::Expr::FtnAddr { entry, .. } => stack.push(entry),
         }
-        hir::Expr::Conv { arg, .. } => has_global_effect(arg),
-        hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => has_global_effect(arg),
-        hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => has_global_effect(arg),
-        hir::Expr::Call { .. } => true,
-        hir::Expr::NullCheck { arg } => has_global_effect(arg),
-        // The length read dereferences the array header.
-        hir::Expr::ArrLen { .. } => true,
-        hir::Expr::ArrElemAddr { array, index, .. } => {
-            has_global_effect(array) || has_global_effect(index)
-        }
-        // Both expand to helper calls.
-        hir::Expr::Cast { .. } | hir::Expr::Box { .. } => true,
-        // The struct value IS a memory read; only a frame slot is local.
-        hir::Expr::StructVal { addr, .. } => !matches!(**addr, hir::Expr::LocalAddr(_)),
-        // An opaque global store (GTF_ASG); the fence is its own effect.
-        hir::Expr::AtomicCmpXchg { .. }
-        | hir::Expr::AtomicXchg { .. }
-        | hir::Expr::AtomicXadd { .. }
-        | hir::Expr::MemoryFence
-        | hir::Expr::Serialize => true,
-        // The allocation moves rsp for the rest of the method.
-        hir::Expr::LocAlloc { .. } => true,
-        hir::Expr::FtnAddr { entry, .. } => has_global_effect(entry),
     }
+    false
 }
 
 /// The `CORINFO_HELP_VIRTUAL_FUNC_PTR` lookup call (step_10.12): the EE
@@ -25799,5 +25848,78 @@ mod tests {
             matches!(&err, CompileError::BadIl(m) if m.contains("no following instruction")),
             "{err:?}"
         );
+    }
+
+    // --- step_11.17: the tree predicates run on an explicit stack ---
+
+    /// A `depth`-deep left-nested `Binary{Add}` chain over `innermost`,
+    /// built ITERATIVELY — a recursive builder (or the recursive test
+    /// helpers `expr_has_ushr`/`count_lt`, which must NOT be used on
+    /// this fixture) would overflow before the predicate under test
+    /// runs. `mem::forget`ped by the caller: dropping a 10k-deep Box
+    /// chain is itself recursive glue.
+    fn deep_left_adds(depth: usize, innermost: hir::Expr) -> hir::Expr {
+        let mut expr = innermost;
+        for _ in 0..depth {
+            expr = hir::Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(expr),
+                rhs: Box::new(hir::Expr::Const(Const::Int32(1))),
+            };
+        }
+        expr
+    }
+
+    #[test]
+    fn references_local_reaches_the_bottom_of_a_deep_tree() {
+        // The answer depends on the deepest node: Local(7) at the
+        // bottom of a 10k-deep chain.
+        let deep = deep_left_adds(10_000, hir::Expr::Local(LocalId(7)));
+        assert!(references_local(&deep, LocalId(7)));
+        assert!(!references_local(&deep, LocalId(8)));
+        std::mem::forget(deep);
+    }
+
+    #[test]
+    fn must_eval_reaches_the_bottom_of_a_deep_tree() {
+        // A trapping div at the bottom; the spine is pure.
+        let div = hir::Expr::Binary {
+            op: BinaryOp::Div,
+            lhs: Box::new(hir::Expr::Local(LocalId(0))),
+            rhs: Box::new(hir::Expr::Const(Const::Int32(2))),
+        };
+        let deep = deep_left_adds(10_000, div);
+        assert!(must_eval(&deep));
+        let pure = deep_left_adds(10_000, hir::Expr::Const(Const::Int32(0)));
+        assert!(!must_eval(&pure));
+        std::mem::forget(deep);
+        std::mem::forget(pure);
+    }
+
+    #[test]
+    fn has_global_effect_reaches_the_bottom_of_a_deep_tree() {
+        // A memory read at the bottom; the spine is pure. Also a deep
+        // right-nested chain — the pop order covers both spine shapes.
+        let load = hir::Expr::Load {
+            addr: Box::new(hir::Expr::Local(LocalId(0))),
+            offset: 0,
+            ty: Type::Int32,
+            access: MemAccess::Natural,
+        };
+        let deep = deep_left_adds(10_000, load);
+        assert!(has_global_effect(&deep));
+        std::mem::forget(deep);
+
+        let mut right = hir::Expr::Const(Const::Int32(0));
+        for _ in 0..10_000 {
+            right = hir::Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(hir::Expr::Const(Const::Int32(1))),
+                rhs: Box::new(right),
+            };
+        }
+        assert!(!has_global_effect(&right));
+        assert!(!must_eval(&right));
+        std::mem::forget(right);
     }
 }

@@ -34,13 +34,12 @@ are counted under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 2405 |
-| CRASH | 1 |
+| MATCH | 2406 |
 | ARTIFACT | 16 |
 | TIMEOUT | 27 |
 | COMPILE_FAIL | 832 |
 
-Of the MATCHes, 2386 exit 100 (the CoreCLR pass
+Of the MATCHes, 2387 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ, no named gate in stderr;
@@ -127,6 +126,4 @@ RokaJIT failures with no `CompileError` marker in stderr — either
 silent-wrong-result bugs (MISMATCH with a clean run) or crashes the
 error model didn't classify. Each carries its stderr signature.
 
-| Test | Category | Detail | Stderr signature |
-| --- | --- | --- | --- |
-| `JIT/Methodical/largeframes/skip6/skippage6.cs` | CRASH | SIGABRT | Stack overflow. |
+None.

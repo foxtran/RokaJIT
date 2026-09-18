@@ -102,62 +102,101 @@ pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
 /// list is complete — declared args plus the receiver when `has_this`.
 /// Argument *order* needs no check: it is IL push order by construction
 /// (the tree's field order), which is the order lowering flattens.
+///
+/// The walk runs on an explicit stack (step_11.17): tree depth scales
+/// with IL input (a 4000-operand left-fold sum — skippage6's
+/// `BigArgSpace` — is a 4000-deep `Binary` chain), and native recursion
+/// here exhausted the compile-time stack. The visit order is exactly the
+/// recursive walk's: pre-order, children left-to-right, and a call's
+/// arity check lands only after its subtrees certified (the recursive
+/// order), so the FIRST error a bad tree reports is unchanged.
 fn certify_expr(expr: &hir::Expr) -> CompileResult<()> {
-    match expr {
-        hir::Expr::Const(_)
-        | hir::Expr::Local(_)
-        | hir::Expr::LocalAddr(_)
-        | hir::Expr::StaticFieldAddr { .. }
-        | hir::Expr::NextCallReturnAddress
-        | hir::Expr::CatchArg => {}
-        hir::Expr::Load { addr, .. } => certify_expr(addr)?,
-        hir::Expr::FieldAddr { obj, .. } => certify_expr(obj)?,
-        hir::Expr::Unary { arg, .. } => certify_expr(arg)?,
-        hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
-            certify_expr(lhs)?;
-            certify_expr(rhs)?;
-        }
-        hir::Expr::Conv { arg, .. } => certify_expr(arg)?,
-        hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => certify_expr(arg)?,
-        hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => certify_expr(arg)?,
-        hir::Expr::Call { target, sig, args } => {
-            if let CallTarget::Indirect(addr) = target {
-                certify_expr(addr)?;
+    /// One pending step: visit a subtree, or run a call's arity check
+    /// once its subtrees have certified (the recursive arm's tail).
+    enum Step<'a> {
+        Visit(&'a hir::Expr),
+        CallArity { declared: usize, actual: usize },
+    }
+    let mut stack = vec![Step::Visit(expr)];
+    while let Some(step) = stack.pop() {
+        let expr = match step {
+            Step::Visit(expr) => expr,
+            Step::CallArity { declared, actual } => {
+                if actual != declared {
+                    return Err(CompileError::Internal(
+                        "call argument list does not match its signature",
+                    ));
+                }
+                continue;
             }
-            for arg in args {
-                certify_expr(arg)?;
+        };
+        match expr {
+            hir::Expr::Const(_)
+            | hir::Expr::Local(_)
+            | hir::Expr::LocalAddr(_)
+            | hir::Expr::StaticFieldAddr { .. }
+            | hir::Expr::NextCallReturnAddress
+            | hir::Expr::CatchArg => {}
+            hir::Expr::Load { addr, .. } => stack.push(Step::Visit(addr)),
+            hir::Expr::FieldAddr { obj, .. } => stack.push(Step::Visit(obj)),
+            hir::Expr::Unary { arg, .. } => stack.push(Step::Visit(arg)),
+            // Children pop left-to-right (the recursive arm's order):
+            // push the LAST child first.
+            hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
+                stack.push(Step::Visit(rhs));
+                stack.push(Step::Visit(lhs));
             }
-            if args.len() != sig.args.len() + usize::from(sig.has_this) {
-                return Err(CompileError::Internal(
-                    "call argument list does not match its signature",
-                ));
+            hir::Expr::Conv { arg, .. } => stack.push(Step::Visit(arg)),
+            hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => {
+                stack.push(Step::Visit(arg))
             }
+            hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => {
+                stack.push(Step::Visit(arg))
+            }
+            hir::Expr::Call { target, sig, args } => {
+                // The arity check pops last — after the target address
+                // and every argument subtree certified, the recursive
+                // arm's order.
+                stack.push(Step::CallArity {
+                    declared: sig.args.len() + usize::from(sig.has_this),
+                    actual: args.len(),
+                });
+                for arg in args.iter().rev() {
+                    stack.push(Step::Visit(arg));
+                }
+                if let CallTarget::Indirect(addr) = target {
+                    stack.push(Step::Visit(addr));
+                }
+            }
+            hir::Expr::NullCheck { arg } => stack.push(Step::Visit(arg)),
+            hir::Expr::ArrLen { array } => stack.push(Step::Visit(array)),
+            hir::Expr::ArrElemAddr { array, index, .. } => {
+                stack.push(Step::Visit(index));
+                stack.push(Step::Visit(array));
+            }
+            hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => {
+                stack.push(Step::Visit(arg))
+            }
+            hir::Expr::StructVal { addr, .. } => stack.push(Step::Visit(addr)),
+            hir::Expr::AtomicCmpXchg {
+                addr,
+                value,
+                comparand,
+                ..
+            } => {
+                stack.push(Step::Visit(comparand));
+                stack.push(Step::Visit(value));
+                stack.push(Step::Visit(addr));
+            }
+            hir::Expr::AtomicXchg { addr, value, .. }
+            | hir::Expr::AtomicXadd { addr, value, .. } => {
+                stack.push(Step::Visit(value));
+                stack.push(Step::Visit(addr));
+            }
+            hir::Expr::MemoryFence | hir::Expr::Serialize => {}
+            hir::Expr::LocAlloc { size } => stack.push(Step::Visit(size)),
+            hir::Expr::FtnAddr { entry, .. } => stack.push(Step::Visit(entry)),
         }
-        hir::Expr::NullCheck { arg } => certify_expr(arg)?,
-        hir::Expr::ArrLen { array } => certify_expr(array)?,
-        hir::Expr::ArrElemAddr { array, index, .. } => {
-            certify_expr(array)?;
-            certify_expr(index)?;
-        }
-        hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => certify_expr(arg)?,
-        hir::Expr::StructVal { addr, .. } => certify_expr(addr)?,
-        hir::Expr::AtomicCmpXchg {
-            addr,
-            value,
-            comparand,
-            ..
-        } => {
-            certify_expr(addr)?;
-            certify_expr(value)?;
-            certify_expr(comparand)?;
-        }
-        hir::Expr::AtomicXchg { addr, value, .. } | hir::Expr::AtomicXadd { addr, value, .. } => {
-            certify_expr(addr)?;
-            certify_expr(value)?;
-        }
-        hir::Expr::MemoryFence | hir::Expr::Serialize => {}
-        hir::Expr::LocAlloc { size } => certify_expr(size)?,
-        hir::Expr::FtnAddr { entry, .. } => certify_expr(entry)?,
     }
     Ok(())
 }
@@ -505,5 +544,73 @@ mod tests {
             generics_context: None,
         });
         assert!(m.is_ok());
+    }
+
+    // --- step_11.17: the certify walk runs on an explicit stack ---
+
+    /// A `depth`-deep left-nested `Binary{Add}` chain over an Int32
+    /// constant — skippage6's `BigArgSpace` shape, built ITERATIVELY (a
+    /// recursive builder would overflow before the walker under test
+    /// runs). `mem::forget`ped by the caller: dropping a 10k-deep Box
+    /// chain is itself recursive glue.
+    fn deep_left_adds(depth: usize) -> hir::Expr {
+        let mut expr = hir::Expr::Const(Const::Int32(0));
+        for _ in 0..depth {
+            expr = hir::Expr::Binary {
+                op: crate::ir::BinaryOp::Add,
+                lhs: Box::new(expr),
+                rhs: Box::new(hir::Expr::Const(Const::Int32(1))),
+            };
+        }
+        expr
+    }
+
+    #[test]
+    fn certify_walks_a_deep_left_nested_chain() {
+        let expr = deep_left_adds(10_000);
+        assert!(certify_expr(&expr).is_ok(), "no native recursion");
+        std::mem::forget(expr);
+    }
+
+    #[test]
+    fn certify_walks_a_deep_right_nested_chain() {
+        let mut expr = hir::Expr::Const(Const::Int32(0));
+        for _ in 0..10_000 {
+            expr = hir::Expr::Binary {
+                op: crate::ir::BinaryOp::Add,
+                lhs: Box::new(hir::Expr::Const(Const::Int32(1))),
+                rhs: Box::new(expr),
+            };
+        }
+        assert!(certify_expr(&expr).is_ok());
+        std::mem::forget(expr);
+    }
+
+    #[test]
+    fn certify_finds_a_bad_call_at_the_bottom_of_a_deep_tree() {
+        // The bad call is the innermost node: the iterative walk must
+        // reach it (and only then report — the arity check fires after
+        // its subtrees certify, the recursive order).
+        let bad_call = hir::Expr::Call {
+            target: CallTarget::Direct(
+                MethodHandle::from_raw(0x7777usize as ffi::CORINFO_METHOD_HANDLE).unwrap(),
+            ),
+            sig: CallSig {
+                ret: Type::Int32,
+                args: vec![Type::Int32],
+                has_this: false,
+            },
+            args: Vec::new(),
+        };
+        let mut expr = bad_call;
+        for _ in 0..10_000 {
+            expr = hir::Expr::Binary {
+                op: crate::ir::BinaryOp::Add,
+                lhs: Box::new(expr),
+                rhs: Box::new(hir::Expr::Const(Const::Int32(1))),
+            };
+        }
+        assert!(certify_expr(&expr).is_err(), "the deep bad call is found");
+        std::mem::forget(expr);
     }
 }

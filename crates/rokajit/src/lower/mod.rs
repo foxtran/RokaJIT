@@ -48,7 +48,7 @@ mod dsl;
 
 use crate::error::{CompileError, CompileResult};
 use crate::ir::{
-    hir, lir, BinaryOp, BlockId, CallSig, CallTarget, Const, IlOffset, LocalId, Type,
+    hir, lir, BinaryOp, BlockId, CallSig, CallTarget, Const, IlOffset, LocalId, Type, UnaryOp,
     IL_OFFSET_NONE,
 };
 use crate::structs::StructLayouts;
@@ -150,6 +150,98 @@ pub fn lower(method: hir::Method, target: &dyn Target) -> CompileResult<lir::Met
 struct Flatten<'a> {
     locals: Vec<hir::Local>,
     layouts: &'a StructLayouts,
+}
+
+/// One step of the explicit-stack flattener (step_11.17): the recursive
+/// walk's continuations made heap values, because tree depth scales with
+/// IL input (skippage6's `BigArgSpace` is a 4000-deep left-nested
+/// `Binary` chain) and native recursion here exhausted the compile-time
+/// stack. `Eval` enters a subtree — its arm pushes its finishing step
+/// first and its children last, so children pop left-to-right in field
+/// order, the IL push order the importer encoded. The `Finish*` steps
+/// pop the child operands and run the arm's post-children emission;
+/// `FreezeIf`/`AddrOfTop` are the between-children operand actions (the
+/// step_11.13 freeze rule; the address materialization), popping at
+/// exactly the points the recursive walk performs them. The emitted
+/// statement sequence is therefore byte-identical to the recursive
+/// flattener's.
+enum FlatTask<'m> {
+    /// Flatten this subtree; its operand is pushed onto the value stack.
+    Eval(&'m hir::Expr),
+    /// Replace the value stack's top with its frozen form when the flag
+    /// is set (a deferred `Local` read must not cross a later sibling's
+    /// effects — [`tree_has_effect`], step_11.13).
+    FreezeIf(bool),
+    /// Replace the value stack's top with its address-value form (an
+    /// `AddrOf` materializes into a fresh ByRef temp). `ArrElemAddr`'s
+    /// array operand materializes before the index flattens.
+    AddrOfTop,
+    /// Pop rhs, lhs; emit the `Binary` statement (a compare's result is
+    /// Int32; every other op takes its integer operands' type).
+    FinishBinary { op: BinaryOp },
+    /// Pop rhs, lhs; emit the checked-arithmetic statement (the result
+    /// is the operands' promoted type, like `Binary`).
+    FinishBinaryOvf { op: BinaryOp, unsigned: bool },
+    /// Pop the flattened arguments (and the indirect target's address —
+    /// it flattened last, its `calli` IL position); emit the call.
+    FinishCall {
+        target: &'m CallTarget<hir::Expr>,
+        sig: &'m CallSig,
+        args: &'m [hir::Expr],
+        /// In value position the result operand is pushed (a void call
+        /// there is an importer bug); a discarded call pushes nothing.
+        value_position: bool,
+    },
+    /// Pop the size; emit the `localloc` statement (a NativeInt address).
+    FinishLocAlloc,
+    /// Pop the address; emit the load at the constant offset.
+    FinishLoad {
+        offset: u32,
+        ty: Type,
+        access: crate::ir::MemAccess,
+    },
+    /// Pop the object; emit the `obj + offset` byref add (a managed
+    /// byref — an interior-pointer GC root at every safepoint).
+    FinishFieldAddr { offset: u32 },
+    /// Pop the source; emit the unary statement.
+    FinishUnary { op: UnaryOp },
+    /// Pop the source; emit the conversion — a float source with an
+    /// integer target expands to the .NET 9+ saturating statement
+    /// sequence, not a single `Conv` (step_10.11 / step_11.5).
+    FinishConv { to: Type, unsigned: bool },
+    /// Pop the source; emit the checked conversion (one statement
+    /// carrying the explicit target width/signedness to codegen).
+    FinishConvOvf {
+        to: Type,
+        dst_bits: u32,
+        signed_dst: bool,
+        unsigned_src: bool,
+    },
+    /// Pop the source; emit the round-to-nearest-even conversion.
+    FinishConvRne { to: Type },
+    /// Pop the source; emit the raw truncating (`cvtt`) conversion.
+    FinishConvTrunc { to: Type },
+    /// Pop the source; emit the finiteness check (the value passes
+    /// through unchanged; the statement exists for its throw).
+    FinishCkFinite,
+    /// Pop comparand, value, addr; emit the cmpxchg statement.
+    FinishCmpXchg { bits: u8, signed: bool },
+    /// Pop value, addr; emit the xchg statement.
+    FinishXchg { bits: u8, signed: bool },
+    /// Pop value, addr; emit the xadd statement.
+    FinishXadd { bits: u8, signed: bool },
+    /// Pop the checked value; emit the trap-based null check. The value
+    /// itself is the result.
+    FinishNullCheck,
+    /// Pop the array; emit the length load (doubling as the null check —
+    /// the step_10.4 trap model).
+    FinishArrLen,
+    /// Pop index, array; emit the `array + data_offset + index*size`
+    /// chain (the index zero-extends to native width first).
+    FinishArrElemAddr { elem_size: u32 },
+    /// Pop the address; a struct value IS its address (step_10.9), with
+    /// the block-op const materialization applied.
+    FinishStructVal,
 }
 
 impl Flatten<'_> {
@@ -818,7 +910,14 @@ impl Flatten<'_> {
         il: IlOffset,
     ) -> CompileResult<()> {
         if let hir::Expr::Call { target, sig, args } = expr {
-            self.flatten_call(target, sig, args, out, il)?;
+            // Statement position: the same task sequence as a `Call` in
+            // value position, but no result operand is produced (a void
+            // call is legal here).
+            let mut tasks = Vec::new();
+            Self::push_call_tasks(&mut tasks, target, sig, args, false)?;
+            let mut values = Vec::new();
+            self.run_flatten(&mut tasks, &mut values, out, il)?;
+            debug_assert!(values.is_empty(), "a discarded call yields no operand");
         } else if let hir::Expr::StructVal { addr, class } = expr {
             let src = self.flatten_expr(addr, out, il)?;
             let src = self.block_addr_value(src, out, il);
@@ -923,57 +1022,510 @@ impl Flatten<'_> {
     /// Tree → flat statements; returns the operand holding the value.
     /// Children flatten depth-first in field order, preserving the IL
     /// push order the importer encoded (ir-design.md, "Evaluation order").
+    ///
+    /// The walk runs on an explicit task stack (step_11.17 — see
+    /// [`FlatTask`]): the value stack holds the operands of finished
+    /// subtrees, and each `Finish*` step consumes exactly the operands
+    /// its subtree produced, so nesting balances at every point.
     fn flatten_expr(
         &mut self,
         expr: &hir::Expr,
         out: &mut Vec<lir::Stmt>,
         il: IlOffset,
     ) -> CompileResult<lir::Operand> {
+        let mut tasks = vec![FlatTask::Eval(expr)];
+        let mut values = Vec::new();
+        self.run_flatten(&mut tasks, &mut values, out, il)?;
+        debug_assert_eq!(values.len(), 1, "one operand per flattened tree");
+        Ok(values.pop().unwrap())
+    }
+
+    /// The flattener's loop: pop a step, run it, until the task stack
+    /// drains. [`Flatten::eval_task`] enters subtrees; the `Finish*`
+    /// arms below emit the statements.
+    fn run_flatten(
+        &mut self,
+        tasks: &mut Vec<FlatTask<'_>>,
+        values: &mut Vec<lir::Operand>,
+        out: &mut Vec<lir::Stmt>,
+        il: IlOffset,
+    ) -> CompileResult<()> {
+        while let Some(task) = tasks.pop() {
+            match task {
+                FlatTask::Eval(expr) => self.eval_task(expr, tasks, values, out, il)?,
+                FlatTask::FreezeIf(effect) => {
+                    let operand = values.pop().unwrap();
+                    let operand = if effect {
+                        self.freeze_local(operand, out, il)
+                    } else {
+                        operand
+                    };
+                    values.push(operand);
+                }
+                FlatTask::AddrOfTop => {
+                    let operand = values.pop().unwrap();
+                    values.push(self.addr_value(operand, out, il));
+                }
+                FlatTask::FinishBinary { op } => {
+                    let rhs = values.pop().unwrap();
+                    let lhs = values.pop().unwrap();
+                    let lhs = self.value_operand(lhs, out, il);
+                    let rhs = self.value_operand(rhs, out, il);
+                    // A compare's result is Int32 (ECMA-335 III.1.5);
+                    // every other binary op has its (integer) operands'
+                    // type — for shifts that is the value operand's, per
+                    // the importer.
+                    let ty = if is_compare(op) {
+                        Type::Int32
+                    } else {
+                        self.operand_ty(&lhs)?
+                    };
+                    let dst = self.temp(ty);
+                    Self::push(out, il, lir::StmtKind::Binary { dst, op, lhs, rhs });
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishBinaryOvf { op, unsigned } => {
+                    // Checked arithmetic: same flattening as `Binary`,
+                    // but the statement carries the overflow check to
+                    // codegen (the conditional OVERFLOW helper call).
+                    let rhs = values.pop().unwrap();
+                    let lhs = values.pop().unwrap();
+                    let lhs = self.value_operand(lhs, out, il);
+                    let rhs = self.value_operand(rhs, out, il);
+                    let ty = self.operand_ty(&lhs)?;
+                    let dst = self.temp(ty);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::BinaryOvf {
+                            dst,
+                            op,
+                            unsigned,
+                            lhs,
+                            rhs,
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishCall {
+                    target,
+                    sig,
+                    args,
+                    value_position,
+                } => {
+                    let target = match target {
+                        CallTarget::Direct(m) => CallTarget::Direct(*m),
+                        CallTarget::Virtual { method } => CallTarget::Virtual { method: *method },
+                        CallTarget::Helper(h) => CallTarget::Helper(*h),
+                        CallTarget::Indirect(_) => {
+                            CallTarget::Indirect(Box::new(values.pop().unwrap()))
+                        }
+                    };
+                    let mut operands = Vec::with_capacity(args.len());
+                    for _ in args.iter() {
+                        operands.push(values.pop().unwrap());
+                    }
+                    operands.reverse();
+                    let dst = match sig.ret {
+                        Type::Void => None,
+                        Type::Struct(class) => {
+                            if self.layouts[&class].sysv.passed_in_registers {
+                                Some(self.temp(sig.ret))
+                            } else {
+                                // A non-register-passed struct returns
+                                // through the hidden retbuf the importer
+                                // already passed as an argument — the
+                                // call has no register result.
+                                None
+                            }
+                        }
+                        _ => Some(self.temp(sig.ret)),
+                    };
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::Call {
+                            dst,
+                            target,
+                            sig: sig.clone(),
+                            args: operands,
+                        },
+                    );
+                    if value_position {
+                        match dst {
+                            // A struct call result lives in the call's
+                            // destination temp; the value is its address
+                            // (step_10.9).
+                            Some(dst) if matches!(sig.ret, Type::Struct(_)) => {
+                                values.push(lir::Operand::AddrOf(dst))
+                            }
+                            Some(dst) => values.push(lir::Operand::Temp(dst)),
+                            // The importer's well-typedness guarantee
+                            // makes a void call in value position
+                            // unreachable.
+                            None => {
+                                return Err(CompileError::Internal("void call used as a value"))
+                            }
+                        }
+                    }
+                }
+                FlatTask::FinishLocAlloc => {
+                    let size = values.pop().unwrap();
+                    let dst = self.temp(Type::NativeInt);
+                    Self::push(out, il, lir::StmtKind::LocAlloc { dst, size });
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishLoad { offset, ty, access } => {
+                    // Load through a byref at a constant offset (`ldfld`).
+                    let addr = values.pop().unwrap();
+                    let addr = self.addr_value(addr, out, il);
+                    let dst = self.temp(ty);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::Load {
+                            dst,
+                            addr,
+                            offset,
+                            ty,
+                            access,
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishFieldAddr { offset } => {
+                    // A field address is `obj + offset`, a managed byref:
+                    // the temp is ByRef-typed, so it is automatically an
+                    // interior-pointer GC root at every safepoint. An
+                    // AddrOf object (a `ldloca`-shaped receiver)
+                    // materializes into a byref temp first — the Binary
+                    // rules consume values, not address-of forms.
+                    let obj = values.pop().unwrap();
+                    let obj = self.addr_value(obj, out, il);
+                    let dst = self.temp(Type::ByRef);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::Binary {
+                            dst,
+                            op: BinaryOp::Add,
+                            lhs: obj,
+                            rhs: lir::Operand::Const(Const::NativeInt(offset as isize)),
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishUnary { op } => {
+                    let src = values.pop().unwrap();
+                    let src = self.value_operand(src, out, il);
+                    let ty = self.operand_ty(&src)?;
+                    let dst = self.temp(ty);
+                    Self::push(out, il, lir::StmtKind::Unary { dst, op, src });
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishConv { to, unsigned } => {
+                    let src = values.pop().unwrap();
+                    let src = self.value_operand(src, out, il);
+                    // A float source with an integer target is the .NET 9+
+                    // saturating conversion — expanded to a statement
+                    // sequence, not a single Conv: the unsigned forms
+                    // (step_10.11), the signed forms (step_11.5).
+                    let src_ty = self.operand_ty(&src)?;
+                    if matches!(src_ty, Type::Float | Type::Double)
+                        && matches!(to, Type::Int32 | Type::Int64 | Type::NativeInt)
+                    {
+                        let result = if unsigned {
+                            self.lower_conv_f_to_uint(to, src_ty, src, out, il)?
+                        } else {
+                            self.lower_conv_f_to_int(to, src_ty, src, out, il)?
+                        };
+                        values.push(result);
+                        continue;
+                    }
+                    let dst = self.temp(to);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::Conv {
+                            dst,
+                            to,
+                            overflow: false,
+                            unsigned,
+                            src,
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishConvOvf {
+                    to,
+                    dst_bits,
+                    signed_dst,
+                    unsigned_src,
+                } => {
+                    // The checked conversion: one statement carrying the
+                    // explicit target width/signedness to codegen (the
+                    // conditional OVERFLOW helper call, the BinaryOvf
+                    // shape).
+                    let src = values.pop().unwrap();
+                    let src = self.value_operand(src, out, il);
+                    let dst = self.temp(to);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::ConvOvf {
+                            dst,
+                            dst_bits,
+                            signed_dst,
+                            unsigned_src,
+                            src,
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishConvRne { to } => {
+                    let src = values.pop().unwrap();
+                    let src = self.value_operand(src, out, il);
+                    let dst = self.temp(to);
+                    Self::push(out, il, lir::StmtKind::ConvRne { dst, to, src });
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishConvTrunc { to } => {
+                    // The raw cvtt (the WithTruncation intrinsic leaves) —
+                    // the LIR Conv IS the plain truncating conversion; the
+                    // .NET 9+ saturating expansion lives on the IL-level
+                    // HIR Conv arm.
+                    let src = values.pop().unwrap();
+                    let src = self.value_operand(src, out, il);
+                    let dst = self.temp(to);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::Conv {
+                            dst,
+                            to,
+                            overflow: false,
+                            unsigned: false,
+                            src,
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishCkFinite => {
+                    // The value passes through unchanged (same float
+                    // type); the statement exists for its finiteness
+                    // check.
+                    let src = values.pop().unwrap();
+                    let ty = self.operand_ty(&src)?;
+                    let dst = self.temp(ty);
+                    Self::push(out, il, lir::StmtKind::CkFinite { dst, src });
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishCmpXchg { bits, signed } => {
+                    let comparand = values.pop().unwrap();
+                    let value = values.pop().unwrap();
+                    let addr = values.pop().unwrap();
+                    let addr = self.value_operand(addr, out, il);
+                    let value = self.value_operand(value, out, il);
+                    let comparand = self.value_operand(comparand, out, il);
+                    let dst = self.temp(if bits <= 32 { Type::Int32 } else { Type::Int64 });
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::AtomicCmpXchg {
+                            dst,
+                            addr,
+                            value,
+                            comparand,
+                            bits,
+                            signed,
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishXchg { bits, signed } => {
+                    let value = values.pop().unwrap();
+                    let addr = values.pop().unwrap();
+                    let addr = self.value_operand(addr, out, il);
+                    let value = self.value_operand(value, out, il);
+                    let dst = self.temp(if bits <= 32 { Type::Int32 } else { Type::Int64 });
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::AtomicXchg {
+                            dst,
+                            addr,
+                            value,
+                            bits,
+                            signed,
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishXadd { bits, signed } => {
+                    let value = values.pop().unwrap();
+                    let addr = values.pop().unwrap();
+                    let addr = self.value_operand(addr, out, il);
+                    let value = self.value_operand(value, out, il);
+                    let dst = self.temp(if bits <= 32 { Type::Int32 } else { Type::Int64 });
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::AtomicXadd {
+                            dst,
+                            addr,
+                            value,
+                            bits,
+                            signed,
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishNullCheck => {
+                    // The explicit, trap-based null check (step_10.4):
+                    // the checked value is the result — the statement
+                    // exists purely for its fault. The arg is a value
+                    // position (step_11.10: `ldarga; conv.u; ldfld`
+                    // retypes a local's address to a NativeInt receiver —
+                    // unsafe-5's test_5 — and an AddrOf has no
+                    // instruction-source form).
+                    let arg = values.pop().unwrap();
+                    let arg = self.value_operand(arg, out, il);
+                    Self::push(out, il, lir::StmtKind::NullCheck { arg });
+                    values.push(arg);
+                }
+                FlatTask::FinishArrLen => {
+                    // The length sits at offset 8 (corinfo.h's
+                    // CORINFO_Array layout); the load doubles as the null
+                    // check — a null array faults here, the hardware
+                    // fault translated to the NRE (step_10.4's trap
+                    // model).
+                    let array = values.pop().unwrap();
+                    let array = self.addr_value(array, out, il);
+                    let dst = self.temp(Type::Int32);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::Load {
+                            dst,
+                            addr: array,
+                            offset: crate::ir::ARRAY_LENGTH_OFFSET,
+                            ty: Type::Int32,
+                            access: crate::ir::MemAccess::Natural,
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishArrElemAddr { elem_size } => {
+                    // Element address: `array + 16 + index * elem_size`
+                    // (corinfo.h's CORINFO_Array layout) — the FieldAddr
+                    // shape: the address temp is ByRef-typed, so it is
+                    // automatically an interior-pointer GC root.
+                    let index = values.pop().unwrap();
+                    let array = values.pop().unwrap();
+                    // A 32-bit index zero-extends to native width (the
+                    // bounds check already proved 0 <= index < len).
+                    let index = if self.operand_ty(&index)? == Type::Int32 {
+                        let dst = self.temp(Type::NativeInt);
+                        Self::push(
+                            out,
+                            il,
+                            lir::StmtKind::Conv {
+                                dst,
+                                to: Type::NativeInt,
+                                overflow: false,
+                                unsigned: true,
+                                src: index,
+                            },
+                        );
+                        lir::Operand::Temp(dst)
+                    } else {
+                        index
+                    };
+                    let scaled = self.temp(Type::NativeInt);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::Binary {
+                            dst: scaled,
+                            op: BinaryOp::Mul,
+                            lhs: index,
+                            rhs: lir::Operand::Const(Const::NativeInt(elem_size as isize)),
+                        },
+                    );
+                    let offset = self.temp(Type::NativeInt);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::Binary {
+                            dst: offset,
+                            op: BinaryOp::Add,
+                            lhs: lir::Operand::Temp(scaled),
+                            rhs: lir::Operand::Const(Const::NativeInt(
+                                crate::ir::ARRAY_DATA_OFFSET as isize,
+                            )),
+                        },
+                    );
+                    let dst = self.temp(Type::ByRef);
+                    Self::push(
+                        out,
+                        il,
+                        lir::StmtKind::Binary {
+                            dst,
+                            op: BinaryOp::Add,
+                            lhs: array,
+                            rhs: lir::Operand::Temp(offset),
+                        },
+                    );
+                    values.push(lir::Operand::Temp(dst));
+                }
+                FlatTask::FinishStructVal => {
+                    // A struct value IS its address (step_10.9): in LIR
+                    // every struct-typed value is a ByRef operand naming
+                    // the memory the value occupies. A constant address
+                    // (a struct-typed static's frozen address, step_10.7)
+                    // materializes first.
+                    let addr = values.pop().unwrap();
+                    values.push(self.block_addr_value(addr, out, il));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The `Eval` step: leaf nodes produce their operand (or statement)
+    /// directly; interior nodes push their finishing step first, then
+    /// the between-children actions and children — last child first, so
+    /// everything pops in the recursive walk's order.
+    fn eval_task<'m>(
+        &mut self,
+        expr: &'m hir::Expr,
+        tasks: &mut Vec<FlatTask<'m>>,
+        values: &mut Vec<lir::Operand>,
+        out: &mut Vec<lir::Stmt>,
+        il: IlOffset,
+    ) -> CompileResult<()> {
         match expr {
-            hir::Expr::Const(k) => Ok(lir::Operand::Const(*k)),
-            hir::Expr::Local(id) => Ok(lir::Operand::Local(*id)),
-            hir::Expr::LocalAddr(id) => Ok(lir::Operand::AddrOf(*id)),
+            hir::Expr::Const(k) => values.push(lir::Operand::Const(*k)),
+            hir::Expr::Local(id) => values.push(lir::Operand::Local(*id)),
+            hir::Expr::LocalAddr(id) => values.push(lir::Operand::AddrOf(*id)),
             // The FtnAddr wrapper is import-time provenance only (delegate
             // newobj's GetDelegateCtor lookup); the value is the entry
-            // expression (step_11.8).
-            hir::Expr::FtnAddr { entry, .. } => self.flatten_expr(entry, out, il),
+            // expression (step_11.8) — it flattens straight through.
+            hir::Expr::FtnAddr { entry, .. } => tasks.push(FlatTask::Eval(entry)),
             // The importer builds CatchArg only as the value of a catch
             // handler's synthesized entry store, handled in `lower_block`.
-            hir::Expr::CatchArg => Err(CompileError::Internal(
-                "CatchArg outside a catch handler's entry store",
-            )),
+            hir::Expr::CatchArg => {
+                return Err(CompileError::Internal(
+                    "CatchArg outside a catch handler's entry store",
+                ))
+            }
             hir::Expr::Binary { op, lhs, rhs } => {
-                let lhs = self.flatten_expr(lhs, out, il)?;
                 // IL order reads the left operand before the right's
                 // effects (the freeze rule — tree_has_effect).
-                let lhs = if tree_has_effect(rhs) {
-                    self.freeze_local(lhs, out, il)
-                } else {
-                    lhs
-                };
-                let rhs = self.flatten_expr(rhs, out, il)?;
-                let lhs = self.value_operand(lhs, out, il);
-                let rhs = self.value_operand(rhs, out, il);
-                // A compare's result is Int32 (ECMA-335 III.1.5); every
-                // other binary op has its (integer) operands' type — for
-                // shifts that is the value operand's, per the importer.
-                let ty = if is_compare(*op) {
-                    Type::Int32
-                } else {
-                    self.operand_ty(&lhs)?
-                };
-                let dst = self.temp(ty);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::Binary {
-                        dst,
-                        op: *op,
-                        lhs,
-                        rhs,
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishBinary { op: *op });
+                tasks.push(FlatTask::Eval(rhs));
+                tasks.push(FlatTask::FreezeIf(tree_has_effect(rhs)));
+                tasks.push(FlatTask::Eval(lhs));
             }
             hir::Expr::BinaryOvf {
                 op,
@@ -981,56 +1533,24 @@ impl Flatten<'_> {
                 lhs,
                 rhs,
             } => {
-                // Checked arithmetic: same flattening as `Binary`, but the
-                // statement carries the overflow check to codegen (the
-                // conditional OVERFLOW helper call). The result has the
-                // (integer) operands' promoted type, like `Binary`.
-                let lhs = self.flatten_expr(lhs, out, il)?;
-                let lhs = if tree_has_effect(rhs) {
-                    self.freeze_local(lhs, out, il)
-                } else {
-                    lhs
-                };
-                let rhs = self.flatten_expr(rhs, out, il)?;
-                let lhs = self.value_operand(lhs, out, il);
-                let rhs = self.value_operand(rhs, out, il);
-                let ty = self.operand_ty(&lhs)?;
-                let dst = self.temp(ty);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::BinaryOvf {
-                        dst,
-                        op: *op,
-                        unsigned: *unsigned,
-                        lhs,
-                        rhs,
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishBinaryOvf {
+                    op: *op,
+                    unsigned: *unsigned,
+                });
+                tasks.push(FlatTask::Eval(rhs));
+                tasks.push(FlatTask::FreezeIf(tree_has_effect(rhs)));
+                tasks.push(FlatTask::Eval(lhs));
             }
             hir::Expr::Call { target, sig, args } => {
-                match self.flatten_call(target, sig, args, out, il)? {
-                    // A struct call result lives in the call's destination
-                    // temp; the value is its address (step_10.9).
-                    Some(dst) if matches!(sig.ret, Type::Struct(_)) => {
-                        Ok(lir::Operand::AddrOf(dst))
-                    }
-                    Some(dst) => Ok(lir::Operand::Temp(dst)),
-                    // The importer's well-typedness guarantee makes a void
-                    // call in value position unreachable.
-                    None => Err(CompileError::Internal("void call used as a value")),
-                }
+                Self::push_call_tasks(tasks, target, sig, args, true)?;
             }
             hir::Expr::LocAlloc { size } => {
                 // localloc: a statement-level dynamic stack allocation
                 // (it moves rsp and its zero-init is a helper call), so
                 // it forces to statement level like a call, its address
                 // landing in a fresh NativeInt temp.
-                let size = self.flatten_expr(size, out, il)?;
-                let dst = self.temp(Type::NativeInt);
-                Self::push(out, il, lir::StmtKind::LocAlloc { dst, size });
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishLocAlloc);
+                tasks.push(FlatTask::Eval(size));
             }
             hir::Expr::NextCallReturnAddress => {
                 // The pending-call-label discipline is codegen's (the
@@ -1038,7 +1558,7 @@ impl Flatten<'_> {
                 // is a NativeInt code address, never a GC root.
                 let dst = self.temp(Type::NativeInt);
                 Self::push(out, il, lir::StmtKind::NextCallReturnAddress { dst });
-                Ok(lir::Operand::Temp(dst))
+                values.push(lir::Operand::Temp(dst));
             }
             hir::Expr::Load {
                 addr,
@@ -1046,55 +1566,25 @@ impl Flatten<'_> {
                 ty,
                 access,
             } => {
-                // Load through a byref at a constant offset (`ldfld`).
-                let addr = self.flatten_expr(addr, out, il)?;
-                let addr = self.addr_value(addr, out, il);
-                let dst = self.temp(*ty);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::Load {
-                        dst,
-                        addr,
-                        offset: *offset,
-                        ty: *ty,
-                        access: *access,
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishLoad {
+                    offset: *offset,
+                    ty: *ty,
+                    access: *access,
+                });
+                tasks.push(FlatTask::Eval(addr));
             }
             hir::Expr::FieldAddr { obj, offset, .. } => {
-                // A field address is `obj + offset`, a managed byref: the
-                // temp is ByRef-typed, so it is automatically an interior-
-                // pointer GC root at every safepoint. An AddrOf object
-                // (a `ldloca`-shaped receiver) materializes into a byref
-                // temp first — the Binary rules consume values, not
-                // address-of forms.
-                let obj = self.flatten_expr(obj, out, il)?;
-                let obj = self.addr_value(obj, out, il);
-                let dst = self.temp(Type::ByRef);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::Binary {
-                        dst,
-                        op: BinaryOp::Add,
-                        lhs: obj,
-                        rhs: lir::Operand::Const(Const::NativeInt(*offset as isize)),
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishFieldAddr { offset: *offset });
+                tasks.push(FlatTask::Eval(obj));
             }
-            hir::Expr::StaticFieldAddr { .. } => Err(CompileError::Unsupported(
-                "static fields: not yet supported",
-            )),
+            hir::Expr::StaticFieldAddr { .. } => {
+                return Err(CompileError::Unsupported(
+                    "static fields: not yet supported",
+                ))
+            }
             hir::Expr::Unary { op, arg } => {
-                let src = self.flatten_expr(arg, out, il)?;
-                let src = self.value_operand(src, out, il);
-                let ty = self.operand_ty(&src)?;
-                let dst = self.temp(ty);
-                Self::push(out, il, lir::StmtKind::Unary { dst, op: *op, src });
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishUnary { op: *op });
+                tasks.push(FlatTask::Eval(arg));
             }
             hir::Expr::Conv {
                 to,
@@ -1107,35 +1597,11 @@ impl Flatten<'_> {
                 if *overflow {
                     return Err(CompileError::Unsupported("checked (ovf) conversion"));
                 }
-                let src = self.flatten_expr(arg, out, il)?;
-                let src = self.value_operand(src, out, il);
-                // A float source with an integer target is the .NET 9+
-                // saturating conversion — expanded to a statement
-                // sequence, not a single Conv: the unsigned forms
-                // (step_10.11), the signed forms (step_11.5).
-                let src_ty = self.operand_ty(&src)?;
-                if matches!(src_ty, Type::Float | Type::Double)
-                    && matches!(*to, Type::Int32 | Type::Int64 | Type::NativeInt)
-                {
-                    return if *unsigned {
-                        self.lower_conv_f_to_uint(*to, src_ty, src, out, il)
-                    } else {
-                        self.lower_conv_f_to_int(*to, src_ty, src, out, il)
-                    };
-                }
-                let dst = self.temp(*to);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::Conv {
-                        dst,
-                        to: *to,
-                        overflow: *overflow,
-                        unsigned: *unsigned,
-                        src,
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishConv {
+                    to: *to,
+                    unsigned: *unsigned,
+                });
+                tasks.push(FlatTask::Eval(arg));
             }
             hir::Expr::ConvOvf {
                 to,
@@ -1144,61 +1610,25 @@ impl Flatten<'_> {
                 unsigned_src,
                 arg,
             } => {
-                // The checked conversion: one statement carrying the
-                // explicit target width/signedness to codegen (the
-                // conditional OVERFLOW helper call, the BinaryOvf shape).
-                let src = self.flatten_expr(arg, out, il)?;
-                let src = self.value_operand(src, out, il);
-                let dst = self.temp(*to);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::ConvOvf {
-                        dst,
-                        dst_bits: *dst_bits,
-                        signed_dst: *signed_dst,
-                        unsigned_src: *unsigned_src,
-                        src,
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishConvOvf {
+                    to: *to,
+                    dst_bits: *dst_bits,
+                    signed_dst: *signed_dst,
+                    unsigned_src: *unsigned_src,
+                });
+                tasks.push(FlatTask::Eval(arg));
             }
             hir::Expr::ConvRne { to, arg } => {
-                let src = self.flatten_expr(arg, out, il)?;
-                let src = self.value_operand(src, out, il);
-                let dst = self.temp(*to);
-                Self::push(out, il, lir::StmtKind::ConvRne { dst, to: *to, src });
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishConvRne { to: *to });
+                tasks.push(FlatTask::Eval(arg));
             }
             hir::Expr::ConvTrunc { to, arg } => {
-                // The raw cvtt (the WithTruncation intrinsic leaves) —
-                // the LIR Conv IS the plain truncating conversion; the
-                // .NET 9+ saturating expansion lives on the IL-level HIR
-                // Conv arm above.
-                let src = self.flatten_expr(arg, out, il)?;
-                let src = self.value_operand(src, out, il);
-                let dst = self.temp(*to);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::Conv {
-                        dst,
-                        to: *to,
-                        overflow: false,
-                        unsigned: false,
-                        src,
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishConvTrunc { to: *to });
+                tasks.push(FlatTask::Eval(arg));
             }
             hir::Expr::CkFinite { arg } => {
-                // The value passes through unchanged (same float type);
-                // the statement exists for its finiteness check.
-                let src = self.flatten_expr(arg, out, il)?;
-                let ty = self.operand_ty(&src)?;
-                let dst = self.temp(ty);
-                Self::push(out, il, lir::StmtKind::CkFinite { dst, src });
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishCkFinite);
+                tasks.push(FlatTask::Eval(arg));
             }
             // The Interlocked expansions (step_11.15 follow-up): operands
             // flatten in field order (IL push order) with the Binary-rule
@@ -1210,40 +1640,17 @@ impl Flatten<'_> {
                 bits,
                 signed,
             } => {
-                let addr = self.flatten_expr(addr, out, il)?;
-                let addr = if tree_has_effect(value) || tree_has_effect(comparand) {
-                    self.freeze_local(addr, out, il)
-                } else {
-                    addr
-                };
-                let value = self.flatten_expr(value, out, il)?;
-                let value = if tree_has_effect(comparand) {
-                    self.freeze_local(value, out, il)
-                } else {
-                    value
-                };
-                let comparand = self.flatten_expr(comparand, out, il)?;
-                let addr = self.value_operand(addr, out, il);
-                let value = self.value_operand(value, out, il);
-                let comparand = self.value_operand(comparand, out, il);
-                let dst = self.temp(if *bits <= 32 {
-                    Type::Int32
-                } else {
-                    Type::Int64
+                tasks.push(FlatTask::FinishCmpXchg {
+                    bits: *bits,
+                    signed: *signed,
                 });
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::AtomicCmpXchg {
-                        dst,
-                        addr,
-                        value,
-                        comparand,
-                        bits: *bits,
-                        signed: *signed,
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::Eval(comparand));
+                tasks.push(FlatTask::FreezeIf(tree_has_effect(comparand)));
+                tasks.push(FlatTask::Eval(value));
+                tasks.push(FlatTask::FreezeIf(
+                    tree_has_effect(value) || tree_has_effect(comparand),
+                ));
+                tasks.push(FlatTask::Eval(addr));
             }
             hir::Expr::AtomicXchg {
                 addr,
@@ -1251,32 +1658,13 @@ impl Flatten<'_> {
                 bits,
                 signed,
             } => {
-                let addr = self.flatten_expr(addr, out, il)?;
-                let addr = if tree_has_effect(value) {
-                    self.freeze_local(addr, out, il)
-                } else {
-                    addr
-                };
-                let value = self.flatten_expr(value, out, il)?;
-                let addr = self.value_operand(addr, out, il);
-                let value = self.value_operand(value, out, il);
-                let dst = self.temp(if *bits <= 32 {
-                    Type::Int32
-                } else {
-                    Type::Int64
+                tasks.push(FlatTask::FinishXchg {
+                    bits: *bits,
+                    signed: *signed,
                 });
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::AtomicXchg {
-                        dst,
-                        addr,
-                        value,
-                        bits: *bits,
-                        signed: *signed,
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::Eval(value));
+                tasks.push(FlatTask::FreezeIf(tree_has_effect(value)));
+                tasks.push(FlatTask::Eval(addr));
             }
             hir::Expr::AtomicXadd {
                 addr,
@@ -1284,81 +1672,37 @@ impl Flatten<'_> {
                 bits,
                 signed,
             } => {
-                let addr = self.flatten_expr(addr, out, il)?;
-                let addr = if tree_has_effect(value) {
-                    self.freeze_local(addr, out, il)
-                } else {
-                    addr
-                };
-                let value = self.flatten_expr(value, out, il)?;
-                let addr = self.value_operand(addr, out, il);
-                let value = self.value_operand(value, out, il);
-                let dst = self.temp(if *bits <= 32 {
-                    Type::Int32
-                } else {
-                    Type::Int64
+                tasks.push(FlatTask::FinishXadd {
+                    bits: *bits,
+                    signed: *signed,
                 });
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::AtomicXadd {
-                        dst,
-                        addr,
-                        value,
-                        bits: *bits,
-                        signed: *signed,
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::Eval(value));
+                tasks.push(FlatTask::FreezeIf(tree_has_effect(value)));
+                tasks.push(FlatTask::Eval(addr));
             }
             hir::Expr::MemoryFence => {
                 Self::push(out, il, lir::StmtKind::MemoryFence);
                 // Value position never: the importer's `Eval` wrapper is
                 // the only producer (MemoryBarrier returns void).
-                Err(CompileError::Internal(
+                return Err(CompileError::Internal(
                     "MemoryFence outside its Eval statement",
-                ))
+                ));
             }
             hir::Expr::Serialize => {
                 Self::push(out, il, lir::StmtKind::Serialize);
                 // Value position never: the importer's `Eval` wrapper is
                 // the only producer (Serialize returns void).
-                Err(CompileError::Internal(
+                return Err(CompileError::Internal(
                     "Serialize outside its Eval statement",
-                ))
+                ));
             }
             hir::Expr::NullCheck { arg } => {
-                // The explicit, trap-based null check (step_10.4): the
-                // checked value is the result — the statement exists purely
-                // for its fault. The arg is a value position
-                // (step_11.10: `ldarga; conv.u; ldfld` retypes a local's
-                // address to a NativeInt receiver — unsafe-5's test_5 —
-                // and an AddrOf has no instruction-source form).
-                let arg = self.flatten_expr(arg, out, il)?;
-                let arg = self.value_operand(arg, out, il);
-                Self::push(out, il, lir::StmtKind::NullCheck { arg });
-                Ok(arg)
+                tasks.push(FlatTask::FinishNullCheck);
+                tasks.push(FlatTask::Eval(arg));
             }
             hir::Expr::ArrLen { array } => {
-                // The length sits at offset 8 (corinfo.h's CORINFO_Array
-                // layout); the load doubles as the null check — a null
-                // array faults here, the hardware fault translated to the
-                // NRE (step_10.4's trap model).
-                let array = self.flatten_expr(array, out, il)?;
-                let array = self.addr_value(array, out, il);
-                let dst = self.temp(Type::Int32);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::Load {
-                        dst,
-                        addr: array,
-                        offset: crate::ir::ARRAY_LENGTH_OFFSET,
-                        ty: Type::Int32,
-                        access: crate::ir::MemAccess::Natural,
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                tasks.push(FlatTask::FinishArrLen);
+                tasks.push(FlatTask::Eval(array));
             }
             hir::Expr::ArrElemAddr {
                 array,
@@ -1366,152 +1710,65 @@ impl Flatten<'_> {
                 elem_size,
                 ..
             } => {
-                // Element address: `array + 16 + index * elem_size`
-                // (corinfo.h's CORINFO_Array layout) — the FieldAddr
-                // shape: the address temp is ByRef-typed, so it is
-                // automatically an interior-pointer GC root.
-                let array = self.flatten_expr(array, out, il)?;
-                let array = self.addr_value(array, out, il);
-                let index = self.flatten_expr(index, out, il)?;
-                // A 32-bit index zero-extends to native width (the bounds
-                // check already proved 0 <= index < len).
-                let index = if self.operand_ty(&index)? == Type::Int32 {
-                    let dst = self.temp(Type::NativeInt);
-                    Self::push(
-                        out,
-                        il,
-                        lir::StmtKind::Conv {
-                            dst,
-                            to: Type::NativeInt,
-                            overflow: false,
-                            unsigned: true,
-                            src: index,
-                        },
-                    );
-                    lir::Operand::Temp(dst)
-                } else {
-                    index
-                };
-                let scaled = self.temp(Type::NativeInt);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::Binary {
-                        dst: scaled,
-                        op: BinaryOp::Mul,
-                        lhs: index,
-                        rhs: lir::Operand::Const(Const::NativeInt(*elem_size as isize)),
-                    },
-                );
-                let offset = self.temp(Type::NativeInt);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::Binary {
-                        dst: offset,
-                        op: BinaryOp::Add,
-                        lhs: lir::Operand::Temp(scaled),
-                        rhs: lir::Operand::Const(Const::NativeInt(
-                            crate::ir::ARRAY_DATA_OFFSET as isize,
-                        )),
-                    },
-                );
-                let dst = self.temp(Type::ByRef);
-                Self::push(
-                    out,
-                    il,
-                    lir::StmtKind::Binary {
-                        dst,
-                        op: BinaryOp::Add,
-                        lhs: array,
-                        rhs: lir::Operand::Temp(offset),
-                    },
-                );
-                Ok(lir::Operand::Temp(dst))
+                // The array's address-value materialization pops between
+                // the array and the index — the recursive arm's order.
+                tasks.push(FlatTask::FinishArrElemAddr {
+                    elem_size: *elem_size,
+                });
+                tasks.push(FlatTask::Eval(index));
+                tasks.push(FlatTask::AddrOfTop);
+                tasks.push(FlatTask::Eval(array));
             }
             hir::Expr::Cast { .. } | hir::Expr::Box { .. } => {
-                Err(CompileError::Unsupported("cast/box: not yet supported"))
+                return Err(CompileError::Unsupported("cast/box: not yet supported"))
             }
             hir::Expr::StructVal { addr, .. } => {
-                // A struct value IS its address (step_10.9): in LIR every
-                // struct-typed value is a ByRef operand naming the memory
-                // the value occupies. A constant address (a struct-typed
-                // static's frozen address, step_10.7) materializes first.
-                let addr = self.flatten_expr(addr, out, il)?;
-                Ok(self.block_addr_value(addr, out, il))
+                tasks.push(FlatTask::FinishStructVal);
+                tasks.push(FlatTask::Eval(addr));
             }
         }
+        Ok(())
     }
 
-    /// Lifts a call to a top-level LIR statement. Arguments flatten in
-    /// list order — the IL push order the importer and morph certify —
-    /// and an indirect target's address expression evaluates *after* the
-    /// arguments, as `calli` requires. Returns the fresh temp holding the
-    /// result, or `None` for `Type::Void`.
-    fn flatten_call(
-        &mut self,
-        target: &CallTarget<hir::Expr>,
-        sig: &CallSig,
-        args: &[hir::Expr],
-        out: &mut Vec<lir::Stmt>,
-        il: IlOffset,
-    ) -> CompileResult<Option<LocalId>> {
+    /// Pushes the task sequence flattening a call — arguments in list
+    /// order (the IL push order the importer and morph certify), an
+    /// indirect target's address expression evaluating *after* the
+    /// arguments, as `calli` requires. A deferred `Local` read must not
+    /// cross a later argument's (or the indirect target's) effects:
+    /// freeze at the operand's own position (tree_has_effect;
+    /// step_11.13). Shared by the `Call` expression arm (value position)
+    /// and `flatten_eval`'s discarded-call case.
+    fn push_call_tasks<'m>(
+        tasks: &mut Vec<FlatTask<'m>>,
+        target: &'m CallTarget<hir::Expr>,
+        sig: &'m CallSig,
+        args: &'m [hir::Expr],
+        value_position: bool,
+    ) -> CompileResult<()> {
         if args.len() != sig.args.len() + usize::from(sig.has_this) {
             return Err(CompileError::Internal(
                 "call argument list does not match its signature",
             ));
         }
-        let mut operands = Vec::with_capacity(args.len());
-        // A deferred `Local` read must not cross a later argument's (or
-        // the indirect target's — it flattens last, its IL position)
-        // effects: freeze at the operand's own position
-        // (tree_has_effect; step_11.13).
         let target_has_effect = match target {
             CallTarget::Indirect(addr) => tree_has_effect(addr),
             _ => false,
         };
-        for (i, arg) in args.iter().enumerate() {
-            let operand = self.flatten_expr(arg, out, il)?;
-            let crossed = target_has_effect || args[i + 1..].iter().any(tree_has_effect);
-            operands.push(if crossed {
-                self.freeze_local(operand, out, il)
-            } else {
-                operand
-            });
+        tasks.push(FlatTask::FinishCall {
+            target,
+            sig,
+            args,
+            value_position,
+        });
+        if let CallTarget::Indirect(addr) = target {
+            tasks.push(FlatTask::Eval(addr));
         }
-        let target = match target {
-            CallTarget::Direct(m) => CallTarget::Direct(*m),
-            CallTarget::Virtual { method } => CallTarget::Virtual { method: *method },
-            CallTarget::Helper(h) => CallTarget::Helper(*h),
-            CallTarget::Indirect(addr) => {
-                CallTarget::Indirect(Box::new(self.flatten_expr(addr, out, il)?))
-            }
-        };
-        let dst = match sig.ret {
-            Type::Void => None,
-            Type::Struct(class) => {
-                if self.layouts[&class].sysv.passed_in_registers {
-                    Some(self.temp(sig.ret))
-                } else {
-                    // A non-register-passed struct returns through the
-                    // hidden retbuf the importer already passed as an
-                    // argument — the call has no register result.
-                    None
-                }
-            }
-            _ => Some(self.temp(sig.ret)),
-        };
-        Self::push(
-            out,
-            il,
-            lir::StmtKind::Call {
-                dst,
-                target,
-                sig: sig.clone(),
-                args: operands,
-            },
-        );
-        Ok(dst)
+        for (i, arg) in args.iter().enumerate().rev() {
+            let crossed = target_has_effect || args[i + 1..].iter().any(tree_has_effect);
+            tasks.push(FlatTask::FreezeIf(crossed));
+            tasks.push(FlatTask::Eval(arg));
+        }
+        Ok(())
     }
 
     /// Terminators become the block's trailing statements. Derived
@@ -1691,38 +1948,48 @@ fn struct_class_of(expr: &hir::Expr) -> Option<rokajit_ee::handles::ClassHandle>
 /// Temps freeze their values by construction; `Local` is the only
 /// deferred read. (`Cast`/`Box` are counted too: currently Unsupported
 /// here, but call-shaped when they land.)
+///
+/// Explicit stack (step_11.17): the freeze rule asks this of every
+/// sibling subtree, and tree depth scales with IL input. Children push
+/// last-first so they pop left-to-right — the recursive walk's order.
 fn tree_has_effect(expr: &hir::Expr) -> bool {
-    match expr {
-        hir::Expr::Call { .. } | hir::Expr::LocAlloc { .. } => true,
-        hir::Expr::Cast { .. } | hir::Expr::Box { .. } => true,
-        hir::Expr::Const(_)
-        | hir::Expr::Local(_)
-        | hir::Expr::LocalAddr(_)
-        | hir::Expr::StaticFieldAddr { .. }
-        | hir::Expr::NextCallReturnAddress
-        | hir::Expr::CatchArg => false,
-        hir::Expr::Load { addr, .. } => tree_has_effect(addr),
-        hir::Expr::FieldAddr { obj, .. } => tree_has_effect(obj),
-        hir::Expr::Unary { arg, .. } | hir::Expr::Conv { arg, .. } => tree_has_effect(arg),
-        hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => tree_has_effect(arg),
-        hir::Expr::ConvOvf { arg, .. } => tree_has_effect(arg),
-        hir::Expr::CkFinite { arg } => tree_has_effect(arg),
-        hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
-            tree_has_effect(lhs) || tree_has_effect(rhs)
+    let mut stack = vec![expr];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            hir::Expr::Call { .. } | hir::Expr::LocAlloc { .. } => return true,
+            hir::Expr::Cast { .. } | hir::Expr::Box { .. } => return true,
+            hir::Expr::Const(_)
+            | hir::Expr::Local(_)
+            | hir::Expr::LocalAddr(_)
+            | hir::Expr::StaticFieldAddr { .. }
+            | hir::Expr::NextCallReturnAddress
+            | hir::Expr::CatchArg => {}
+            hir::Expr::Load { addr, .. } => stack.push(addr),
+            hir::Expr::FieldAddr { obj, .. } => stack.push(obj),
+            hir::Expr::Unary { arg, .. } | hir::Expr::Conv { arg, .. } => stack.push(arg),
+            hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => stack.push(arg),
+            hir::Expr::ConvOvf { arg, .. } => stack.push(arg),
+            hir::Expr::CkFinite { arg } => stack.push(arg),
+            hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
+                stack.push(rhs);
+                stack.push(lhs);
+            }
+            hir::Expr::NullCheck { arg, .. } => stack.push(arg),
+            hir::Expr::ArrLen { array } => stack.push(array),
+            hir::Expr::ArrElemAddr { array, index, .. } => {
+                stack.push(index);
+                stack.push(array);
+            }
+            hir::Expr::StructVal { addr, .. } => stack.push(addr),
+            hir::Expr::AtomicCmpXchg { .. }
+            | hir::Expr::AtomicXchg { .. }
+            | hir::Expr::AtomicXadd { .. }
+            | hir::Expr::MemoryFence
+            | hir::Expr::Serialize => return true,
+            hir::Expr::FtnAddr { entry, .. } => stack.push(entry),
         }
-        hir::Expr::NullCheck { arg, .. } => tree_has_effect(arg),
-        hir::Expr::ArrLen { array } => tree_has_effect(array),
-        hir::Expr::ArrElemAddr { array, index, .. } => {
-            tree_has_effect(array) || tree_has_effect(index)
-        }
-        hir::Expr::StructVal { addr, .. } => tree_has_effect(addr),
-        hir::Expr::AtomicCmpXchg { .. }
-        | hir::Expr::AtomicXchg { .. }
-        | hir::Expr::AtomicXadd { .. }
-        | hir::Expr::MemoryFence
-        | hir::Expr::Serialize => true,
-        hir::Expr::FtnAddr { entry, .. } => tree_has_effect(entry),
     }
+    false
 }
 
 #[cfg(test)]
@@ -3755,5 +4022,399 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // --- step_11.17: the flattener runs on an explicit task stack ---
+
+    /// A `depth`-deep left-nested `Binary{Add}` chain over Int32
+    /// constants — skippage6's `BigArgSpace` shape — built ITERATIVELY
+    /// (a recursive builder would overflow before the flattener under
+    /// test runs).
+    fn deep_left_adds(depth: usize) -> hir::Expr {
+        let mut expr = hir::Expr::Const(Const::Int32(0));
+        for _ in 0..depth {
+            expr = hir::Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(expr),
+                rhs: Box::new(hir::Expr::Const(Const::Int32(1))),
+            };
+        }
+        expr
+    }
+
+    #[test]
+    fn a_deep_left_nested_chain_flattens_innermost_first() {
+        // 10k deep: the recursive flattener exhausted the native stack
+        // on this shape (step_11.17). The post-order is unchanged: the
+        // innermost add emits first and each add reads its predecessor's
+        // temp.
+        let m = lower_ret(deep_left_adds(10_000));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 10_001, "one Binary per add, then Return");
+        let mut prev = match &stmts[0].kind {
+            lir::StmtKind::Binary { dst, lhs, rhs, .. } => {
+                assert!(matches!(lhs, lir::Operand::Const(_)), "innermost lhs");
+                assert!(matches!(rhs, lir::Operand::Const(_)), "innermost rhs");
+                *dst
+            }
+            _ => panic!("the innermost add"),
+        };
+        for (i, stmt) in stmts[1..10_000].iter().enumerate() {
+            let lir::StmtKind::Binary { dst, lhs, .. } = &stmt.kind else {
+                panic!("statement {} is an add", i + 1);
+            };
+            assert!(
+                matches!(lhs, lir::Operand::Temp(t) if *t == prev),
+                "statement {} reads the previous add's temp",
+                i + 1
+            );
+            prev = *dst;
+        }
+        assert!(
+            matches!(
+                stmts[10_000].kind,
+                lir::StmtKind::Return {
+                    value: Some(lir::Operand::Temp(t))
+                } if t == prev
+            ),
+            "the return reads the outermost add's temp"
+        );
+    }
+
+    #[test]
+    fn a_deep_right_nested_chain_flattens_innermost_first() {
+        let mut expr = hir::Expr::Const(Const::Int32(0));
+        for _ in 0..10_000 {
+            expr = hir::Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(hir::Expr::Const(Const::Int32(1))),
+                rhs: Box::new(expr),
+            };
+        }
+        let m = lower_ret(expr);
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 10_001, "one Binary per add, then Return");
+        let mut prev = match &stmts[0].kind {
+            lir::StmtKind::Binary { dst, rhs, .. } => {
+                assert!(matches!(rhs, lir::Operand::Const(_)), "innermost rhs");
+                *dst
+            }
+            _ => panic!("the innermost add"),
+        };
+        for (i, stmt) in stmts[1..10_000].iter().enumerate() {
+            let lir::StmtKind::Binary { dst, rhs, .. } = &stmt.kind else {
+                panic!("statement {} is an add", i + 1);
+            };
+            assert!(
+                matches!(rhs, lir::Operand::Temp(t) if *t == prev),
+                "statement {} reads the previous add's temp",
+                i + 1
+            );
+            prev = *dst;
+        }
+    }
+
+    #[test]
+    fn a_deep_mixed_chain_flattens() {
+        // Alternating left/right nesting: no native frame at any depth.
+        let mut expr = hir::Expr::Const(Const::Int32(0));
+        for i in 0..10_000 {
+            let leaf = hir::Expr::Const(Const::Int32(1));
+            expr = if i % 2 == 0 {
+                hir::Expr::Binary {
+                    op: BinaryOp::Add,
+                    lhs: Box::new(expr),
+                    rhs: Box::new(leaf),
+                }
+            } else {
+                hir::Expr::Binary {
+                    op: BinaryOp::Add,
+                    lhs: Box::new(leaf),
+                    rhs: Box::new(expr),
+                }
+            };
+        }
+        let m = lower_ret(expr);
+        assert_eq!(m.blocks[0].stmts.len(), 10_001);
+    }
+
+    #[test]
+    fn tree_has_effect_reaches_the_bottom_of_a_deep_tree() {
+        // The answer depends on the DEEPEST node, so the walk must get
+        // there (and must not recurse natively). Built iteratively;
+        // forgotten — dropping a 10k-deep Box chain is recursive glue.
+        let mut effectful = hir::Expr::MemoryFence;
+        let mut pure = hir::Expr::Const(Const::Int32(0));
+        for _ in 0..10_000 {
+            effectful = hir::Expr::Unary {
+                op: UnaryOp::Neg,
+                arg: Box::new(effectful),
+            };
+            pure = hir::Expr::Unary {
+                op: UnaryOp::Neg,
+                arg: Box::new(pure),
+            };
+        }
+        assert!(tree_has_effect(&effectful), "the deep fence is seen");
+        assert!(!tree_has_effect(&pure), "no effect anywhere");
+        std::mem::forget(effectful);
+        std::mem::forget(pure);
+    }
+
+    /// The recursive reference flattener (step_11.17's oracle): the
+    /// pre-conversion recursion over the pure-scalar subset the
+    /// generator below builds — Const / Local / LocalAddr / Unary /
+    /// Binary / Conv / LocAlloc — with its own temp counter (temps start
+    /// after the fixture's one arg). The property test asserts the
+    /// explicit-stack machine emits the identical statement sequence.
+    struct OracleFlatten {
+        next_temp: u32,
+        stmts: Vec<lir::Stmt>,
+    }
+
+    impl OracleFlatten {
+        fn temp(&mut self) -> LocalId {
+            let id = LocalId(self.next_temp);
+            self.next_temp += 1;
+            id
+        }
+
+        fn push(&mut self, kind: lir::StmtKind) {
+            // hstmt's offset, matching the fixture statement.
+            self.stmts.push(lir::Stmt {
+                il_offset: IlOffset(3),
+                kind,
+            });
+        }
+
+        fn freeze_local(&mut self, operand: lir::Operand) -> lir::Operand {
+            match operand {
+                lir::Operand::Local(id) => {
+                    let dst = self.temp();
+                    self.push(lir::StmtKind::Copy {
+                        dst,
+                        src: lir::Operand::Local(id),
+                    });
+                    lir::Operand::Temp(dst)
+                }
+                other => other,
+            }
+        }
+
+        fn value_operand(&mut self, operand: lir::Operand) -> lir::Operand {
+            match operand {
+                lir::Operand::AddrOf(_) => {
+                    let dst = self.temp();
+                    self.push(lir::StmtKind::Copy { dst, src: operand });
+                    lir::Operand::Temp(dst)
+                }
+                _ => operand,
+            }
+        }
+
+        fn eval(&mut self, expr: &hir::Expr) -> lir::Operand {
+            match expr {
+                hir::Expr::Const(k) => lir::Operand::Const(*k),
+                hir::Expr::Local(id) => lir::Operand::Local(*id),
+                hir::Expr::LocalAddr(id) => lir::Operand::AddrOf(*id),
+                hir::Expr::Unary { op, arg } => {
+                    let src = self.eval(arg);
+                    let src = self.value_operand(src);
+                    let dst = self.temp();
+                    self.push(lir::StmtKind::Unary { dst, op: *op, src });
+                    lir::Operand::Temp(dst)
+                }
+                hir::Expr::Binary { op, lhs, rhs } => {
+                    let lhs = self.eval(lhs);
+                    let lhs = if tree_has_effect(rhs) {
+                        self.freeze_local(lhs)
+                    } else {
+                        lhs
+                    };
+                    let rhs = self.eval(rhs);
+                    let lhs = self.value_operand(lhs);
+                    let rhs = self.value_operand(rhs);
+                    let dst = self.temp();
+                    self.push(lir::StmtKind::Binary {
+                        dst,
+                        op: *op,
+                        lhs,
+                        rhs,
+                    });
+                    lir::Operand::Temp(dst)
+                }
+                hir::Expr::Conv {
+                    to, unsigned, arg, ..
+                } => {
+                    let src = self.eval(arg);
+                    let src = self.value_operand(src);
+                    let dst = self.temp();
+                    self.push(lir::StmtKind::Conv {
+                        dst,
+                        to: *to,
+                        overflow: false,
+                        unsigned: *unsigned,
+                        src,
+                    });
+                    lir::Operand::Temp(dst)
+                }
+                hir::Expr::LocAlloc { size } => {
+                    let size = self.eval(size);
+                    let dst = self.temp();
+                    self.push(lir::StmtKind::LocAlloc { dst, size });
+                    lir::Operand::Temp(dst)
+                }
+                _ => unreachable!("the generator only builds the oracle subset"),
+            }
+        }
+    }
+
+    /// A tiny deterministic PRNG — no dev-dependency for a property test.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u32) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) % u64::from(n)) as u32
+        }
+    }
+
+    /// A random tree of at most `budget` nodes over the oracle's subset.
+    /// LocAlloc is the effect carrier (it exercises the Binary freeze
+    /// rule); the recursion depth is bounded by the budget.
+    fn random_scalar_tree(rng: &mut Lcg, budget: &mut u32) -> hir::Expr {
+        let leaf = |rng: &mut Lcg| match rng.below(3) {
+            0 => hir::Expr::Const(Const::Int32(rng.below(100) as i32)),
+            1 => hir::Expr::Local(LocalId(0)),
+            _ => hir::Expr::LocalAddr(LocalId(0)),
+        };
+        if *budget == 0 {
+            return leaf(rng);
+        }
+        *budget -= 1;
+        match rng.below(6) {
+            0 | 1 => leaf(rng),
+            2 => hir::Expr::Unary {
+                op: if rng.below(2) == 0 {
+                    UnaryOp::Neg
+                } else {
+                    UnaryOp::Not
+                },
+                arg: Box::new(random_scalar_tree(rng, budget)),
+            },
+            3 | 4 => hir::Expr::Binary {
+                op: if rng.below(2) == 0 {
+                    BinaryOp::Add
+                } else {
+                    BinaryOp::Sub
+                },
+                lhs: Box::new(random_scalar_tree(rng, budget)),
+                rhs: Box::new(random_scalar_tree(rng, budget)),
+            },
+            5 if rng.below(2) == 0 => hir::Expr::Conv {
+                to: Type::Int64,
+                overflow: false,
+                unsigned: false,
+                arg: Box::new(random_scalar_tree(rng, budget)),
+            },
+            _ => hir::Expr::LocAlloc {
+                size: Box::new(random_scalar_tree(rng, budget)),
+            },
+        }
+    }
+
+    /// Structural equality over the oracle's statement subset (lir
+    /// carries no `PartialEq`; only these kinds can appear).
+    fn same_stmt(a: &lir::Stmt, b: &lir::Stmt) -> bool {
+        if a.il_offset != b.il_offset {
+            return false;
+        }
+        match (&a.kind, &b.kind) {
+            (
+                lir::StmtKind::Copy { dst: d1, src: s1 },
+                lir::StmtKind::Copy { dst: d2, src: s2 },
+            ) => d1 == d2 && s1 == s2,
+            (
+                lir::StmtKind::Unary {
+                    dst: d1,
+                    op: o1,
+                    src: s1,
+                },
+                lir::StmtKind::Unary {
+                    dst: d2,
+                    op: o2,
+                    src: s2,
+                },
+            ) => d1 == d2 && o1 == o2 && s1 == s2,
+            (
+                lir::StmtKind::Binary {
+                    dst: d1,
+                    op: o1,
+                    lhs: l1,
+                    rhs: r1,
+                },
+                lir::StmtKind::Binary {
+                    dst: d2,
+                    op: o2,
+                    lhs: l2,
+                    rhs: r2,
+                },
+            ) => d1 == d2 && o1 == o2 && l1 == l2 && r1 == r2,
+            (
+                lir::StmtKind::Conv {
+                    dst: d1,
+                    to: t1,
+                    overflow: ov1,
+                    unsigned: u1,
+                    src: s1,
+                },
+                lir::StmtKind::Conv {
+                    dst: d2,
+                    to: t2,
+                    overflow: ov2,
+                    unsigned: u2,
+                    src: s2,
+                },
+            ) => d1 == d2 && t1 == t2 && ov1 == ov2 && u1 == u2 && s1 == s2,
+            (
+                lir::StmtKind::LocAlloc { dst: d1, size: s1 },
+                lir::StmtKind::LocAlloc { dst: d2, size: s2 },
+            ) => d1 == d2 && s1 == s2,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn the_explicit_stack_flattener_matches_the_recursive_oracle() {
+        // Random small trees over the oracle subset: the machine's
+        // statement sequence must be byte-identical to the recursive
+        // walk's — emitted order IS the program's semantics.
+        let mut rng = Lcg(0x2545_F491_4F6C_DD1D);
+        for case in 0..200 {
+            let mut budget = 60;
+            let expr = random_scalar_tree(&mut rng, &mut budget);
+            let mut oracle = OracleFlatten {
+                next_temp: 1,
+                stmts: Vec::new(),
+            };
+            oracle.eval(&expr);
+            let m = lower_ok(method_with(block(
+                0,
+                vec![hstmt(hir::StmtKind::Eval(expr))],
+                hir::Terminator::Return { value: None },
+            )));
+            let stmts = &m.blocks[0].stmts;
+            assert_eq!(
+                stmts.len(),
+                oracle.stmts.len() + 1,
+                "case {case}: statement count"
+            );
+            for (i, (expected, actual)) in oracle.stmts.iter().zip(stmts.iter()).enumerate() {
+                assert!(same_stmt(expected, actual), "case {case} statement {i}");
+            }
+        }
     }
 }
