@@ -58,6 +58,14 @@ pub trait MethodQueries {
     /// classes. `None` when the method has no metadata.
     fn get_method_declaring_namespace(&self, ftn: MethodHandle) -> Option<String>;
 
+    /// The innermost ENCLOSING class name from the same C++ query
+    /// (corinfo.h:3228), the `enclosingClassNames[0]` slot of the
+    /// nested-class walk (jitinterface.cpp:6378): `Sse.X64`'s methods
+    /// answer `Some("Sse")`. `None` for a non-nested declaring class or
+    /// no metadata. Step_11.14's per-family `IsSupported` table needs it:
+    /// a nested X64/Wide class follows its enclosing family's answer.
+    fn get_method_declaring_enclosing_class_name(&self, ftn: MethodHandle) -> Option<String>;
+
     /// C++ `ICorStaticInfo::isIntrinsic` (corinfo.h:2140). Fast equivalent of
     /// testing the `CORINFO_FLG_INTRINSIC` bit of `get_method_attribs`.
     fn is_intrinsic(&self, ftn: MethodHandle) -> bool;
@@ -496,6 +504,29 @@ impl MethodQueries for GasketEeInfo {
         // EE-lifetime storage: copy, nothing to free.
         Some(
             unsafe { std::ffi::CStr::from_ptr(ns) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    fn get_method_declaring_enclosing_class_name(&self, ftn: MethodHandle) -> Option<String> {
+        let mut enclosing: [*const std::ffi::c_char; 1] = [std::ptr::null()];
+        let name = unsafe {
+            rokajit_ee_get_method_name_from_metadata(
+                self.comp_raw(),
+                ftn.as_raw(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                enclosing.as_mut_ptr(),
+                enclosing.len(),
+            )
+        };
+        if name.is_null() || enclosing[0].is_null() {
+            return None;
+        }
+        // EE-lifetime storage: copy, nothing to free.
+        Some(
+            unsafe { std::ffi::CStr::from_ptr(enclosing[0]) }
                 .to_string_lossy()
                 .into_owned(),
         )

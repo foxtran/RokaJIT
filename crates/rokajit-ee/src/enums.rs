@@ -758,6 +758,13 @@ flag_set!(
     // no entry point to call, so `newobj` on one is the NEW_MDARR helper
     // (importer.cpp:9042's array branch), never the String redirect.
     ARRAY => CorInfoFlag_CORINFO_FLG_ARRAY,
+    // The class contains GC pointers (corinfo.h:774; the EE sets it on
+    // `pMT->ContainsGCPointers() || pMT == g_TypedReferenceMT`,
+    // jitinterface.cpp:3837) — the struct-layout half of RyuJIT's
+    // `IsReferenceOrContainsReferences<T>` expansion
+    // (importercalls.cpp:3925); the GC-type half comes from
+    // `as_cor_info_type`, not this bit.
+    CONTAINS_GC_PTR => CorInfoFlag_CORINFO_FLG_CONTAINS_GC_PTR,
 );
 
 flag_set!(

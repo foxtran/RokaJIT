@@ -471,6 +471,9 @@ impl ValueState {
 /// embedded GC pointer (slot offset + cell offset; byref cells set the
 /// interior flag; step_10.9). `slots` is the target's frame layout,
 /// indexed by [`LocalId`]; `layouts` answers the struct cell questions.
+/// Call RETURN registers are the one non-frame root and do not appear
+/// here — they ride [`crate::artifact::CallSite::ret_gc_regs`]
+/// (step_11.15).
 ///
 /// Struct cell addresses are `rbp - (slot_offset - cell_offset)`: a slot's
 /// bytes are `[rbp - slot_offset, rbp - slot_offset + size)`, so a cell at

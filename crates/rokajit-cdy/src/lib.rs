@@ -159,6 +159,16 @@ fn compile_method(
                     return result.to_raw();
                 }
             };
+            if std::env::var_os("ROKAJIT_LOG_OK").is_some() {
+                let name = rokajit_ee::ee_info::MethodQueries::print_method_name(ee, ftn);
+                let class = ee.get_method_class(ftn);
+                let class_name = rokajit_ee::ee_info::ClassQueries::print_class_name(ee, class);
+                eprintln!(
+                    "rokajit: code {class_name}::{name} ftn={:p} at {:p} size {size}",
+                    info.ftn,
+                    entry.as_ptr()
+                );
+            }
             // SAFETY: the EE passes valid out-param pointers (the standard
             // compileMethod contract).
             unsafe {

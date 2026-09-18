@@ -300,6 +300,13 @@ pub enum Inst {
         dst: XmmPlace,
         src: XmmSrc,
     },
+    /// Float `sqrt`: `dst := sqrt(src)` — `sqrtss`/`sqrtsd` (the Sse/Avx
+    /// `Sqrt` leaf expansion; correctly rounded per MXCSR).
+    SqrtF {
+        width: FWidth,
+        dst: XmmPlace,
+        src: XmmSrc,
+    },
     /// `ucomiss`/`ucomisd lhs, rhs` — the unordered-aware compare; sets
     /// ZF/PF/CF for the [`Inst::SetccF`]/[`Inst::JccF`] that immediately
     /// follows (same adjacency contract as [`Inst::Cmp`]). `ucomis*` (not
@@ -352,6 +359,16 @@ pub enum Inst {
     /// conversion also uses it (the low half is the result — values up to
     /// 2³²−1 convert exactly, everything beyond is unspecified by ECMA).
     CvtFToInt {
+        src_width: FWidth,
+        dst_w64: bool,
+        dst: Place,
+        src: XmmSrc,
+    },
+    /// `cvtss2si`/`cvtsd2si dst, src` — float to integer with MXCSR
+    /// rounding (nearest-even by default), NOT truncation: the LIR
+    /// `ConvRne` (Sse.ConvertToInt32 expansion). Same operand rules and
+    /// integer-indefinite result as [`Inst::CvtFToInt`].
+    CvtFToIntRne {
         src_width: FWidth,
         dst_w64: bool,
         dst: Place,
@@ -529,6 +546,63 @@ pub enum Inst {
     /// Always explicit: the offset-vs-page-size folding RyuJIT does is a
     /// later optimization.
     NullCheck { addr: Src },
+    /// `lock cmpxchg [addr], value` — the `Interlocked.CompareExchange`
+    /// expansion (LIR `AtomicCmpXchg`; RyuJIT's GT_CMPXCHG codegen,
+    /// codegenxarch.cpp:4358): the comparand rides `rax` (fixed duty,
+    /// like `idiv`'s), the cell is `bits` (8/16/32/64) wide, and the OLD
+    /// cell value lands in `rax` — then `dst` from `rax`, extended for
+    /// the narrow widths (cmpxchg writes only `al`/`ax` back on a
+    /// mismatch): sign-extended when `signed` (the `sbyte`/`short`
+    /// overloads; RyuJIT's `varTypeIsSigned → INS_movsx`,
+    /// codegenxarch.cpp:4388-4392), zero-extended otherwise. A null
+    /// `addr` faults — the trap-model NRE. No call, so no safepoint: the
+    /// address temp's interior-root report covers it.
+    CmpXchg {
+        bits: u8,
+        signed: bool,
+        dst: Place,
+        addr: Src,
+        value: Src,
+    },
+    /// `xchg [addr], value` — the `Interlocked.Exchange` expansion (LIR
+    /// `AtomicXchg`; RyuJIT's GT_XCHG): implicitly locked with a memory
+    /// operand. The OLD cell value stays in the value register (only its
+    /// low bytes on the narrow forms), then `dst` from it, extended for
+    /// 8/16 — sign when `signed`, zero otherwise (same rule as
+    /// [`Inst::CmpXchg`], codegenxarch.cpp:4341-4345). Same
+    /// fault/safepoint story as [`Inst::CmpXchg`].
+    Xchg {
+        bits: u8,
+        signed: bool,
+        dst: Place,
+        addr: Src,
+        value: Src,
+    },
+    /// `lock xadd [addr], value` — the `Interlocked.ExchangeAdd`
+    /// expansion (LIR `AtomicXadd`; RyuJIT's GT_XADD): the cell gets
+    /// `old + value`, the OLD value lands in the value register, then
+    /// `dst` from it. (`signed` is dead weight today: .NET has no narrow
+    /// ExchangeAdd overloads and RyuJIT asserts XADD is never small —
+    /// kept so all three atomics share one shape.) Same fault/safepoint
+    /// story as [`Inst::CmpXchg`].
+    Xadd {
+        bits: u8,
+        signed: bool,
+        dst: Place,
+        addr: Src,
+        value: Src,
+    },
+    /// `lock or dword [rsp], 0` — the `Interlocked.MemoryBarrier`
+    /// expansion (LIR `MemoryFence`; RyuJIT's instGen_MemoryBarrier
+    /// BARRIER_FULL, codegenxarch.cpp:11552): the no-op store to the
+    /// stack top is the cheapest seq-cst fence on x64.
+    MemFence,
+    /// `serialize` (`0F 01 E8`) — the `X86Serialize.Serialize()`
+    /// expansion (LIR `Serialize`; RyuJIT's INS_serialize): a genuine
+    /// serializing instruction (all prior loads/stores complete before
+    /// the next instruction fetches), NOT a no-op. No operands, no
+    /// flags, no safepoint.
+    Serialize,
     /// The array bounds check (step_10.8): the 32-bit length load at
     /// `[array + 8]` doubles as the null check (a null array faults — the
     /// trap model), then `index < length` unsigned decides between
@@ -759,6 +833,12 @@ impl Inst {
             Inst::Cdq { .. } => FixedRegs {
                 uses: &[Gpr::Rax],
                 defs: &[Gpr::Rdx],
+            },
+            // `lock cmpxchg`: the comparand goes in and the old value
+            // comes out through rax (the idiv precedent).
+            Inst::CmpXchg { .. } => FixedRegs {
+                uses: &[Gpr::Rax],
+                defs: &[Gpr::Rax],
             },
             Inst::Idiv { .. } | Inst::Div { .. } => FixedRegs {
                 uses: &[Gpr::Rax, Gpr::Rdx],

@@ -65,6 +65,14 @@ impl MethodQueries for MockEe {
             .cloned()
     }
 
+    fn get_method_declaring_enclosing_class_name(&self, ftn: MethodHandle) -> Option<String> {
+        // Canned per-method innermost enclosing class name (step_11.14's
+        // nested X64/Wide fixtures); `None` for non-nested/unknown.
+        self.method_enclosing_classes
+            .get(&(ftn.as_raw() as usize))
+            .cloned()
+    }
+
     fn is_intrinsic(&self, ftn: MethodHandle) -> bool {
         // Canned [Intrinsic] methods (the GetMethodTable fixtures),
         // keyed by the method handle's raw value; default false.

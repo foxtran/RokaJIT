@@ -595,6 +595,44 @@ impl Flatten<'_> {
                         lir::StmtKind::BoundsCheck { array, index },
                     );
                 }
+                hir::StmtKind::DivRem {
+                    dst_q,
+                    dst_r,
+                    lo,
+                    hi,
+                    divisor,
+                } => {
+                    // Signature order: lo, hi, divisor (the freeze rule,
+                    // tree_has_effect, keeps each read ahead of the next
+                    // operand's effects).
+                    let lo = self.flatten_expr(lo, &mut stmts, stmt.il_offset)?;
+                    let lo = if tree_has_effect(hi) || tree_has_effect(divisor) {
+                        self.freeze_local(lo, &mut stmts, stmt.il_offset)
+                    } else {
+                        lo
+                    };
+                    let hi = self.flatten_expr(hi, &mut stmts, stmt.il_offset)?;
+                    let hi = if tree_has_effect(divisor) {
+                        self.freeze_local(hi, &mut stmts, stmt.il_offset)
+                    } else {
+                        hi
+                    };
+                    let divisor = self.flatten_expr(divisor, &mut stmts, stmt.il_offset)?;
+                    let lo = self.value_operand(lo, &mut stmts, stmt.il_offset);
+                    let hi = self.value_operand(hi, &mut stmts, stmt.il_offset);
+                    let divisor = self.value_operand(divisor, &mut stmts, stmt.il_offset);
+                    Self::push(
+                        &mut stmts,
+                        stmt.il_offset,
+                        lir::StmtKind::DivRem {
+                            dst_q: *dst_q,
+                            dst_r: *dst_r,
+                            lo,
+                            hi,
+                            divisor,
+                        },
+                    );
+                }
                 hir::StmtKind::Eval(expr) => {
                     self.flatten_eval(expr, &mut stmts, stmt.il_offset)?;
                 }
@@ -638,6 +676,12 @@ impl Flatten<'_> {
                     class: *class,
                 },
             );
+        } else if let hir::Expr::MemoryFence = expr {
+            // `Interlocked.MemoryBarrier`: the fence statement itself.
+            Self::push(out, il, lir::StmtKind::MemoryFence);
+        } else if let hir::Expr::Serialize = expr {
+            // `X86Serialize.Serialize()`: the instruction itself.
+            Self::push(out, il, lir::StmtKind::Serialize);
         } else {
             self.flatten_expr(expr, out, il)?;
         }
@@ -950,6 +994,13 @@ impl Flatten<'_> {
                 );
                 Ok(lir::Operand::Temp(dst))
             }
+            hir::Expr::ConvRne { to, arg } => {
+                let src = self.flatten_expr(arg, out, il)?;
+                let src = self.value_operand(src, out, il);
+                let dst = self.temp(*to);
+                Self::push(out, il, lir::StmtKind::ConvRne { dst, to: *to, src });
+                Ok(lir::Operand::Temp(dst))
+            }
             hir::Expr::CkFinite { arg } => {
                 // The value passes through unchanged (same float type);
                 // the statement exists for its finiteness check.
@@ -958,6 +1009,133 @@ impl Flatten<'_> {
                 let dst = self.temp(ty);
                 Self::push(out, il, lir::StmtKind::CkFinite { dst, src });
                 Ok(lir::Operand::Temp(dst))
+            }
+            // The Interlocked expansions (step_11.15 follow-up): operands
+            // flatten in field order (IL push order) with the Binary-rule
+            // freezes; the statement is one atomic instruction.
+            hir::Expr::AtomicCmpXchg {
+                addr,
+                value,
+                comparand,
+                bits,
+                signed,
+            } => {
+                let addr = self.flatten_expr(addr, out, il)?;
+                let addr = if tree_has_effect(value) || tree_has_effect(comparand) {
+                    self.freeze_local(addr, out, il)
+                } else {
+                    addr
+                };
+                let value = self.flatten_expr(value, out, il)?;
+                let value = if tree_has_effect(comparand) {
+                    self.freeze_local(value, out, il)
+                } else {
+                    value
+                };
+                let comparand = self.flatten_expr(comparand, out, il)?;
+                let addr = self.value_operand(addr, out, il);
+                let value = self.value_operand(value, out, il);
+                let comparand = self.value_operand(comparand, out, il);
+                let dst = self.temp(if *bits <= 32 {
+                    Type::Int32
+                } else {
+                    Type::Int64
+                });
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::AtomicCmpXchg {
+                        dst,
+                        addr,
+                        value,
+                        comparand,
+                        bits: *bits,
+                        signed: *signed,
+                    },
+                );
+                Ok(lir::Operand::Temp(dst))
+            }
+            hir::Expr::AtomicXchg {
+                addr,
+                value,
+                bits,
+                signed,
+            } => {
+                let addr = self.flatten_expr(addr, out, il)?;
+                let addr = if tree_has_effect(value) {
+                    self.freeze_local(addr, out, il)
+                } else {
+                    addr
+                };
+                let value = self.flatten_expr(value, out, il)?;
+                let addr = self.value_operand(addr, out, il);
+                let value = self.value_operand(value, out, il);
+                let dst = self.temp(if *bits <= 32 {
+                    Type::Int32
+                } else {
+                    Type::Int64
+                });
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::AtomicXchg {
+                        dst,
+                        addr,
+                        value,
+                        bits: *bits,
+                        signed: *signed,
+                    },
+                );
+                Ok(lir::Operand::Temp(dst))
+            }
+            hir::Expr::AtomicXadd {
+                addr,
+                value,
+                bits,
+                signed,
+            } => {
+                let addr = self.flatten_expr(addr, out, il)?;
+                let addr = if tree_has_effect(value) {
+                    self.freeze_local(addr, out, il)
+                } else {
+                    addr
+                };
+                let value = self.flatten_expr(value, out, il)?;
+                let addr = self.value_operand(addr, out, il);
+                let value = self.value_operand(value, out, il);
+                let dst = self.temp(if *bits <= 32 {
+                    Type::Int32
+                } else {
+                    Type::Int64
+                });
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::AtomicXadd {
+                        dst,
+                        addr,
+                        value,
+                        bits: *bits,
+                        signed: *signed,
+                    },
+                );
+                Ok(lir::Operand::Temp(dst))
+            }
+            hir::Expr::MemoryFence => {
+                Self::push(out, il, lir::StmtKind::MemoryFence);
+                // Value position never: the importer's `Eval` wrapper is
+                // the only producer (MemoryBarrier returns void).
+                Err(CompileError::Internal(
+                    "MemoryFence outside its Eval statement",
+                ))
+            }
+            hir::Expr::Serialize => {
+                Self::push(out, il, lir::StmtKind::Serialize);
+                // Value position never: the importer's `Eval` wrapper is
+                // the only producer (Serialize returns void).
+                Err(CompileError::Internal(
+                    "Serialize outside its Eval statement",
+                ))
             }
             hir::Expr::NullCheck { arg } => {
                 // The explicit, trap-based null check (step_10.4): the
@@ -1335,6 +1513,7 @@ fn tree_has_effect(expr: &hir::Expr) -> bool {
         hir::Expr::Load { addr, .. } => tree_has_effect(addr),
         hir::Expr::FieldAddr { obj, .. } => tree_has_effect(obj),
         hir::Expr::Unary { arg, .. } | hir::Expr::Conv { arg, .. } => tree_has_effect(arg),
+        hir::Expr::ConvRne { arg, .. } => tree_has_effect(arg),
         hir::Expr::ConvOvf { arg, .. } => tree_has_effect(arg),
         hir::Expr::CkFinite { arg } => tree_has_effect(arg),
         hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
@@ -1346,6 +1525,11 @@ fn tree_has_effect(expr: &hir::Expr) -> bool {
             tree_has_effect(array) || tree_has_effect(index)
         }
         hir::Expr::StructVal { addr, .. } => tree_has_effect(addr),
+        hir::Expr::AtomicCmpXchg { .. }
+        | hir::Expr::AtomicXchg { .. }
+        | hir::Expr::AtomicXadd { .. }
+        | hir::Expr::MemoryFence
+        | hir::Expr::Serialize => true,
         hir::Expr::FtnAddr { entry, .. } => tree_has_effect(entry),
     }
 }

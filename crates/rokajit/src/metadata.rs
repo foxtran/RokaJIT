@@ -14,7 +14,7 @@
 //! no EH, no IL map. What must never change is that a new side table is a
 //! new section on this builder, never a new ad-hoc channel.
 
-use crate::artifact::{EhClause, IlMapEntry};
+use crate::artifact::{EhClause, GcReturnReg, IlMapEntry};
 use crate::error::{CompileError, CompileResult};
 use crate::ir::lir;
 use crate::pipeline::{
@@ -46,6 +46,21 @@ pub struct GcInfoInput {
     /// fully-interruptible (EH) methods: the fat header carries
     /// NUM_SAFE_POINTS = 0.
     pub safepoints: Vec<u32>,
+    /// Register roots (step_11.15): the distinct registers that carry a GC
+    /// pointer at some safepoint — the return registers of ref/byref/
+    /// GC-struct-returning calls — in the canonical order (interior first,
+    /// then register number; the slot table's delta rule), with the merged
+    /// interior flag (a register that is a byref return anywhere keeps it
+    /// everywhere; interior reporting subsumes exact refs).
+    pub reg_roots: Vec<GcReturnReg>,
+    /// Parallel to `safepoints` (BEFORE the encoder's ascending sort):
+    /// the bitmask over `reg_roots` live at that safepoint. Empty when
+    /// `reg_roots` is empty.
+    pub reg_live: Vec<u32>,
+    /// Parallel to `safepoints`: the native offset where the call's result
+    /// is fully homed (the register is live over `[safepoint, home_end)`).
+    /// Only the fully-interruptible (EH) chunk encoding consumes it.
+    pub reg_home_end: Vec<u32>,
     /// Fully-interruptible ranges `[start, end)`, native hot-relative,
     /// sorted, disjoint. Non-empty ⇒ EH method: fat header, fully
     /// interruptible, WantsReportOnlyLeaf — and safepoints are NOT emitted.
@@ -87,6 +102,12 @@ pub struct MetadataBuilder {
     frame_size: u32,
     gc_roots: Vec<GcRootSlot>,
     safepoints: Vec<u32>,
+    /// Parallel to `safepoints`: the GC-pointer return registers of the
+    /// call whose return address is the safepoint (step_11.15).
+    safepoint_ret_regs: Vec<Vec<GcReturnReg>>,
+    /// Parallel to `safepoints`: the offset where the call's result is
+    /// fully homed (the window end; only the EH chunk encoding needs it).
+    safepoint_home_end: Vec<u32>,
     eh_clauses: Vec<EhClause>,
     il_map: Vec<IlMapEntry>,
     funclets: Vec<FuncletInfo>,
@@ -103,6 +124,8 @@ impl MetadataBuilder {
             frame_size,
             gc_roots,
             safepoints: Vec::new(),
+            safepoint_ret_regs: Vec::new(),
+            safepoint_home_end: Vec::new(),
             eh_clauses: Vec::new(),
             il_map: Vec::new(),
             funclets: Vec::new(),
@@ -114,9 +137,21 @@ impl MetadataBuilder {
 
     /// Record a managed call site: a GC safepoint (the GC-info section keys
     /// off these) and the future home of deopt data (verdict 5). The
-    /// safepoint is the return address: `offset + size`.
-    pub fn record_safepoint_call(&mut self, offset: u32, size: u32) {
+    /// safepoint is the return address: `offset + size`. `ret_regs` are the
+    /// call's GC-pointer return registers and `home_end` the offset where
+    /// the result is fully homed — the registers are live over
+    /// `[offset + size, home_end)` (step_11.15; empty/0 for void/scalar
+    /// returns).
+    pub fn record_safepoint_call(
+        &mut self,
+        offset: u32,
+        size: u32,
+        ret_regs: &[GcReturnReg],
+        home_end: u32,
+    ) {
         self.safepoints.push(offset + size);
+        self.safepoint_ret_regs.push(ret_regs.to_vec());
+        self.safepoint_home_end.push(home_end);
     }
 
     /// Record one EH clause with native offsets (drained to `setEHinfo`).
@@ -160,6 +195,62 @@ impl MetadataBuilder {
     /// encoders (the EE-facing formats are target-owned), EH clauses and
     /// the IL-offset map target-independently.
     pub fn finish(self, target: &dyn Target) -> CompileResult<MetadataOutput> {
+        // The register-root merge (step_11.15): distinct registers across
+        // every safepoint's return set, interior flags OR-merged; each
+        // safepoint's bitmask over that set. The canonical order is
+        // FLAGGED (interior) first, then register number — the slot
+        // table's delta form only follows zero-flag predecessors
+        // (gcinfoencoder.cpp:1584-1595's rule applies to registers too,
+        // gcinfodecoder.cpp:1195-1220), so plain registers form the delta
+        // tail; the encoder validates this order.
+        let mut reg_roots: Vec<GcReturnReg> = Vec::new();
+        for ret_regs in &self.safepoint_ret_regs {
+            for &ret in ret_regs {
+                match reg_roots.iter_mut().find(|r| r.reg == ret.reg) {
+                    Some(r) => r.interior |= ret.interior,
+                    None => reg_roots.push(ret),
+                }
+            }
+        }
+        reg_roots.sort_by_key(|r| (std::cmp::Reverse(r.interior), r.reg));
+        let mut reg_live: Vec<u32> = Vec::new();
+        let mut reg_home_end: Vec<u32> = Vec::new();
+        if !reg_roots.is_empty() {
+            for (ret_regs, &home_end) in self
+                .safepoint_ret_regs
+                .iter()
+                .zip(self.safepoint_home_end.iter())
+            {
+                let mut mask = 0u32;
+                for ret in ret_regs {
+                    let idx = reg_roots
+                        .iter()
+                        .position(|r| r.reg == ret.reg)
+                        .expect("every recorded return register is in the merged set");
+                    mask |= 1 << idx;
+                }
+                reg_live.push(mask);
+                reg_home_end.push(home_end);
+            }
+        }
+        if std::env::var_os("ROKAJIT_DEBUG_GCINFO").is_some() {
+            let roots: Vec<String> = self
+                .gc_roots
+                .iter()
+                .map(|r| format!("{}{}", r.offset, if r.is_byref { ":byref" } else { "" }))
+                .collect();
+            let regs: Vec<String> = reg_roots
+                .iter()
+                .map(|r| format!("r{}{}", r.reg, if r.interior { ":interior" } else { "" }))
+                .collect();
+            eprintln!(
+                "rokajit: gcinfo frame={} out={} roots=[{}] reg_roots=[{}]",
+                self.frame_size,
+                self.outgoing_area_size,
+                roots.join(" "),
+                regs.join(" ")
+            );
+        }
         let gc_info = target.encode_gc_info(&GcInfoInput {
             // TOTAL code length (main + funclets): funclets live in the hot
             // chunk after the main body.
@@ -167,6 +258,9 @@ impl MetadataBuilder {
             frame_size: self.frame_size,
             gc_roots: self.gc_roots,
             safepoints: self.safepoints,
+            reg_roots,
+            reg_live,
+            reg_home_end,
             interruptible_ranges: self.interruptible_ranges,
             outgoing_area_size: self.outgoing_area_size,
             generics_context: self.generics_context,
@@ -213,7 +307,7 @@ pub fn build_metadata(
         output.frame.gc_roots.clone(),
     );
     for site in &output.call_sites {
-        builder.record_safepoint_call(site.offset, site.size);
+        builder.record_safepoint_call(site.offset, site.size, &site.ret_gc_regs, site.ret_home_end);
     }
     for clause in &output.eh_clauses {
         builder.record_eh_clause(*clause);
@@ -287,6 +381,18 @@ mod tests {
                 blob.extend(start.to_le_bytes());
                 blob.extend(end.to_le_bytes());
             }
+            // The register roots (step_11.15), only when non-empty so the
+            // pre-11.15 assertions keep their exact shapes: the merged set,
+            // then the per-safepoint live masks, then the home-end offsets.
+            if !input.reg_roots.is_empty() {
+                blob.push(input.reg_roots.len() as u8);
+                for reg in &input.reg_roots {
+                    blob.push(reg.reg);
+                    blob.push(u8::from(reg.interior));
+                }
+                blob.extend(input.reg_live.iter().flat_map(|m| m.to_le_bytes()));
+                blob.extend(input.reg_home_end.iter().flat_map(|o| o.to_le_bytes()));
+            }
             Ok(blob)
         }
         fn encode_unwind_info(&self, input: &UnwindInput) -> CompileResult<Vec<UnwindBlob>> {
@@ -329,6 +435,8 @@ mod tests {
                     size: 5,
                     sig: None,
                     method: None,
+                    ret_gc_regs: Vec::new(),
+                    ret_home_end: 0,
                 })
                 .collect(),
             frame: FrameInfo {
@@ -435,6 +543,91 @@ mod tests {
         assert_eq!(meta.gc_info[18], 0);
         assert_eq!(meta.gc_info[19..23], 24u32.to_le_bytes());
         assert_eq!(meta.gc_info[23], 1, "the byref temp's flag");
+    }
+
+    /// The register roots (step_11.15): the builder merges the per-call
+    /// return registers into the distinct sorted set with OR-merged
+    /// interior flags, and each safepoint's live mask indexes that set.
+    #[test]
+    fn register_return_roots_merge_and_drain() {
+        let rax = GcReturnReg {
+            reg: 0,
+            interior: false,
+        };
+        let rax_interior = GcReturnReg {
+            reg: 0,
+            interior: true,
+        };
+        let rdx_interior = GcReturnReg {
+            reg: 2,
+            interior: true,
+        };
+        let mut output = codegen_output(&[0xAA; 64], &[8, 20, 40]);
+        // safepoint 13: a ref return in rax; safepoint 25: a byref return
+        // in rax (merges to interior); safepoint 45: a Span-shaped struct
+        // return (byref in rax, nothing in rdx) plus a second byref in rdx.
+        output.call_sites[0].ret_gc_regs = vec![rax];
+        output.call_sites[1].ret_gc_regs = vec![rax_interior];
+        output.call_sites[2].ret_gc_regs = vec![rax_interior, rdx_interior];
+        output.call_sites[0].ret_home_end = 16;
+        output.call_sites[1].ret_home_end = 28;
+        output.call_sites[2].ret_home_end = 52;
+        let meta = build_metadata(&output, &empty_method(), &EchoTarget).expect("renders");
+
+        // code_len, frame_size, three safepoints, zero frame roots, the EH
+        // echo tail (outgoing 0, zero ranges)...
+        assert_eq!(meta.gc_info[0..4], 64u32.to_le_bytes());
+        assert_eq!(meta.gc_info[4..8], 32u32.to_le_bytes());
+        assert_eq!(meta.gc_info[8..12], 13u32.to_le_bytes());
+        assert_eq!(meta.gc_info[12..16], 25u32.to_le_bytes());
+        assert_eq!(meta.gc_info[16..20], 45u32.to_le_bytes());
+        assert_eq!(meta.gc_info[20], 0, "no frame roots");
+        assert_eq!(meta.gc_info[21..25], 0u32.to_le_bytes(), "no outgoing area");
+        assert_eq!(meta.gc_info[25], 0, "no interruptible ranges");
+        // ...then the register echo: two roots (rax interior, rdx
+        // interior), then the three live masks (rax, rax, rax|rdx), then
+        // the three home ends.
+        assert_eq!(meta.gc_info[26], 2, "two register roots");
+        assert_eq!(&meta.gc_info[27..29], &[0u8, 1], "rax, interior-merged");
+        assert_eq!(&meta.gc_info[29..31], &[2u8, 1], "rdx, interior");
+        assert_eq!(meta.gc_info[31..35], 0b01u32.to_le_bytes(), "safepoint 13");
+        assert_eq!(meta.gc_info[35..39], 0b01u32.to_le_bytes(), "safepoint 25");
+        assert_eq!(meta.gc_info[39..43], 0b11u32.to_le_bytes(), "safepoint 45");
+        assert_eq!(meta.gc_info[43..47], 16u32.to_le_bytes(), "home end 13");
+        assert_eq!(meta.gc_info[47..51], 28u32.to_le_bytes(), "home end 25");
+        assert_eq!(meta.gc_info[51..55], 52u32.to_le_bytes(), "home end 45");
+        assert_eq!(meta.gc_info.len(), 55);
+    }
+
+    /// Fully-interruptible (EH) methods keep their register return roots:
+    /// the tracked-slot chunk encoding (gcinfo.rs) reports them — the
+    /// thread-race.cs Console-path residual closed in the same step.
+    #[test]
+    fn eh_methods_keep_register_return_roots() {
+        let mut output = codegen_output(&[0xAA; 100], &[32]);
+        output.call_sites[0].ret_gc_regs = vec![GcReturnReg {
+            reg: 0,
+            interior: true,
+        }];
+        output.call_sites[0].ret_home_end = 40;
+        output.funclets.push(FuncletInfo {
+            start_offset: 80,
+            end_offset: 100,
+            prolog_len: 4,
+            sp_delta: 16,
+            kind: CorJitFuncKind::Handler,
+        });
+        output.interruptible_ranges = vec![(8, 73), (84, 96)];
+        let meta = build_metadata(&output, &empty_method(), &EchoTarget).expect("renders");
+        // The EH echo tail follows the frame-root count: outgoing 0, two
+        // ranges — then the register echo (roots, mask, home end).
+        assert_eq!(meta.gc_info[13..17], 0u32.to_le_bytes());
+        assert_eq!(meta.gc_info[17], 2, "two ranges");
+        assert_eq!(meta.gc_info[18 + 16], 1, "one register root");
+        assert_eq!(&meta.gc_info[19 + 16..21 + 16], &[0u8, 1], "rax interior");
+        assert_eq!(meta.gc_info[21 + 16..25 + 16], 0b1u32.to_le_bytes());
+        assert_eq!(meta.gc_info[25 + 16..29 + 16], 40u32.to_le_bytes());
+        assert_eq!(meta.gc_info.len(), 29 + 16);
     }
 
     /// The EH and IL-map sections drain through the channel: recorded

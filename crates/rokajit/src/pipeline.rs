@@ -154,7 +154,10 @@ pub struct FrameInfo {
     /// Frame slots that hold GC pointers. In tier 0 every GC-ref local is
     /// frame-resident for its whole scope (Winch-style), so this one set is
     /// the root set at *every* safepoint; per-safepoint liveness arrives
-    /// with tier 1 as a contract extension.
+    /// with tier 1 as a contract extension. The one register exception:
+    /// call RETURN registers (rax/rdx on x64) hold ref/byref results at
+    /// their own safepoints and travel on
+    /// [`crate::artifact::CallSite::ret_gc_regs`] instead (step_11.15).
     pub gc_roots: Vec<GcRootSlot>,
     /// The generics-context slot the GC info reports (step_11.3B), when
     /// the method carries one — its presence forces the fat header.

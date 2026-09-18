@@ -82,13 +82,17 @@ pub trait TokensAndSignatures {
 
     /// C++ `ICorSigInfo::getArgType` (corinfo.h:3106). The `vcTypeRet`
     /// out-param (set for value-class args) becomes the second tuple
-    /// element. `CorInfoTypeWithMod` modifiers (modreq/modopt) are dropped;
-    /// no consumer needs them yet.
+    /// element. `CorInfoTypeWithMod` modifiers (modreq/modopt) are dropped
+    /// except `CORINFO_TYPE_MOD_PINNED` (corinfo.h:634 — a `fixed` local's
+    /// marker, RyuJIT's `lvPinned` read at lclvars.cpp:240), reported as
+    /// the third tuple element: the GC-info pinned slot flag depends on it
+    /// (an unpinned `fixed` buffer moves under a native write —
+    /// thread-race.cs's residual crash).
     fn get_arg_type(
         &self,
         sig: &CORINFO_SIG_INFO,
         args: ArgListHandle,
-    ) -> (CorInfoType, Option<ClassHandle>);
+    ) -> (CorInfoType, Option<ClassHandle>, bool);
 
     /// C++ `ICorArgInfo::getExactClasses` (corinfo.h:3115): the exact loaded
     /// classes deriving from `base_type`, up to `max_exact_classes`. The C++
@@ -441,16 +445,18 @@ impl TokensAndSignatures for GasketEeInfo {
         &self,
         sig: &CORINFO_SIG_INFO,
         args: ArgListHandle,
-    ) -> (CorInfoType, Option<ClassHandle>) {
+    ) -> (CorInfoType, Option<ClassHandle>, bool) {
         let sig = sig as *const CORINFO_SIG_INFO as *mut CORINFO_SIG_INFO;
         let mut vc_type: ffi::CORINFO_CLASS_HANDLE = std::ptr::null_mut();
         let raw =
             unsafe { rokajit_ee_get_arg_type(self.comp_raw(), sig, args.as_raw(), &mut vc_type) };
         // Strip the CorInfoTypeWithMod modifiers (the trait contract drops
-        // them); the mask leaves a plain CorInfoType.
+        // them); the mask leaves a plain CorInfoType. `MOD_PINNED`
+        // survives separately.
         let ty = CorInfoType::from_raw(raw & ffi::CorInfoTypeWithMod_CORINFO_TYPE_MASK)
             .unwrap_or(CorInfoType::Undef);
-        (ty, ClassHandle::from_raw(vc_type))
+        let pinned = raw & ffi::CorInfoTypeWithMod_CORINFO_TYPE_MOD_PINNED != 0;
+        (ty, ClassHandle::from_raw(vc_type), pinned)
     }
 
     fn get_exact_classes(

@@ -180,6 +180,9 @@ pub enum BinaryOp {
 pub enum UnaryOp {
     Neg,
     Not,
+    /// The IEEE square root (floats only — the Sse/Avx `Sqrt` leaf
+    /// expansion; MXCSR rounding, correctly rounded).
+    Sqrt,
 }
 
 /// How a call reaches its target. Shared by both IR levels; only the
@@ -297,6 +300,21 @@ pub mod hir {
         /// (`initblk`, 0xFE 18): the runtime-sized sibling of
         /// [`StmtKind::BlockZero`].
         BlockFillDyn { dst: Expr, fill: Expr, size: Expr },
+        /// The `X86Base.X64.DivRem(ulong, ulong, ulong)` expansion
+        /// (step_11.14 phase 3): the unsigned 128-by-64 hardware divide —
+        /// `dst_q`/`dst_r` receive quotient and remainder of
+        /// `hi:lo / divisor` (x64 `div`: rdx:rax / operand). Like the
+        /// `div.un` lowering, #DE on a zero divisor or a quotient
+        /// overflow is the hardware trap (the managed API documents the
+        /// same fault). Fields evaluate in signature order: lo, hi,
+        /// divisor.
+        DivRem {
+            dst_q: LocalId,
+            dst_r: LocalId,
+            lo: Expr,
+            hi: Expr,
+            divisor: Expr,
+        },
         /// The array bounds check (step_10.8: `ldelem`/`stelem`/`ldelema`):
         /// throws `IndexOutOfRangeException` unless `0 <= index < len`
         /// (unsigned — a negative index is huge); a null array faults on
@@ -447,6 +465,67 @@ pub mod hir {
         CkFinite {
             arg: Box<Expr>,
         },
+        /// Round-to-nearest-even float→integer conversion — the
+        /// `cvtss2si`/`cvtsd2si` semantics (MXCSR's default rounding),
+        /// NOT the truncating `conv.*` of [`Expr::Conv`]. Only the
+        /// hardware-intrinsic expansions build it (Sse.ConvertToInt32
+        /// & co., step_11.14 phase 3); no IL opcode maps to it.
+        /// Out-of-range/NaN yields the hardware's integer-indefinite
+        /// value (`0x8000…`). `to` is Int32 or Int64.
+        ConvRne {
+            to: Type,
+            arg: Box<Expr>,
+        },
+        /// `Interlocked.CompareExchange` — the importer's expansion of the
+        /// deliberately self-recursive [Intrinsic] bodies
+        /// (Interlocked.cs:322's "Must expand intrinsic"; RyuJIT's
+        /// GT_CMPXCHG, importercalls.cpp:4506): atomically compare the
+        /// `bits`-wide (8/16/32/64) cell at `addr` with `comparand` and
+        /// store `value` when equal; the result is the cell's OLD value.
+        /// An opaque global store (GTF_ASG — can fault on a null byref).
+        /// Refs are NOT in scope (the write-barrier-on-success story is a
+        /// later step; the overloads stay gated). `signed` is the cell
+        /// type's signedness (sbyte/short): the narrow old-value result
+        /// sign-extends to the IL stack answer when set, zero-extends
+        /// otherwise (RyuJIT's `varTypeIsSigned → INS_movsx`,
+        /// codegenxarch.cpp:4388-4392).
+        AtomicCmpXchg {
+            addr: Box<Expr>,
+            value: Box<Expr>,
+            comparand: Box<Expr>,
+            bits: u8,
+            signed: bool,
+        },
+        /// `Interlocked.Exchange` — the same family (RyuJIT's GT_XCHG):
+        /// atomically swap `value` into the `bits`-wide cell at `addr`;
+        /// the result is the OLD value. Same effects/gates as
+        /// [`Expr::AtomicCmpXchg`].
+        AtomicXchg {
+            addr: Box<Expr>,
+            value: Box<Expr>,
+            bits: u8,
+            signed: bool,
+        },
+        /// `Interlocked.ExchangeAdd` (RyuJIT's GT_XADD): atomically add
+        /// `value` to the `bits`-wide cell at `addr`; the result is the
+        /// OLD value. Same effects/gates as [`Expr::AtomicCmpXchg`].
+        /// (No narrow ExchangeAdd overloads exist — `signed` is always
+        /// false here; kept for one shared atomic shape.)
+        AtomicXadd {
+            addr: Box<Expr>,
+            value: Box<Expr>,
+            bits: u8,
+            signed: bool,
+        },
+        /// `Interlocked.MemoryBarrier` (RyuJIT's GT_MEMORYBARRIER,
+        /// BARRIER_FULL): a full hardware fence — x64 `lock or dword
+        /// [rsp], 0`. Effectful by definition.
+        MemoryFence,
+        /// `X86Serialize.Serialize()` (RyuJIT's NI_X86Serialize_Serialize,
+        /// INS_serialize): the `serialize` instruction (0F 01 E8), a
+        /// genuine serializing instruction — NOT a no-op. Effectful by
+        /// definition.
+        Serialize,
         /// **A call in HIR is an expression node** (`Expr::Call`) that may
         /// nest anywhere a value is legal. Compare `lir::StmtKind::Call`.
         Call {
@@ -667,6 +746,24 @@ pub mod lir {
             dst: LocalId,
             src: Operand,
         },
+        /// Round-to-nearest-even float→integer (HIR [`Expr::ConvRne`]):
+        /// `cvtss2si`/`cvtsd2si` — the Sse.ConvertToInt32 expansion's
+        /// rounding, not `conv.*`'s truncation.
+        ConvRne {
+            dst: LocalId,
+            to: Type,
+            src: Operand,
+        },
+        /// The unsigned 128-by-64 hardware divide (HIR
+        /// [`StmtKind::DivRem`]): `dst_q`/`dst_r` = quotient/remainder of
+        /// `hi:lo / divisor`.
+        DivRem {
+            dst_q: LocalId,
+            dst_r: LocalId,
+            lo: Operand,
+            hi: Operand,
+            divisor: Operand,
+        },
         /// Load through a byref operand at a constant offset.
         Load {
             dst: LocalId,
@@ -724,6 +821,47 @@ pub mod lir {
             array: Operand,
             index: Operand,
         },
+        /// The `Interlocked.CompareExchange` expansion (HIR
+        /// [`Expr::AtomicCmpXchg`]): `dst` = the OLD value of the
+        /// `bits`-wide cell at `addr` after the atomic
+        /// compare-and-swap with `comparand`/`value` — extended per
+        /// `signed` on the narrow widths.
+        AtomicCmpXchg {
+            dst: LocalId,
+            addr: Operand,
+            value: Operand,
+            comparand: Operand,
+            bits: u8,
+            signed: bool,
+        },
+        /// The `Interlocked.Exchange` expansion (HIR
+        /// [`Expr::AtomicXchg`]): `dst` = the OLD value of the
+        /// `bits`-wide cell at `addr` after the atomic swap with `value`.
+        AtomicXchg {
+            dst: LocalId,
+            addr: Operand,
+            value: Operand,
+            bits: u8,
+            signed: bool,
+        },
+        /// The `Interlocked.ExchangeAdd` expansion (HIR
+        /// [`Expr::AtomicXadd`]): `dst` = the OLD value of the
+        /// `bits`-wide cell at `addr` after the atomic add of `value`.
+        AtomicXadd {
+            dst: LocalId,
+            addr: Operand,
+            value: Operand,
+            bits: u8,
+            signed: bool,
+        },
+        /// The `Interlocked.MemoryBarrier` expansion (HIR
+        /// [`Expr::MemoryFence`]): a full hardware fence. A statement (no
+        /// result value).
+        MemoryFence,
+        /// The `X86Serialize.Serialize()` expansion (HIR
+        /// [`Expr::Serialize`]): the `serialize` instruction. A statement
+        /// (no result value).
+        Serialize,
         Cast {
             dst: LocalId,
             src: Operand,
@@ -843,6 +981,8 @@ pub mod lir {
                 StmtKind::Conv { .. } => "Conv",
                 StmtKind::ConvOvf { .. } => "ConvOvf",
                 StmtKind::CkFinite { .. } => "CkFinite",
+                StmtKind::ConvRne { .. } => "ConvRne",
+                StmtKind::DivRem { .. } => "DivRem",
                 StmtKind::Load { .. } => "Load",
                 StmtKind::Store { .. } => "Store",
                 StmtKind::Call { .. } => "Call",
@@ -853,6 +993,11 @@ pub mod lir {
                 StmtKind::Cast { .. } => "Cast",
                 StmtKind::Box { .. } => "Box",
                 StmtKind::NullCheck { .. } => "NullCheck",
+                StmtKind::AtomicCmpXchg { .. } => "AtomicCmpXchg",
+                StmtKind::AtomicXchg { .. } => "AtomicXchg",
+                StmtKind::AtomicXadd { .. } => "AtomicXadd",
+                StmtKind::MemoryFence => "MemoryFence",
+                StmtKind::Serialize => "Serialize",
                 StmtKind::BlockCopy { .. } => "BlockCopy",
                 StmtKind::BlockZero { .. } => "BlockZero",
                 StmtKind::BlockCopyDyn { .. } => "BlockCopyDyn",

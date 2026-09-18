@@ -774,6 +774,10 @@ KNOWN_ARTIFACTS: dict[str, str] = {
     "JIT/opt/OSR/integersumloop.cs": "timing values in output; both exit 100",
     "JIT/Performance/CodeQuality/SIMD/SeekUnroll/SeekUnroll.cs": "timing values in output; both exit 100",
     "JIT/Performance/CodeQuality/SIMD/RayTracer/RayTracerBench.cs": "frames/sec timing value in output; both exit 100",
+    "JIT/Methodical/tailcall/Desktop/thread-race.cs": "thread-scheduling interleave of Fibonacci prints; sorted lines identical; both exit 100 (SEGV runs fall through to CRASH — the exit-code rule)",
+    "JIT/Regression/CLR-x86-JIT/V1-M09/b13647/b13647.cs": "wall-clock timestamp printed; runs straddle a second boundary; both exit 100",
+    "JIT/Performance/CodeQuality/BilinearInterpol/BilinearInterpol.cs": "timing values in output; both exit 100",
+    "JIT/Performance/CodeQuality/HWIntrinsic/X86/PacketTracer/Program.cs": "frames/sec timing value in output; both exit 100",
 }
 
 

@@ -234,6 +234,10 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
     narrow_access.extend(sig_arg_accesses(&info.locals, ee)?);
     local_types.extend(sig_arg_types(&info.locals, ee, &mut struct_layouts)?);
     let num_il_locals = local_types.len() as u32 - num_args;
+    // `fixed` locals: the locals signature's CORINFO_TYPE_MOD_PINNED
+    // bits (lclvars.cpp:240) — the GC-info pinned flag rides
+    // hir::Local::pinned to the slot table.
+    let il_local_pins = sig_arg_pins(&info.locals, ee)?;
 
     let insns = decode(&info.il)?;
     let clauses = fetch_clauses(info, ee)?;
@@ -374,11 +378,16 @@ pub fn import(info: &MethodInfo, ee: &dyn EeInfo) -> CompileResult<hir::Method> 
             } else {
                 hir::LocalKind::Temp
             };
-            hir::Local {
-                ty,
-                kind,
-                pinned: false,
-            }
+            // RyuJIT's gate (lclvars.cpp:243): the pin applies to
+            // CLASS/BYREF locals only.
+            let pinned = match kind {
+                hir::LocalKind::IlLocal(j) => {
+                    matches!(ty, Type::Ref | Type::ByRef)
+                        && il_local_pins.get(j as usize).copied().unwrap_or(false)
+                }
+                _ => false,
+            };
+            hir::Local { ty, kind, pinned }
         })
         .collect();
     // With EH clauses the block list is rebuilt (step_10.6): main-area
@@ -782,11 +791,50 @@ fn sig_arg_types(
         let Some(arg) = cursor else {
             return Err(CompileError::BadIl("sig arg list shorter than numArgs"));
         };
-        let (ty, value_class) = ee.get_arg_type(sig, arg);
+        let (ty, value_class, _) = ee.get_arg_type(sig, arg);
         types.push(sig_elem_type(Some(ty), value_class, ee, layouts)?);
         cursor = ee.get_arg_next(arg);
     }
     Ok(types)
+}
+
+/// The raw per-argument `CorInfoType`s of a signature — the same walk as
+/// [`sig_arg_accesses`], without the stack-type normalization (the
+/// Interlocked expansion reads the cell width from the VALUE argument's
+/// metadata type, which the stack type erases).
+fn sig_corinfo_types(
+    sig: &ffi::CORINFO_SIG_INFO,
+    ee: &dyn EeInfo,
+) -> CompileResult<Vec<CorInfoType>> {
+    let mut types = Vec::with_capacity(sig.numArgs() as usize);
+    let mut cursor = ArgListHandle::from_raw(sig.args);
+    for _ in 0..sig.numArgs() {
+        let Some(arg) = cursor else {
+            return Err(CompileError::BadIl("sig arg list shorter than numArgs"));
+        };
+        let (ty, _, _) = ee.get_arg_type(sig, arg);
+        types.push(ty);
+        cursor = ee.get_arg_next(arg);
+    }
+    Ok(types)
+}
+
+/// The per-element `CORINFO_TYPE_MOD_PINNED` bits of a signature (the
+/// locals signature carries them for `fixed` locals; RyuJIT's
+/// lclvars.cpp:240 reads the same bit). Args are never pinned, so only
+/// the locals walk consumes this.
+fn sig_arg_pins(sig: &ffi::CORINFO_SIG_INFO, ee: &dyn EeInfo) -> CompileResult<Vec<bool>> {
+    let mut pins = Vec::with_capacity(sig.numArgs() as usize);
+    let mut cursor = ArgListHandle::from_raw(sig.args);
+    for _ in 0..sig.numArgs() {
+        let Some(arg) = cursor else {
+            return Err(CompileError::BadIl("sig arg list shorter than numArgs"));
+        };
+        let (_, _, pinned) = ee.get_arg_type(sig, arg);
+        pins.push(pinned);
+        cursor = ee.get_arg_next(arg);
+    }
+    Ok(pins)
 }
 
 /// The per-element memory access of a signature, for the IL arg/local
@@ -803,7 +851,7 @@ fn sig_arg_accesses(sig: &ffi::CORINFO_SIG_INFO, ee: &dyn EeInfo) -> CompileResu
         let Some(arg) = cursor else {
             return Err(CompileError::BadIl("sig arg list shorter than numArgs"));
         };
-        let (ty, _) = ee.get_arg_type(sig, arg);
+        let (ty, _, _) = ee.get_arg_type(sig, arg);
         accesses.push(match ty {
             CorInfoType::Bool | CorInfoType::UByte => MemAccess::U8,
             CorInfoType::Byte => MemAccess::I8,
@@ -1258,6 +1306,456 @@ const STIND_FIXED_KINDS: [(Type, MemAccess); 7] = [
 /// native type handle at 8.
 const TYPED_REF_DATA_OFFSET: u32 = 0;
 const TYPED_REF_TYPE_OFFSET: u32 = 8;
+
+/// The `System.Runtime.Intrinsics.X86` ISA-family support table
+/// (step_11.14 phase 2): family name → the `get_IsSupported` answer. The
+/// family set is measured from the CoreLib X86 tree
+/// (runtime/src/libraries/System.Private.CoreLib/src/System/Runtime/
+/// Intrinsics/X86/); nested X64/Wide classes carry no entry — the lookup
+/// (`BlockImport::x86_isa_support`) walks to the enclosing family's.
+/// Phase 3 increments 1-2: Sse/Sse2/X86Base (the x64 baseline) and
+/// Avx/Avx2 (this host's 256-bit families) answer `true` — the
+/// reference's answers here; X86Serialize follows in the phase-3
+/// straggler slice (this host has SERIALIZE — the reference answers true
+/// — and the `Serialize()` leaf expands to the real instruction, so the
+/// flip is honest). Every other family stays `false` (RyuJIT's
+/// NI_IsSupported_False stance) and CoreLib's guarded vector arms for
+/// them fold onto their software fallbacks. The flipped families' leaves
+/// expand scalarized (`expand_hw_intrinsic_leaf`); the
+/// `Vector.IsHardwareAccelerated` expansion answers consistently
+/// (Vector128/256 and System.Numerics.Vector true, the rest false).
+const X86_ISA_SUPPORTED: &[(&str, bool)] = &[
+    ("Sse", true),
+    ("Sse2", true),
+    ("Sse3", false),
+    ("Ssse3", false),
+    ("Sse41", false),
+    ("Sse42", false),
+    ("Avx", true),
+    ("Avx2", true),
+    ("Avx512F", false),
+    ("Avx512BW", false),
+    ("Avx512CD", false),
+    ("Avx512DQ", false),
+    ("Avx512Vbmi", false),
+    ("Avx512Vbmi2", false),
+    ("Avx512Bmm", false),
+    ("Avx10v1", false),
+    ("Avx10v2", false),
+    ("Aes", false),
+    ("AvxVnni", false),
+    ("AvxVnniInt16", false),
+    ("AvxVnniInt8", false),
+    ("Bmi1", false),
+    ("Bmi2", false),
+    ("Fma", false),
+    ("Gfni", false),
+    ("Lzcnt", false),
+    ("Pclmulqdq", false),
+    ("Popcnt", false),
+    ("X86Base", true),
+    ("X86Serialize", true),
+];
+
+/// Measured leaves of UNFLIPPED families that flipped-family code paths
+/// reach anyway (step_11.14 phase 3 increment 2): the Avx-guarded arms of
+/// GitHub_17073 call `Sse41.TestZ` directly, the 32-byte decomposition of
+/// `Vector<int>.Min`/`Max` calls `Sse41.Min`/`Max`, GitHub_19550's Avx arm
+/// calls `Sse41.LoadAlignedVector128NonTemporal`. The family's
+/// `IsSupported` answer stays `false` (the reference's true answer only
+/// routes those tests through MORE checks that print nothing on success);
+/// expanding the reached leaf is what makes the flipped-family arms
+/// compute reference-identical results.
+const X86_STRAGGLER_LEAVES: &[(&str, &str)] = &[
+    ("Sse41", "TestZ"),
+    ("Sse41", "TestC"),
+    ("Sse41", "TestNotZAndNotC"),
+    ("Sse41", "Min"),
+    ("Sse41", "Max"),
+    ("Sse41", "LoadAlignedVector128NonTemporal"),
+];
+
+/// A vector hardware-intrinsic leaf's element type — the width-generic
+/// scalar cell of the Sse/Sse2 expansions (step_11.14 phase 3 increment
+/// 1). The vector's byte width never rides this type: the expander reads
+/// it from the EE layout, so the 32-byte Avx increment reuses the same
+/// machinery.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum VecElem {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    F32,
+    F64,
+}
+
+impl VecElem {
+    /// The element type of a primitive `CorInfoType`, or `None` for
+    /// anything outside the vector element set.
+    fn of_cor_info(ty: CorInfoType) -> Option<VecElem> {
+        Some(match ty {
+            CorInfoType::Byte => VecElem::I8,
+            CorInfoType::UByte | CorInfoType::Bool => VecElem::U8,
+            CorInfoType::Short => VecElem::I16,
+            CorInfoType::UShort | CorInfoType::Char => VecElem::U16,
+            CorInfoType::Int => VecElem::I32,
+            CorInfoType::UInt => VecElem::U32,
+            CorInfoType::Long => VecElem::I64,
+            CorInfoType::ULong => VecElem::U64,
+            CorInfoType::Float => VecElem::F32,
+            CorInfoType::Double => VecElem::F64,
+            _ => return None,
+        })
+    }
+
+    /// The element size in bytes.
+    fn size(self) -> u32 {
+        match self {
+            VecElem::I8 | VecElem::U8 => 1,
+            VecElem::I16 | VecElem::U16 => 2,
+            VecElem::I32 | VecElem::U32 | VecElem::F32 => 4,
+            VecElem::I64 | VecElem::U64 | VecElem::F64 => 8,
+        }
+    }
+
+    /// The HIR load/store cell for an element: narrow integers extend to
+    /// Int32 on load (sign per the element type) and truncate on store
+    /// (the MemAccess rules), which is exactly the lane-wrap semantics of
+    /// the integer SSE ops; floats ride Float/Double.
+    fn cell(self) -> (Type, MemAccess) {
+        match self {
+            VecElem::I8 => (Type::Int32, MemAccess::I8),
+            VecElem::U8 => (Type::Int32, MemAccess::U8),
+            VecElem::I16 => (Type::Int32, MemAccess::I16),
+            VecElem::U16 => (Type::Int32, MemAccess::U16),
+            VecElem::I32 | VecElem::U32 => (Type::Int32, MemAccess::Natural),
+            VecElem::I64 | VecElem::U64 => (Type::Int64, MemAccess::Natural),
+            VecElem::F32 => (Type::Float, MemAccess::Natural),
+            VecElem::F64 => (Type::Double, MemAccess::Natural),
+        }
+    }
+
+    /// The same-width cell read as a SIGNED integer — mask
+    /// materialization and MoveMask's sign-bit reads; floats reinterpret
+    /// their raw bits.
+    fn signed_cell(self) -> (Type, MemAccess) {
+        match self {
+            VecElem::I8 | VecElem::U8 => (Type::Int32, MemAccess::I8),
+            VecElem::I16 | VecElem::U16 => (Type::Int32, MemAccess::I16),
+            VecElem::I32 | VecElem::U32 | VecElem::F32 => (Type::Int32, MemAccess::Natural),
+            VecElem::I64 | VecElem::U64 | VecElem::F64 => (Type::Int64, MemAccess::Natural),
+        }
+    }
+
+    fn is_float(self) -> bool {
+        matches!(self, VecElem::F32 | VecElem::F64)
+    }
+
+    /// A signed integer element (the SSE2 integer compares are signed-
+    /// only, the arithmetic shifts too).
+    fn is_signed_int(self) -> bool {
+        matches!(
+            self,
+            VecElem::I8 | VecElem::I16 | VecElem::I32 | VecElem::I64
+        )
+    }
+}
+
+/// An SSE compare predicate (the CMPPS/CMPPD immediates). The float
+/// forms map onto the backend's ECMA-335 float compares, whose parity
+/// handling covers the ordered/unordered space exactly
+/// (emit_setcc_f): ordered compares are false on NaN, the Not* forms
+/// true.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum CmpPred {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    NLt,
+    NLe,
+    NGt,
+    NGe,
+    Ord,
+    Unord,
+    /// The two predicates the AVX 32-mode space adds over the SSE dozen:
+    /// EQ_UQ (equal, TRUE on NaN) = Eq|Unord and NEQ_OQ (not equal, FALSE
+    /// on NaN) = Ne&Ord. Signaling variants are sNaN-only, unobservable.
+    EqUq,
+    NeOq,
+    /// _CMP_FALSE_OQ/_CMP_TRUE_UQ: the operand-independent outcomes.
+    False,
+    True,
+}
+
+/// The AVX `FloatComparisonMode` (vcmpps imm8) → predicate map. Modes
+/// 16-31 repeat 0-15 with signaling flipped (sNaN #IA — unobservable in
+/// this process), so the low 3 bits select within an 8-entry octad and
+/// bit 3 flips the ordered/unordered NaN polarity where it exists.
+fn pred_of_avx_mode(mode: u32) -> Option<CmpPred> {
+    Some(match mode {
+        0 | 16 => CmpPred::Eq,
+        1 | 17 => CmpPred::Lt,
+        2 | 18 => CmpPred::Le,
+        3 | 19 => CmpPred::Unord,
+        4 | 20 => CmpPred::Ne,
+        5 | 21 => CmpPred::NLt,
+        6 | 22 => CmpPred::NLe,
+        7 | 23 => CmpPred::Ord,
+        8 | 24 => CmpPred::EqUq,
+        9 | 25 => CmpPred::NGe,
+        10 | 26 => CmpPred::NGt,
+        11 | 27 => CmpPred::False,
+        12 | 28 => CmpPred::NeOq,
+        13 | 29 => CmpPred::Ge,
+        14 | 30 => CmpPred::Gt,
+        15 | 31 => CmpPred::True,
+        _ => return None,
+    })
+}
+
+/// The shift direction of a `ShiftLeftLogical`/`ShiftRightLogical`/
+/// `ShiftRightArithmetic` leaf.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ShiftDir {
+    Left,
+    RightLogical,
+    RightArith,
+}
+
+/// The ptest flag a `TestZ`/`TestC`/`TestNotZAndNotC` leaf answers.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum PTestKind {
+    /// ZF: (a & b) == 0 over every lane.
+    Z,
+    /// CF: (~a & b) == 0 over every lane.
+    C,
+    /// !ZF && !CF.
+    NotZAndNotC,
+}
+
+/// One measured Sse/Sse2/X86Base leaf expansion (step_11.14 phase 3
+/// increments 1-2): the classifier [`BlockImport::hw_leaf_op`] produces it
+/// from the method name + signature; [`BlockImport::expand_hw_intrinsic_leaf`]
+/// builds the scalarized HIR. Anything outside the measured set classifies
+/// to `None` and keeps the loud poison.
+#[derive(Copy, Clone, Debug)]
+enum HwLeafOp {
+    /// Elementwise arithmetic over two vector args: Add/Subtract (any
+    /// element), Multiply/Divide (float/double only — SSE2 has no 32-bit
+    /// integer multiply), MultiplyLow (16-bit lanes: the Int32 product
+    /// truncated by the narrow store IS pmullw), Min/Max (float/double —
+    /// [`BinaryOp::MinF`]/`MaxF` carry the SSE second-operand-wins NaN
+    /// rule).
+    Arith {
+        elem: VecElem,
+        op: BinaryOp,
+    },
+    /// And/Or/Xor over two vector args (bitwise — element-agnostic; the
+    /// element type only sets the cell width).
+    Bitwise {
+        elem: VecElem,
+        op: BinaryOp,
+    },
+    /// AndNot: `~left & right` (the PANDN operand order — NOT
+    /// Vector128.AndNot's).
+    AndNot {
+        elem: VecElem,
+    },
+    /// A vector compare: the all-ones/all-zeros mask per element.
+    Compare {
+        elem: VecElem,
+        pred: CmpPred,
+    },
+    /// CompareScalarOrdered*: element 0 compared, Int32 0/1 result.
+    CompareScalarOrdered {
+        elem: VecElem,
+        pred: CmpPred,
+    },
+    /// MoveMask: the sign-bit gather, one result bit per element.
+    MoveMask {
+        elem: VecElem,
+    },
+    /// LoadVector128/LoadAlignedVector128 from a pointer arg (alignment
+    /// is a performance contract only — the expansion never faults on
+    /// misalignment, a correctness superset of movaps).
+    Load {
+        elem: VecElem,
+    },
+    /// LoadScalarVector128: element 0 from memory, the rest zeroed.
+    LoadScalar {
+        elem: VecElem,
+    },
+    /// Store/StoreAligned: the full vector to a pointer arg.
+    Store {
+        elem: VecElem,
+    },
+    /// StoreScalar: element 0 to a pointer arg.
+    StoreScalar {
+        elem: VecElem,
+    },
+    /// LoadLow: the low 64 bits from the pointer arg, the rest from the
+    /// vector arg (movlps/movlpd).
+    LoadLow {
+        elem: VecElem,
+    },
+    /// LoadHigh: the high 64 bits from the pointer arg, the low ones
+    /// from the vector arg (movhps/movhpd).
+    LoadHigh {
+        elem: VecElem,
+    },
+    /// The immediate-count shifts (SSE saturating count: ≥ lane bits ⇒
+    /// 0 for the logical forms, sign-fill for arithmetic). `vec_count`
+    /// is the vector-count form: the count is the low 64 bits of the
+    /// second vector (psll*'s count operand).
+    Shift {
+        elem: VecElem,
+        dir: ShiftDir,
+        vec_count: bool,
+    },
+    /// PackUnsignedSaturate: (short,short)→byte / (int,int)→ushort —
+    /// signed source elements clamped to the unsigned target range,
+    /// `a`'s lanes then `b`'s.
+    PackUnsignedSaturate {
+        from: VecElem,
+        to: VecElem,
+    },
+    /// Sse.Shuffle (float) / Sse2.Shuffle (double): the
+    /// two-interleaved-source permute, control byte selecting lanes.
+    Shuffle {
+        elem: VecElem,
+    },
+    /// Sse2.Shuffle(Vector128<int/uint>, byte): pshufd — the
+    /// single-source 32-bit-lane permute.
+    Shuffle1 {
+        elem: VecElem,
+    },
+    /// ConvertToInt32/ConvertToInt64 [WithTruncation] of element 0:
+    /// `rne` selects cvt (round-to-nearest-even) over cvtt.
+    ConvertToInt {
+        elem: VecElem,
+        to64: bool,
+        rne: bool,
+    },
+    /// The integer-element ConvertToInt32/ConvertToInt64 forms
+    /// (movd/movq): element 0 extracted, no conversion.
+    ExtractScalar,
+    /// ConvertToVector128Single(Vector128<int>) /
+    /// ConvertToVector128Double(Vector128<int>) /
+    /// ConvertToVector256Double(Vector128<int>) /
+    /// ConvertToVector128Int32WithTruncation(Vector256<double>) /
+    /// ConvertToVector256Int32(Vector256<float>): the first
+    /// `size_of(ret)/size_of(to)` lanes converted (cvtdq2ps/cvtdq2pd ride
+    /// the conv_i_to_f rule; the f→i forms are cvtt via `Conv` or cvt
+    /// round-to-nearest-even via `ConvRne` — `rne` selects).
+    ConvertElems {
+        from: VecElem,
+        to: VecElem,
+        rne: bool,
+    },
+    /// ConvertScalarToVector128Single/…Double(upper, value): element 0 =
+    /// (float/double)value (cvtsi2ss/cvtsi2sd, RNE — the int/long arg
+    /// both ride the conv_i_to_f rule), the rest from `upper`.
+    ConvertScalarToF32,
+    ConvertScalarToF64,
+    /// Sse2 (.X64).StoreNonTemporal(int*/long*, value): movnti. The
+    /// non-temporal hint is a cache-policy detail; the expansion is a
+    /// plain scalar store (no WC memory exists in this process's view —
+    /// and the fence leaves are already the no-code/full-fence stance).
+    StoreNonTemporalScalar,
+    /// X86Base-family `ConvertScalarToVector128Int64(long)`: element 0 =
+    /// the scalar, the rest zeroed (movq).
+    ConvertScalarToIntVector,
+    /// Sse/Sse2/Avx `Sqrt`: the elementwise IEEE square root
+    /// (sqrtss/sqrtsd per lane — correctly rounded, so the scalarized
+    /// form IS the hardware semantics).
+    Sqrt {
+        elem: VecElem,
+    },
+    /// Avx/Avx2 `BroadcastScalarToVector128`/`…ToVector256`(ptr): every
+    /// lane of the result = the pointed-to element (vbroadcastss & co.).
+    BroadcastScalar {
+        elem: VecElem,
+    },
+    /// Avx/Avx2 `MaskLoad(ptr, mask)`: a lane loads only where the mask
+    /// element's sign bit is set, and is zero otherwise — vmaskmov's
+    /// fault suppression is semantic (a masked-off lane may point at
+    /// unmapped memory), so the expansion selects the ADDRESS (the real
+    /// one or a frame-resident dummy), never conditionally the value.
+    MaskLoad {
+        elem: VecElem,
+    },
+    /// Avx `Compare`/`CompareScalar`(left, right, FloatComparisonMode):
+    /// the 32-mode predicate space ([`pred_of_avx_mode`]; the signaling
+    /// bit is sNaN-only, unobservable). A constant mode folds statically;
+    /// a runtime mode rides a per-lane 32-bit predicate bitmask shifted
+    /// by the mode. CompareScalar (vcmpss/vcmpsd) writes the mask to
+    /// element 0 and copies the upper elements from `left`.
+    CompareMode {
+        elem: VecElem,
+        scalar: bool,
+    },
+    /// Avx2 `GatherVector256`(base, indices, scale): per lane,
+    /// `base + (sign-extended)index[i] * scale` loaded. The unmasked
+    /// forms touch every lane. `index_elem` is the index vector's element
+    /// type (i32 — sign-extended per vgatherdp*/vpgatherd* — or i64).
+    Gather {
+        elem: VecElem,
+        index_elem: VecElem,
+    },
+    /// Sse41 `TestZ`/`TestC`/`TestNotZAndNotC`: integer lanes use ptest
+    /// (full bitwise AND); the Avx float/double forms are vtestps/vtestpd
+    /// — the AND runs on the lanes' SIGN BITS only.
+    PTest {
+        elem: VecElem,
+        kind: PTestKind,
+    },
+    /// Sse41 `Min`/`Max` on integer lanes (pmins*/pmaxs* — the measured
+    /// demand is 32-bit; the xor-select expansion is sign-correct for
+    /// every integer width): `r ^ ((l ^ r) & (0 - (l<r)))` for Min,
+    /// Gt for Max; the compare signedness follows the element type.
+    MinMaxInt {
+        elem: VecElem,
+        is_max: bool,
+    },
+    /// Avx `BlendVariable(a, b, mask)` (vblendvps/vblendvpd): per lane,
+    /// the mask element's sign bit selects `b` over `a`. (The Avx2
+    /// integer forms are vpblendvb — BYTE-granular masks, a different
+    /// shape, not measured.)
+    BlendVariable {
+        elem: VecElem,
+    },
+    /// Avx `Floor` (vroundps/vroundpd toward -inf): exact per-lane via
+    /// RNE-to-integer + adjust (`rf = RNE(x); floor = rf - (rf > x)`)
+    /// with an in-range guard (|x| beyond the integer cell is already
+    /// integral — passthrough; NaN/inf compares false — passthrough).
+    /// Known 1-bit divergence: floor(-0.0) yields +0.0 (numerically
+    /// equal; vroundps preserves the sign).
+    Floor {
+        elem: VecElem,
+    },
+    /// Avx `ExtractVector128(Vector256<T>, index)` (vextractf128): the
+    /// immediate's low bit selects which 128-bit half of the source the
+    /// (16-byte) result copies. Branchless over a runtime index.
+    ExtractHalf {
+        elem: VecElem,
+    },
+    /// LoadFence/StoreFence: no code on x64 (TSO — no non-temporal
+    /// stores exist in this backend). MemoryFence: the full fence.
+    Fence {
+        full: bool,
+    },
+    /// X86Base.X64.DivRem(ulong, ulong, ulong) → (ulong, ulong): the
+    /// 128-by-64 hardware divide.
+    DivRem64,
+}
 
 /// Bounds-checked cursor over the IL stream.
 struct Reader<'a> {
@@ -2548,6 +3046,7 @@ fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
             references_local(lhs, id) || references_local(rhs, id)
         }
         hir::Expr::Conv { arg, .. } => references_local(arg, id),
+        hir::Expr::ConvRne { arg, .. } => references_local(arg, id),
         hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => references_local(arg, id),
         hir::Expr::Call { target, args, .. } => {
             let target_ref = match target {
@@ -2563,6 +3062,20 @@ fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
         }
         hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => references_local(arg, id),
         hir::Expr::StructVal { addr, .. } => references_local(addr, id),
+        hir::Expr::AtomicCmpXchg {
+            addr,
+            value,
+            comparand,
+            ..
+        } => {
+            references_local(addr, id)
+                || references_local(value, id)
+                || references_local(comparand, id)
+        }
+        hir::Expr::AtomicXchg { addr, value, .. } | hir::Expr::AtomicXadd { addr, value, .. } => {
+            references_local(addr, id) || references_local(value, id)
+        }
+        hir::Expr::MemoryFence | hir::Expr::Serialize => false,
         hir::Expr::LocAlloc { size } => references_local(size, id),
         hir::Expr::FtnAddr { entry, .. } => references_local(entry, id),
     }
@@ -2591,6 +3104,7 @@ fn must_eval(expr: &hir::Expr) -> bool {
         // when the value is discarded.
         hir::Expr::BinaryOvf { .. } => true,
         hir::Expr::Conv { arg, .. } => must_eval(arg),
+        hir::Expr::ConvRne { arg, .. } => must_eval(arg),
         // The checked conversion and the finiteness check can throw —
         // observable even when the value is discarded.
         hir::Expr::ConvOvf { .. } | hir::Expr::CkFinite { .. } => true,
@@ -2610,6 +3124,14 @@ fn must_eval(expr: &hir::Expr) -> bool {
             **addr,
             hir::Expr::LocalAddr(_) | hir::Expr::StaticFieldAddr { .. }
         ),
+        // An opaque global store that can fault (a null byref) — always
+        // observable (RyuJIT's GTF_ASG on the atomic nodes); the fence is
+        // its own effect.
+        hir::Expr::AtomicCmpXchg { .. }
+        | hir::Expr::AtomicXchg { .. }
+        | hir::Expr::AtomicXadd { .. }
+        | hir::Expr::MemoryFence
+        | hir::Expr::Serialize => true,
         // The allocation moves rsp for the rest of the method — an effect
         // even when the address is discarded.
         hir::Expr::LocAlloc { .. } => true,
@@ -2635,6 +3157,7 @@ fn has_global_effect(expr: &hir::Expr) -> bool {
             has_global_effect(lhs) || has_global_effect(rhs)
         }
         hir::Expr::Conv { arg, .. } => has_global_effect(arg),
+        hir::Expr::ConvRne { arg, .. } => has_global_effect(arg),
         hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => has_global_effect(arg),
         hir::Expr::Call { .. } => true,
         hir::Expr::NullCheck { arg } => has_global_effect(arg),
@@ -2647,6 +3170,12 @@ fn has_global_effect(expr: &hir::Expr) -> bool {
         hir::Expr::Cast { .. } | hir::Expr::Box { .. } => true,
         // The struct value IS a memory read; only a frame slot is local.
         hir::Expr::StructVal { addr, .. } => !matches!(**addr, hir::Expr::LocalAddr(_)),
+        // An opaque global store (GTF_ASG); the fence is its own effect.
+        hir::Expr::AtomicCmpXchg { .. }
+        | hir::Expr::AtomicXchg { .. }
+        | hir::Expr::AtomicXadd { .. }
+        | hir::Expr::MemoryFence
+        | hir::Expr::Serialize => true,
         // The allocation moves rsp for the rest of the method.
         hir::Expr::LocAlloc { .. } => true,
         hir::Expr::FtnAddr { entry, .. } => has_global_effect(entry),
@@ -4982,6 +5511,78 @@ impl BlockImport<'_> {
                 },
             );
         }
+        // `RuntimeHelpers.IsReferenceOrContainsReferences<T>()` — the
+        // same deliberately self-recursive [Intrinsic] shape
+        // (RuntimeHelpers.cs:189: the body returns
+        // `IsReferenceOrContainsReferences<T>()`, the [Intrinsic] marker
+        // is the real implementation), so a literal compile recurses
+        // until the stack overflows (thread-race.cs: Int32.ToString →
+        // Number.UInt32ToDecStr → MemoryMarshal.Cast<char, DigitPair>).
+        // RyuJIT expands it (importercalls.cpp:3917-3928, mustExpand at
+        // 3746-3748): the methInst type arg answers 1 when it is a GC
+        // type (TypeHandleToVarType → TYP_REF/BYREF — reference classes,
+        // arrays, strings) or a value class whose layout carries GC
+        // pointers (the EE's CONTAINS_GC_PTR class attrib,
+        // jitinterface.cpp:3837), 0 otherwise. A type-variable argument
+        // answers CORINFO_TYPE_UNDEF → 0, exactly RyuJIT's
+        // JITtype2varType(UNDEF) → not-GC outcome — and never occurs in
+        // practice: every CoreLib caller constrains T to `struct`.
+        if virtual_kind.is_none()
+            && constrained_resolved.is_none()
+            && !has_this
+            && ret == Type::Int32
+            && arg_types.is_empty()
+            && call.sig.sigInst.methInstCount == 1
+            && self.is_reference_or_contains_references_intrinsic(method)
+        {
+            // SAFETY: methInstCount == 1 ⇒ methInst names one class
+            // handle (the GetArrayDataReference contract above).
+            let type_handle = unsafe { *call.sig.sigInst.methInst };
+            let Some(class) = ClassHandle::from_raw(type_handle) else {
+                return Err(CompileError::BadIl(
+                    "null type argument on an IsReferenceOrContainsReferences<T> call",
+                ));
+            };
+            let answer = match self.ee.as_cor_info_type(class) {
+                // varTypeIsGC(TYP_REF | TYP_BYREF) — the reference half.
+                CorInfoType::Class | CorInfoType::ByRef => true,
+                // fromLayout->HasGCPtr() — the struct-layout half.
+                CorInfoType::ValueClass => self
+                    .ee
+                    .get_class_attribs(class)
+                    .contains(ClassAttribs::CONTAINS_GC_PTR),
+                _ => false,
+            };
+            return self.push(
+                Type::Int32,
+                hir::Expr::Const(Const::Int32(i32::from(answer))),
+            );
+        }
+        // `Interlocked.CompareExchange`/`Exchange`/`ExchangeAdd`/
+        // `MemoryBarrier` — the deliberately self-recursive [Intrinsic]
+        // family (Interlocked.CoreCLR.cs:56/120/...: `return Exchange(...);
+        // // Must expand intrinsic`; Interlocked.cs:322 same for
+        // byte/ushort). Tier-0 calls never JIT these bodies (the R2R image
+        // covers CoreLib), but a tier-1 RE-JIT compiles the IL and the
+        // self-call recurses to a stack overflow (thread-race.cs's
+        // ConsolePal cursor path; the 11.4 close's
+        // ConstStringConstIndexOptimizations note). RyuJIT expands the
+        // recursive call site (mustExpand = gtIsRecursiveCall,
+        // importercalls.cpp:3333) to the atomic node (GT_CMPXCHG/GT_XCHG/
+        // GT_XADD, importercalls.cpp:4506-4560); we expand at every call
+        // site — tier 0's only tier. x64: `lock cmpxchg` / `xchg` /
+        // `lock xadd`; MemoryBarrier is `lock or dword [rsp], 0`
+        // (codegenxarch.cpp:11552). The object/`T` overloads stay gated:
+        // an atomic ref store's write barrier (on cmpxchg success only)
+        // is a later step — the post-hoc CHECKED_ASSIGN_REF re-store would
+        // race another thread's intervening swap.
+        if virtual_kind.is_none()
+            && constrained_resolved.is_none()
+            && !has_this
+            && self.is_interlocked_intrinsic(method)
+        {
+            return self.expand_interlocked(method, args, &call.sig, stmts, il_offset);
+        }
         // `Volatile.ReadBarrier()`/`WriteBarrier()`: the same deliberately
         // self-recursive [Intrinsic] shape (System.Threading.Volatile.cs),
         // compiler fences only — no code on x64, and tier 0 reorders
@@ -5042,19 +5643,24 @@ impl BlockImport<'_> {
         // `Vector.IsHardwareAccelerated` (System.Numerics and the
         // System.Runtime.Intrinsics Vector64/128/256/512 classes): the same
         // deliberately self-recursive [Intrinsic] shape (Vector.cs:24).
-        // RyuJIT answers by ISA support; RokaJIT expands no SIMD (the
-        // is_hw_intrinsic_leaf gate below names that gap), so the honest
-        // answer is `false` — RyuJIT's NI_IsSupported_False stance — which
-        // short-circuits every CoreLib guard onto the scalar fallback path
-        // (Linq.cs: Enumerable.FillIncrementing's vector branch).
+        // RyuJIT answers by ISA support; phase 3 increments 1-2 flipped
+        // Sse/Sse2 and Avx/Avx2, so Vector128, Vector256 and
+        // System.Numerics.Vector answer `true` (the reference's answers on
+        // this host — Vector<T> is 32 bytes here); Vector64 (x64 SSE is a
+        // 128-bit ISA — 64-bit vectors are not accelerated) and Vector512
+        // stay `false`.
         if virtual_kind.is_none()
             && constrained_resolved.is_none()
             && !has_this
             && ret == Type::Int32
             && arg_types.is_empty()
-            && self.is_is_hardware_accelerated_intrinsic(method)
         {
-            return self.push(Type::Int32, hir::Expr::Const(Const::Int32(0)));
+            if let Some(accelerated) = self.hardware_accelerated_answer(method) {
+                return self.push(
+                    Type::Int32,
+                    hir::Expr::Const(Const::Int32(i32::from(accelerated))),
+                );
+            }
         }
         // `System.Double/Single.ConvertToIntegerNative<T>(value)`: the
         // [Intrinsic] the managed DBL2*_OVF dynamic helpers
@@ -5096,17 +5702,144 @@ impl BlockImport<'_> {
                 },
             );
         }
+        // `get_IsSupported` on the System.Runtime.Intrinsics.X86 ISA
+        // families (Sse … X86Serialize, the nested X64/Wide classes
+        // included): the same deliberately self-recursive [Intrinsic]
+        // shape (Sse.cs:19: `get => IsSupported;`). The answer is
+        // DATA-DRIVEN: X86_ISA_SUPPORTED names each family — phase 3
+        // increments 1-2 flipped Sse/Sse2/X86Base and Avx/Avx2 true; the
+        // rest answer `false` (RyuJIT's NI_IsSupported_False stance),
+        // folding those guarded CoreLib vector arms onto their software
+        // paths. The `Vector.IsHardwareAccelerated` expansion above
+        // answers consistently (Vector128/256 true, the rest false).
+        if virtual_kind.is_none()
+            && constrained_resolved.is_none()
+            && !has_this
+            && ret == Type::Int32
+            && arg_types.is_empty()
+        {
+            if let Some(supported) = self.x86_isa_support(method) {
+                return self.push(
+                    Type::Int32,
+                    hir::Expr::Const(Const::Int32(i32::from(supported))),
+                );
+            }
+        }
         // The System.Runtime.Intrinsics.X86 leaves (Sse*/Avx*/Aes/Bmi*/
         // Fma/Lzcnt/Popcnt/…): their CoreLib bodies are deliberately
         // self-recursive [Intrinsic]s with NO software path (the
         // GetMethodTable shape), so a literal compile recurses until the
-        // stack overflows (Runtime_106480's family). Real SIMD expansion
-        // is its own unscheduled step (step_11.10 measured and deferred
-        // it); name the gap instead of overflowing.
+        // stack overflows (Runtime_106480's family). The measured
+        // Sse/Sse2/Avx/Avx2 leaves expand scalarized
+        // (expand_hw_intrinsic_leaf, above this gate); everything else
+        // gets the loud poison: the
+        // THROW_NOT_IMPLEMENTED helper call, then the return type's
+        // default to keep the IL stack balanced — a REACHED leaf throws
+        // (never silently wrong) and logs the demand signal the next
+        // increment's map step collects. Failing the whole method's
+        // compile here took down unguarded callers on a tiering-timing
+        // coin flip (Runtime_128895's string.IndexOfAny compiled or not
+        // depending on when tiering landed the InvalidProgramException).
+        // `X86Base.Pause()`: a spin-wait scheduling hint with no
+        // computational effect — no code, the FastPollGC/Volatile-barrier
+        // stance. X86Base is baseline x86-64 (flipped true with Sse/Sse2,
+        // phase 3 increment 1); the spin loops that call it (SpinWait,
+        // the Interlocked slow paths) must not trip the leaf poison below.
+        if virtual_kind.is_none()
+            && constrained_resolved.is_none()
+            && !has_this
+            && ret == Type::Void
+            && arg_types.is_empty()
+            && self.is_x86_pause_intrinsic(method)
+        {
+            return Ok(());
+        }
+        // `X86Serialize.Serialize()` (the nested X64 class's included):
+        // the same self-recursive [Intrinsic] leaf shape, but a GENUINE
+        // serializing instruction — `serialize` (0F 01 E8), not a no-op
+        // (RyuJIT's NI_X86Serialize_Serialize → INS_serialize; the host
+        // executes it natively, so the honest expansion is the real
+        // thing). The family answers IsSupported true on this host (the
+        // reference's answer), so Serialize.X64's consistency assert
+        // (`IsSupported ? Pass : Fail`, then the call) must both read
+        // true and execute the instruction.
+        if virtual_kind.is_none()
+            && constrained_resolved.is_none()
+            && !has_this
+            && ret == Type::Void
+            && arg_types.is_empty()
+            && self.is_x86_serialize_intrinsic(method)
+        {
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Eval(hir::Expr::Serialize),
+            });
+            return Ok(());
+        }
+        // `System.Single.MultiplyAddEstimate(left, right, addend)` (and
+        // the identical MathF overload): the deliberately self-recursive
+        // [Intrinsic] (Single.cs:1234 — the GetMethodTable class), so a
+        // literal compile recurses until the stack overflows
+        // (Matrix4x4.cs's Vector4.Transform path, Runtime_91062). RyuJIT
+        // expands it (NI_System_Math_MultiplyAddEstimate,
+        // importercalls.cpp:11174) to NI_AVX2_MultiplyAddScalar — a FUSED
+        // multiply-add — when AVX2 answers (this host: true, so the
+        // reference's answer is the fused one and ours must fuse
+        // bit-exactly). The float fma through the double intermediate is
+        // EXACT: the double product of two floats needs 48 ≤ 53
+        // significand bits (exact), and with 53 ≥ 2·24+2 intermediate
+        // bits the add-then-round-to-float is the correctly rounded
+        // single-precision fma (Figueroa's double-rounding theorem).
+        // The DOUBLE overload (Double/Math, (double, double, double) ->
+        // double) is the named gate below: RyuJIT fuses it to vfmadd…sd
+        // here and NO wider exact intermediate exists, so we refuse
+        // loudly rather than approximate (mul+add would diverge from the
+        // reference's fused answer).
+        if virtual_kind.is_none()
+            && constrained_resolved.is_none()
+            && !has_this
+            && self.is_multiply_add_estimate_intrinsic(method)
+        {
+            let f32_shape = ret == Type::Float && arg_types == [Type::Float; 3];
+            if !f32_shape {
+                return Err(CompileError::Unsupported(
+                    "Double.MultiplyAddEstimate (no exact wider intermediate for the reference's fused vfmadd answer)",
+                ));
+            }
+            let addend = args.pop().expect("addend");
+            let right = args.pop().expect("right");
+            let left = args.pop().expect("left");
+            let widen = |e: hir::Expr| hir::Expr::Conv {
+                to: Type::Double,
+                overflow: false,
+                unsigned: false,
+                arg: Box::new(e),
+            };
+            let product = hir::Expr::Binary {
+                op: BinaryOp::Mul,
+                lhs: Box::new(widen(left)),
+                rhs: Box::new(widen(right)),
+            };
+            let sum = hir::Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(product),
+                rhs: Box::new(widen(addend)),
+            };
+            return self.push(
+                Type::Float,
+                hir::Expr::Conv {
+                    to: Type::Float,
+                    overflow: false,
+                    unsigned: false,
+                    arg: Box::new(sum),
+                },
+            );
+        }
         if self.is_hw_intrinsic_leaf(method) {
-            return Err(CompileError::Unsupported(
-                "hardware intrinsics (SIMD vector semantics)",
-            ));
+            if let Some(op) = self.hw_leaf_op(method, ret, &arg_types)? {
+                return self.expand_hw_intrinsic_leaf(op, ret, args, &arg_types, stmts, il_offset);
+            }
+            return self.poison_hw_intrinsic_leaf(method, ret, args, &arg_types, stmts, il_offset);
         }
         // CORINFO_CALL_CODE_POINTER: hMethod is not valid
         // (corinfo.h:1343) — the indirect target comes from the
@@ -5471,32 +6204,163 @@ impl BlockImport<'_> {
         }
     }
 
-    /// Whether `method` is an `IsHardwareAccelerated` getter RokaJIT must
-    /// answer `false` for: the [Intrinsic] bit plus the name match (as
-    /// RyuJIT name-matches them, importercalls.cpp:12153) on
-    /// `System.Numerics.Vector` or a `System.Runtime.Intrinsics`
-    /// Vector64/128/256/512 class. (`Vector<T>.IsHardwareAccelerated`
-    /// forwards to the non-generic `Vector`'s, so it needs no entry.)
-    fn is_is_hardware_accelerated_intrinsic(&self, method: MethodHandle) -> bool {
+    /// Whether `method` is a `System.Threading.Interlocked` method — the
+    /// [Intrinsic] bit plus the declaring class (the name match happens in
+    /// [`Self::expand_interlocked`], which owns the per-overload gates).
+    fn is_interlocked_intrinsic(&self, method: MethodHandle) -> bool {
         if !self.ee.is_intrinsic(method) {
-            return false;
-        }
-        if self.ee.get_method_name_from_metadata(method).as_deref()
-            != Some("get_IsHardwareAccelerated")
-        {
             return false;
         }
         let class = self.ee.get_method_class(method);
         match self.ee.get_class_name_from_metadata(class) {
-            Some((name, ns)) => {
-                (name == "Vector" && ns.as_deref() == Some("System.Numerics"))
-                    || (matches!(
-                        name.as_str(),
-                        "Vector64" | "Vector128" | "Vector256" | "Vector512"
-                    ) && ns.as_deref() == Some("System.Runtime.Intrinsics"))
-            }
+            Some((name, ns)) => name == "Interlocked" && ns.as_deref() == Some("System.Threading"),
             None => false,
         }
+    }
+
+    /// The expansion behind the [`Self::is_interlocked_intrinsic`] gate.
+    /// `MemoryBarrier` emits the fence statement and pushes nothing; the
+    /// value-producing overloads push the atomic node typed like the IL
+    /// stack answer (Int32 for ≤32-bit cells, Int64 for 64-bit). The
+    /// object/`T` (reference) overloads are the named gate: an atomic ref
+    /// store's write barrier — on cmpxchg SUCCESS only — is a later step
+    /// (a post-hoc CHECKED_ASSIGN_REF would race an intervening swap).
+    fn expand_interlocked(
+        &mut self,
+        method: MethodHandle,
+        mut args: Vec<hir::Expr>,
+        sig: &ffi::CORINFO_SIG_INFO,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let name = self.ee.get_method_name_from_metadata(method);
+        // The cell width rides the VALUE argument's raw signature type
+        // (the address is always byref/pointer-shaped): byte→8 … long/
+        // nativeint→64. Reference and other element types are the gate.
+        // The signedness rides it too: the narrow OLD-value result
+        // sign-extends for sbyte/short (the IL stack answer for
+        // `Interlocked.CompareExchange(ref sbyte, …)` holding 0xFB is
+        // -5, not 251 — RyuJIT's `varTypeIsSigned → INS_movsx`,
+        // codegenxarch.cpp:4388-4392).
+        let arg_corinfo = sig_corinfo_types(sig, self.ee)?;
+        let shape_of = |t: CorInfoType| -> Option<(u8, bool)> {
+            match t {
+                CorInfoType::Byte => Some((8, true)),
+                CorInfoType::Short => Some((16, true)),
+                CorInfoType::Bool | CorInfoType::UByte => Some((8, false)),
+                CorInfoType::Char | CorInfoType::UShort => Some((16, false)),
+                CorInfoType::Int | CorInfoType::UInt => Some((32, false)),
+                CorInfoType::Long
+                | CorInfoType::ULong
+                | CorInfoType::NativeInt
+                | CorInfoType::NativeUInt => Some((64, false)),
+                _ => None,
+            }
+        };
+        let gate =
+            |what: &'static str| -> CompileResult<()> { Err(CompileError::Unsupported(what)) };
+        match name.as_deref() {
+            // `lock or dword [rsp], 0` — the x64 full fence
+            // (codegenxarch.cpp:11552, BARRIER_FULL).
+            Some("MemoryBarrier") if args.is_empty() => {
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Eval(hir::Expr::MemoryFence),
+                });
+                Ok(())
+            }
+            Some("CompareExchange") if args.len() == 3 => {
+                let Some((bits, signed)) = arg_corinfo.get(1).copied().and_then(shape_of) else {
+                    return gate(
+                        "Interlocked.CompareExchange on object references (the atomic write barrier is a later step)",
+                    );
+                };
+                let comparand = args.pop().expect("comparand");
+                let value = args.pop().expect("value");
+                let addr = args.pop().expect("location");
+                self.push(
+                    if bits <= 32 { Type::Int32 } else { Type::Int64 },
+                    hir::Expr::AtomicCmpXchg {
+                        addr: Box::new(addr),
+                        value: Box::new(value),
+                        comparand: Box::new(comparand),
+                        bits,
+                        signed,
+                    },
+                )
+            }
+            Some("Exchange") if args.len() == 2 => {
+                let Some((bits, signed)) = arg_corinfo.get(1).copied().and_then(shape_of) else {
+                    return gate(
+                        "Interlocked.Exchange on object references (the atomic write barrier is a later step)",
+                    );
+                };
+                let value = args.pop().expect("value");
+                let addr = args.pop().expect("location");
+                self.push(
+                    if bits <= 32 { Type::Int32 } else { Type::Int64 },
+                    hir::Expr::AtomicXchg {
+                        addr: Box::new(addr),
+                        value: Box::new(value),
+                        bits,
+                        signed,
+                    },
+                )
+            }
+            Some("ExchangeAdd") if args.len() == 2 => {
+                let Some((bits, signed)) = arg_corinfo.get(1).copied().and_then(shape_of) else {
+                    return gate("Interlocked.ExchangeAdd outside int/long");
+                };
+                let value = args.pop().expect("value");
+                let addr = args.pop().expect("location");
+                self.push(
+                    if bits <= 32 { Type::Int32 } else { Type::Int64 },
+                    hir::Expr::AtomicXadd {
+                        addr: Box::new(addr),
+                        value: Box::new(value),
+                        bits,
+                        signed,
+                    },
+                )
+            }
+            _ => gate("Interlocked overload outside the expanded set"),
+        }
+    }
+
+    /// The `IsHardwareAccelerated` answer for `method`, or `None` when
+    /// `method` is not such a getter: the [Intrinsic] bit plus the name
+    /// match (as RyuJIT name-matches them, importercalls.cpp:12153) on
+    /// `System.Numerics.Vector` or a `System.Runtime.Intrinsics`
+    /// Vector64/128/256/512 class. (`Vector<T>.IsHardwareAccelerated`
+    /// forwards to the non-generic `Vector`'s, so it needs no entry.)
+    /// The answer is the phase-3 stance: Vector128/Vector256 and
+    /// System.Numerics.Vector true (Sse/Sse2 + Avx/Avx2 flipped,
+    /// increments 1-2 — the reference answers true on this host), the
+    /// rest false — Vector64 included: x64 SSE is a 128-bit ISA, so
+    /// 64-bit vectors are not accelerated (the reference answers false
+    /// for Vector64 here; answering true would diverge).
+    fn hardware_accelerated_answer(&self, method: MethodHandle) -> Option<bool> {
+        if !self.ee.is_intrinsic(method) {
+            return None;
+        }
+        if self.ee.get_method_name_from_metadata(method).as_deref()
+            != Some("get_IsHardwareAccelerated")
+        {
+            return None;
+        }
+        let class = self.ee.get_method_class(method);
+        let (name, ns) = self.ee.get_class_name_from_metadata(class)?;
+        if name == "Vector" && ns.as_deref() == Some("System.Numerics") {
+            return Some(true);
+        }
+        if ns.as_deref() == Some("System.Runtime.Intrinsics") {
+            return match name.as_str() {
+                "Vector128" | "Vector256" => Some(true),
+                "Vector64" | "Vector512" => Some(false),
+                _ => None,
+            };
+        }
+        None
     }
 
     /// Whether `method` is `System.Double.ConvertToIntegerNative<T>` /
@@ -5519,6 +6383,242 @@ impl BlockImport<'_> {
                 matches!(name.as_str(), "Double" | "Single") && ns.as_deref() == Some("System")
             }
             None => false,
+        }
+    }
+
+    /// Whether `method` is the
+    /// `System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>`
+    /// intrinsic: the [Intrinsic] bit plus the name match (as RyuJIT
+    /// name-matches it, namedintrinsiclist.h; see
+    /// `is_get_method_table_intrinsic`) on the declaring class. The type
+    /// argument `T` is read from the call sig's method instantiation at
+    /// the expansion site.
+    fn is_reference_or_contains_references_intrinsic(&self, method: MethodHandle) -> bool {
+        if !self.ee.is_intrinsic(method) {
+            return false;
+        }
+        if self.ee.get_method_name_from_metadata(method).as_deref()
+            != Some("IsReferenceOrContainsReferences")
+        {
+            return false;
+        }
+        let class = self.ee.get_method_class(method);
+        match self.ee.get_class_name_from_metadata(class) {
+            Some((name, ns)) => {
+                name == "RuntimeHelpers" && ns.as_deref() == Some("System.Runtime.CompilerServices")
+            }
+            None => false,
+        }
+    }
+
+    /// The `System.Runtime.Intrinsics.X86` ISA-family `get_IsSupported`
+    /// answer for `method`, or `None` when `method` is not such a getter:
+    /// the [Intrinsic] bit plus the name match (as RyuJIT name-matches
+    /// them; see `is_get_method_table_intrinsic`), the declaring class in
+    /// the X86 tree (the method query's enclosing-class walk answers the
+    /// outermost namespace for the nested X64/Wide classes —
+    /// `is_hw_intrinsic_leaf`'s comment), and the family name looked up
+    /// in [`X86_ISA_SUPPORTED`]. The family is the declaring class name
+    /// for the top-level classes; a nested class (its own namespace is
+    /// empty) follows its enclosing family's answer (Sse.X64 flips with
+    /// Sse in phase 3).
+    fn x86_isa_support(&self, method: MethodHandle) -> Option<bool> {
+        if !self.ee.is_intrinsic(method) {
+            return None;
+        }
+        if self.ee.get_method_name_from_metadata(method).as_deref() != Some("get_IsSupported") {
+            return None;
+        }
+        let ns = self.ee.get_method_declaring_namespace(method)?;
+        if !ns.starts_with("System.Runtime.Intrinsics.X86") {
+            return None;
+        }
+        let class = self.ee.get_method_class(method);
+        let (name, class_ns) = self.ee.get_class_name_from_metadata(class)?;
+        let family = if class_ns.as_deref().is_some_and(|n| !n.is_empty()) {
+            name
+        } else {
+            self.ee.get_method_declaring_enclosing_class_name(method)?
+        };
+        X86_ISA_SUPPORTED
+            .iter()
+            .find(|(family_name, _)| *family_name == family)
+            .map(|(_, supported)| *supported)
+    }
+
+    /// Whether `method` is `X86Base.Pause()` (or the nested X64 class's):
+    /// the [Intrinsic] bit plus the name match on a method whose declaring
+    /// namespace is in the X86 tree (`Pause` exists nowhere else there).
+    fn is_x86_pause_intrinsic(&self, method: MethodHandle) -> bool {
+        if !self.ee.is_intrinsic(method) {
+            return false;
+        }
+        if self.ee.get_method_name_from_metadata(method).as_deref() != Some("Pause") {
+            return false;
+        }
+        matches!(
+            self.ee.get_method_declaring_namespace(method),
+            Some(ns) if ns.starts_with("System.Runtime.Intrinsics.X86")
+        )
+    }
+
+    /// Whether `method` is `X86Serialize.Serialize()` (or the nested X64
+    /// class's): the [Intrinsic] bit plus the name match on a method whose
+    /// declaring namespace is in the X86 tree (`Serialize` exists nowhere
+    /// else there) — the same shape as [`Self::is_x86_pause_intrinsic`].
+    fn is_x86_serialize_intrinsic(&self, method: MethodHandle) -> bool {
+        if !self.ee.is_intrinsic(method) {
+            return false;
+        }
+        if self.ee.get_method_name_from_metadata(method).as_deref() != Some("Serialize") {
+            return false;
+        }
+        matches!(
+            self.ee.get_method_declaring_namespace(method),
+            Some(ns) if ns.starts_with("System.Runtime.Intrinsics.X86")
+        )
+    }
+
+    /// Whether `method` is `MultiplyAddEstimate` on `System.Single`,
+    /// `System.Double`, `System.MathF`, or `System.Math` — the [Intrinsic]
+    /// bit plus the name and declaring-class match (RyuJIT's
+    /// lookupPrimitiveFloatNamedIntrinsic covers exactly these four
+    /// classes for NI_System_Math_MultiplyAddEstimate,
+    /// importercalls.cpp:11647/11703/11785/12940). The per-overload shape
+    /// gate (float expands, double refuses) lives at the call site.
+    fn is_multiply_add_estimate_intrinsic(&self, method: MethodHandle) -> bool {
+        if !self.ee.is_intrinsic(method) {
+            return false;
+        }
+        if self.ee.get_method_name_from_metadata(method).as_deref() != Some("MultiplyAddEstimate") {
+            return false;
+        }
+        let class = self.ee.get_method_class(method);
+        match self.ee.get_class_name_from_metadata(class) {
+            Some((name, ns)) => {
+                matches!(name.as_str(), "Single" | "Double" | "MathF" | "Math")
+                    && ns.as_deref() == Some("System")
+            }
+            None => false,
+        }
+    }
+
+    /// The stance on an X86-tree [Intrinsic] leaf (`is_hw_intrinsic_leaf`)
+    /// outside the measured expansion set: not a compile error — a
+    /// compiled poison. With the unflipped families' `get_IsSupported`
+    /// expanded to `false`, their guarded vector arms are dynamically
+    /// dead, so a REACHED leaf means the guard model broke; throwing
+    /// (CORINFO_HELP_THROW_NOT_IMPLEMENTED, the (void)->Void helper) is
+    /// loud where a compile-time Unsupported only moved the failure to a
+    /// tiering-dependent InvalidProgram-Exception somewhere in the caller
+    /// chain. The callee's argument
+    /// side effects still evaluate first (exception honesty — the
+    /// ordering spill's shape), then the return type's default value
+    /// keeps the IL stack balanced for the (dead) continuation: a zero
+    /// const for scalars, null for references, a zeroed struct temp for
+    /// value classes (the value-class newobj zero-init machinery),
+    /// nothing for void. The site logs at compile time — the
+    /// `rokajit: …` stderr precedent — so phase 3's map step collects
+    /// demand from the logs.
+    fn poison_hw_intrinsic_leaf(
+        &mut self,
+        method: MethodHandle,
+        ret: Type,
+        args: Vec<hir::Expr>,
+        arg_types: &[Type],
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        let name = self
+            .ee
+            .get_method_name_from_metadata(method)
+            .unwrap_or_else(|| "<no-metadata>".into());
+        let ns = self
+            .ee
+            .get_method_declaring_namespace(method)
+            .unwrap_or_default();
+        let class_name = self
+            .ee
+            .get_class_name_from_metadata(self.ee.get_method_class(method))
+            .map(|(n, _)| n)
+            .unwrap_or_else(|| "<no-metadata>".into());
+        // Vector detail for the demand log: the EE's byte size and the
+        // instantiation element per struct argument (the ClassHandle dump
+        // alone made increment-2's element-type questions unanswerable).
+        let vec_detail = |ty: &Type| -> String {
+            let Type::Struct(class) = ty else {
+                return String::new();
+            };
+            let size = self.ee.get_class_size(*class);
+            let elem = self
+                .vector_elem_of(ty)
+                .map(|e| format!("{e:?}"))
+                .unwrap_or_else(|| "?".into());
+            format!("<{size}b {elem}>")
+        };
+        let detail: String = arg_types
+            .iter()
+            .map(vec_detail)
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "rokajit: poisoned hardware-intrinsic call {ns}.{class_name}.{name} \
+             ret={ret:?}{} args={arg_types:?}[{detail}] \
+             (X86-tree [Intrinsic] leaf, no SIMD expansion yet)",
+            vec_detail(&ret)
+        );
+        self.spill_stack(stmts, il_offset)?;
+        for (arg, &ty) in args.into_iter().zip(arg_types.iter()) {
+            if matches!(
+                arg,
+                hir::Expr::Local(_) | hir::Expr::Const(_) | hir::Expr::LocalAddr(_)
+            ) {
+                continue;
+            }
+            let t = self.temp(ty);
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::Store { dst: t, value: arg },
+            });
+        }
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::THROW_NOT_IMPLEMENTED),
+                sig: CallSig {
+                    ret: Type::Void,
+                    args: vec![],
+                    has_this: false,
+                },
+                args: vec![],
+            }),
+        });
+        match ret {
+            Type::Void => Ok(()),
+            Type::Int32 => self.push(Type::Int32, hir::Expr::Const(Const::Int32(0))),
+            Type::Int64 => self.push(Type::Int64, hir::Expr::Const(Const::Int64(0))),
+            Type::NativeInt | Type::ByRef => self.push(ret, hir::Expr::Const(Const::NativeInt(0))),
+            Type::Float => self.push(Type::Float, hir::Expr::Const(Const::Float(0.0))),
+            Type::Double => self.push(Type::Double, hir::Expr::Const(Const::Double(0.0))),
+            Type::Ref => self.push(Type::Ref, hir::Expr::Const(Const::NullRef)),
+            Type::Struct(class) => {
+                layout_of(&mut self.struct_layouts, self.ee, class)?;
+                let t = self.temp(ret);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::BlockZero {
+                        addr: hir::Expr::LocalAddr(t),
+                        class,
+                    },
+                });
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(hir::Expr::LocalAddr(t)),
+                        class,
+                    },
+                )
+            }
         }
     }
 
@@ -5548,6 +6648,2101 @@ impl BlockImport<'_> {
             Some(ns) => ns.starts_with("System.Runtime.Intrinsics.X86"),
             None => false,
         }
+    }
+
+    /// The element type of a `Vector64/128/256<T>`-typed value: the class
+    /// instantiation's first type argument (`getTypeInstantiationArgument`)
+    /// mapped through `asCorInfoType`.
+    fn vector_elem_of(&self, ty: &Type) -> Option<VecElem> {
+        let Type::Struct(class) = ty else { return None };
+        let t = self.ee.get_type_instantiation_argument(*class, 0)?;
+        VecElem::of_cor_info(self.ee.as_cor_info_type(t))
+    }
+
+    /// The element count of a vector value of `class` with element type
+    /// `elem` — the EE layout's byte size over the element size (16 bytes
+    /// for Vector128; the 32-byte Avx increment reuses this unchanged).
+    fn vector_count(&mut self, class: ClassHandle, elem: VecElem) -> CompileResult<u32> {
+        layout_of(&mut self.struct_layouts, self.ee, class)?;
+        Ok(self.struct_layouts[&class].size / elem.size())
+    }
+
+    /// The EE's byte size of a vector-typed value (16/32 on this host —
+    /// getClassSize is the 32-byte-truth authority), or `None` for a
+    /// non-struct type.
+    fn vector_bytes(&self, ty: &Type) -> Option<u32> {
+        let Type::Struct(class) = ty else { return None };
+        Some(self.ee.get_class_size(*class))
+    }
+
+    /// The measured Sse/Sse2/X86Base leaf expansion for `method`
+    /// (step_11.14 phase 3 increments 1-2), or `None` — the loud poison —
+    /// when the leaf is outside the measured set, its family is
+    /// unflipped, or the signature is not the measured shape (the
+    /// vector-count shift forms, the 32-bit DivRem, …). A `None` here is
+    /// never a silent accept: the caller poisons.
+    fn hw_leaf_op(
+        &mut self,
+        method: MethodHandle,
+        ret: Type,
+        arg_types: &[Type],
+    ) -> CompileResult<Option<HwLeafOp>> {
+        let class = self.ee.get_method_class(method);
+        let Some((class_name, class_ns)) = self.ee.get_class_name_from_metadata(class) else {
+            return Ok(None);
+        };
+        let Some(name) = self.ee.get_method_name_from_metadata(method) else {
+            return Ok(None);
+        };
+        // The nested X64/Wide classes follow the enclosing family (the
+        // x86_isa_support walk): their own namespace is empty.
+        let family = if class_ns.as_deref().is_some_and(|n| !n.is_empty()) {
+            class_name
+        } else {
+            match self.ee.get_method_declaring_enclosing_class_name(method) {
+                Some(f) => f,
+                None => return Ok(None),
+            }
+        };
+        let family_flipped = X86_ISA_SUPPORTED
+            .iter()
+            .any(|(f, supported)| *f == family && *supported);
+        if !family_flipped
+            && !X86_STRAGGLER_LEAVES
+                .iter()
+                .any(|&(f, n)| f == family && n == name)
+        {
+            return Ok(None);
+        }
+        let is_vec2 = || matches!(arg_types, [Type::Struct(_), Type::Struct(_)]);
+        let vec_ret = matches!(ret, Type::Struct(_));
+        let elem_arg = |i: usize| self.vector_elem_of(&arg_types[i]);
+        let op = match name.as_str() {
+            "Add" | "Subtract" | "Multiply" | "Divide" if is_vec2() && vec_ret => {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                let op = match name.as_str() {
+                    "Add" => BinaryOp::Add,
+                    "Subtract" => BinaryOp::Sub,
+                    // SSE2 integer multiply is 16-bit only (MultiplyLow);
+                    // 32-bit integer multiply is SSE4.1 — not this leaf.
+                    "Multiply" | "Divide" if !elem.is_float() => return Ok(None),
+                    "Multiply" => BinaryOp::Mul,
+                    _ => BinaryOp::Div,
+                };
+                HwLeafOp::Arith { elem, op }
+            }
+            "MultiplyLow" if is_vec2() && vec_ret => {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                if !matches!(elem, VecElem::I16 | VecElem::U16) {
+                    return Ok(None);
+                }
+                HwLeafOp::Arith {
+                    elem,
+                    op: BinaryOp::Mul,
+                }
+            }
+            "Min" | "Max" if is_vec2() && vec_ret => {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                if elem.is_float() {
+                    HwLeafOp::Arith {
+                        elem,
+                        op: if name == "Min" {
+                            BinaryOp::MinF
+                        } else {
+                            BinaryOp::MaxF
+                        },
+                    }
+                } else {
+                    // pmins*/pmaxs*: signed and unsigned forms exist for
+                    // every integer width across Sse2 (byte/short) and
+                    // Sse41/Avx2 — the xor-select expansion keys the
+                    // compare's signedness off the element type.
+                    HwLeafOp::MinMaxInt {
+                        elem,
+                        is_max: name == "Max",
+                    }
+                }
+            }
+            "And" | "Or" | "Xor" if is_vec2() && vec_ret => {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                let op = match name.as_str() {
+                    "And" => BinaryOp::And,
+                    "Or" => BinaryOp::Or,
+                    _ => BinaryOp::Xor,
+                };
+                HwLeafOp::Bitwise { elem, op }
+            }
+            "AndNot" if is_vec2() && vec_ret => {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                HwLeafOp::AndNot { elem }
+            }
+            // The vector compares: floats take the whole predicate space;
+            // integers only Eq (any width) and the signed Lt/Gt (the SSE2
+            // integer compare set) — everything else keeps the poison.
+            _ if is_vec2() && vec_ret && name.starts_with("Compare") => {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                let pred = match name.as_str() {
+                    "CompareEqual" => CmpPred::Eq,
+                    "CompareNotEqual" => CmpPred::Ne,
+                    "CompareLessThan" => CmpPred::Lt,
+                    "CompareLessThanOrEqual" => CmpPred::Le,
+                    "CompareGreaterThan" => CmpPred::Gt,
+                    "CompareGreaterThanOrEqual" => CmpPred::Ge,
+                    "CompareNotLessThan" => CmpPred::NLt,
+                    "CompareNotLessThanOrEqual" => CmpPred::NLe,
+                    "CompareNotGreaterThan" => CmpPred::NGt,
+                    "CompareNotGreaterThanOrEqual" => CmpPred::NGe,
+                    "CompareOrdered" => CmpPred::Ord,
+                    "CompareUnordered" => CmpPred::Unord,
+                    _ => return Ok(None),
+                };
+                if elem.is_float() {
+                    HwLeafOp::Compare { elem, pred }
+                } else {
+                    match pred {
+                        CmpPred::Eq => HwLeafOp::Compare { elem, pred },
+                        CmpPred::Lt | CmpPred::Gt if elem.is_signed_int() => {
+                            HwLeafOp::Compare { elem, pred }
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            }
+            // The scalar ordered compares (comis* — bool result, element
+            // 0 only): Eq/Ne/Lt/Le/Gt/Ge. The CompareScalarUnordered*
+            // family shares the predicates exactly — the UCOMISS-vs-
+            // COMISS difference is sNaN signaling, unobservable here
+            // (the flag conditions in the Sse.cs doc comments reduce to
+            // the same six).
+            _ if is_vec2()
+                && ret == Type::Int32
+                && (name.starts_with("CompareScalarOrdered")
+                    || name.starts_with("CompareScalarUnordered")) =>
+            {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                if !elem.is_float() {
+                    return Ok(None);
+                }
+                // Longest-suffix first: "…OrEqual" must precede the bare
+                // "Equal"/"LessThan"/"GreaterThan" checks.
+                let pred = if name.ends_with("NotEqual") {
+                    CmpPred::Ne
+                } else if name.ends_with("LessThanOrEqual") {
+                    CmpPred::Le
+                } else if name.ends_with("GreaterThanOrEqual") {
+                    CmpPred::Ge
+                } else if name.ends_with("LessThan") {
+                    CmpPred::Lt
+                } else if name.ends_with("GreaterThan") {
+                    CmpPred::Gt
+                } else if name.ends_with("Equal") {
+                    CmpPred::Eq
+                } else {
+                    return Ok(None);
+                };
+                HwLeafOp::CompareScalarOrdered { elem, pred }
+            }
+            "MoveMask" if matches!(arg_types, [Type::Struct(_)]) && ret == Type::Int32 => {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                HwLeafOp::MoveMask { elem }
+            }
+            "LoadVector128" | "LoadAlignedVector128" | "LoadVector256" | "LoadAlignedVector256"
+                if arg_types.len() == 1
+                    && matches!(arg_types[0], Type::NativeInt | Type::ByRef)
+                    && vec_ret =>
+            {
+                let Some(elem) = self.vector_elem_of(&ret) else {
+                    return Ok(None);
+                };
+                HwLeafOp::Load { elem }
+            }
+            "LoadScalarVector128"
+                if arg_types.len() == 1
+                    && matches!(arg_types[0], Type::NativeInt | Type::ByRef)
+                    && vec_ret =>
+            {
+                let Some(elem) = self.vector_elem_of(&ret) else {
+                    return Ok(None);
+                };
+                HwLeafOp::LoadScalar { elem }
+            }
+            "Store" | "StoreAligned"
+                if arg_types.len() == 2
+                    && matches!(arg_types[0], Type::NativeInt | Type::ByRef)
+                    && matches!(arg_types[1], Type::Struct(_))
+                    && ret == Type::Void =>
+            {
+                let Some(elem) = elem_arg(1) else {
+                    return Ok(None);
+                };
+                HwLeafOp::Store { elem }
+            }
+            "StoreScalar"
+                if arg_types.len() == 2
+                    && matches!(arg_types[0], Type::NativeInt | Type::ByRef)
+                    && matches!(arg_types[1], Type::Struct(_))
+                    && ret == Type::Void =>
+            {
+                let Some(elem) = elem_arg(1) else {
+                    return Ok(None);
+                };
+                HwLeafOp::StoreScalar { elem }
+            }
+            "LoadLow" | "LoadHigh"
+                if arg_types.len() == 2
+                    && matches!(arg_types[0], Type::Struct(_))
+                    && matches!(arg_types[1], Type::NativeInt | Type::ByRef)
+                    && vec_ret =>
+            {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                if name == "LoadLow" {
+                    HwLeafOp::LoadLow { elem }
+                } else {
+                    HwLeafOp::LoadHigh { elem }
+                }
+            }
+            "ShiftLeftLogical" | "ShiftRightLogical" | "ShiftRightArithmetic"
+                if arg_types.len() == 2
+                    && matches!(arg_types[0], Type::Struct(_))
+                    && (arg_types[1] == Type::Int32 || matches!(arg_types[1], Type::Struct(_)))
+                    && vec_ret =>
+            {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                let dir = match name.as_str() {
+                    "ShiftLeftLogical" => ShiftDir::Left,
+                    "ShiftRightLogical" => ShiftDir::RightLogical,
+                    _ => ShiftDir::RightArith,
+                };
+                match dir {
+                    // psll*/psrl*: 16/32/64-bit lanes only (no byte lanes).
+                    ShiftDir::Left | ShiftDir::RightLogical if elem.size() < 2 => return Ok(None),
+                    // psra*: signed 16/32 only.
+                    ShiftDir::RightArith if !matches!(elem, VecElem::I16 | VecElem::I32) => {
+                        return Ok(None)
+                    }
+                    _ => {}
+                }
+                HwLeafOp::Shift {
+                    elem,
+                    dir,
+                    vec_count: matches!(arg_types[1], Type::Struct(_)),
+                }
+            }
+            "PackUnsignedSaturate" if is_vec2() && vec_ret => {
+                // vpackuswb/vpackuswd at 256 bits interleave per 128-bit
+                // lane ([a-lo, b-lo, a-hi, b-hi]), NOT the 128-bit
+                // a-then-b order — gate to 16 bytes until the 256 form is
+                // measured (the loud poison is the demand signal).
+                if self.vector_bytes(&arg_types[0]) != Some(16) {
+                    return Ok(None);
+                }
+                let Some(from) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                let to = match from {
+                    VecElem::I16 => VecElem::U8,
+                    VecElem::I32 => VecElem::U16,
+                    _ => return Ok(None),
+                };
+                HwLeafOp::PackUnsignedSaturate { from, to }
+            }
+            "Shuffle"
+                if arg_types.len() == 3
+                    && matches!(arg_types[0], Type::Struct(_))
+                    && matches!(arg_types[1], Type::Struct(_))
+                    && arg_types[2] == Type::Int32
+                    && vec_ret =>
+            {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                // vshufps/vshufpd at 256 bits shuffle per 128-bit lane —
+                // the expansion handles the per-half interleave
+                // (measured: PacketTracer).
+                if !elem.is_float() {
+                    return Ok(None);
+                }
+                HwLeafOp::Shuffle { elem }
+            }
+            // pshufd: the single-source 32-bit-lane form.
+            "Shuffle"
+                if arg_types.len() == 2
+                    && matches!(arg_types[0], Type::Struct(_))
+                    && arg_types[1] == Type::Int32
+                    && vec_ret =>
+            {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                // vpshufd at 256 bits is per-128-bit-lane too — handled.
+                if !matches!(elem, VecElem::I32 | VecElem::U32) {
+                    return Ok(None);
+                }
+                HwLeafOp::Shuffle1 { elem }
+            }
+            // vextractf128: the 256→128 half extract, the immediate's low
+            // bit selects (PacketTracer). The reverse (InsertVector128)
+            // is not measured.
+            "ExtractVector128"
+                if arg_types.len() == 2
+                    && matches!(arg_types[0], Type::Struct(_))
+                    && arg_types[1] == Type::Int32
+                    && vec_ret =>
+            {
+                let Some(elem) = self.vector_elem_of(&ret) else {
+                    return Ok(None);
+                };
+                if self.vector_bytes(&arg_types[0]) != Some(32)
+                    || self.vector_bytes(&ret) != Some(16)
+                {
+                    return Ok(None);
+                }
+                HwLeafOp::ExtractHalf { elem }
+            }
+            "ConvertToInt32" | "ConvertToInt32WithTruncation"
+                if matches!(arg_types, [Type::Struct(_)]) && ret == Type::Int32 =>
+            {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                match elem {
+                    VecElem::F32 | VecElem::F64 => HwLeafOp::ConvertToInt {
+                        elem,
+                        to64: false,
+                        rne: name == "ConvertToInt32",
+                    },
+                    // Sse2.ConvertToInt32(Vector128<int>): movd — element
+                    // 0 extracted, no conversion.
+                    VecElem::I32 | VecElem::U32 if name == "ConvertToInt32" => {
+                        HwLeafOp::ExtractScalar
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            "ConvertToInt64" | "ConvertToInt64WithTruncation"
+                if matches!(arg_types, [Type::Struct(_)]) && ret == Type::Int64 =>
+            {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                match elem {
+                    VecElem::F32 | VecElem::F64 => HwLeafOp::ConvertToInt {
+                        elem,
+                        to64: true,
+                        rne: name == "ConvertToInt64",
+                    },
+                    // Sse2.X64.ConvertToInt64(Vector128<long>): movq.
+                    VecElem::I64 | VecElem::U64 if name == "ConvertToInt64" => {
+                        HwLeafOp::ExtractScalar
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            // Sse2.X64.ConvertToUInt64(Vector128<ulong>): movq — the
+            // Int64 stack type is the same 64 bits.
+            "ConvertToUInt64" if matches!(arg_types, [Type::Struct(_)]) && ret == Type::Int64 => {
+                match elem_arg(0) {
+                    Some(VecElem::I64 | VecElem::U64) => HwLeafOp::ExtractScalar,
+                    _ => return Ok(None),
+                }
+            }
+            "ConvertToVector128Single" if matches!(arg_types, [Type::Struct(_)]) && vec_ret => {
+                let (Some(from), Some(VecElem::F32)) = (elem_arg(0), self.vector_elem_of(&ret))
+                else {
+                    return Ok(None);
+                };
+                if from != VecElem::I32 {
+                    return Ok(None);
+                }
+                HwLeafOp::ConvertElems {
+                    from,
+                    to: VecElem::F32,
+                    rne: false,
+                }
+            }
+            "ConvertToVector128Double" if matches!(arg_types, [Type::Struct(_)]) && vec_ret => {
+                let (Some(from), Some(VecElem::F64)) = (elem_arg(0), self.vector_elem_of(&ret))
+                else {
+                    return Ok(None);
+                };
+                if from != VecElem::I32 {
+                    return Ok(None);
+                }
+                HwLeafOp::ConvertElems {
+                    from,
+                    to: VecElem::F64,
+                    rne: false,
+                }
+            }
+            "ConvertScalarToVector128Single" | "ConvertScalarToVector128Double"
+                if arg_types.len() == 2
+                    && matches!(arg_types[0], Type::Struct(_))
+                    && matches!(arg_types[1], Type::Int32 | Type::Int64)
+                    && vec_ret =>
+            {
+                if name == "ConvertScalarToVector128Single" {
+                    HwLeafOp::ConvertScalarToF32
+                } else {
+                    HwLeafOp::ConvertScalarToF64
+                }
+            }
+            "ConvertScalarToVector128Int64" | "ConvertScalarToVector128UInt64"
+                if matches!(arg_types, [Type::Int64]) && vec_ret =>
+            {
+                HwLeafOp::ConvertScalarToIntVector
+            }
+            "StoreNonTemporal"
+                if arg_types.len() == 2
+                    && matches!(arg_types[0], Type::NativeInt | Type::ByRef)
+                    && matches!(arg_types[1], Type::Int32 | Type::Int64)
+                    && ret == Type::Void =>
+            {
+                HwLeafOp::StoreNonTemporalScalar
+            }
+            "LoadFence" | "StoreFence" if arg_types.is_empty() && ret == Type::Void => {
+                // sfence/lfence order non-temporal and speculative
+                // accesses; this backend emits neither — plain x64 TSO
+                // makes both no-ops.
+                HwLeafOp::Fence { full: false }
+            }
+            "MemoryFence" if arg_types.is_empty() && ret == Type::Void => {
+                HwLeafOp::Fence { full: true }
+            }
+            "DivRem"
+                if arg_types == [Type::Int64, Type::Int64, Type::Int64]
+                    && matches!(ret, Type::Struct(_)) =>
+            {
+                HwLeafOp::DivRem64
+            }
+            "Sqrt" if matches!(arg_types, [Type::Struct(_)]) && vec_ret => {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                if !elem.is_float() {
+                    return Ok(None);
+                }
+                HwLeafOp::Sqrt { elem }
+            }
+            "BroadcastScalarToVector128" | "BroadcastScalarToVector256"
+                if arg_types.len() == 1
+                    && matches!(arg_types[0], Type::NativeInt | Type::ByRef)
+                    && vec_ret =>
+            {
+                let Some(elem) = self.vector_elem_of(&ret) else {
+                    return Ok(None);
+                };
+                HwLeafOp::BroadcastScalar { elem }
+            }
+            "MaskLoad"
+                if arg_types.len() == 2
+                    && matches!(arg_types[0], Type::NativeInt | Type::ByRef)
+                    && matches!(arg_types[1], Type::Struct(_))
+                    && vec_ret =>
+            {
+                let Some(elem) = self.vector_elem_of(&ret) else {
+                    return Ok(None);
+                };
+                // vmaskmovps/pd (Avx) and vpmaskmovd/q (Avx2) — the
+                // measured set; no narrower integer form exists.
+                if !matches!(
+                    elem,
+                    VecElem::F32
+                        | VecElem::F64
+                        | VecElem::I32
+                        | VecElem::U32
+                        | VecElem::I64
+                        | VecElem::U64
+                ) {
+                    return Ok(None);
+                }
+                HwLeafOp::MaskLoad { elem }
+            }
+            // vcmpps/vcmppd with the FloatComparisonMode immediate (the
+            // named CompareEqual & co. arms above are the fixed-predicate
+            // forms; this one takes the mode as an ARGUMENT — constant or
+            // not, GitHub_131472).
+            "Compare"
+                if arg_types.len() == 3
+                    && matches!(arg_types[0], Type::Struct(_))
+                    && matches!(arg_types[1], Type::Struct(_))
+                    && arg_types[2] == Type::Int32
+                    && vec_ret =>
+            {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                if !elem.is_float() {
+                    return Ok(None);
+                }
+                HwLeafOp::CompareMode {
+                    elem,
+                    scalar: false,
+                }
+            }
+            // vcmpss/vcmpsd: element 0 = the predicate mask, upper
+            // elements copied from `left`.
+            "CompareScalar"
+                if arg_types.len() == 3
+                    && matches!(arg_types[0], Type::Struct(_))
+                    && matches!(arg_types[1], Type::Struct(_))
+                    && arg_types[2] == Type::Int32
+                    && vec_ret =>
+            {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                if !elem.is_float() {
+                    return Ok(None);
+                }
+                HwLeafOp::CompareMode { elem, scalar: true }
+            }
+            "GatherVector256"
+                if arg_types.len() == 3
+                    && matches!(arg_types[0], Type::NativeInt | Type::ByRef)
+                    && matches!(arg_types[1], Type::Struct(_))
+                    && arg_types[2] == Type::Int32
+                    && vec_ret =>
+            {
+                let Some(elem) = self.vector_elem_of(&ret) else {
+                    return Ok(None);
+                };
+                let Some(index_elem) = elem_arg(1) else {
+                    return Ok(None);
+                };
+                if !matches!(
+                    index_elem,
+                    VecElem::I32 | VecElem::U32 | VecElem::I64 | VecElem::U64
+                ) {
+                    return Ok(None);
+                }
+                HwLeafOp::Gather { elem, index_elem }
+            }
+            // ptest (integers)/vtestps/vtestpd (floats — the sign-bit
+            // forms; both measured: GitHub_17073's Avx arms bind the
+            // 128-bit float overloads, PacketTracer TestC at 256).
+            "TestZ" | "TestC" | "TestNotZAndNotC" if is_vec2() && ret == Type::Int32 => {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                let kind = match name.as_str() {
+                    "TestZ" => PTestKind::Z,
+                    "TestC" => PTestKind::C,
+                    _ => PTestKind::NotZAndNotC,
+                };
+                HwLeafOp::PTest { elem, kind }
+            }
+            // movntdqa: the non-temporal hint is cache policy — a plain
+            // load is the correctness superset (the StoreNonTemporal
+            // stance).
+            "LoadAlignedVector128NonTemporal"
+                if arg_types.len() == 1
+                    && matches!(arg_types[0], Type::NativeInt | Type::ByRef)
+                    && vec_ret =>
+            {
+                let Some(elem) = self.vector_elem_of(&ret) else {
+                    return Ok(None);
+                };
+                HwLeafOp::Load { elem }
+            }
+            // vcvtdq2pd (ymm, xmm): the four int32 lanes → four doubles —
+            // the 256-bit sibling of ConvertToVector128Double.
+            "ConvertToVector256Double" if matches!(arg_types, [Type::Struct(_)]) && vec_ret => {
+                let (Some(from), Some(VecElem::F64)) = (elem_arg(0), self.vector_elem_of(&ret))
+                else {
+                    return Ok(None);
+                };
+                if from != VecElem::I32 {
+                    return Ok(None);
+                }
+                HwLeafOp::ConvertElems {
+                    from,
+                    to: VecElem::F64,
+                    rne: false,
+                }
+            }
+            // vcvttpd2dq (xmm, ymm): four doubles → four int32, truncation
+            // (the `Conv` node IS cvtt — the WithTruncation suffix is the
+            // only form measured).
+            "ConvertToVector128Int32WithTruncation"
+                if matches!(arg_types, [Type::Struct(_)]) && vec_ret =>
+            {
+                let (Some(from), Some(VecElem::I32)) = (elem_arg(0), self.vector_elem_of(&ret))
+                else {
+                    return Ok(None);
+                };
+                if from != VecElem::F64 {
+                    return Ok(None);
+                }
+                HwLeafOp::ConvertElems {
+                    from,
+                    to: VecElem::I32,
+                    rne: false,
+                }
+            }
+            // vcvtps2dq: eight floats → eight int32, round-to-nearest-
+            // even (PacketTracer; the WithTruncation sibling is
+            // unmeasured and keeps the poison).
+            "ConvertToVector256Int32" if matches!(arg_types, [Type::Struct(_)]) && vec_ret => {
+                let (Some(from), Some(VecElem::I32)) = (elem_arg(0), self.vector_elem_of(&ret))
+                else {
+                    return Ok(None);
+                };
+                if from != VecElem::F32 {
+                    return Ok(None);
+                }
+                HwLeafOp::ConvertElems {
+                    from,
+                    to: VecElem::I32,
+                    rne: true,
+                }
+            }
+            // vcvtdq2ps at 256: eight int32 → eight floats (the
+            // conv_i_to_f rule; PacketTracer).
+            "ConvertToVector256Single" if matches!(arg_types, [Type::Struct(_)]) && vec_ret => {
+                let (Some(from), Some(VecElem::F32)) = (elem_arg(0), self.vector_elem_of(&ret))
+                else {
+                    return Ok(None);
+                };
+                if from != VecElem::I32 {
+                    return Ok(None);
+                }
+                HwLeafOp::ConvertElems {
+                    from,
+                    to: VecElem::F32,
+                    rne: false,
+                }
+            }
+            // vroundps/vroundpd toward -inf (PacketTracer; Ceiling and
+            // the other RoundTo* forms are unmeasured and keep the
+            // poison).
+            "Floor" if matches!(arg_types, [Type::Struct(_)]) && vec_ret => {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                if !elem.is_float() {
+                    return Ok(None);
+                }
+                HwLeafOp::Floor { elem }
+            }
+            // vblendvps/vblendvpd: the mask lane's sign bit selects.
+            "BlendVariable"
+                if arg_types.len() == 3
+                    && matches!(arg_types[0], Type::Struct(_))
+                    && matches!(arg_types[1], Type::Struct(_))
+                    && matches!(arg_types[2], Type::Struct(_))
+                    && vec_ret =>
+            {
+                let Some(elem) = elem_arg(0) else {
+                    return Ok(None);
+                };
+                if !elem.is_float() {
+                    return Ok(None);
+                }
+                HwLeafOp::BlendVariable { elem }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(op))
+    }
+
+    /// Build the scalarized expansion of a measured leaf (strategy A —
+    /// the ABI verdict proved no xmm is ever required: vector values are
+    /// frame-resident structs, so each leaf is element-wise scalar IR
+    /// over the struct's memory). The argument side effects evaluate in
+    /// signature order first (the spill + materialization discipline of
+    /// the poison path); then every element op is pure loads/computes/
+    /// stores.
+    fn expand_hw_intrinsic_leaf(
+        &mut self,
+        op: HwLeafOp,
+        ret: Type,
+        args: Vec<hir::Expr>,
+        arg_types: &[Type],
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> CompileResult<()> {
+        self.spill_stack(stmts, il_offset)?;
+        // Materialize every argument into a stable, reusable form: the
+        // element loops read each vector several times. Vector args yield
+        // their value's ADDRESS (a struct arg is a StructVal — the ldobj
+        // shape); scalars a plain value temp.
+        let mut vals: Vec<hir::Expr> = Vec::with_capacity(args.len());
+        for (arg, &ty) in args.into_iter().zip(arg_types.iter()) {
+            let stable = matches!(
+                arg,
+                hir::Expr::Local(_) | hir::Expr::Const(_) | hir::Expr::LocalAddr(_)
+            );
+            let v = match (arg, ty) {
+                (hir::Expr::StructVal { addr, .. }, Type::Struct(_)) => match *addr {
+                    hir::Expr::LocalAddr(_) | hir::Expr::Const(_) => *addr,
+                    addr => {
+                        let t = self.temp(Type::ByRef);
+                        stmts.push(hir::Stmt {
+                            il_offset,
+                            kind: hir::StmtKind::Store {
+                                dst: t,
+                                value: addr,
+                            },
+                        });
+                        hir::Expr::Local(t)
+                    }
+                },
+                (other, Type::Struct(class)) => {
+                    let t = self.temp(Type::Struct(class));
+                    stmts.push(hir::Stmt {
+                        il_offset,
+                        kind: hir::StmtKind::Store {
+                            dst: t,
+                            value: other,
+                        },
+                    });
+                    hir::Expr::LocalAddr(t)
+                }
+                (other, _) if stable => other,
+                (other, _) => {
+                    let t = self.temp(ty);
+                    stmts.push(hir::Stmt {
+                        il_offset,
+                        kind: hir::StmtKind::Store {
+                            dst: t,
+                            value: other,
+                        },
+                    });
+                    hir::Expr::Local(t)
+                }
+            };
+            vals.push(v);
+        }
+
+        // --- small builders ------------------------------------------------
+        fn bin(op: BinaryOp, lhs: hir::Expr, rhs: hir::Expr) -> hir::Expr {
+            hir::Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            }
+        }
+        fn not(e: hir::Expr) -> hir::Expr {
+            hir::Expr::Unary {
+                op: UnaryOp::Not,
+                arg: Box::new(e),
+            }
+        }
+        fn iconst(v: i32) -> hir::Expr {
+            hir::Expr::Const(Const::Int32(v))
+        }
+        fn lconst(v: i64) -> hir::Expr {
+            hir::Expr::Const(Const::Int64(v))
+        }
+        /// Load element `index` of the vector at `addr` through `cell`.
+        fn elem_load(
+            addr: &hir::Expr,
+            index: u32,
+            elem: VecElem,
+            cell: (Type, MemAccess),
+        ) -> hir::Expr {
+            hir::Expr::Load {
+                addr: Box::new(addr.clone()),
+                offset: index * elem.size(),
+                ty: cell.0,
+                access: cell.1,
+            }
+        }
+        fn zero_of(ty: Type) -> hir::Expr {
+            match ty {
+                Type::Int64 => lconst(0),
+                Type::Float => hir::Expr::Const(Const::Float(0.0)),
+                Type::Double => hir::Expr::Const(Const::Double(0.0)),
+                _ => iconst(0),
+            }
+        }
+        let store_elem = |stmts: &mut Vec<hir::Stmt>,
+                          addr: &hir::Expr,
+                          index: u32,
+                          elem: VecElem,
+                          cell: (Type, MemAccess),
+                          value: hir::Expr| {
+            stmts.push(hir::Stmt {
+                il_offset,
+                kind: hir::StmtKind::StoreInd {
+                    addr: addr.clone(),
+                    offset: index * elem.size(),
+                    value,
+                    access: cell.1,
+                },
+            });
+        };
+        // The compare predicate as an Int32 0/1 (the backend's ECMA
+        // float compares cover the ordered/unordered space: ordered
+        // false on NaN, the `.un`-mapped Not* forms true).
+        let cond = |pred: CmpPred, l: hir::Expr, r: hir::Expr| -> hir::Expr {
+            match pred {
+                CmpPred::Eq => bin(BinaryOp::Eq, l, r),
+                CmpPred::Ne => bin(BinaryOp::Ne, l, r),
+                CmpPred::Lt => bin(BinaryOp::Lt, l, r),
+                CmpPred::Le => bin(BinaryOp::Le, l, r),
+                CmpPred::Gt => bin(BinaryOp::Gt, l, r),
+                CmpPred::Ge => bin(BinaryOp::Ge, l, r),
+                CmpPred::NLt => bin(BinaryOp::UGe, l, r),
+                CmpPred::NLe => bin(BinaryOp::UGt, l, r),
+                CmpPred::NGt => bin(BinaryOp::ULe, l, r),
+                CmpPred::NGe => bin(BinaryOp::ULt, l, r),
+                CmpPred::Ord => bin(
+                    BinaryOp::And,
+                    bin(BinaryOp::Eq, l.clone(), l),
+                    bin(BinaryOp::Eq, r.clone(), r),
+                ),
+                CmpPred::Unord => bin(
+                    BinaryOp::Or,
+                    bin(BinaryOp::Ne, l.clone(), l),
+                    bin(BinaryOp::Ne, r.clone(), r),
+                ),
+                // EQ_UQ: equal OR unordered (true on NaN).
+                CmpPred::EqUq => bin(
+                    BinaryOp::Or,
+                    bin(BinaryOp::Eq, l.clone(), r.clone()),
+                    bin(
+                        BinaryOp::Or,
+                        bin(BinaryOp::Ne, l.clone(), l.clone()),
+                        bin(BinaryOp::Ne, r.clone(), r),
+                    ),
+                ),
+                // NEQ_OQ: not equal AND ordered (false on NaN).
+                CmpPred::NeOq => bin(
+                    BinaryOp::And,
+                    bin(BinaryOp::Ne, l.clone(), r.clone()),
+                    bin(
+                        BinaryOp::And,
+                        bin(BinaryOp::Eq, l.clone(), l),
+                        bin(BinaryOp::Eq, r.clone(), r),
+                    ),
+                ),
+                CmpPred::True => iconst(1),
+                CmpPred::False => iconst(0),
+            }
+        };
+        // A 0/1 Int32 condition widened to the element-width all-ones/
+        // all-zeros mask (two's complement: `0 - cond`).
+        let mask_of = |c: hir::Expr, elem: VecElem| -> hir::Expr {
+            if elem.size() == 8 {
+                let c64 = hir::Expr::Conv {
+                    to: Type::Int64,
+                    overflow: false,
+                    unsigned: false,
+                    arg: Box::new(c),
+                };
+                bin(BinaryOp::Sub, lconst(0), c64)
+            } else {
+                bin(BinaryOp::Sub, iconst(0), c)
+            }
+        };
+
+        match op {
+            HwLeafOp::Arith { elem, op } | HwLeafOp::Bitwise { elem, op } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "arith leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                // Bitwise ops work on the raw lane bits (ANDPS is
+                // bitwise) — the integer cell, not the float one.
+                let cell = match op {
+                    BinaryOp::And | BinaryOp::Or | BinaryOp::Xor if elem.is_float() => {
+                        elem.signed_cell()
+                    }
+                    _ => elem.cell(),
+                };
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let l = elem_load(&vals[0], i, elem, cell);
+                    let r = elem_load(&vals[1], i, elem, cell);
+                    let v = bin(op, l, r);
+                    store_elem(stmts, &dst, i, elem, cell, v);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::AndNot { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "andnot leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                // Bitwise on the raw cells: the integer interpretation of
+                // each lane (float lanes included — ANDPS is bitwise).
+                let cell = if elem.is_float() {
+                    elem.signed_cell()
+                } else {
+                    elem.cell()
+                };
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let l = elem_load(&vals[0], i, elem, cell);
+                    let r = elem_load(&vals[1], i, elem, cell);
+                    store_elem(stmts, &dst, i, elem, cell, bin(BinaryOp::And, not(l), r));
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::Compare { elem, pred } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "compare leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                let mask_cell = elem.signed_cell();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let l = elem_load(&vals[0], i, elem, cell);
+                    let r = elem_load(&vals[1], i, elem, cell);
+                    let c = cond(pred, l, r);
+                    store_elem(stmts, &dst, i, elem, mask_cell, mask_of(c, elem));
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::CompareScalarOrdered { elem, pred } => {
+                let l = elem_load(&vals[0], 0, elem, elem.cell());
+                let r = elem_load(&vals[1], 0, elem, elem.cell());
+                self.push(Type::Int32, cond(pred, l, r))?;
+            }
+            HwLeafOp::MoveMask { elem } => {
+                let Type::Struct(class) = arg_types[0] else {
+                    return Err(CompileError::Internal("movemask with a non-struct arg"));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.signed_cell();
+                let zero = if elem.size() == 8 {
+                    lconst(0)
+                } else {
+                    iconst(0)
+                };
+                let mut acc = iconst(0);
+                for i in 0..count {
+                    let v = elem_load(&vals[0], i, elem, cell);
+                    let neg = bin(BinaryOp::Lt, v, zero.clone());
+                    let bit = if i == 0 {
+                        neg
+                    } else {
+                        bin(BinaryOp::Shl, neg, iconst(i as i32))
+                    };
+                    acc = bin(BinaryOp::Or, acc, bit);
+                }
+                self.push(Type::Int32, acc)?;
+            }
+            HwLeafOp::Load { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal("load leaf with a non-struct return"));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let v = elem_load(&vals[0], i, elem, cell);
+                    store_elem(stmts, &dst, i, elem, cell, v);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::LoadScalar { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "load-scalar leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                let v = elem_load(&vals[0], 0, elem, cell);
+                store_elem(stmts, &dst, 0, elem, cell, v);
+                for i in 1..count {
+                    store_elem(stmts, &dst, i, elem, cell, zero_of(cell.0));
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::Store { elem } => {
+                let Type::Struct(class) = arg_types[1] else {
+                    return Err(CompileError::Internal("store leaf with a non-struct arg"));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                for i in 0..count {
+                    let v = elem_load(&vals[1], i, elem, cell);
+                    store_elem(stmts, &vals[0], i, elem, cell, v);
+                }
+            }
+            HwLeafOp::StoreScalar { elem } => {
+                let cell = elem.cell();
+                let v = elem_load(&vals[1], 0, elem, cell);
+                store_elem(stmts, &vals[0], 0, elem, cell, v);
+            }
+            HwLeafOp::LoadLow { elem } | HwLeafOp::LoadHigh { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "loadlow leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                // movlps/movlpd (movhps/movhpd): the low (high) 64 bits
+                // come from memory, the rest from the vector arg. Memory
+                // lanes index from 0; vector lanes keep their index.
+                let mem_lanes = (8 / elem.size()).min(count);
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let from_mem = match op {
+                        HwLeafOp::LoadLow { .. } => i < mem_lanes,
+                        _ => i >= count - mem_lanes,
+                    };
+                    let (src, mi) = if from_mem {
+                        let mi = match op {
+                            HwLeafOp::LoadLow { .. } => i,
+                            _ => i - (count - mem_lanes),
+                        };
+                        (&vals[1], mi)
+                    } else {
+                        (&vals[0], i)
+                    };
+                    let v = elem_load(src, mi, elem, cell);
+                    store_elem(stmts, &dst, i, elem, cell, v);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::Shift {
+                elem,
+                dir,
+                vec_count,
+            } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "shift leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let w = elem.size() * 8;
+                // The Int64 lanes shift in the 64-bit container.
+                let wide = elem.size() == 8;
+                let (shift_mask, sign_bits) = if wide { (63, 63) } else { (31, 31) };
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    // A logical right must read the lane zero-extended
+                    // even for a signed element type; arithmetic right
+                    // sign-extends.
+                    let cell = match dir {
+                        ShiftDir::RightLogical => match elem.size() {
+                            2 => (Type::Int32, MemAccess::U16),
+                            4 => (Type::Int32, MemAccess::Natural),
+                            _ => (Type::Int64, MemAccess::Natural),
+                        },
+                        _ => elem.cell(),
+                    };
+                    let v = elem_load(&vals[0], i, elem, cell);
+                    // The count: the immediate byte form arrives as an
+                    // Int32; the vector-count form is the low 64 bits of
+                    // the count vector (psll* semantics), saturated in
+                    // the 64-bit domain then narrowed (≤63 after masking).
+                    let (c, valid) = if vec_count {
+                        let c64 = hir::Expr::Load {
+                            addr: Box::new(vals[1].clone()),
+                            offset: 0,
+                            ty: Type::Int64,
+                            access: MemAccess::Natural,
+                        };
+                        let valid =
+                            mask_of(bin(BinaryOp::ULt, c64.clone(), lconst(w as i64)), elem);
+                        let cm32 = hir::Expr::Conv {
+                            to: Type::Int32,
+                            overflow: false,
+                            unsigned: false,
+                            arg: Box::new(bin(BinaryOp::And, c64, lconst(63))),
+                        };
+                        (cm32, valid)
+                    } else {
+                        let c = vals[1].clone();
+                        // The SSE saturating count: count >= lane bits ⇒ 0
+                        // (logical) / sign-fill (arithmetic). The hardware
+                        // shift masks its count, so gate with a mask; for
+                        // lane widths < 32 the intermediate counts in
+                        // [w, 32) already shift the lane's bits out of the
+                        // narrow-store window.
+                        let valid = mask_of(bin(BinaryOp::ULt, c.clone(), iconst(w as i32)), elem);
+                        (c, valid)
+                    };
+                    let cm = bin(BinaryOp::And, c, iconst(shift_mask));
+                    let shifted = match dir {
+                        ShiftDir::Left => bin(BinaryOp::Shl, v.clone(), cm),
+                        ShiftDir::RightLogical => bin(BinaryOp::UShr, v.clone(), cm),
+                        ShiftDir::RightArith => bin(BinaryOp::Shr, v.clone(), cm),
+                    };
+                    let result = match dir {
+                        ShiftDir::RightArith => {
+                            let sign = bin(BinaryOp::Shr, v.clone(), iconst(sign_bits));
+                            bin(
+                                BinaryOp::Or,
+                                bin(BinaryOp::And, shifted, valid.clone()),
+                                bin(BinaryOp::And, sign, not(valid)),
+                            )
+                        }
+                        _ => bin(BinaryOp::And, shifted, valid),
+                    };
+                    store_elem(stmts, &dst, i, elem, elem.cell(), result);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::PackUnsignedSaturate { from, to } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal("pack leaf with a non-struct return"));
+                };
+                let in_count = self.vector_count(class, to)? / 2;
+                let in_cell = from.cell();
+                let out_cell = to.cell();
+                let max = iconst(match to {
+                    VecElem::U8 => 0xFF,
+                    _ => 0xFFFF,
+                });
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for (src_idx, arg) in [(0usize, vals[0].clone()), (1, vals[1].clone())] {
+                    for i in 0..in_count {
+                        let v = elem_load(&arg, i, from, in_cell);
+                        // Branchless clamp to [0, max]: v<0 ⇒ 0 via the
+                        // sign mask; v>max ⇒ max via the (max-v) sign.
+                        let neg = bin(BinaryOp::Shr, v.clone(), iconst(31));
+                        let v1 = bin(BinaryOp::And, v, not(neg));
+                        let over = bin(
+                            BinaryOp::Shr,
+                            bin(BinaryOp::Sub, max.clone(), v1.clone()),
+                            iconst(31),
+                        );
+                        let clamped = bin(
+                            BinaryOp::Xor,
+                            v1.clone(),
+                            bin(BinaryOp::And, bin(BinaryOp::Xor, v1, max.clone()), over),
+                        );
+                        store_elem(
+                            stmts,
+                            &dst,
+                            src_idx as u32 * in_count + i,
+                            to,
+                            out_cell,
+                            clamped,
+                        );
+                    }
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::Shuffle { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "shuffle leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let raw = elem.signed_cell();
+                let control = vals[2].clone();
+                let sel_bits = match elem {
+                    VecElem::F32 => 2,
+                    _ => 1,
+                };
+                // Per 128-bit lane (vshufps/vshufpd never cross halves):
+                // within a half, the low sub-lanes select from `a`, the
+                // high ones from `b`, with the control bits indexed by the
+                // SUB-lane position (they repeat per half at 256 bits).
+                let lanes128 = 16 / elem.size();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let half = i / lanes128;
+                    let sub = i % lanes128;
+                    let src = if sub < lanes128 / 2 {
+                        &vals[0]
+                    } else {
+                        &vals[1]
+                    };
+                    let sel = bin(
+                        BinaryOp::And,
+                        bin(
+                            BinaryOp::UShr,
+                            control.clone(),
+                            iconst((sub * sel_bits) as i32),
+                        ),
+                        iconst((1 << sel_bits) - 1),
+                    );
+                    let mut acc = if elem.size() == 8 {
+                        lconst(0)
+                    } else {
+                        iconst(0)
+                    };
+                    for k in 0..lanes128 {
+                        let hit = bin(BinaryOp::Eq, sel.clone(), iconst(k as i32));
+                        let lane = elem_load(src, half * lanes128 + k, elem, raw);
+                        acc = bin(
+                            BinaryOp::Or,
+                            acc,
+                            bin(BinaryOp::And, lane, mask_of(hit, elem)),
+                        );
+                    }
+                    store_elem(stmts, &dst, i, elem, raw, acc);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::Shuffle1 { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "shuffle leaf with a non-struct return",
+                    ));
+                };
+                // pshufd: result lane i = source lane (control >> 2i) & 3,
+                // per 128-bit lane at 256 bits (the control's 2-bit fields
+                // repeat per half).
+                let count = self.vector_count(class, elem)?;
+                let raw = elem.signed_cell();
+                let control = vals[1].clone();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let half = i / 4;
+                    let sub = i % 4;
+                    let sel = bin(
+                        BinaryOp::And,
+                        bin(BinaryOp::UShr, control.clone(), iconst((sub * 2) as i32)),
+                        iconst(3),
+                    );
+                    let mut acc = iconst(0);
+                    for k in 0..4 {
+                        let hit = bin(BinaryOp::Eq, sel.clone(), iconst(k as i32));
+                        let lane = elem_load(&vals[0], half * 4 + k, elem, raw);
+                        acc = bin(
+                            BinaryOp::Or,
+                            acc,
+                            bin(BinaryOp::And, lane, mask_of(hit, elem)),
+                        );
+                    }
+                    store_elem(stmts, &dst, i, elem, raw, acc);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::ExtractHalf { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "extract leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?; // 16-byte result
+                let raw = elem.signed_cell();
+                // keep_lo = (index & 1) == 0, as an all-ones/zeros mask.
+                let keep_lo = mask_of(
+                    bin(
+                        BinaryOp::Eq,
+                        bin(BinaryOp::And, vals[1].clone(), iconst(1)),
+                        iconst(0),
+                    ),
+                    elem,
+                );
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let lo = elem_load(&vals[0], i, elem, raw);
+                    let hi = elem_load(&vals[0], i + count, elem, raw);
+                    let v = bin(
+                        BinaryOp::Or,
+                        bin(BinaryOp::And, lo, keep_lo.clone()),
+                        bin(BinaryOp::And, hi, not(keep_lo.clone())),
+                    );
+                    store_elem(stmts, &dst, i, elem, raw, v);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::ConvertToInt { elem, to64, rne } => {
+                let v = elem_load(&vals[0], 0, elem, elem.cell());
+                let to = if to64 { Type::Int64 } else { Type::Int32 };
+                let e = if rne {
+                    hir::Expr::ConvRne {
+                        to,
+                        arg: Box::new(v),
+                    }
+                } else {
+                    hir::Expr::Conv {
+                        to,
+                        overflow: false,
+                        unsigned: false,
+                        arg: Box::new(v),
+                    }
+                };
+                self.push(to, e)?;
+            }
+            HwLeafOp::ExtractScalar => {
+                let Type::Struct(_) = arg_types[0] else {
+                    return Err(CompileError::Internal("extract leaf with a non-struct arg"));
+                };
+                let cell_ty = if ret == Type::Int64 {
+                    Type::Int64
+                } else {
+                    Type::Int32
+                };
+                self.push(
+                    ret,
+                    hir::Expr::Load {
+                        addr: Box::new(vals[0].clone()),
+                        offset: 0,
+                        ty: cell_ty,
+                        access: MemAccess::Natural,
+                    },
+                )?;
+            }
+            HwLeafOp::ConvertElems { from, to, rne } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "convert leaf with a non-struct return",
+                    ));
+                };
+                // cvtdq2ps converts all four lanes; cvtdq2pd the low two —
+                // the count comes from the RESULT width.
+                let out_count = self.vector_count(class, to)?;
+                let out_cell = to.cell();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..out_count {
+                    let v = elem_load(&vals[0], i, from, from.cell());
+                    let c = if rne {
+                        // cvtps2dq & co.: MXCSR rounding (nearest-even).
+                        hir::Expr::ConvRne {
+                            to: out_cell.0,
+                            arg: Box::new(v),
+                        }
+                    } else {
+                        hir::Expr::Conv {
+                            to: out_cell.0,
+                            overflow: false,
+                            unsigned: false,
+                            arg: Box::new(v),
+                        }
+                    };
+                    store_elem(stmts, &dst, i, to, out_cell, c);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::ConvertScalarToF32 | HwLeafOp::ConvertScalarToF64 => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "cvtsi2ss leaf with a non-struct return",
+                    ));
+                };
+                let elem = if matches!(op, HwLeafOp::ConvertScalarToF32) {
+                    VecElem::F32
+                } else {
+                    VecElem::F64
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                // Element 0 converts (cvtsi2ss/cvtsi2sd, RNE — the
+                // conv_i_to_f rule); the rest come from the vector arg.
+                let c = hir::Expr::Conv {
+                    to: cell.0,
+                    overflow: false,
+                    unsigned: false,
+                    arg: Box::new(vals[1].clone()),
+                };
+                store_elem(stmts, &dst, 0, elem, cell, c);
+                for i in 1..count {
+                    let v = elem_load(&vals[0], i, elem, cell);
+                    store_elem(stmts, &dst, i, elem, cell, v);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::ConvertScalarToIntVector => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "ConvertScalarToVector128Int64 with a non-struct return",
+                    ));
+                };
+                let elem = VecElem::I64;
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                store_elem(stmts, &dst, 0, elem, cell, vals[0].clone());
+                for i in 1..count {
+                    store_elem(stmts, &dst, i, elem, cell, lconst(0));
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::StoreNonTemporalScalar => {
+                let ty = arg_types[1];
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::StoreInd {
+                        addr: vals[0].clone(),
+                        offset: 0,
+                        value: vals[1].clone(),
+                        access: MemAccess::Natural,
+                    },
+                });
+                let _ = ty;
+            }
+            HwLeafOp::Fence { full } => {
+                if full {
+                    stmts.push(hir::Stmt {
+                        il_offset,
+                        kind: hir::StmtKind::Eval(hir::Expr::MemoryFence),
+                    });
+                }
+            }
+            HwLeafOp::DivRem64 => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal("DivRem with a non-struct return"));
+                };
+                layout_of(&mut self.struct_layouts, self.ee, class)?;
+                let q = self.temp(Type::Int64);
+                let r = self.temp(Type::Int64);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::DivRem {
+                        dst_q: q,
+                        dst_r: r,
+                        lo: vals[0].clone(),
+                        hi: vals[1].clone(),
+                        divisor: vals[2].clone(),
+                    },
+                });
+                // (ulong Quotient, ulong Remainder): the ValueTuple's two
+                // ulong fields, sequential at 0/8.
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                store_elem(
+                    stmts,
+                    &dst,
+                    0,
+                    VecElem::U64,
+                    VecElem::U64.cell(),
+                    hir::Expr::Local(q),
+                );
+                store_elem(
+                    stmts,
+                    &dst,
+                    1,
+                    VecElem::U64,
+                    VecElem::U64.cell(),
+                    hir::Expr::Local(r),
+                );
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::Sqrt { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal("sqrt leaf with a non-struct return"));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let v = elem_load(&vals[0], i, elem, cell);
+                    store_elem(
+                        stmts,
+                        &dst,
+                        i,
+                        elem,
+                        cell,
+                        hir::Expr::Unary {
+                            op: UnaryOp::Sqrt,
+                            arg: Box::new(v),
+                        },
+                    );
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::BroadcastScalar { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "broadcast leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                // One load; the pointer's memory is not written by the
+                // expansion, so reloading per lane would be equivalent —
+                // the temp is just cheaper.
+                let v = elem_load(&vals[0], 0, elem, cell);
+                let vt = self.temp(cell.0);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store { dst: vt, value: v },
+                });
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    store_elem(stmts, &dst, i, elem, cell, hir::Expr::Local(vt));
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::MaskLoad { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "maskload leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let raw = elem.signed_cell();
+                // The pointer as a NativeInt (the address arithmetic below
+                // is integer-domain).
+                let ptr_ni = self.temp(Type::NativeInt);
+                let ptr_val = if arg_types[0] == Type::NativeInt {
+                    vals[0].clone()
+                } else {
+                    hir::Expr::Conv {
+                        to: Type::NativeInt,
+                        overflow: false,
+                        unsigned: false,
+                        arg: Box::new(vals[0].clone()),
+                    }
+                };
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store {
+                        dst: ptr_ni,
+                        value: ptr_val,
+                    },
+                });
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                // The fault-suppression dummy: the result temp's own
+                // address (frame-resident, always mapped; masked-off lanes
+                // read it and the value is then ANDed to zero).
+                let dummy_ni = self.temp(Type::NativeInt);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::Store {
+                        dst: dummy_ni,
+                        value: hir::Expr::Conv {
+                            to: Type::NativeInt,
+                            overflow: false,
+                            unsigned: false,
+                            arg: Box::new(dst.clone()),
+                        },
+                    },
+                });
+                for i in 0..count {
+                    let m = elem_load(&vals[1], i, elem, raw);
+                    let zero = if raw.0 == Type::Int64 {
+                        lconst(0)
+                    } else {
+                        iconst(0)
+                    };
+                    let c = bin(BinaryOp::Lt, m, zero);
+                    let c_ni = hir::Expr::Conv {
+                        to: Type::NativeInt,
+                        overflow: false,
+                        unsigned: false,
+                        arg: Box::new(c),
+                    };
+                    let m64 = bin(BinaryOp::Sub, hir::Expr::Const(Const::NativeInt(0)), c_ni);
+                    let real = bin(
+                        BinaryOp::Add,
+                        hir::Expr::Local(ptr_ni),
+                        hir::Expr::Const(Const::NativeInt((i * elem.size()) as isize)),
+                    );
+                    // addr = dummy ^ ((real ^ dummy) & m64)
+                    let addr = bin(
+                        BinaryOp::Xor,
+                        hir::Expr::Local(dummy_ni),
+                        bin(
+                            BinaryOp::And,
+                            bin(BinaryOp::Xor, real, hir::Expr::Local(dummy_ni)),
+                            m64,
+                        ),
+                    );
+                    let v = hir::Expr::Load {
+                        addr: Box::new(addr),
+                        offset: 0,
+                        ty: raw.0,
+                        access: raw.1,
+                    };
+                    let lane_mask = mask_of(
+                        bin(
+                            BinaryOp::Lt,
+                            elem_load(&vals[1], i, elem, raw),
+                            if raw.0 == Type::Int64 {
+                                lconst(0)
+                            } else {
+                                iconst(0)
+                            },
+                        ),
+                        elem,
+                    );
+                    store_elem(stmts, &dst, i, elem, raw, bin(BinaryOp::And, v, lane_mask));
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::CompareMode { elem, scalar } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "compare-mode leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                let mask_cell = elem.signed_cell();
+                let mode = vals[2].clone();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                // vcmpss/vcmpsd: only element 0 carries the mask; the upper
+                // elements copy `left` (done below the mask store).
+                let mask_lanes = if scalar { 1 } else { count };
+                for i in 0..mask_lanes {
+                    let l = elem_load(&vals[0], i, elem, cell);
+                    let r = elem_load(&vals[1], i, elem, cell);
+                    let mask = if let hir::Expr::Const(Const::Int32(m)) = &mode {
+                        // [ConstantExpected] callers pass the enum; the
+                        // low 5 bits are the predicate (hardware's rule).
+                        let p = pred_of_avx_mode((*m as u32) & 31)
+                            .expect("mode & 31 is always a predicate");
+                        mask_of(cond(p, l, r), elem)
+                    } else {
+                        // A runtime mode (GitHub_131472): pack all 32
+                        // predicate outcomes into a bitmask and shift it
+                        // by the mode. The 16 distinct predicates (14
+                        // compares + the two constants) repeat per the
+                        // signaling table.
+                        let mut bits = iconst(0);
+                        for m in 0..32u32 {
+                            let p = pred_of_avx_mode(m).expect("0..32 is total");
+                            let c = cond(p, l.clone(), r.clone());
+                            let shifted = if m == 0 {
+                                c
+                            } else {
+                                bin(BinaryOp::Shl, c, iconst(m as i32))
+                            };
+                            bits = bin(BinaryOp::Or, bits, shifted);
+                        }
+                        let m31 = bin(BinaryOp::And, mode.clone(), iconst(31));
+                        let bit = bin(BinaryOp::And, bin(BinaryOp::UShr, bits, m31), iconst(1));
+                        mask_of(bit, elem)
+                    };
+                    store_elem(stmts, &dst, i, elem, mask_cell, mask);
+                }
+                if scalar {
+                    for i in 1..count {
+                        let v = elem_load(&vals[0], i, elem, mask_cell);
+                        store_elem(stmts, &dst, i, elem, mask_cell, v);
+                    }
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::Gather { elem, index_elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "gather leaf with a non-struct return",
+                    ));
+                };
+                let Type::Struct(index_class) = arg_types[1] else {
+                    return Err(CompileError::Internal("gather with a non-struct index"));
+                };
+                let count = self.vector_count(class, elem)?;
+                let index_count = self.vector_count(index_class, index_elem)?;
+                if index_count != count {
+                    return Err(CompileError::Unsupported(
+                        "gather with a lane count outside the measured vgather*/vpgather* forms",
+                    ));
+                }
+                let cell = elem.cell();
+                let index_cell = index_elem.cell();
+                let scale_ni = hir::Expr::Conv {
+                    to: Type::NativeInt,
+                    overflow: false,
+                    unsigned: false,
+                    arg: Box::new(vals[2].clone()),
+                };
+                let ptr_val = if arg_types[0] == Type::NativeInt {
+                    vals[0].clone()
+                } else {
+                    hir::Expr::Conv {
+                        to: Type::NativeInt,
+                        overflow: false,
+                        unsigned: false,
+                        arg: Box::new(vals[0].clone()),
+                    }
+                };
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    // vgatherdp*/vpgatherd* sign-extend i32 indices; the
+                    // i64 forms (vpgatherq*) ride the same-width conv.
+                    let idx = elem_load(&vals[1], i, index_elem, index_cell);
+                    let idx_ni = hir::Expr::Conv {
+                        to: Type::NativeInt,
+                        overflow: false,
+                        unsigned: false,
+                        arg: Box::new(idx),
+                    };
+                    let addr = bin(
+                        BinaryOp::Add,
+                        ptr_val.clone(),
+                        bin(BinaryOp::Mul, idx_ni, scale_ni.clone()),
+                    );
+                    let v = hir::Expr::Load {
+                        addr: Box::new(addr),
+                        offset: 0,
+                        ty: cell.0,
+                        access: cell.1,
+                    };
+                    store_elem(stmts, &dst, i, elem, cell, v);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::PTest { elem, kind } => {
+                let Type::Struct(class) = arg_types[0] else {
+                    return Err(CompileError::Internal("ptest with a non-struct arg"));
+                };
+                let count = self.vector_count(class, elem)?;
+                // Bitwise AND per lane — the signed read's extension bits
+                // cannot flip the != 0 answer (they only replicate the
+                // lane's own top bit).
+                let cell = elem.signed_cell();
+                let zero = if elem.size() == 8 {
+                    lconst(0)
+                } else {
+                    iconst(0)
+                };
+                let mut any_ab = iconst(0);
+                let mut any_nab = iconst(0);
+                let sign_bits = (elem.size() * 8 - 1) as i32;
+                for i in 0..count {
+                    let l = elem_load(&vals[0], i, elem, cell);
+                    let r = elem_load(&vals[1], i, elem, cell);
+                    // vtestps/vtestpd: only the lanes' sign bits AND.
+                    let (l, r) = if elem.is_float() {
+                        (
+                            bin(BinaryOp::Shr, l, iconst(sign_bits)),
+                            bin(BinaryOp::Shr, r, iconst(sign_bits)),
+                        )
+                    } else {
+                        (l, r)
+                    };
+                    let ab = bin(
+                        BinaryOp::Ne,
+                        bin(BinaryOp::And, l.clone(), r.clone()),
+                        zero.clone(),
+                    );
+                    let nab = bin(BinaryOp::Ne, bin(BinaryOp::And, not(l), r), zero.clone());
+                    any_ab = bin(BinaryOp::Or, any_ab, ab);
+                    any_nab = bin(BinaryOp::Or, any_nab, nab);
+                }
+                let result = match kind {
+                    PTestKind::Z => bin(BinaryOp::Xor, any_ab, iconst(1)),
+                    PTestKind::C => bin(BinaryOp::Xor, any_nab, iconst(1)),
+                    PTestKind::NotZAndNotC => bin(BinaryOp::And, any_ab, any_nab),
+                };
+                self.push(Type::Int32, result)?;
+            }
+            HwLeafOp::MinMaxInt { elem, is_max } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "int min/max leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                let cop = match (is_max, elem.is_signed_int()) {
+                    (false, true) => BinaryOp::Lt,
+                    (false, false) => BinaryOp::ULt,
+                    (true, true) => BinaryOp::Gt,
+                    (true, false) => BinaryOp::UGt,
+                };
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let l = elem_load(&vals[0], i, elem, cell);
+                    let r = elem_load(&vals[1], i, elem, cell);
+                    // min: r ^ ((l ^ r) & -(l < r)) — the narrow lanes'
+                    // extension bits participate uniformly (both operands
+                    // extended the same way), so the 32-bit select picks
+                    // the right lane and the narrow store truncates.
+                    let m = mask_of(bin(cop, l.clone(), r.clone()), elem);
+                    let v = bin(
+                        BinaryOp::Xor,
+                        r.clone(),
+                        bin(BinaryOp::And, bin(BinaryOp::Xor, l, r), m),
+                    );
+                    store_elem(stmts, &dst, i, elem, cell, v);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::BlendVariable { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "blendvariable leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let raw = elem.signed_cell();
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let a = elem_load(&vals[0], i, elem, raw);
+                    let b = elem_load(&vals[1], i, elem, raw);
+                    let m = elem_load(&vals[2], i, elem, raw);
+                    let zero = if raw.0 == Type::Int64 {
+                        lconst(0)
+                    } else {
+                        iconst(0)
+                    };
+                    let sel = mask_of(bin(BinaryOp::Lt, m, zero), elem);
+                    // (a & ~sel) | (b & sel)
+                    let v = bin(
+                        BinaryOp::Or,
+                        bin(BinaryOp::And, a, not(sel.clone())),
+                        bin(BinaryOp::And, b, sel),
+                    );
+                    store_elem(stmts, &dst, i, elem, raw, v);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::Floor { elem } => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal(
+                        "floor leaf with a non-struct return",
+                    ));
+                };
+                let count = self.vector_count(class, elem)?;
+                let cell = elem.cell();
+                let raw = elem.signed_cell();
+                // The integer cell and range bound per element width.
+                let (int_ty, lo_bound, hi_bound) = match elem {
+                    VecElem::F32 => (
+                        Type::Int32,
+                        hir::Expr::Const(Const::Float(-2147483648.0)),
+                        hir::Expr::Const(Const::Float(2147483648.0)),
+                    ),
+                    _ => (
+                        Type::Int64,
+                        hir::Expr::Const(Const::Double(-9223372036854775808.0)),
+                        hir::Expr::Const(Const::Double(9223372036854775808.0)),
+                    ),
+                };
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for i in 0..count {
+                    let x = elem_load(&vals[0], i, elem, cell);
+                    // in_range = (x >= lo) & (x < hi) — both ordered
+                    // compares, false on NaN → passthrough.
+                    let in_range = bin(
+                        BinaryOp::And,
+                        bin(BinaryOp::Ge, x.clone(), lo_bound.clone()),
+                        bin(BinaryOp::Lt, x.clone(), hi_bound.clone()),
+                    );
+                    let ri = hir::Expr::ConvRne {
+                        to: int_ty,
+                        arg: Box::new(x.clone()),
+                    };
+                    let rf = hir::Expr::Conv {
+                        to: cell.0,
+                        overflow: false,
+                        unsigned: false,
+                        arg: Box::new(ri),
+                    };
+                    // floor = rf - (rf > x ? 1 : 0)
+                    let delta = hir::Expr::Conv {
+                        to: cell.0,
+                        overflow: false,
+                        unsigned: false,
+                        arg: Box::new(cond(CmpPred::Gt, rf.clone(), x.clone())),
+                    };
+                    let floored = bin(BinaryOp::Sub, rf, delta);
+                    // Select in raw bits: in_range ? floored : x.
+                    let ft = self.temp(cell.0);
+                    stmts.push(hir::Stmt {
+                        il_offset,
+                        kind: hir::StmtKind::Store {
+                            dst: ft,
+                            value: floored,
+                        },
+                    });
+                    let fraw = hir::Expr::Load {
+                        addr: Box::new(hir::Expr::LocalAddr(ft)),
+                        offset: 0,
+                        ty: raw.0,
+                        access: raw.1,
+                    };
+                    let xraw = elem_load(&vals[0], i, elem, raw);
+                    let m = mask_of(in_range, elem);
+                    let v = bin(
+                        BinaryOp::Or,
+                        bin(BinaryOp::And, fraw, m.clone()),
+                        bin(BinaryOp::And, xraw, not(m)),
+                    );
+                    store_elem(stmts, &dst, i, elem, raw, v);
+                }
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// The dispatch target of a `CORINFO_VIRTUALCALL_VTABLE` verdict: the
@@ -16761,6 +19956,258 @@ mod tests {
         ));
     }
 
+    /// A `fixed` local's MOD_PINNED bit (the locals signature's
+    /// CORINFO_TYPE_MOD_PINNED, corinfo.h:634) rides the EE surface into
+    /// hir::Local::pinned — the GC-info pinned slot flag's source
+    /// (thread-race.cs's residual: an unpinned `fixed` buffer moves under
+    /// a native write).
+    #[test]
+    fn pinned_local_marks_the_local_pinned() {
+        // ldloc.0; pop; ret — one pinned ByRef local (the `fixed` shape).
+        let il = [0x06, 0x26, 0x2A];
+        let (mut ee, _info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[]);
+        let locals = [CorInfoType::ByRef];
+        let info = MethodInfo {
+            locals: ee.make_locals_sig_pinned(&locals, &[true]),
+            ..fixture(&il, &sig(CorInfoType::Void, &[]), &[]).1
+        };
+        let m = import(&info, &ee).expect("imports");
+        assert!(m.locals.iter().any(|l| l.pinned), "the pin survived");
+        // The control: the same locals sig unpinned; and a pinned INT
+        // local stays unpinned (RyuJIT's CLASS/BYREF gate,
+        // lclvars.cpp:243).
+        let (mut ee, _info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[]);
+        let info = MethodInfo {
+            locals: ee.make_locals_sig(&locals),
+            ..fixture(&il, &sig(CorInfoType::Void, &[]), &[]).1
+        };
+        let m = import(&info, &ee).expect("imports");
+        assert!(
+            !m.locals.iter().any(|l| l.pinned),
+            "no pins without the modifier"
+        );
+    }
+
+    /// `Interlocked.CompareExchange`/`Exchange`/`ExchangeAdd`/
+    /// `MemoryBarrier` (step_11.15's thread-race fix): the self-recursive
+    /// [Intrinsic] bodies (Interlocked.CoreCLR.cs:56/120/216,
+    /// Interlocked.cs:322) expand to the atomic nodes; the object
+    /// overload stays gated (the atomic write barrier is a later step).
+    #[test]
+    fn interlocked_intrinsics_expand_and_refs_gate() {
+        let ce_il = [0x02, 0x03, 0x04, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        fn interlocked_fixture(
+            il: &[u8],
+            home: MockSig,
+            callee: MockSig,
+            name: &str,
+        ) -> (MockEe, MethodInfo) {
+            let (mut ee, info) = fixture(il, &home, &[]);
+            let handle = ee.add_method(0x0600_0033, callee);
+            ee.method_name = Some(name.into());
+            ee.class_names.insert(
+                handle.as_raw() as usize,
+                ("Interlocked".into(), Some("System.Threading".into())),
+            );
+            ee.intrinsic_methods.insert(handle.as_raw() as usize);
+            (ee, info)
+        }
+
+        // CompareExchange(ref int, int, int): the 32-bit cell.
+        let (ee, info) = interlocked_fixture(
+            &ce_il,
+            sig(
+                CorInfoType::Int,
+                &[CorInfoType::ByRef, CorInfoType::Int, CorInfoType::Int],
+            ),
+            sig(
+                CorInfoType::Int,
+                &[CorInfoType::ByRef, CorInfoType::Int, CorInfoType::Int],
+            ),
+            "CompareExchange",
+        );
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::AtomicCmpXchg {
+            addr,
+            value,
+            comparand,
+            bits: 32,
+            signed: false,
+        } = return_value(&m, 0)
+        else {
+            panic!("expected the AtomicCmpXchg node")
+        };
+        assert_eq!(as_local(addr), LocalId(0), "location");
+        assert_eq!(as_local(value), LocalId(1), "value");
+        assert_eq!(as_local(comparand), LocalId(2), "comparand");
+
+        // CompareExchange(ref byte, byte, byte): the 8-bit cell
+        // (thread-race.cs's ConsolePal.CheckTerminalSettingsInvalidated).
+        let (ee, info) = interlocked_fixture(
+            &ce_il,
+            sig(
+                CorInfoType::UByte,
+                &[CorInfoType::ByRef, CorInfoType::UByte, CorInfoType::UByte],
+            ),
+            sig(
+                CorInfoType::UByte,
+                &[CorInfoType::ByRef, CorInfoType::UByte, CorInfoType::UByte],
+            ),
+            "CompareExchange",
+        );
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::AtomicCmpXchg {
+            bits: 8,
+            signed: false,
+            ..
+        } = return_value(&m, 0)
+        else {
+            panic!("expected the 8-bit AtomicCmpXchg node")
+        };
+
+        // CompareExchange(ref sbyte, sbyte, sbyte): the SIGNED 8-bit cell
+        // — `signed` must be set (the JIT/Intrinsics/Interlocked.cs L114
+        // case: a cell holding 0xFB answers -5, not 251).
+        let (ee, info) = interlocked_fixture(
+            &ce_il,
+            sig(
+                CorInfoType::Byte,
+                &[CorInfoType::ByRef, CorInfoType::Byte, CorInfoType::Byte],
+            ),
+            sig(
+                CorInfoType::Byte,
+                &[CorInfoType::ByRef, CorInfoType::Byte, CorInfoType::Byte],
+            ),
+            "CompareExchange",
+        );
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::AtomicCmpXchg {
+            bits: 8,
+            signed: true,
+            ..
+        } = return_value(&m, 0)
+        else {
+            panic!("expected the signed 8-bit AtomicCmpXchg node")
+        };
+
+        // CompareExchange(ref short, short, short): the SIGNED 16-bit cell.
+        let (ee, info) = interlocked_fixture(
+            &ce_il,
+            sig(
+                CorInfoType::Short,
+                &[CorInfoType::ByRef, CorInfoType::Short, CorInfoType::Short],
+            ),
+            sig(
+                CorInfoType::Short,
+                &[CorInfoType::ByRef, CorInfoType::Short, CorInfoType::Short],
+            ),
+            "CompareExchange",
+        );
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::AtomicCmpXchg {
+            bits: 16,
+            signed: true,
+            ..
+        } = return_value(&m, 0)
+        else {
+            panic!("expected the signed 16-bit AtomicCmpXchg node")
+        };
+
+        // CompareExchange(ref long, long, long): the 64-bit cell.
+        let (ee, info) = interlocked_fixture(
+            &ce_il,
+            sig(
+                CorInfoType::Long,
+                &[CorInfoType::ByRef, CorInfoType::Long, CorInfoType::Long],
+            ),
+            sig(
+                CorInfoType::Long,
+                &[CorInfoType::ByRef, CorInfoType::Long, CorInfoType::Long],
+            ),
+            "CompareExchange",
+        );
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::AtomicCmpXchg { bits: 64, .. } = return_value(&m, 0) else {
+            panic!("expected the 64-bit AtomicCmpXchg node")
+        };
+
+        // CompareExchange(ref object, object, object): the named gate.
+        let (ee, info) = interlocked_fixture(
+            &ce_il,
+            sig(
+                CorInfoType::Class,
+                &[CorInfoType::ByRef, CorInfoType::Class, CorInfoType::Class],
+            ),
+            sig(
+                CorInfoType::Class,
+                &[CorInfoType::ByRef, CorInfoType::Class, CorInfoType::Class],
+            ),
+            "CompareExchange",
+        );
+        assert!(
+            matches!(import(&info, &ee), Err(CompileError::Unsupported(_))),
+            "the object overload is gated"
+        );
+
+        // Exchange(ref int, int): xchg; ldarg.0; ldarg.1; call; ret.
+        let xchg_il = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (ee, info) = interlocked_fixture(
+            &xchg_il,
+            sig(CorInfoType::Int, &[CorInfoType::ByRef, CorInfoType::Int]),
+            sig(CorInfoType::Int, &[CorInfoType::ByRef, CorInfoType::Int]),
+            "Exchange",
+        );
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::AtomicXchg { bits: 32, .. } = return_value(&m, 0) else {
+            panic!("expected the AtomicXchg node")
+        };
+
+        // Exchange(ref sbyte, sbyte): the signed narrow swap.
+        let (ee, info) = interlocked_fixture(
+            &xchg_il,
+            sig(CorInfoType::Byte, &[CorInfoType::ByRef, CorInfoType::Byte]),
+            sig(CorInfoType::Byte, &[CorInfoType::ByRef, CorInfoType::Byte]),
+            "Exchange",
+        );
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::AtomicXchg {
+            bits: 8,
+            signed: true,
+            ..
+        } = return_value(&m, 0)
+        else {
+            panic!("expected the signed 8-bit AtomicXchg node")
+        };
+
+        // ExchangeAdd(ref long, long): lock xadd.
+        let (ee, info) = interlocked_fixture(
+            &xchg_il,
+            sig(CorInfoType::Long, &[CorInfoType::ByRef, CorInfoType::Long]),
+            sig(CorInfoType::Long, &[CorInfoType::ByRef, CorInfoType::Long]),
+            "ExchangeAdd",
+        );
+        let m = import(&info, &ee).expect("imports");
+        let hir::Expr::AtomicXadd { bits: 64, .. } = return_value(&m, 0) else {
+            panic!("expected the AtomicXadd node")
+        };
+
+        // MemoryBarrier(): the Eval(MemoryFence) statement.
+        let (ee, info) = interlocked_fixture(
+            &[0x28, 0x33, 0x00, 0x00, 0x06, 0x2A],
+            sig(CorInfoType::Void, &[]),
+            sig(CorInfoType::Void, &[]),
+            "MemoryBarrier",
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert!(
+            matches!(
+                m.blocks[0].stmts[0].kind,
+                hir::StmtKind::Eval(hir::Expr::MemoryFence)
+            ),
+            "the fence statement"
+        );
+    }
+
     /// `Double.ConvertToIntegerNative<int>(value)`: the self-recursive
     /// [Intrinsic] body (Double.cs:670) must never compile — the importer
     /// expands the call to the plain truncating conversion (the managed
@@ -16830,14 +20277,18 @@ mod tests {
         ));
     }
 
-    /// A call into the System.Runtime.Intrinsics.X86 leaves (Sse & co.)
-    /// is named Unsupported, never compiled: the CoreLib bodies are
-    /// self-recursive [Intrinsic]s with no software path, so a literal
-    /// compile recurses to a stack overflow (step_11.10's SIMD deferral).
-    /// The vector classes directly under System.Runtime.Intrinsics keep
-    /// compiling — several members have real software fallbacks.
+    /// A call into the System.Runtime.Intrinsics.X86 leaves outside the
+    /// measured expansion set compiles to the loud poison (step_11.14
+    /// phase 3): the CoreLib bodies are self-recursive [Intrinsic]s with
+    /// no software path; an unmeasured or unresolvable leaf (this fixture
+    /// cans no class metadata — the classifier can't even name the
+    /// family) imports as the THROW_NOT_IMPLEMENTED helper call plus the
+    /// return type's default (a zeroed struct temp here) instead of
+    /// failing the whole method's compile. The vector classes directly
+    /// under System.Runtime.Intrinsics keep compiling plain calls —
+    /// several members have real software fallbacks.
     #[test]
-    fn hw_intrinsic_leaves_are_a_named_unsupported() {
+    fn hw_intrinsic_leaves_compile_to_the_loud_poison() {
         // ldarg.0; ldarg.1; call Sse.Add; ret.
         let il = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
         let (mut ee, c) = struct_ee(16, &[], None);
@@ -16876,11 +20327,24 @@ mod tests {
             args: ee.make_method_sig(&entry),
             locals: ee.make_locals_sig(&[]),
         };
-        match import(&info, &ee) {
-            Err(CompileError::Unsupported("hardware intrinsics (SIMD vector semantics)")) => {}
-            Err(e) => panic!("expected the named SIMD gate, got {e:?}"),
-            Ok(_) => panic!("expected the named SIMD gate, but the call imported"),
-        }
+        let m = import(&info, &ee).expect("the poisoned call compiles");
+        // The poison statement: Eval(call CORINFO_HELP_THROW_NOT_IMPLEMENTED).
+        assert!(m.blocks[0].stmts.iter().any(|s| matches!(
+            &s.kind,
+            hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::THROW_NOT_IMPLEMENTED),
+                sig,
+                args,
+            }) if sig.ret == Type::Void && sig.args.is_empty() && args.is_empty()
+        )));
+        // The struct default: a BlockZero of the struct temp …
+        assert!(m.blocks[0].stmts.iter().any(|s| matches!(
+            &s.kind,
+            hir::StmtKind::BlockZero { class, .. } if *class == c
+        )));
+        // … whose StructVal value the (dead) continuation holds; the
+        // layout was queried into the side table for the temp.
+        assert_eq!(m.struct_layouts[&c].size, 16);
 
         // Same [Intrinsic] bit, Vector128's own namespace: NOT gated.
         let (mut ee, c) = struct_ee(16, &[], None);
@@ -16916,8 +20380,1150 @@ mod tests {
         );
     }
 
-    // --- Linq.cs follow-ups: the self-recursive [Intrinsic]s behind the
-    // --- shared-generic stack overflows ---
+    /// The scalar-returning poison pushes the zero constant of the return
+    /// type for the dead continuation.
+    #[test]
+    fn hw_intrinsic_leaf_poison_pushes_the_scalar_default() {
+        // call Popcnt.PopCount; ret — no args, Int32 return.
+        let il = [0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Int, &[]), &[]);
+        let handle = ee.add_method(0x0600_0033, sig(CorInfoType::Int, &[]));
+        ee.method_name = Some("PopCount".into());
+        ee.method_namespaces.insert(
+            handle.as_raw() as usize,
+            "System.Runtime.Intrinsics.X86".into(),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let m = import(&info, &ee).expect("the poisoned call compiles");
+        assert!(m.blocks[0].stmts.iter().any(|s| matches!(
+            &s.kind,
+            hir::StmtKind::Eval(hir::Expr::Call {
+                target: CallTarget::Helper(CorInfoHelpFunc::THROW_NOT_IMPLEMENTED),
+                ..
+            })
+        )));
+        assert_eq!(as_i32(return_value(&m, 0)), 0, "the pushed default");
+    }
+
+    // --- step_11.14 phase 3 increment 1: the measured Sse/Sse2/X86Base
+    // --- leaf expansions ---
+
+    /// Cans an X86-tree leaf call: `method_name` on `class_name` (namespace
+    /// System.Runtime.Intrinsics.X86) with the [Intrinsic] bit; the vector
+    /// class `c` (16 bytes) gets `elem` as its instantiation element type.
+    fn hw_leaf_fixture(
+        ee: &mut MockEe,
+        c: ClassHandle,
+        token: u32,
+        leaf: MockSig,
+        method_name: &str,
+        class_name: &str,
+        elem: CorInfoType,
+    ) {
+        let elem_class = ee.add_class(4, 4, &[], None);
+        ee.class_cor_info_types
+            .insert(elem_class.as_raw() as usize, elem);
+        ee.type_inst_args
+            .insert((c.as_raw() as usize, 0), elem_class);
+        let handle = ee.add_method(token, leaf);
+        ee.method_name = Some(method_name.into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            (
+                class_name.into(),
+                Some("System.Runtime.Intrinsics.X86".into()),
+            ),
+        );
+        ee.method_namespaces.insert(
+            handle.as_raw() as usize,
+            "System.Runtime.Intrinsics.X86".into(),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+    }
+
+    fn vec_sig(c: ClassHandle) -> MockSig {
+        MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::ValueClass, CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![Some(c), Some(c)],
+        }
+    }
+
+    /// Whether the imported method carries the poison's THROW.
+    fn has_poison(m: &hir::Method) -> bool {
+        m.blocks.iter().any(|b| {
+            b.stmts.iter().any(|s| {
+                matches!(
+                    &s.kind,
+                    hir::StmtKind::Eval(hir::Expr::Call {
+                        target: CallTarget::Helper(CorInfoHelpFunc::THROW_NOT_IMPLEMENTED),
+                        ..
+                    })
+                )
+            })
+        })
+    }
+
+    /// Sse.Add(Vector128<float>, Vector128<float>): the elementwise
+    /// expansion — four Float `Add`s over the two struct args loaded and
+    /// stored per element, no poison.
+    #[test]
+    fn sse_add_expands_elementwise() {
+        // ldarg.0; ldarg.1; call Sse.Add; ret.
+        let il = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let entry = vec_sig(c);
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            vec_sig(c),
+            "Add",
+            "Sse",
+            CorInfoType::Float,
+        );
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m));
+        let adds = m.blocks[0]
+            .stmts
+            .iter()
+            .filter(|s| {
+                matches!(
+                    &s.kind,
+                    hir::StmtKind::StoreInd {
+                        value: hir::Expr::Binary {
+                            op: BinaryOp::Add,
+                            lhs,
+                            rhs,
+                        },
+                        ..
+                    } if matches!(**lhs, hir::Expr::Load { ty: Type::Float, .. })
+                        && matches!(**rhs, hir::Expr::Load { ty: Type::Float, .. })
+                )
+            })
+            .count();
+        assert_eq!(adds, 4, "one scalar add per float lane");
+    }
+
+    /// The compare mask materialization: all-ones/all-zeros per lane.
+    #[test]
+    fn sse_compare_equal_expands_to_the_mask() {
+        // ldarg.0; ldarg.1; call Sse.CompareEqual; ret.
+        let il = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let entry = vec_sig(c);
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            vec_sig(c),
+            "CompareEqual",
+            "Sse",
+            CorInfoType::Float,
+        );
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m));
+        let masks = m.blocks[0]
+            .stmts
+            .iter()
+            .filter(|s| {
+                matches!(
+                    &s.kind,
+                    hir::StmtKind::StoreInd {
+                        value: hir::Expr::Binary {
+                            op: BinaryOp::Sub,
+                            lhs,
+                            rhs,
+                        },
+                        ..
+                    } if matches!(**lhs, hir::Expr::Const(Const::Int32(0)))
+                        && matches!(**rhs, hir::Expr::Binary { op: BinaryOp::Eq, .. })
+                )
+            })
+            .count();
+        assert_eq!(masks, 4, "0 - (l == r) per lane");
+    }
+
+    /// An unmeasured leaf on a flipped family keeps the poison
+    /// (Avx.Reciprocal was never demanded); an unflipped family (Avx512F)
+    /// keeps it too.
+    #[test]
+    fn unmeasured_and_unflipped_leaves_keep_the_poison() {
+        // ldarg.0; ldarg.1; call <leaf>; ret.
+        let il = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        for (name, class) in [("Reciprocal", "Avx"), ("Add", "Avx512F")] {
+            let (mut ee, c) = struct_ee(16, &[], None);
+            let entry = vec_sig(c);
+            hw_leaf_fixture(
+                &mut ee,
+                c,
+                0x0600_0033,
+                vec_sig(c),
+                name,
+                class,
+                CorInfoType::Float,
+            );
+            let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+            let m = import(&info, &ee).expect("the poisoned call compiles");
+            assert!(has_poison(&m), "{class}.{name} stays poisoned");
+        }
+    }
+
+    // --- step_11.14 phase 3 increment 2: the Avx/Avx2 flip at 32 bytes ---
+
+    /// Avx.Add(Vector256<float>, Vector256<float>): the width-generic
+    /// expansion at 32 bytes — eight Float lanes, no poison.
+    #[test]
+    fn avx_add_expands_elementwise_at_32_bytes() {
+        // ldarg.0; ldarg.1; call Avx.Add; ret.
+        let il = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(32, &[], None);
+        let entry = vec_sig(c);
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            vec_sig(c),
+            "Add",
+            "Avx",
+            CorInfoType::Float,
+        );
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m));
+        let adds = m.blocks[0]
+            .stmts
+            .iter()
+            .filter(|s| {
+                matches!(
+                    &s.kind,
+                    hir::StmtKind::StoreInd {
+                        value: hir::Expr::Binary {
+                            op: BinaryOp::Add,
+                            lhs,
+                            rhs,
+                        },
+                        ..
+                    } if matches!(**lhs, hir::Expr::Load { ty: Type::Float, .. })
+                        && matches!(**rhs, hir::Expr::Load { ty: Type::Float, .. })
+                )
+            })
+            .count();
+        assert_eq!(adds, 8, "one scalar add per float lane at 256 bits");
+    }
+
+    /// The 256-bit shuffle forms expand with the per-128-bit-lane
+    /// interleave (vshufps at 32 bytes — measured: PacketTracer); the
+    /// 256-bit pack interleave (vpackus*'s [a-lo, b-lo, a-hi, b-hi]) stays
+    /// poisoned until measured — never a silently-wrong 128-bit algorithm.
+    #[test]
+    fn width_sensitive_leaves_at_32_bytes() {
+        // ldarg.0; ldarg.1; ldc.i4.0; call Avx.Shuffle; ret.
+        let il = [0x02, 0x03, 0x16, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(32, &[], None);
+        let shuffle3 = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![
+                CorInfoType::ValueClass,
+                CorInfoType::ValueClass,
+                CorInfoType::Int,
+            ],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![Some(c), Some(c), None],
+        };
+        let entry = shuffle3.clone();
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            shuffle3,
+            "Shuffle",
+            "Avx",
+            CorInfoType::Float,
+        );
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m), "256-bit Shuffle expands per-128-lane");
+
+        // ldarg.0; ldarg.1; call Avx2.PackUnsignedSaturate; ret.
+        let il2 = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(32, &[], None);
+        let entry = vec_sig(c);
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            vec_sig(c),
+            "PackUnsignedSaturate",
+            "Avx2",
+            CorInfoType::Short,
+        );
+        let info = struct_info(&mut ee, &il2, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("the poisoned call compiles");
+        assert!(
+            has_poison(&m),
+            "256-bit PackUnsignedSaturate stays poisoned"
+        );
+    }
+
+    /// Avx.Compare with a CONSTANT mode folds to the one predicate; with a
+    /// runtime mode the expansion is the 32-bit predicate bitmask shifted
+    /// by the mode (GitHub_131472's non-constant shape).
+    #[test]
+    fn avx_compare_mode_constant_and_runtime() {
+        let compare_sig = |c: ClassHandle| MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![
+                CorInfoType::ValueClass,
+                CorInfoType::ValueClass,
+                CorInfoType::Int,
+            ],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![Some(c), Some(c), None],
+        };
+        // ldarg.0; ldarg.1; ldc.i4.1 (LessThanSignaling); call; ret.
+        let const_il = [0x02, 0x03, 0x1F, 0x01, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(32, &[], None);
+        let entry = compare_sig(c);
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            compare_sig(c),
+            "Compare",
+            "Avx",
+            CorInfoType::Float,
+        );
+        let info = struct_info(&mut ee, &const_il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m));
+        let has_runtime_shift = m.blocks.iter().any(|b| {
+            b.stmts.iter().any(|s| {
+                matches!(
+                    &s.kind,
+                    hir::StmtKind::StoreInd {
+                        value: hir::Expr::Binary {
+                            op: BinaryOp::UShr,
+                            ..
+                        },
+                        ..
+                    }
+                ) || matches!(
+                    &s.kind,
+                    hir::StmtKind::Store {
+                        value: hir::Expr::Binary {
+                            op: BinaryOp::UShr,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(!has_runtime_shift, "a constant mode folds statically");
+
+        // ldarg.0; ldarg.1; ldarg.2; call; ret — the runtime mode.
+        let rt_il = [0x02, 0x03, 0x04, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(32, &[], None);
+        let entry = compare_sig(c);
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            compare_sig(c),
+            "Compare",
+            "Avx",
+            CorInfoType::Float,
+        );
+        let info = struct_info(&mut ee, &rt_il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m));
+        let masks = m.blocks[0]
+            .stmts
+            .iter()
+            .filter(|s| matches!(&s.kind, hir::StmtKind::StoreInd { .. }))
+            .count();
+        assert!(masks >= 8, "one mask store per lane at 256 bits");
+        // The runtime-mode path: a 32-bit predicate bitmask shifted by the
+        // mode — a UShr somewhere in the statement values.
+        fn expr_has_ushr(e: &hir::Expr) -> bool {
+            match e {
+                hir::Expr::Binary { op, lhs, rhs } => {
+                    *op == BinaryOp::UShr || expr_has_ushr(lhs) || expr_has_ushr(rhs)
+                }
+                hir::Expr::Unary { arg, .. } => expr_has_ushr(arg),
+                hir::Expr::Conv { arg, .. } => expr_has_ushr(arg),
+                hir::Expr::Load { addr, .. } => expr_has_ushr(addr),
+                _ => false,
+            }
+        }
+        let has_ushr = m.blocks.iter().any(|b| {
+            b.stmts.iter().any(|s| match &s.kind {
+                hir::StmtKind::Store { value, .. } => expr_has_ushr(value),
+                hir::StmtKind::StoreInd { value, .. } => expr_has_ushr(value),
+                _ => false,
+            })
+        });
+        assert!(has_ushr, "the runtime-mode bitmask shifts by the mode");
+    }
+
+    /// The Sse41 straggler leaves classify with the family unflipped —
+    /// they are reached from flipped-family (Avx-guarded) arms.
+    #[test]
+    fn sse41_straggler_leaves_expand() {
+        // ldarg.0; ldarg.1; call Sse41.TestZ; ret — Int32 return.
+        let il = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let leaf = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::ValueClass, CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c), Some(c)],
+        };
+        let entry = leaf.clone();
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            leaf,
+            "TestZ",
+            "Sse41",
+            CorInfoType::Int,
+        );
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m), "Sse41.TestZ expands (straggler)");
+
+        // Avx.TestZ(Vector256<int>) — the GitHub_17073 shape (the int
+        // overload is 256-bit-only; the Vector128<int> call sites bind
+        // through the implicit widening conversion).
+        let (mut ee, c) = struct_ee(32, &[], None);
+        let leaf = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::ValueClass, CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c), Some(c)],
+        };
+        let entry = leaf.clone();
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            leaf,
+            "TestZ",
+            "Avx",
+            CorInfoType::Int,
+        );
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m), "Avx.TestZ(Vector256<int>) expands");
+
+        // Sse41.Min on int32 lanes: the xor-select expansion.
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let entry = vec_sig(c);
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            vec_sig(c),
+            "Min",
+            "Sse41",
+            CorInfoType::Int,
+        );
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m), "Sse41.Min(int) expands (straggler)");
+
+        // An UNMEASURED Sse41 leaf keeps the poison.
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let entry = vec_sig(c);
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            vec_sig(c),
+            "Multiply",
+            "Sse41",
+            CorInfoType::Int,
+        );
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(has_poison(&m), "Sse41.Multiply was never measured");
+    }
+
+    /// Avx.Sqrt / Avx2.BroadcastScalarToVector256 / Avx.MaskLoad /
+    /// Avx2.GatherVector256 classify and expand (shapes; e2e semantics in
+    /// tests/avxflip.cs and the runtime tests that demanded them).
+    #[test]
+    fn increment2_leaves_expand() {
+        // ldarg.0; call; ret — the one-vector-arg Sqrt.
+        let il1 = [0x02, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(32, &[], None);
+        let unary_sig = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![Some(c)],
+        };
+        let entry = unary_sig.clone();
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            unary_sig,
+            "Sqrt",
+            "Avx",
+            CorInfoType::Float,
+        );
+        let info = struct_info(&mut ee, &il1, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m), "Avx.Sqrt");
+        let sqrts = m.blocks[0]
+            .stmts
+            .iter()
+            .filter(|s| {
+                matches!(
+                    &s.kind,
+                    hir::StmtKind::StoreInd {
+                        value: hir::Expr::Unary {
+                            op: UnaryOp::Sqrt,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(sqrts, 8, "one sqrt per float lane at 256 bits");
+
+        // ldarg.0; call; ret — BroadcastScalarToVector256(ptr).
+        let (mut ee, c) = struct_ee(32, &[], None);
+        let ptr_sig = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::Ptr],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![None],
+        };
+        let entry = ptr_sig.clone();
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            ptr_sig,
+            "BroadcastScalarToVector256",
+            "Avx2",
+            CorInfoType::Int,
+        );
+        let info = struct_info(&mut ee, &il1, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m), "Avx2.BroadcastScalarToVector256");
+
+        // ldarg.0; ldarg.1; call; ret — MaskLoad(ptr, mask).
+        let il2 = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(32, &[], None);
+        let maskload_sig = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::Ptr, CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![None, Some(c)],
+        };
+        let entry = maskload_sig.clone();
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            maskload_sig,
+            "MaskLoad",
+            "Avx",
+            CorInfoType::Float,
+        );
+        let info = struct_info(&mut ee, &il2, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m), "Avx.MaskLoad");
+
+        // ldarg.0; ldarg.1; ldarg.2; call; ret — GatherVector256(ptr,
+        // indices, scale): double lanes from an i32 index vector (the
+        // BilinearInterpol shape: 4 lanes each — the index struct here is
+        // 16 bytes vs the 32-byte result).
+        let il3 = [0x02, 0x03, 0x04, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(32, &[], None);
+        let (ci, c128) = {
+            // A second class: the 16-byte Vector128<int> index vector.
+            let c128 = ee.add_class(16, 8, &[], None);
+            (c, c128)
+        };
+        let _ = ci;
+        let elem_class = ee.add_class(4, 4, &[], None);
+        ee.class_cor_info_types
+            .insert(elem_class.as_raw() as usize, CorInfoType::Int);
+        ee.type_inst_args
+            .insert((c128.as_raw() as usize, 0), elem_class);
+        let gather_sig = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::Ptr, CorInfoType::ValueClass, CorInfoType::Int],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![None, Some(c128), None],
+        };
+        let entry = gather_sig.clone();
+        // The result is Vector256<double>.
+        let dbl = ee.add_class(8, 8, &[], None);
+        ee.class_cor_info_types
+            .insert(dbl.as_raw() as usize, CorInfoType::Double);
+        ee.type_inst_args.insert((c.as_raw() as usize, 0), dbl);
+        let handle = ee.add_method(0x0600_0033, gather_sig);
+        ee.method_name = Some("GatherVector256".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            ("Avx2".into(), Some("System.Runtime.Intrinsics.X86".into())),
+        );
+        ee.method_namespaces.insert(
+            handle.as_raw() as usize,
+            "System.Runtime.Intrinsics.X86".into(),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let info = struct_info(&mut ee, &il3, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m), "Avx2.GatherVector256(double, i32-index)");
+        let gathers = m.blocks[0]
+            .stmts
+            .iter()
+            .filter(|s| {
+                matches!(
+                    &s.kind,
+                    hir::StmtKind::StoreInd {
+                        value: hir::Expr::Load {
+                            ty: Type::Double,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(gathers, 4, "one scalar gather load per double lane");
+    }
+
+    /// Sse2.MoveMask(Vector128<byte>): the sign-bit gather.
+    #[test]
+    fn sse2_movemask_expands_the_sign_gather() {
+        // ldarg.0; call Sse2.MoveMask; ret — one struct arg, Int32 return.
+        let il = [0x02, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let leaf = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c)],
+        };
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c)],
+        };
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            leaf,
+            "MoveMask",
+            "Sse2",
+            CorInfoType::UByte,
+        );
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m));
+        // 16 lanes: 16 sign tests (`Lt` against zero) anywhere in the
+        // accumulated expression tree.
+        fn count_lt(e: &hir::Expr) -> usize {
+            let mut n = usize::from(matches!(
+                e,
+                hir::Expr::Binary {
+                    op: BinaryOp::Lt,
+                    ..
+                }
+            ));
+            match e {
+                hir::Expr::Unary { arg, .. } => n += count_lt(arg),
+                hir::Expr::Binary { lhs, rhs, .. } => n += count_lt(lhs) + count_lt(rhs),
+                hir::Expr::Load { addr, .. } => n += count_lt(addr),
+                hir::Expr::StructVal { addr, .. } => n += count_lt(addr),
+                _ => {}
+            }
+            n
+        }
+        let mut total = 0;
+        for b in &m.blocks {
+            for s in &b.stmts {
+                match &s.kind {
+                    hir::StmtKind::Store { value, .. } => total += count_lt(value),
+                    hir::StmtKind::StoreInd { addr, value, .. } => {
+                        total += count_lt(addr) + count_lt(value)
+                    }
+                    _ => {}
+                }
+            }
+            if let hir::Terminator::Return { value: Some(v) } = &b.terminator {
+                total += count_lt(v);
+            }
+        }
+        assert_eq!(total, 16, "one sign test per byte lane");
+    }
+
+    /// X86Base.X64.DivRem(ulong, ulong, ulong): the 128-by-64 divide
+    /// statement, quotient/remainder stored into the tuple result.
+    #[test]
+    fn x86base_x64_divrem_expands() {
+        // ldarg.0; ldarg.1; ldarg.2; call DivRem; ret.
+        let il = [0x02, 0x03, 0x04, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let leaf = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::Long, CorInfoType::Long, CorInfoType::Long],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![None, None, None],
+        };
+        let entry = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::Long, CorInfoType::Long, CorInfoType::Long],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![None, None, None],
+        };
+        let handle = ee.add_method(0x0600_0033, leaf);
+        ee.method_name = Some("DivRem".into());
+        // The nested X64 class: empty class namespace; the family comes
+        // from the enclosing-class walk.
+        ee.class_names
+            .insert(handle.as_raw() as usize, ("X64".into(), None));
+        ee.method_namespaces.insert(
+            handle.as_raw() as usize,
+            "System.Runtime.Intrinsics.X86".into(),
+        );
+        ee.method_enclosing_classes
+            .insert(handle.as_raw() as usize, "X86Base".into());
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m));
+        assert!(m.blocks[0]
+            .stmts
+            .iter()
+            .any(|s| matches!(&s.kind, hir::StmtKind::DivRem { .. })));
+        // Quotient at tuple offset 0, remainder at 8.
+        let mut offsets: Vec<u32> = m.blocks[0]
+            .stmts
+            .iter()
+            .filter_map(|s| match &s.kind {
+                hir::StmtKind::StoreInd {
+                    offset,
+                    value: hir::Expr::Local(_),
+                    ..
+                } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        offsets.sort_unstable();
+        assert!(offsets.contains(&0) && offsets.contains(&8), "{offsets:?}");
+    }
+
+    /// X86Base.Pause(): the spin-wait hint is no code (the FastPollGC
+    /// precedent).
+    #[test]
+    fn x86base_pause_expands_to_no_code() {
+        // call Pause; ret — in a void method.
+        let il = [0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[]);
+        let handle = ee.add_method(0x0600_0033, sig(CorInfoType::Void, &[]));
+        ee.method_name = Some("Pause".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            (
+                "X86Base".into(),
+                Some("System.Runtime.Intrinsics.X86".into()),
+            ),
+        );
+        ee.method_namespaces.insert(
+            handle.as_raw() as usize,
+            "System.Runtime.Intrinsics.X86".into(),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let m = import(&info, &ee).expect("imports");
+        assert!(m.blocks[0].stmts.is_empty(), "no code");
+        assert!(!has_poison(&m));
+    }
+
+    /// The flipped families answer `get_IsSupported` true (Sse2.X64 by
+    /// the enclosing walk); Vector128/Vector256.IsHardwareAccelerated true
+    /// (increment 2 — the 32-byte truth is live), Vector64/512 false.
+    #[test]
+    fn flipped_families_answer_supported() {
+        let (mut ee, info) = fixture(&ISSUP_IL, &sig(CorInfoType::Bool, &[]), &[]);
+        is_supported_fixture(&mut ee, "Sse2", Some("System.Runtime.Intrinsics.X86"));
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 1, "Sse2 flipped");
+
+        let (mut ee, info) = fixture(&ISSUP_IL, &sig(CorInfoType::Bool, &[]), &[]);
+        let handle = is_supported_fixture(&mut ee, "X64", None);
+        ee.method_enclosing_classes
+            .insert(handle.as_raw() as usize, "Sse".into());
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 1, "Sse.X64 follows Sse");
+
+        // IsHardwareAccelerated: Vector128/Vector256 true, Vector64 false.
+        let il = [0x28, 0x37, 0x00, 0x00, 0x06, 0x2A];
+        for (class, want) in [("Vector128", 1), ("Vector256", 1), ("Vector64", 0)] {
+            let (mut ee, info) = fixture(&il, &sig(CorInfoType::Bool, &[]), &[]);
+            let handle = ee.add_method(0x0600_0037, sig(CorInfoType::Bool, &[]));
+            ee.method_name = Some("get_IsHardwareAccelerated".into());
+            ee.class_names.insert(
+                handle.as_raw() as usize,
+                (class.into(), Some("System.Runtime.Intrinsics".into())),
+            );
+            ee.intrinsic_methods.insert(handle.as_raw() as usize);
+            let m = import(&info, &ee).expect("imports");
+            assert_eq!(as_i32(return_value(&m, 0)), want, "{class}");
+        }
+    }
+
+    /// `RuntimeHelpers.IsReferenceOrContainsReferences<T>`: the
+    /// self-recursive [Intrinsic] body (RuntimeHelpers.cs:189) expands to
+    /// the constant — RyuJIT's importercalls.cpp:3917-3928 rule: a GC
+    /// type (reference class) or a value class whose layout carries GC
+    /// pointers answers 1, anything else 0.
+    const IROR_TOKEN: u32 = 0x0600_0038;
+
+    /// Cans `IsReferenceOrContainsReferences<T>` with `type_arg` as the
+    /// call sig's one method-instantiation class handle.
+    fn iror_fixture(ee: &mut MockEe, type_arg: ClassHandle) {
+        let handle = ee.add_method(IROR_TOKEN, sig(CorInfoType::Bool, &[]));
+        ee.method_name = Some("IsReferenceOrContainsReferences".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            (
+                "RuntimeHelpers".into(),
+                Some("System.Runtime.CompilerServices".into()),
+            ),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        ee.call_meth_inst
+            .insert(IROR_TOKEN, Box::new(type_arg.as_raw()));
+    }
+
+    /// call IsReferenceOrContainsReferences; ret — in a bool-returning
+    /// method.
+    const IROR_IL: [u8; 6] = [0x28, 0x38, 0x00, 0x00, 0x06, 0x2A];
+
+    #[test]
+    fn is_reference_or_contains_references_of_a_reference_type_is_one() {
+        let (mut ee, info) = fixture(&IROR_IL, &sig(CorInfoType::Bool, &[]), &[]);
+        // An unregistered handle answers CorInfoType::Class — a reference.
+        iror_fixture(&mut ee, ClassHandle::from_raw(0xBEEF_usize as _).unwrap());
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 1);
+    }
+
+    #[test]
+    fn is_reference_or_contains_references_of_a_plain_struct_is_zero() {
+        let (mut ee, c) = struct_ee(16, &[], None);
+        iror_fixture(&mut ee, c);
+        let info = MethodInfo {
+            ftn: MethodHandle::from_raw(1usize as ffi::CORINFO_METHOD_HANDLE).unwrap(),
+            il: IROR_IL.to_vec(),
+            max_stack: 8,
+            eh_count: 0,
+            init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
+            args: ee.make_method_sig(&sig(CorInfoType::Bool, &[])),
+            locals: ee.make_locals_sig(&[]),
+        };
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 0);
+    }
+
+    #[test]
+    fn is_reference_or_contains_references_of_a_gc_struct_is_one() {
+        let (mut ee, c) = struct_ee(16, &[(0, true)], None);
+        ee.class_attribs_overrides.insert(
+            c.as_raw() as usize,
+            ClassAttribs::VALUECLASS | ClassAttribs::CONTAINS_GC_PTR,
+        );
+        iror_fixture(&mut ee, c);
+        let info = MethodInfo {
+            ftn: MethodHandle::from_raw(1usize as ffi::CORINFO_METHOD_HANDLE).unwrap(),
+            il: IROR_IL.to_vec(),
+            max_stack: 8,
+            eh_count: 0,
+            init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
+            args: ee.make_method_sig(&sig(CorInfoType::Bool, &[])),
+            locals: ee.make_locals_sig(&[]),
+        };
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 1);
+    }
+
+    #[test]
+    fn is_reference_or_contains_references_of_a_primitive_is_zero() {
+        let (mut ee, c) = struct_ee(2, &[], None);
+        // The char stand-in: a value class with a primitive CorInfoType.
+        ee.class_cor_info_types
+            .insert(c.as_raw() as usize, CorInfoType::Char);
+        iror_fixture(&mut ee, c);
+        let info = MethodInfo {
+            ftn: MethodHandle::from_raw(1usize as ffi::CORINFO_METHOD_HANDLE).unwrap(),
+            il: IROR_IL.to_vec(),
+            max_stack: 8,
+            eh_count: 0,
+            init_locals: false,
+            generics_context: None,
+            generics_context_keep_alive: false,
+            args: ee.make_method_sig(&sig(CorInfoType::Bool, &[])),
+            locals: ee.make_locals_sig(&[]),
+        };
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 0);
+    }
+
+    /// Without the call-sig instantiation the name+shape match is not
+    /// enough: the same call is an ordinary direct call.
+    #[test]
+    fn is_reference_or_contains_references_without_the_instantiation_is_a_plain_call() {
+        let (mut ee, info) = fixture(&IROR_IL, &sig(CorInfoType::Bool, &[]), &[]);
+        let handle = ee.add_method(IROR_TOKEN, sig(CorInfoType::Bool, &[]));
+        ee.method_name = Some("IsReferenceOrContainsReferences".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            (
+                "RuntimeHelpers".into(),
+                Some("System.Runtime.CompilerServices".into()),
+            ),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let m = import(&info, &ee).expect("imports");
+        assert!(matches!(
+            return_value(&m, 0),
+            hir::Expr::Call {
+                target: CallTarget::Direct(_),
+                ..
+            }
+        ));
+    }
+
+    /// The X86-tree `get_IsSupported` expansion (step_11.14 phase 2):
+    /// every family answers `false` from X86_ISA_SUPPORTED — the top-level
+    /// classes by their own name, the nested X64/Wide classes by the
+    /// enclosing family's.
+    fn is_supported_fixture(
+        ee: &mut MockEe,
+        class_name: &str,
+        class_ns: Option<&str>,
+    ) -> MethodHandle {
+        let handle = ee.add_method(0x0600_0039, sig(CorInfoType::Bool, &[]));
+        ee.method_name = Some("get_IsSupported".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            (class_name.into(), class_ns.map(str::to_string)),
+        );
+        ee.method_namespaces.insert(
+            handle.as_raw() as usize,
+            "System.Runtime.Intrinsics.X86".into(),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        handle
+    }
+
+    /// call get_IsSupported; ret — in a bool-returning method.
+    const ISSUP_IL: [u8; 6] = [0x28, 0x39, 0x00, 0x00, 0x06, 0x2A];
+
+    #[test]
+    fn x86_is_supported_expands_to_false_for_a_top_level_family() {
+        let (mut ee, info) = fixture(&ISSUP_IL, &sig(CorInfoType::Bool, &[]), &[]);
+        is_supported_fixture(&mut ee, "Sse41", Some("System.Runtime.Intrinsics.X86"));
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 0);
+    }
+
+    #[test]
+    fn x86_is_supported_expands_to_false_for_a_nested_x64_class() {
+        let (mut ee, info) = fixture(&ISSUP_IL, &sig(CorInfoType::Bool, &[]), &[]);
+        // Sse41.X64: the class query's namespace is empty for nested
+        // types; the family comes from the enclosing-class walk.
+        let handle = is_supported_fixture(&mut ee, "X64", None);
+        ee.method_enclosing_classes
+            .insert(handle.as_raw() as usize, "Sse41".into());
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 0);
+    }
+
+    /// A `get_IsSupported` outside the X86 tree (the Arm family's) is not
+    /// RokaJIT's to answer: no expansion, an ordinary direct call.
+    #[test]
+    fn non_x86_is_supported_is_a_plain_call() {
+        let (mut ee, info) = fixture(&ISSUP_IL, &sig(CorInfoType::Bool, &[]), &[]);
+        let handle = ee.add_method(0x0600_0039, sig(CorInfoType::Bool, &[]));
+        ee.method_name = Some("get_IsSupported".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            (
+                "AdvSimd".into(),
+                Some("System.Runtime.Intrinsics.Arm".into()),
+            ),
+        );
+        ee.method_namespaces.insert(
+            handle.as_raw() as usize,
+            "System.Runtime.Intrinsics.Arm".into(),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let m = import(&info, &ee).expect("imports");
+        assert!(matches!(
+            return_value(&m, 0),
+            hir::Expr::Call {
+                target: CallTarget::Direct(_),
+                ..
+            }
+        ));
+    }
+
+    /// X86Serialize flipped true with its leaf expansion (step_11.14
+    /// phase 3 stragglers): the top-level family AND the nested X64
+    /// class answer `true` (the reference's answer on this SERIALIZE
+    /// host).
+    #[test]
+    fn x86_serialize_is_supported_expands_to_true() {
+        let (mut ee, info) = fixture(&ISSUP_IL, &sig(CorInfoType::Bool, &[]), &[]);
+        is_supported_fixture(
+            &mut ee,
+            "X86Serialize",
+            Some("System.Runtime.Intrinsics.X86"),
+        );
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 1);
+
+        let (mut ee, info) = fixture(&ISSUP_IL, &sig(CorInfoType::Bool, &[]), &[]);
+        let handle = is_supported_fixture(&mut ee, "X64", None);
+        ee.method_enclosing_classes
+            .insert(handle.as_raw() as usize, "X86Serialize".into());
+        let m = import(&info, &ee).expect("imports");
+        assert_eq!(as_i32(return_value(&m, 0)), 1);
+    }
+
+    /// `X86Serialize.Serialize()`: the call expands to the instruction
+    /// statement (Eval(Serialize)) — nothing else in the family changes
+    /// (Serialize is its only leaf).
+    #[test]
+    fn x86_serialize_leaf_expands_to_the_instruction() {
+        // call Serialize(); ret — in a void method.
+        let il = [0x28, 0x3A, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[]);
+        let handle = ee.add_method(0x0600_003A, sig(CorInfoType::Void, &[]));
+        ee.method_name = Some("Serialize".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            (
+                "X86Serialize".into(),
+                Some("System.Runtime.Intrinsics.X86".into()),
+            ),
+        );
+        ee.method_namespaces.insert(
+            handle.as_raw() as usize,
+            "System.Runtime.Intrinsics.X86".into(),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let m = import(&info, &ee).expect("imports");
+        assert!(
+            matches!(
+                m.blocks[0].stmts[0].kind,
+                hir::StmtKind::Eval(hir::Expr::Serialize)
+            ),
+            "the serialize statement"
+        );
+    }
+
+    /// `Single.MultiplyAddEstimate(a, b, c)` (step_11.14 phase 3
+    /// stragglers): the self-recursive [Intrinsic] expands to the exact
+    /// fused fma through the double intermediate —
+    /// `conv.r4(conv.r8(a) * conv.r8(b) + conv.r8(c))`. The MathF
+    /// overload shares the shape; the DOUBLE overload is the named gate
+    /// (no exact wider intermediate for the reference's fused answer).
+    #[test]
+    fn multiply_add_estimate_f32_expands_through_the_double_intermediate() {
+        // ldarg.0; ldarg.1; ldarg.2; call MultiplyAddEstimate; ret.
+        let il = [0x02, 0x03, 0x04, 0x28, 0x3B, 0x00, 0x00, 0x06, 0x2A];
+        let f32_sig = sig(
+            CorInfoType::Float,
+            &[CorInfoType::Float, CorInfoType::Float, CorInfoType::Float],
+        );
+        for class in ["Single", "MathF"] {
+            let (mut ee, info) = fixture(&il, &f32_sig, &[]);
+            let handle = ee.add_method(0x0600_003B, f32_sig.clone());
+            ee.method_name = Some("MultiplyAddEstimate".into());
+            ee.class_names.insert(
+                handle.as_raw() as usize,
+                (class.into(), Some("System".into())),
+            );
+            ee.intrinsic_methods.insert(handle.as_raw() as usize);
+            let m = import(&info, &ee).expect("imports");
+            let (to, _, _, sum) = as_conv(return_value(&m, 0));
+            assert_eq!(to, Type::Float, "{class}: the final narrowing");
+            let (BinaryOp::Add, product, addend) = as_binary(sum) else {
+                panic!("{class}: the add")
+            };
+            let (to, _, _, c) = as_conv(addend);
+            assert_eq!(to, Type::Double, "{class}: the widened addend");
+            assert_eq!(as_local(c), LocalId(2));
+            let (BinaryOp::Mul, a, b) = as_binary(product) else {
+                panic!("{class}: the exact double product")
+            };
+            let (to, _, _, a) = as_conv(a);
+            assert_eq!(to, Type::Double, "{class}: the widened left");
+            assert_eq!(as_local(a), LocalId(0));
+            let (to, _, _, b) = as_conv(b);
+            assert_eq!(to, Type::Double, "{class}: the widened right");
+            assert_eq!(as_local(b), LocalId(1));
+        }
+
+        // The double overload: the named gate, never the approximation.
+        let f64_sig = sig(
+            CorInfoType::Double,
+            &[
+                CorInfoType::Double,
+                CorInfoType::Double,
+                CorInfoType::Double,
+            ],
+        );
+        for class in ["Double", "Math"] {
+            let (mut ee, info) = fixture(&il, &f64_sig, &[]);
+            let handle = ee.add_method(0x0600_003B, f64_sig.clone());
+            ee.method_name = Some("MultiplyAddEstimate".into());
+            ee.class_names.insert(
+                handle.as_raw() as usize,
+                (class.into(), Some("System".into())),
+            );
+            ee.intrinsic_methods.insert(handle.as_raw() as usize);
+            assert!(
+                matches!(import(&info, &ee), Err(CompileError::Unsupported(_))),
+                "{class}: the double overload is gated"
+            );
+        }
+    }
 
     const GADR_TOKEN: u32 = 0x0600_0034;
 
@@ -17073,10 +21679,11 @@ mod tests {
         ));
     }
 
-    /// `Vector.IsHardwareAccelerated`: the self-recursive [Intrinsic] body
-    /// (Vector.cs:24) expands to `false` — RokaJIT expands no SIMD (the
-    /// NI_IsSupported_False stance), short-circuiting CoreLib's vector
-    /// guards onto the scalar fallback paths.
+    /// `Vector512.IsHardwareAccelerated`: the self-recursive [Intrinsic]
+    /// body (Vector512.cs) expands to `false` — AVX-512 is out (this host
+    /// lacks it; the reference answers false too). The flipped families'
+    /// classes (Vector128/256, System.Numerics.Vector) answer true —
+    /// covered by `flipped_families_answer_supported`.
     #[test]
     fn is_hardware_accelerated_intrinsic_expands_to_false() {
         // call get_IsHardwareAccelerated; ret — in a bool-returning method.
@@ -17086,7 +21693,7 @@ mod tests {
         ee.method_name = Some("get_IsHardwareAccelerated".into());
         ee.class_names.insert(
             handle.as_raw() as usize,
-            ("Vector".into(), Some("System.Numerics".into())),
+            ("Vector512".into(), Some("System.Runtime.Intrinsics".into())),
         );
         ee.intrinsic_methods.insert(handle.as_raw() as usize);
         let m = import(&info, &ee).expect("imports");

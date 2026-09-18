@@ -49,6 +49,8 @@ pub struct MockSig {
 pub struct MockArg {
     pub ty: CorInfoType,
     pub class: Option<ClassHandle>,
+    /// The `CORINFO_TYPE_MOD_PINNED` bit (a `fixed` local).
+    pub pinned: bool,
 }
 
 /// A canned value class (step_10.9): the layout and SysV descriptor facts
@@ -136,6 +138,11 @@ pub struct MockField {
 pub struct MockEe {
     pub method_attribs: MethodAttribs,
     pub class_attribs: ClassAttribs,
+    /// Per-class `get_class_attribs` overrides (step_11.14: one fixture
+    /// mixing a GC-pointer-carrying struct with a plain one), keyed by
+    /// the class handle's raw value; absent handles answer
+    /// `class_attribs`.
+    pub class_attribs_overrides: HashMap<usize, ClassAttribs>,
     pub method_name: Option<String>,
     /// Canned methods for `resolve_token`/`get_call_info`/`get_method_sig`,
     /// keyed by metadata token.
@@ -208,6 +215,11 @@ pub struct MockEe {
     /// keep the default (ValueClass if registered in `classes`, Class
     /// otherwise).
     pub class_cor_info_types: HashMap<usize, CorInfoType>,
+    /// Canned `get_type_instantiation_argument` answers (step_11.14
+    /// phase 3: the vector element type of a `Vector128<T>` handle),
+    /// keyed by (class handle raw value, index); absent keys answer
+    /// `None`.
+    pub type_inst_args: HashMap<(usize, u32), ClassHandle>,
     /// Canned directly-callable entry points for `get_function_entry_point`
     /// (step_07.5 codegen tests), keyed by the method handle's raw value.
     /// Absent handles get a zeroed lookup (`IAT_VALUE`, null address).
@@ -284,6 +296,10 @@ pub struct MockEe {
     /// keyed by the method handle's raw value; absent handles answer
     /// `None`.
     pub method_namespaces: HashMap<usize, String>,
+    /// Canned `get_method_declaring_enclosing_class_name` answers
+    /// (step_11.14 — the nested X64/Wide fixtures), keyed by the method
+    /// handle's raw value; absent handles answer `None` (non-nested).
+    pub method_enclosing_classes: HashMap<usize, String>,
     /// The constrained-token operand each `get_call_info` call arrived
     /// with (its metadata token; 0 when the call had no `constrained.`
     /// prefix), in order (step_11.3C).
@@ -365,12 +381,24 @@ impl MockEe {
     /// Registers one argument list, pairing each type with its value-class
     /// handle (padded with `None`).
     fn push_arg_list(&mut self, args: &[CorInfoType], classes: &[Option<ClassHandle>]) -> usize {
+        self.push_arg_list_pinned(args, classes, &[])
+    }
+
+    /// [`MockEe::push_arg_list`] with per-argument pinned bits (empty =
+    /// none pinned).
+    fn push_arg_list_pinned(
+        &mut self,
+        args: &[CorInfoType],
+        classes: &[Option<ClassHandle>],
+        pins: &[bool],
+    ) -> usize {
         let list = args
             .iter()
             .enumerate()
             .map(|(i, &ty)| MockArg {
                 ty,
                 class: classes.get(i).copied().flatten(),
+                pinned: pins.get(i).copied().unwrap_or(false),
             })
             .collect();
         self.arg_lists.push(list);
@@ -491,6 +519,22 @@ impl MockEe {
     /// (step_10.9; shorter-than-`locals` is padded with `None`).
     pub fn make_locals_sig(&mut self, locals: &[CorInfoType]) -> ffi::CORINFO_SIG_INFO {
         self.make_locals_sig_with_classes(locals, &[])
+    }
+
+    /// The pinned-local form of [`MockEe::make_locals_sig`]: `pins[i]`
+    /// marks local `i` with `CORINFO_TYPE_MOD_PINNED` (a `fixed` local).
+    pub fn make_locals_sig_pinned(
+        &mut self,
+        locals: &[CorInfoType],
+        pins: &[bool],
+    ) -> ffi::CORINFO_SIG_INFO {
+        let arg_list = self.push_arg_list_pinned(locals, &[], pins);
+        self.build_sig_info(
+            ffi::CorInfoCallConv_CORINFO_CALLCONV_LOCAL_SIG,
+            CorInfoType::Void,
+            None,
+            arg_list,
+        )
     }
 
     /// The class-carrying form of [`MockEe::make_locals_sig`].

@@ -61,6 +61,13 @@ pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
                     certify_expr(array)?;
                     certify_expr(index)?;
                 }
+                hir::StmtKind::DivRem {
+                    lo, hi, divisor, ..
+                } => {
+                    certify_expr(lo)?;
+                    certify_expr(hi)?;
+                    certify_expr(divisor)?;
+                }
                 hir::StmtKind::Eval(expr) => certify_expr(expr)?,
             }
         }
@@ -104,6 +111,7 @@ fn certify_expr(expr: &hir::Expr) -> CompileResult<()> {
             certify_expr(rhs)?;
         }
         hir::Expr::Conv { arg, .. } => certify_expr(arg)?,
+        hir::Expr::ConvRne { arg, .. } => certify_expr(arg)?,
         hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => certify_expr(arg)?,
         hir::Expr::Call { target, sig, args } => {
             if let CallTarget::Indirect(addr) = target {
@@ -126,6 +134,21 @@ fn certify_expr(expr: &hir::Expr) -> CompileResult<()> {
         }
         hir::Expr::Cast { arg, .. } | hir::Expr::Box { arg, .. } => certify_expr(arg)?,
         hir::Expr::StructVal { addr, .. } => certify_expr(addr)?,
+        hir::Expr::AtomicCmpXchg {
+            addr,
+            value,
+            comparand,
+            ..
+        } => {
+            certify_expr(addr)?;
+            certify_expr(value)?;
+            certify_expr(comparand)?;
+        }
+        hir::Expr::AtomicXchg { addr, value, .. } | hir::Expr::AtomicXadd { addr, value, .. } => {
+            certify_expr(addr)?;
+            certify_expr(value)?;
+        }
+        hir::Expr::MemoryFence | hir::Expr::Serialize => {}
         hir::Expr::LocAlloc { size } => certify_expr(size)?,
         hir::Expr::FtnAddr { entry, .. } => certify_expr(entry)?,
     }

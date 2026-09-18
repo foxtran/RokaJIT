@@ -46,7 +46,7 @@
 //! (the call site is also a GC safepoint, drained from codegen's records).
 
 use crate::inst::{ArithFOp, CondCode, FWidth, Width};
-use crate::regs::{Gpr, Xmm};
+use crate::regs::{Gpr, Xmm, STACK_POINTER};
 use rokajit::lower::Label;
 use rokajit_ee::handles::MethodHandle;
 use std::collections::HashMap;
@@ -690,6 +690,12 @@ impl Asm {
         self.emit_sse(prefix, false, dst as u8, src, 0x57);
     }
 
+    /// `sqrtss`/`sqrtsd dst, src` (`0F 51 /r`, F3/F2): the correctly
+    /// rounded IEEE square root.
+    pub fn sqrt_f(&mut self, width: FWidth, dst: Xmm, src: RmX) {
+        self.emit_sse(sse_prefix(width), false, dst as u8, src, 0x51);
+    }
+
     /// `cvtsi2ss`/`cvtsi2sd dst, src` (`0F 2A /r`, F3/F2): signed integer
     /// to float. `src_w64` selects the 64-bit integer source (REX.W).
     pub fn cvtsi2s(&mut self, width: FWidth, dst: Xmm, src: Rm, src_w64: bool) {
@@ -704,6 +710,14 @@ impl Asm {
     /// destination (REX.W).
     pub fn cvtts2si(&mut self, width: FWidth, dst: Gpr, src: RmX, dst_w64: bool) {
         self.emit_sse(sse_prefix(width), dst_w64, dst as u8, src, 0x2C);
+    }
+
+    /// `cvtss2si`/`cvtsd2si dst, src` (`0F 2D /r`, F3/F2): float to
+    /// integer with MXCSR rounding (nearest-even by default) — the
+    /// Sse.ConvertToInt32 expansion's semantics. Same operands and
+    /// integer-indefinite rule as [`Asm::cvtts2si`].
+    pub fn cvts2si(&mut self, width: FWidth, dst: Gpr, src: RmX, dst_w64: bool) {
+        self.emit_sse(sse_prefix(width), dst_w64, dst as u8, src, 0x2D);
     }
 
     /// `cvtss2sd` (to `FWidth::D`, F3) / `cvtsd2ss` (to `FWidth::S`, F2)
@@ -1023,6 +1037,135 @@ impl Asm {
         self.emit_modrm_insn(false, dst as u8, Rm::Mem(src), &[0x0F, opcode]);
     }
 
+    /// `movzx r32, r8` (`0F B6 /r`) or `movzx r32, r16` (`0F B7 /r`) —
+    /// the register-register form (the atomic ops' narrow results). The
+    /// 8-bit form always carries a REX prefix so `sil`/`dil` and r8+
+    /// stay encodable (the `mov_store_narrow` precedent).
+    pub fn movzx_reg(&mut self, size: u8, dst: Gpr, src: Gpr) {
+        let opcode = match size {
+            1 => 0xB6,
+            2 => 0xB7,
+            _ => unreachable!("movzx_reg covers 1- and 2-byte registers"),
+        };
+        let enc = encode_modrm(false, dst as u8, Rm::Reg(src));
+        if size == 1 || enc.rex != 0 {
+            self.emit_u8(0x40 | enc.rex);
+        }
+        self.emit_u8(0x0F);
+        self.emit_u8(opcode);
+        self.emit_modrm_tail(enc);
+    }
+
+    /// `movsx dst, src` — the signed form of [`Self::movzx_reg`]
+    /// (`0F BE /r` byte, `0F BF /r` word), for the signed narrow
+    /// Interlocked cell types (`sbyte`/`short`): the atomic instruction
+    /// writes only the low bytes of its result register, and the IL
+    /// stack answer for a signed cell is the sign-extended value
+    /// (RyuJIT's `varTypeIsSigned → INS_movsx`, codegenxarch.cpp:4388-4392).
+    pub fn movsx_reg(&mut self, size: u8, dst: Gpr, src: Gpr) {
+        let opcode = match size {
+            1 => 0xBE,
+            2 => 0xBF,
+            _ => unreachable!("movsx_reg covers 1- and 2-byte registers"),
+        };
+        let enc = encode_modrm(false, dst as u8, Rm::Reg(src));
+        if size == 1 || enc.rex != 0 {
+            self.emit_u8(0x40 | enc.rex);
+        }
+        self.emit_u8(0x0F);
+        self.emit_u8(opcode);
+        self.emit_modrm_tail(enc);
+    }
+
+    /// `lock cmpxchg [addr], value` — the Interlocked.CompareExchange
+    /// machine instruction (RyuJIT's `INS_lock` + `INS_cmpxchg`,
+    /// codegenxarch.cpp:4384-4386): the comparand is implicit in
+    /// `al`/`ax`/`eax`/`rax`, the old cell value lands there. `bits` is
+    /// 8/16/32/64: `0F B0 /r` for the byte form, else `0F B1 /r` with
+    /// the 66 prefix (16-bit) or REX.W (64-bit). The 8-bit form always
+    /// carries REX so `sil`/`dil`/r8+ value registers encode.
+    pub fn lock_cmpxchg(&mut self, bits: u8, addr: Gpr, value: Gpr) {
+        self.emit_u8(0xF0);
+        if bits == 16 {
+            self.emit_u8(0x66);
+        }
+        let wide = bits == 64;
+        let enc = encode_mem(
+            (if wide { 0b1000 } else { 0 }) | ((value as u8 >> 3) << 2),
+            value as u8,
+            Mem::base(addr),
+        );
+        if enc.rex != 0 || bits == 8 {
+            self.emit_u8(0x40 | enc.rex);
+        }
+        self.emit_u8(0x0F);
+        self.emit_u8(if bits == 8 { 0xB0 } else { 0xB1 });
+        self.emit_modrm_tail(enc);
+    }
+
+    /// `xchg [addr], value` — Interlocked.Exchange's machine instruction
+    /// (RyuJIT's GT_XCHG → `INS_xchg`): implicitly locked with a memory
+    /// operand, no `lock` prefix needed. `86 /r` for the byte form, else
+    /// `87 /r` with 66/REX.W. The old cell value lands in `value`'s
+    /// register. Same 8-bit REX rule as [`Asm::lock_cmpxchg`].
+    pub fn xchg_mem(&mut self, bits: u8, addr: Gpr, value: Gpr) {
+        if bits == 16 {
+            self.emit_u8(0x66);
+        }
+        let wide = bits == 64;
+        let enc = encode_mem(
+            (if wide { 0b1000 } else { 0 }) | ((value as u8 >> 3) << 2),
+            value as u8,
+            Mem::base(addr),
+        );
+        if enc.rex != 0 || bits == 8 {
+            self.emit_u8(0x40 | enc.rex);
+        }
+        self.emit_u8(if bits == 8 { 0x86 } else { 0x87 });
+        self.emit_modrm_tail(enc);
+    }
+
+    /// `lock xadd [addr], value` — Interlocked.ExchangeAdd's machine
+    /// instruction (RyuJIT's GT_XADD): the cell gets `old + value`, the
+    /// OLD value lands in `value`'s register. `0F C0 /r` for the byte
+    /// form, else `0F C1 /r` with 66/REX.W. Same 8-bit REX rule.
+    pub fn lock_xadd(&mut self, bits: u8, addr: Gpr, value: Gpr) {
+        self.emit_u8(0xF0);
+        if bits == 16 {
+            self.emit_u8(0x66);
+        }
+        let wide = bits == 64;
+        let enc = encode_mem(
+            (if wide { 0b1000 } else { 0 }) | ((value as u8 >> 3) << 2),
+            value as u8,
+            Mem::base(addr),
+        );
+        if enc.rex != 0 || bits == 8 {
+            self.emit_u8(0x40 | enc.rex);
+        }
+        self.emit_u8(0x0F);
+        self.emit_u8(if bits == 8 { 0xC0 } else { 0xC1 });
+        self.emit_modrm_tail(enc);
+    }
+
+    /// `lock or dword [rsp], 0` — the Interlocked.MemoryBarrier full
+    /// fence (RyuJIT's instGen_MemoryBarrier BARRIER_FULL,
+    /// codegenxarch.cpp:11552): F0 83 0C 24 00.
+    pub fn lock_fence(&mut self) {
+        self.emit_u8(0xF0);
+        self.emit_modrm_insn(false, 1, Rm::Mem(Mem::base(STACK_POINTER)), &[0x83]);
+        self.emit_u8(0);
+    }
+
+    /// `serialize` (`0F 01 E8`) — the `X86Serialize.Serialize()`
+    /// expansion: a one-off fixed encoding, no operands (verified
+    /// against GNU as: `serialize` assembles to exactly these bytes).
+    pub fn serialize(&mut self) {
+        self.emit_u8(0x0F);
+        self.emit_u8(0x01);
+        self.emit_u8(0xE8);
+    }
+
     /// `mov r/m8, r8` (`88 /r`) or `mov r/m16, r16` (`66 89 /r`) — the
     /// narrow block-copy stores (step_10.9). The 8-bit form always carries
     /// a REX prefix so `sil`/`dil` and r8+ stay encodable.
@@ -1102,8 +1245,104 @@ mod tests {
         asm.finalize().expect("all labels bound").bytes
     }
 
-    // ---- narrow block-copy moves (step_10.9) ----
+    // ---- the Interlocked atomics (step_11.15 follow-up) ----
 
+    /// Expected bytes cross-checked with GNU `as`/`objdump` (the
+    /// `mov_store_narrow` precedent): every form below was assembled by
+    /// `as` and its bytes lifted verbatim.
+    #[test]
+    fn lock_cmpxchg_forms() {
+        // lock cmpxchg %edx, (%rcx)
+        assert_eq!(
+            finish(|a| a.lock_cmpxchg(32, Rcx, Rdx)),
+            [0xF0, 0x0F, 0xB1, 0x11]
+        );
+        // lock cmpxchg %r9, (%r8) — REX.W | REX.R | REX.B
+        assert_eq!(
+            finish(|a| a.lock_cmpxchg(64, R8, R9)),
+            [0xF0, 0x4D, 0x0F, 0xB1, 0x08]
+        );
+        // lock cmpxchg %sil, (%rax) — the byte form always carries REX
+        assert_eq!(
+            finish(|a| a.lock_cmpxchg(8, Rax, Rsi)),
+            [0xF0, 0x40, 0x0F, 0xB0, 0x30]
+        );
+        // lock cmpxchg %ax, (%rdx) — the 66 prefix
+        assert_eq!(
+            finish(|a| a.lock_cmpxchg(16, Rdx, Rax)),
+            [0xF0, 0x66, 0x0F, 0xB1, 0x02]
+        );
+    }
+
+    #[test]
+    fn xchg_mem_forms() {
+        // xchg %edx, (%rcx) — implicitly locked, no F0
+        assert_eq!(finish(|a| a.xchg_mem(32, Rcx, Rdx)), [0x87, 0x11]);
+        // xchg %rax, (%rdx)
+        assert_eq!(finish(|a| a.xchg_mem(64, Rdx, Rax)), [0x48, 0x87, 0x02]);
+        // xchg %r8b, (%rax) — REX.R for the high value register
+        assert_eq!(finish(|a| a.xchg_mem(8, Rax, R8)), [0x44, 0x86, 0x00]);
+    }
+
+    #[test]
+    fn lock_xadd_forms() {
+        // lock xadd %edx, (%rcx)
+        assert_eq!(
+            finish(|a| a.lock_xadd(32, Rcx, Rdx)),
+            [0xF0, 0x0F, 0xC1, 0x11]
+        );
+        // lock xadd %rdx, (%rcx)
+        assert_eq!(
+            finish(|a| a.lock_xadd(64, Rcx, Rdx)),
+            [0xF0, 0x48, 0x0F, 0xC1, 0x11]
+        );
+    }
+
+    #[test]
+    fn lock_fence_is_the_stack_top_or() {
+        // lock orl $0, (%rsp)
+        assert_eq!(finish(|a| a.lock_fence()), [0xF0, 0x83, 0x0C, 0x24, 0x00]);
+    }
+
+    #[test]
+    fn serialize_is_the_fixed_three_byte_encoding() {
+        // GNU as: `serialize` → 0F 01 E8 (no prefixes, no ModRM).
+        assert_eq!(finish(|a| a.serialize()), [0x0F, 0x01, 0xE8]);
+    }
+
+    #[test]
+    fn movzx_reg_forms() {
+        // movzbl %al, %ecx — the byte form always carries REX
+        assert_eq!(
+            finish(|a| a.movzx_reg(1, Rcx, Rax)),
+            [0x40, 0x0F, 0xB6, 0xC8]
+        );
+        // movzwl %ax, %ecx
+        assert_eq!(finish(|a| a.movzx_reg(2, Rcx, Rax)), [0x0F, 0xB7, 0xC8]);
+        // movzbl %r10b, %r9d — REX.R | REX.B
+        assert_eq!(
+            finish(|a| a.movzx_reg(1, R9, R10)),
+            [0x45, 0x0F, 0xB6, 0xCA]
+        );
+    }
+
+    #[test]
+    fn movsx_reg_forms() {
+        // movsbl %al, %ecx — the byte form always carries REX
+        assert_eq!(
+            finish(|a| a.movsx_reg(1, Rcx, Rax)),
+            [0x40, 0x0F, 0xBE, 0xC8]
+        );
+        // movswl %ax, %ecx
+        assert_eq!(finish(|a| a.movsx_reg(2, Rcx, Rax)), [0x0F, 0xBF, 0xC8]);
+        // movsbl %r10b, %r9d — REX.R | REX.B
+        assert_eq!(
+            finish(|a| a.movsx_reg(1, R9, R10)),
+            [0x45, 0x0F, 0xBE, 0xCA]
+        );
+    }
+
+    // ---- narrow block-copy moves (step_10.9) ----
     #[test]
     fn movzx_load_forms() {
         // movzxb -4(%rbp), %eax
@@ -2082,6 +2321,25 @@ mod tests {
     }
 
     #[test]
+    fn sqrt_forms() {
+        // sqrtss %xmm3, %xmm15 — F3 + REX.R (GNU as: f3 44 0f 51 fb).
+        assert_eq!(
+            finish(|a| a.sqrt_f(S, Xmm15, RmX::Reg(Xmm3))),
+            [0xF3, 0x44, 0x0F, 0x51, 0xFB]
+        );
+        // sqrtsd (%rax), %xmm15 — F2 + REX.R.
+        assert_eq!(
+            finish(|a| a.sqrt_f(D, Xmm15, RmX::Mem(Mem::base(Rax)))),
+            [0xF2, 0x44, 0x0F, 0x51, 0x38]
+        );
+        // sqrtsd %xmm5, %xmm2 — F2, no REX.
+        assert_eq!(
+            finish(|a| a.sqrt_f(D, Xmm2, RmX::Reg(Xmm5))),
+            [0xF2, 0x0F, 0x51, 0xD5]
+        );
+    }
+
+    #[test]
     fn cvt_forms() {
         // cvtsi2sdl %eax, %xmm0
         assert_eq!(
@@ -2112,6 +2370,21 @@ mod tests {
         assert_eq!(
             finish(|a| a.cvtts2si(S, Rcx, RmX::Reg(Xmm2), false)),
             [0xF3, 0x0F, 0x2C, 0xCA]
+        );
+        // cvtss2si %xmm2, %ecx — the RNE form (0F 2D).
+        assert_eq!(
+            finish(|a| a.cvts2si(S, Rcx, RmX::Reg(Xmm2), false)),
+            [0xF3, 0x0F, 0x2D, 0xCA]
+        );
+        // cvtsd2si %xmm0, %rax — RNE, 64-bit destination.
+        assert_eq!(
+            finish(|a| a.cvts2si(D, Rax, RmX::Reg(Xmm0), true)),
+            [0xF2, 0x48, 0x0F, 0x2D, 0xC0]
+        );
+        // cvtss2si -8(%rbp), %eax — memory source.
+        assert_eq!(
+            finish(|a| a.cvts2si(S, Rax, RmX::Mem(Mem::base_disp(Rbp, -8)), false)),
+            [0xF3, 0x0F, 0x2D, 0x45, 0xF8]
         );
         // cvtss2sd %xmm1, %xmm0 — F3 (the prefix names the source width).
         assert_eq!(

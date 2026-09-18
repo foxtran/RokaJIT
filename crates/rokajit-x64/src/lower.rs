@@ -573,6 +573,65 @@ rokajit::lower_rules! {
             rhs: r,
         }];
 
+    /// `t := Interlocked.CompareExchange(addr, value, comparand)` — the
+    /// importer's self-recursive-[Intrinsic] expansion (step_11.15
+    /// follow-up): the comparand rides `rax` into the `lock cmpxchg`
+    /// (the idiv fixed-duty precedent — the explicit move declares the
+    /// duty to `fixed_gprs`), and the descriptor emits the rest.
+    rule atomic_cmpxchg: AtomicCmpXchg { dst, addr, value, comparand, bits, signed }
+        if let (Some(a), Some(v), Some(c)) = (
+            operand_src(*addr),
+            operand_src(*value),
+            operand_src(*comparand),
+        )
+        => |_| vec![
+            Inst::Mov {
+                width: if *bits == 64 { Width::W64 } else { Width::W32 },
+                dst: Place::Reg(Gpr::Rax),
+                src: c,
+            },
+            Inst::CmpXchg {
+                bits: *bits,
+                signed: *signed,
+                dst: Place::Val(Val(*dst)),
+                addr: a,
+                value: v,
+            },
+        ];
+
+    /// `t := Interlocked.Exchange(addr, value)` — one `xchg` (implicitly
+    /// locked with a memory operand).
+    rule atomic_xchg: AtomicXchg { dst, addr, value, bits, signed }
+        if let (Some(a), Some(v)) = (operand_src(*addr), operand_src(*value))
+        => |_| vec![Inst::Xchg {
+            bits: *bits,
+            signed: *signed,
+            dst: Place::Val(Val(*dst)),
+            addr: a,
+            value: v,
+        }];
+
+    /// `t := Interlocked.ExchangeAdd(addr, value)` — one `lock xadd`.
+    rule atomic_xadd: AtomicXadd { dst, addr, value, bits, signed }
+        if let (Some(a), Some(v)) = (operand_src(*addr), operand_src(*value))
+        => |_| vec![Inst::Xadd {
+            bits: *bits,
+            signed: *signed,
+            dst: Place::Val(Val(*dst)),
+            addr: a,
+            value: v,
+        }];
+
+    /// `Interlocked.MemoryBarrier` — the x64 full fence
+    /// (`lock or dword [rsp], 0`).
+    rule memfence: MemoryFence
+        => |_| vec![Inst::MemFence];
+
+    /// `X86Serialize.Serialize()` — the real `serialize` instruction
+    /// (`0F 01 E8`), a one-off fixed encoding.
+    rule serialize: Serialize
+        => |_| vec![Inst::Serialize];
+
     /// `t := a % b` — the signed-remainder sequence through the
     /// architecture's fixed registers: `rax := a; cdq; idiv b;
     /// t := rdx`. The fixed duties are declared on the descriptors
@@ -720,6 +779,15 @@ rokajit::lower_rules! {
             src: s,
         }];
 
+    /// `t := sqrt(a)` on floats (the Sse/Avx `Sqrt` leaf expansion).
+    rule sqrt_f: Unary { dst, op: rokajit::ir::UnaryOp::Sqrt, src }
+        if let (Some(w), Some(s)) = (fwidth_of(cx, *dst), xmm_opnd(cx, *src))
+        => |_| vec![Inst::SqrtF {
+            width: w,
+            dst: XmmPlace::Val(Val(*dst)),
+            src: s,
+        }];
+
     /// `t := (a cmp b)` — compare-as-a-value (`ceq`/`cgt`/`clt`/…): the
     /// flags materialization of `branch_cmp`, with `setcc` consuming them
     /// into an Int32 0/1. Producer and consumer are adjacent by
@@ -756,6 +824,48 @@ rokajit::lower_rules! {
             },
         ];
 
+    /// `t := rne(a)` — the LIR `ConvRne` (the hardware-intrinsic
+    /// expansions' `Sse.ConvertToInt32` & co.): `cvtss2si`/`cvtsd2si`,
+    /// MXCSR rounding (nearest-even), not `conv.*`'s truncation. Same
+    /// operand rule as `conv_f_to_i`.
+    rule conv_rne: ConvRne { dst, to, src }
+        if let (Some(w64), Some(w), Some(s)) = (
+            match to {
+                Type::Int32 => Some(false),
+                Type::Int64 | Type::NativeInt => Some(true),
+                _ => None,
+            },
+            operand_fwidth(cx, *src),
+            xmm_opnd(cx, *src),
+        )
+        => |_| vec![Inst::CvtFToIntRne {
+            src_width: w,
+            dst_w64: w64,
+            dst: Place::Val(Val(*dst)),
+            src: s,
+        }];
+
+    /// `q, r := hi:lo / divisor` — the LIR `DivRem` (X86Base.X64.DivRem):
+    /// the full `rdx:rax` dividend (hi preloaded into `rdx`, not zeroed),
+    /// both results captured. #DE on a zero divisor/quotient overflow is
+    /// the hardware trap, the `idiv` precedent.
+    rule divrem128: DivRem { dst_q, dst_r, lo, hi, divisor }
+        if let (Some(l), Some(h), Some(d), Some(Width::W64), Some(Width::W64), Some(Width::W64)) = (
+            operand_src(*lo),
+            operand_src(*hi),
+            operand_src(*divisor),
+            operand_width(cx, *lo),
+            operand_width(cx, *hi),
+            operand_width(cx, *divisor),
+        )
+        => |_| vec![
+            Inst::Mov { width: Width::W64, dst: Place::Reg(Gpr::Rax), src: l },
+            Inst::Mov { width: Width::W64, dst: Place::Reg(Gpr::Rdx), src: h },
+            Inst::Div { width: Width::W64, divisor: d },
+            Inst::Mov { width: Width::W64, dst: Place::Val(Val(*dst_q)), src: Src::Reg(Gpr::Rax) },
+            Inst::Mov { width: Width::W64, dst: Place::Val(Val(*dst_r)), src: Src::Reg(Gpr::Rdx) },
+        ];
+
     /// `conv.i4`/`conv.u4` from a 64-bit operand: a 32-bit `mov` keeps the
     /// low half. (Signedness is unobservable in a truncation, and on the
     /// evaluation stack both forms normalize to Int32.)
@@ -782,6 +892,21 @@ rokajit::lower_rules! {
             dst: Place::Val(Val(*dst)),
             src: s,
             signed: !unsigned,
+        }];
+
+    /// Width-preserving 64-bit conv (i64→i64, i64→native int, or a byref
+    /// source — the MaskLoad/Gather expansions' address arithmetic): the
+    /// bits are the answer either way.
+    rule conv_id64: Conv { dst, to, src, .. }
+        if let (true, Some(Width::W64), Some(s)) = (
+            matches!(*to, Type::Int64 | Type::NativeInt),
+            operand_width(cx, *src),
+            operand_src(*src),
+        )
+        => |_| vec![Inst::Mov {
+            width: Width::W64,
+            dst: Place::Val(Val(*dst)),
+            src: s,
         }];
 
     /// `conv.r.un` from a 64-bit operand (u64 → f32/f64): no SSE2
@@ -1489,6 +1614,135 @@ mod tests {
         );
     }
 
+    /// The Interlocked expansions (step_11.15 follow-up): cmpxchg's
+    /// comparand move into rax precedes the descriptor (the idiv
+    /// precedent); xchg/xadd are one descriptor each; the fence is one
+    /// instruction.
+    #[test]
+    fn interlocked_rules_lower_to_the_atomic_descriptors() {
+        let s = stmt(StmtKind::AtomicCmpXchg {
+            dst: LocalId(2),
+            addr: Operand::Local(LocalId(0)),
+            value: Operand::Local(LocalId(1)),
+            comparand: Operand::Local(LocalId(3)),
+            bits: 32,
+            signed: false,
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Reg(Gpr::Rax),
+                    src: vsrc(3),
+                },
+                Inst::CmpXchg {
+                    bits: 32,
+                    signed: false,
+                    dst: val(2),
+                    addr: vsrc(0),
+                    value: vsrc(1),
+                },
+            ])
+        );
+
+        // The signed narrow cell: `signed` rides through to the
+        // descriptor (codegen's movsx-vs-movzx choice).
+        let s = stmt(StmtKind::AtomicCmpXchg {
+            dst: LocalId(2),
+            addr: Operand::Local(LocalId(0)),
+            value: Operand::Local(LocalId(1)),
+            comparand: Operand::Local(LocalId(3)),
+            bits: 8,
+            signed: true,
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Reg(Gpr::Rax),
+                    src: vsrc(3),
+                },
+                Inst::CmpXchg {
+                    bits: 8,
+                    signed: true,
+                    dst: val(2),
+                    addr: vsrc(0),
+                    value: vsrc(1),
+                },
+            ])
+        );
+
+        let s = stmt(StmtKind::AtomicCmpXchg {
+            dst: LocalId(2),
+            addr: Operand::Local(LocalId(0)),
+            value: Operand::Local(LocalId(1)),
+            comparand: Operand::Const(Const::Int64(-1)),
+            bits: 64,
+            signed: false,
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W64,
+                    dst: Place::Reg(Gpr::Rax),
+                    src: Src::Imm(-1),
+                },
+                Inst::CmpXchg {
+                    bits: 64,
+                    signed: false,
+                    dst: val(2),
+                    addr: vsrc(0),
+                    value: vsrc(1),
+                },
+            ])
+        );
+
+        let s = stmt(StmtKind::AtomicXchg {
+            dst: LocalId(2),
+            addr: Operand::Local(LocalId(0)),
+            value: Operand::Local(LocalId(1)),
+            bits: 8,
+            signed: false,
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::Xchg {
+                bits: 8,
+                signed: false,
+                dst: val(2),
+                addr: vsrc(0),
+                value: vsrc(1),
+            }])
+        );
+
+        let s = stmt(StmtKind::AtomicXadd {
+            dst: LocalId(2),
+            addr: Operand::Local(LocalId(0)),
+            value: Operand::Local(LocalId(1)),
+            bits: 32,
+            signed: false,
+        });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::Xadd {
+                bits: 32,
+                signed: false,
+                dst: val(2),
+                addr: vsrc(0),
+                value: vsrc(1),
+            }])
+        );
+
+        let s = stmt(StmtKind::MemoryFence);
+        assert_eq!(lower_one(&s), Some(vec![Inst::MemFence]));
+
+        let s = stmt(StmtKind::Serialize);
+        assert_eq!(lower_one(&s), Some(vec![Inst::Serialize]));
+    }
+
     #[test]
     fn rem_lowers_to_the_idiv_fixed_register_sequence() {
         let s = stmt(StmtKind::Binary {
@@ -1806,7 +2060,9 @@ mod tests {
                 }])
             );
         }
-        // Same-width conversions match no rule (the importer drops them).
+        // Same-width 64-bit conversions (i64→i64/native int, or a byref
+        // source — the MaskLoad/Gather expansions build these directly):
+        // the identity mov.
         let s = stmt(StmtKind::Conv {
             dst: LocalId(4),
             to: Type::Int64,
@@ -1814,7 +2070,38 @@ mod tests {
             unsigned: false,
             src: Operand::Local(LocalId(0)),
         });
-        assert_eq!(lower_with(&locals_mixed(), &s), None);
+        assert_eq!(
+            lower_with(&locals_mixed(), &s),
+            Some(vec![Inst::Mov {
+                width: Width::W64,
+                dst: val(4),
+                src: vsrc(0),
+            }])
+        );
+        // byref → native int (the MaskLoad dummy-address shape).
+        let byref_locals = {
+            let l = |ty: Type, i: u32| hir::Local {
+                ty,
+                kind: hir::LocalKind::IlLocal(i),
+                pinned: false,
+            };
+            vec![l(Type::ByRef, 0), l(Type::NativeInt, 1)]
+        };
+        let s = stmt(StmtKind::Conv {
+            dst: LocalId(1),
+            to: Type::NativeInt,
+            overflow: false,
+            unsigned: false,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_with(&byref_locals, &s),
+            Some(vec![Inst::Mov {
+                width: Width::W64,
+                dst: val(1),
+                src: vsrc(0),
+            }])
+        );
     }
 
     #[test]
@@ -3273,6 +3560,23 @@ mod tests {
     }
 
     #[test]
+    fn float_sqrt_lowers_to_the_sqrt_inst() {
+        let s = stmt(StmtKind::Unary {
+            dst: LocalId(5),
+            op: UnaryOp::Sqrt,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::SqrtF {
+                width: FWidth::D,
+                dst: xval(5),
+                src: xsrc(0),
+            }])
+        );
+    }
+
+    #[test]
     fn float_compare_value_lowers_to_ucomisd_setccf() {
         for op in [
             BinaryOp::Eq,
@@ -3484,6 +3788,81 @@ mod tests {
             src: Operand::Local(LocalId(2)),
         });
         assert_eq!(lower_f(&s), None);
+    }
+
+    #[test]
+    fn conv_rne_lowers_to_the_mxcsr_rounding_descriptor() {
+        // ConvRne to Int32 from a double operand: cvtsd2si, 32-bit dst.
+        let s = stmt(StmtKind::ConvRne {
+            dst: LocalId(5),
+            to: Type::Int32,
+            src: Operand::Local(LocalId(0)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::CvtFToIntRne {
+                src_width: FWidth::D,
+                dst_w64: false,
+                dst: Place::Val(Val(LocalId(5))),
+                src: xsrc(0),
+            }])
+        );
+        // ConvRne to Int64 from a float operand: cvtss2si, 64-bit dst.
+        let s = stmt(StmtKind::ConvRne {
+            dst: LocalId(3),
+            to: Type::Int64,
+            src: Operand::Local(LocalId(3)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![Inst::CvtFToIntRne {
+                src_width: FWidth::S,
+                dst_w64: true,
+                dst: Place::Val(Val(LocalId(3))),
+                src: xsrc(3),
+            }])
+        );
+    }
+
+    #[test]
+    fn divrem_lowers_to_the_full_rdx_rax_divide() {
+        // lo/hi/divisor all the one Int64 local (the fixture's width-4).
+        let s = stmt(StmtKind::DivRem {
+            dst_q: LocalId(5),
+            dst_r: LocalId(2),
+            lo: Operand::Local(LocalId(4)),
+            hi: Operand::Local(LocalId(4)),
+            divisor: Operand::Local(LocalId(4)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W64,
+                    dst: Place::Reg(Gpr::Rax),
+                    src: vsrc(4),
+                },
+                Inst::Mov {
+                    width: Width::W64,
+                    dst: Place::Reg(Gpr::Rdx),
+                    src: vsrc(4),
+                },
+                Inst::Div {
+                    width: Width::W64,
+                    divisor: vsrc(4),
+                },
+                Inst::Mov {
+                    width: Width::W64,
+                    dst: Place::Val(Val(LocalId(5))),
+                    src: Src::Reg(Gpr::Rax),
+                },
+                Inst::Mov {
+                    width: Width::W64,
+                    dst: Place::Val(Val(LocalId(2))),
+                    src: Src::Reg(Gpr::Rdx),
+                },
+            ])
+        );
     }
 
     #[test]

@@ -165,6 +165,39 @@ pub struct CallSite {
     /// for helper calls and signature-less calli (C++ nullptrs).
     pub sig: Option<crate::ir::CallSig>,
     pub method: Option<MethodHandle>,
+    /// The registers carrying GC pointers at this call's safepoint (the
+    /// return address) — the ABI return registers of a ref/byref/
+    /// GC-struct result, e.g. `rax` (and `rdx` for a two-eightbyte
+    /// struct) on x64. Empty for void/scalar returns and for the
+    /// hidden-retbuf convention (the buffer is a reported frame slot; the
+    /// returned pointer is a stack address, not a heap root). Tier 0's
+    /// frame-resident invariant covers frame slots only, so without this
+    /// the return register is an unreported GC root between the call's
+    /// return and the result homing — the thread-race.cs corruption
+    /// (step_11.15).
+    pub ret_gc_regs: Vec<GcReturnReg>,
+    /// The native offset where the call's result is fully homed into its
+    /// frame slot (the end of the result-move instructions following the
+    /// call). The register roots above are live over `[offset + size,
+    /// ret_home_end)`. 0 when `ret_gc_regs` is empty. Only the
+    /// fully-interruptible (EH) encoding needs the window end; the
+    /// partially-interruptible bitmap keys off the return address alone.
+    pub ret_home_end: u32,
+}
+
+/// One register holding a GC pointer at a safepoint, in target-generic
+/// vocabulary (the register is the processor encoding — what the
+/// GC-info register slot names).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct GcReturnReg {
+    /// The processor register number (x64: the hardware encoding,
+    /// rax = 0, rdx = 2 — the decoder's `GetRegisterSlot` index).
+    pub reg: u8,
+    /// Interior pointer (a byref return). Interior reporting subsumes an
+    /// exact object reference (a base pointer is an interior pointer at
+    /// offset 0 — `PromoteCarefully`/`find_object`), so a register that
+    /// carries both across a method's call sites keeps the interior flag.
+    pub interior: bool,
 }
 
 /// Which `allocMem` chunk an offset refers to.

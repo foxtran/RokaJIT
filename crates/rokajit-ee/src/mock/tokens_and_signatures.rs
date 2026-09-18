@@ -99,10 +99,10 @@ impl TokensAndSignatures for MockEe {
         &self,
         _sig: &ffi::CORINFO_SIG_INFO,
         args: ArgListHandle,
-    ) -> (CorInfoType, Option<ClassHandle>) {
+    ) -> (CorInfoType, Option<ClassHandle>, bool) {
         let (list, index) = Self::decode_cursor(args);
         let arg = self.arg_lists[list][index];
-        (arg.ty, arg.class)
+        (arg.ty, arg.class, arg.pinned)
     }
 
     fn get_exact_classes(

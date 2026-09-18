@@ -31,8 +31,11 @@ impl ClassQueries for MockEe {
         self.classes.contains_key(&(cls.as_raw() as usize))
     }
 
-    fn get_class_attribs(&self, _cls: ClassHandle) -> ClassAttribs {
-        self.class_attribs
+    fn get_class_attribs(&self, cls: ClassHandle) -> ClassAttribs {
+        self.class_attribs_overrides
+            .get(&(cls.as_raw() as usize))
+            .copied()
+            .unwrap_or(self.class_attribs)
     }
 
     fn get_class_size(&self, cls: ClassHandle) -> u32 {
@@ -51,12 +54,10 @@ impl ClassQueries for MockEe {
         self.class_names.get(&(cls.as_raw() as usize)).cloned()
     }
 
-    fn get_type_instantiation_argument(
-        &self,
-        _cls: ClassHandle,
-        _index: u32,
-    ) -> Option<ClassHandle> {
-        None
+    fn get_type_instantiation_argument(&self, cls: ClassHandle, index: u32) -> Option<ClassHandle> {
+        self.type_inst_args
+            .get(&(cls.as_raw() as usize, index))
+            .copied()
     }
 
     fn get_method_instantiation_argument(

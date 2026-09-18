@@ -131,6 +131,15 @@ pub fn drain(
     }
 
     // 6. GC info.
+    if std::env::var_os("ROKAJIT_DUMP_GCINFO_HEX").is_some() {
+        let name = rokajit_ee::ee_info::MethodQueries::print_method_name(ee, ftn);
+        let hex: Vec<String> = artifact
+            .gc_info
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        eprintln!("rokajit: gcinfo-blob {name}: {}", hex.join(" "));
+    }
     let gc_block = ee.alloc_gc_info(artifact.gc_info.len());
     // SAFETY: the EE handed us a block of exactly this size.
     unsafe {
@@ -279,6 +288,8 @@ mod tests {
                     size: 5,
                     sig: None,
                     method: None,
+                    ret_gc_regs: Vec::new(),
+                    ret_home_end: 0,
                 },
                 CallSite {
                     chunk: ChunkRef::HotCode,
@@ -286,6 +297,8 @@ mod tests {
                     size: 5,
                     sig: None,
                     method: None,
+                    ret_gc_regs: Vec::new(),
+                    ret_home_end: 0,
                 },
             ],
         }

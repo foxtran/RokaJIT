@@ -34,13 +34,14 @@ are counted under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 2403 |
-| CRASH | 5 |
-| ARTIFACT | 8 |
-| TIMEOUT | 33 |
+| MATCH | 2390 |
+| CRASH | 22 |
+| GATED | 1 |
+| ARTIFACT | 12 |
+| TIMEOUT | 24 |
 | COMPILE_FAIL | 832 |
 
-Of the MATCHes, 2310 exit 100 (the CoreCLR pass
+Of the MATCHes, 2373 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ, no named gate in stderr;
@@ -59,7 +60,7 @@ test count, descending.
 
 | Bucket | Tests | Example tests |
 | --- | ---: | --- |
-| SIMD hardware intrinsics (real vector semantics — deferred, step_11.10) | 3 | `JIT/Methodical/tailcall/Desktop/thread-race.cs`<br>`JIT/Performance/CodeQuality/SIMD/ConsoleMandel/ConsoleMandel.cs`<br>`JIT/Regression_2/Runtime_128895/Runtime_128895.cs` |
+| unsupported (unmapped): Interlocked.CompareExchange on object references (the atomic write barrier is a later step) | 14 | `JIT/HardwareIntrinsics/X86/Lzcnt.X64/Lzcnt.X64.cs`<br>`JIT/HardwareIntrinsics/X86/Popcnt.X64/Popcnt.X64.cs`<br>`JIT/HardwareIntrinsics/X86/Sse42.X64/Crc32.cs`<br>`JIT/HardwareIntrinsics/X86_Avx/AvxVnni_V512/AvxVnni_V512SampleTest.cs`<br>`JIT/HardwareIntrinsics/X86_Avx512/Avx512Bmm/HandwrittenProgram.cs`<br>… and 9 more |
 
 ## Known artifacts (Class C)
 
@@ -72,12 +73,16 @@ verification is a regression, not a fix.
 
 | Test | Reason |
 | --- | --- |
+| `JIT/Methodical/cctor/misc/Desktop/throw.cs` | exception stack-trace text differs (frame-list formatting); both PASSED, exit 100 |
+| `JIT/Methodical/cctor/misc/throw.cs` | exception stack-trace text differs (frame-list formatting); both PASSED, exit 100 |
 | `JIT/Performance/CodeQuality/Benchstones/BenchF/Adams/Adams.cs` | timing values in output; both exit 100 |
-| `JIT/Performance/CodeQuality/SIMD/SeekUnroll/SeekUnroll.cs` | timing values in output; both exit 100 |
+| `JIT/Performance/CodeQuality/BilinearInterpol/BilinearInterpol.cs` | timing values in output; both exit 100 |
+| `JIT/Performance/CodeQuality/HWIntrinsic/X86/PacketTracer/Program.cs` | frames/sec timing value in output; both exit 100 |
 | `JIT/Performance/CodeQuality/V8/Richards/Richards.cs` | timing values in output; both exit 100 |
 | `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b59297/b59297.cs` | timing values in output; both exit 100 |
 | `JIT/Regression/CLR-x86-JIT/V1.2-Beta1/b103058/b103058.cs` | stack addresses printed; both exit 100 |
 | `JIT/Regression/Dev11/External/dev11_239804/ShowLocallocAlignment.cs` | stack addresses printed; both exit 100 |
+| `JIT/Regression/VS-ia64-JIT/M00/b113493/bad.cs` | thread-scheduling interleave of counter prints; both exit 100 |
 | `JIT/opt/OSR/example.cs` | timing values in output; both exit 100 |
 | `JIT/opt/OSR/integersumloop.cs` | timing values in output; both exit 100 |
 
@@ -111,7 +116,8 @@ entry shapes). Out of scope for triage; listed for the record.
 
 | Which JIT timed out | Tests |
 | --- | ---: |
-| ryujit,rokajit | 33 |
+| rokajit | 19 |
+| ryujit,rokajit | 5 |
 
 ## Needs investigation
 
@@ -121,5 +127,12 @@ error model didn't classify. Each carries its stderr signature.
 
 | Test | Category | Detail | Stderr signature |
 | --- | --- | --- | --- |
-| `JIT/Performance/CodeQuality/Span/SpanBench.cs` | CRASH | SIGABRT | Unhandled exception. System.Reflection.CustomAttributeFormatException: 'InnerIterationCount' property specified was not found. |
-| `JIT/Regression_ro_1/Runtime_120522.cs` | CRASH | SIGABRT | Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object. |
+| `JIT/Directed/pinvoke/sysinfo.cs` | CRASH | SIGABRT | Unhandled exception. System.DllNotFoundException: Unable to load shared library 'kernel32' or one of its dependencies. In order to help diagnose loading problem |
+| `JIT/Methodical/largeframes/skip6/skippage6.cs` | CRASH | SIGABRT | Stack overflow. |
+| `JIT/Methodical/tailcall/Desktop/thread-race.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b11490/b11490.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression/CLR-x86-JIT/V1-M09/b15864/b15864.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression/VS-ia64-JIT/M00/b115253/hello2.cs` | CRASH | SIGSEGV | (no stderr output) |
+| `JIT/Regression/VS-ia64-JIT/M00/b141358/test.cs` | CRASH | SIGABRT | Process terminated. |
+| `JIT/Regression/clr-x64-JIT/v4.0/devdiv374539/DevDiv_374539.cs` | CRASH | SIGABRT | Unhandled exception. System.DllNotFoundException: Unable to load shared library 'kernel32.dll' or one of its dependencies. In order to help diagnose loading pro |
+| `JIT/jit64/gc/regress/vswhidbey/143837.cs` | CRASH | SIGSEGV | (no stderr output) |

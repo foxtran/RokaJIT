@@ -184,7 +184,7 @@ fn log_sig(label: &str, sig: &CORINFO_SIG_INFO, ee: &GasketEeInfo) {
     // null).
     for _ in 0..sig.numArgs() {
         let Some(arg) = cursor else { break };
-        let (ty, cls) = ee.get_arg_type(sig, arg);
+        let (ty, cls, _pinned) = ee.get_arg_type(sig, arg);
         if !args.is_empty() {
             args.push_str(", ");
         }

@@ -43,7 +43,8 @@
 //!   half-torn-down frame).
 
 use rokajit::artifact::{
-    CallSite, ChunkRef, ClassTokenOrFilter, CodeChunk, CodeChunks, EhClause, Relocation,
+    CallSite, ChunkRef, ClassTokenOrFilter, CodeChunk, CodeChunks, EhClause, GcReturnReg,
+    Relocation,
 };
 use rokajit::codegen::{Loc, Move, ReadSrc, ValueState};
 use rokajit::error::{CompileError, CompileResult};
@@ -249,6 +250,78 @@ pub fn classify_call(sig: &CallSig, layouts: &StructLayouts) -> CompileResult<Ca
         ret,
         stack_arg_bytes: stack_bytes.div_ceil(16) * 16,
     })
+}
+
+/// The GC-pointer return registers of a call with this signature
+/// (step_11.15): at the call's safepoint (its return address) the result
+/// still sits in the ABI return registers — `rax` for a ref/byref scalar,
+/// the integer eightbyte registers (`rax`/`rdx`) for a register-returned
+/// struct's GC cells. Tier 0's frame-resident invariant covers frame
+/// slots only, so without this report the GC can move the object between
+/// the return and the result homing without updating the pointer — the
+/// thread-race.cs corruption (digits written through a stale
+/// `GetFreshStringSpan` byref; the `SpanHelpers.Memmove` AV). The
+/// hidden-retbuf convention returns a STACK pointer in `rax` (the
+/// caller's own frame slot, already reported by cell), and non-GC scalars
+/// report nothing. `None` sig: a non-`Call` statement's helper (throw /
+/// overflow / bounds-check) — those never return a GC value.
+fn gc_return_regs(
+    sig: Option<&CallSig>,
+    layouts: &StructLayouts,
+) -> CompileResult<Vec<GcReturnReg>> {
+    let Some(sig) = sig else {
+        return Ok(Vec::new());
+    };
+    let scalar = |interior: bool| {
+        vec![GcReturnReg {
+            reg: Gpr::Rax as u8,
+            interior,
+        }]
+    };
+    match sig.ret {
+        Type::Ref => Ok(scalar(false)),
+        Type::ByRef => Ok(scalar(true)),
+        Type::Struct(class) => {
+            let layout = layout_of(layouts, class)?;
+            if layout.gc_cells.is_empty() {
+                return Ok(Vec::new());
+            }
+            match classify_call(sig, layouts)?.ret {
+                Some(ArgLocation::StructRegs {
+                    regs,
+                    count,
+                    sizes,
+                    offsets,
+                }) => {
+                    let mut out = Vec::new();
+                    for k in 0..count as usize {
+                        // An SSE eightbyte carries no GC cells (the EE
+                        // classifies GC eightbytes Integer).
+                        let Some(g) = Gpr::from_phys(regs[k]) else {
+                            continue;
+                        };
+                        let lo = u32::from(offsets[k]);
+                        let hi = lo + u32::from(sizes[k]);
+                        if let Some(cell) = layout
+                            .gc_cells
+                            .iter()
+                            .find(|c| c.offset >= lo && c.offset < hi)
+                        {
+                            out.push(GcReturnReg {
+                                reg: g as u8,
+                                interior: cell.is_byref,
+                            });
+                        }
+                    }
+                    Ok(out)
+                }
+                // The hidden-retbuf convention (and the impossible `None`):
+                // rax is a stack address the GC must not see as a root.
+                _ => Ok(Vec::new()),
+            }
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// The layout of a struct mentioned in a signature, or an upstream-bug
@@ -476,6 +549,7 @@ fn addr_taken_slots(method: &lir::Method) -> Vec<bool> {
                 StmtKind::Copy { src, .. }
                 | StmtKind::Unary { src, .. }
                 | StmtKind::Conv { src, .. }
+                | StmtKind::ConvRne { src, .. }
                 | StmtKind::ConvOvf { src, .. }
                 | StmtKind::CkFinite { src, .. }
                 | StmtKind::Cast { src, .. }
@@ -483,6 +557,13 @@ fn addr_taken_slots(method: &lir::Method) -> Vec<bool> {
                 StmtKind::Binary { lhs, rhs, .. } | StmtKind::BinaryOvf { lhs, rhs, .. } => {
                     mark(lhs, &mut taken);
                     mark(rhs, &mut taken);
+                }
+                StmtKind::DivRem {
+                    lo, hi, divisor, ..
+                } => {
+                    mark(lo, &mut taken);
+                    mark(hi, &mut taken);
+                    mark(divisor, &mut taken);
                 }
                 StmtKind::Load { addr, .. } => mark(addr, &mut taken),
                 StmtKind::Store { addr, src, .. } => {
@@ -497,6 +578,22 @@ fn addr_taken_slots(method: &lir::Method) -> Vec<bool> {
                         mark(arg, &mut taken);
                     }
                 }
+                StmtKind::AtomicCmpXchg {
+                    addr,
+                    value,
+                    comparand,
+                    ..
+                } => {
+                    mark(addr, &mut taken);
+                    mark(value, &mut taken);
+                    mark(comparand, &mut taken);
+                }
+                StmtKind::AtomicXchg { addr, value, .. }
+                | StmtKind::AtomicXadd { addr, value, .. } => {
+                    mark(addr, &mut taken);
+                    mark(value, &mut taken);
+                }
+                StmtKind::MemoryFence | StmtKind::Serialize => {}
                 StmtKind::ArrLen { array, .. }
                 | StmtKind::LocAlloc { size: array, .. }
                 | StmtKind::NullCheck { arg: array }
@@ -906,6 +1003,7 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
             // Scratch allocation must exclude them — they are not
             // value-machine-tracked.
             em.fixed_dests = fixed_gprs(&insts, true);
+            let sites_before = em.call_sites.len();
             for (i, inst) in insts.iter().enumerate() {
                 if matches!(
                     inst,
@@ -917,6 +1015,16 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
                     em.fixed_dests = fixed_gprs(&insts[i + 1..], false);
                 }
                 em.emit_inst(inst)?;
+            }
+            // The return-register homing window (step_11.15): the result
+            // moves are the statement's last instructions, so the window
+            // ends here. Only the fully-interruptible encoding consumes
+            // the end.
+            let home_end = em.asm.offset();
+            for site in &mut em.call_sites[sites_before..] {
+                if !site.ret_gc_regs.is_empty() {
+                    site.ret_home_end = home_end;
+                }
             }
             em.fixed_dests.clear();
             em.call_sig = None;
@@ -1403,6 +1511,19 @@ impl<'a> Emitter<'a> {
         self.define_xmm(dst, width, SCRATCH_XMM_A)
     }
 
+    /// `sqrtss`/`sqrtsd`: destructive two-operand — the source rides a
+    /// scratch register (a memory source loads first), the result defines
+    /// `dst` from the scratch.
+    fn emit_sqrt_f(&mut self, width: FWidth, dst: XmmPlace, src: XmmSrc) -> CompileResult<()> {
+        let src = self.rmx_of(src, width, SCRATCH_XMM_A)?;
+        if src != RmX::Reg(SCRATCH_XMM_A) {
+            self.asm.mov_f_load(width, SCRATCH_XMM_A, src);
+        }
+        self.asm
+            .sqrt_f(width, SCRATCH_XMM_A, RmX::Reg(SCRATCH_XMM_A));
+        self.define_xmm(dst, width, SCRATCH_XMM_A)
+    }
+
     /// `ucomis*`: the lhs must be in a register (there is no
     /// memory-first form); the rhs rides as register or memory.
     fn emit_cmp_f(&mut self, width: FWidth, lhs: XmmSrc, rhs: XmmSrc) -> CompileResult<()> {
@@ -1575,12 +1696,17 @@ impl<'a> Emitter<'a> {
         dst_w64: bool,
         dst: Place,
         src: XmmSrc,
+        rne: bool,
     ) -> CompileResult<()> {
         let src = self.rmx_of(src, src_width, SCRATCH_XMM_A)?;
         let (p, moves) = self.vs.take_scratch(&[]);
         self.apply(moves)?;
         let g = gpr_of(p)?;
-        self.asm.cvtts2si(src_width, g, src, dst_w64);
+        if rne {
+            self.asm.cvts2si(src_width, g, src, dst_w64);
+        } else {
+            self.asm.cvtts2si(src_width, g, src, dst_w64);
+        }
         match dst {
             Place::Val(t) => self.define_temp_reg(t.0, g),
             Place::Reg(g2) => {
@@ -2294,6 +2420,7 @@ impl<'a> Emitter<'a> {
                 rhs,
             } => self.emit_arith_f(op, width, dst, lhs, rhs),
             Inst::NegF { width, dst, src } => self.emit_neg_f(width, dst, src),
+            Inst::SqrtF { width, dst, src } => self.emit_sqrt_f(width, dst, src),
             Inst::CmpF { width, lhs, rhs } => self.emit_cmp_f(width, lhs, rhs),
             Inst::SetccF { op, dst } => self.emit_setcc_f(op, dst),
             Inst::JccF { op, target } => {
@@ -2312,7 +2439,13 @@ impl<'a> Emitter<'a> {
                 dst_w64,
                 dst,
                 src,
-            } => self.emit_cvt_f_to_int(src_width, dst_w64, dst, src),
+            } => self.emit_cvt_f_to_int(src_width, dst_w64, dst, src, false),
+            Inst::CvtFToIntRne {
+                src_width,
+                dst_w64,
+                dst,
+                src,
+            } => self.emit_cvt_f_to_int(src_width, dst_w64, dst, src, true),
             Inst::CvtFToF { to, dst, src } => self.emit_cvt_f_to_f(to, dst, src),
             Inst::Arith {
                 op,
@@ -2420,6 +2553,35 @@ impl<'a> Emitter<'a> {
                 src,
             } => self.emit_store_mem_f(width, addr, disp, src),
             Inst::NullCheck { addr } => self.emit_null_check(addr),
+            Inst::CmpXchg {
+                bits,
+                signed,
+                dst,
+                addr,
+                value,
+            } => self.emit_atomic_cmpxchg(bits, signed, dst, addr, value),
+            Inst::Xchg {
+                bits,
+                signed,
+                dst,
+                addr,
+                value,
+            } => self.emit_atomic_xchg(bits, signed, dst, addr, value),
+            Inst::Xadd {
+                bits,
+                signed,
+                dst,
+                addr,
+                value,
+            } => self.emit_atomic_xadd(bits, signed, dst, addr, value),
+            Inst::MemFence => {
+                self.asm.lock_fence();
+                Ok(())
+            }
+            Inst::Serialize => {
+                self.asm.serialize();
+                Ok(())
+            }
             Inst::BoundsCheck {
                 index,
                 index_wide,
@@ -2745,6 +2907,11 @@ impl<'a> Emitter<'a> {
         match op {
             UnaryOp::Neg => self.asm.neg(width, Rm::Reg(dg)),
             UnaryOp::Not => self.asm.not(width, Rm::Reg(dg)),
+            UnaryOp::Sqrt => {
+                return Err(CompileError::Internal(
+                    "sqrt has no integer form (the float lowering rule intercepts it)",
+                ))
+            }
         }
         self.define_temp_reg(t.0, dg)
     }
@@ -3094,6 +3261,154 @@ impl<'a> Emitter<'a> {
         self.asm
             .mov(Width::W32, Rm::Reg(gd), Rmi::Mem(Mem::base(g)));
         Ok(())
+    }
+
+    /// `lock cmpxchg [addr], value` (LIR `AtomicCmpXchg`): the comparand
+    /// arrived in `rax` through the lowering's explicit move (the idiv
+    /// fixed-duty precedent). The address takes one scratch, the value
+    /// another (neither can be rax — it holds the comparand); the old
+    /// cell value lands in `rax`, then `dst` takes it — extended per
+    /// `signed` on the narrow forms (a mismatched cmpxchg writes only
+    /// `al`/`ax` back). A null address faults on the instruction — the
+    /// trap-model NRE, no explicit check. No call, so no safepoint.
+    fn emit_atomic_cmpxchg(
+        &mut self,
+        bits: u8,
+        signed: bool,
+        dst: Place,
+        addr: Src,
+        value: Src,
+    ) -> CompileResult<()> {
+        let (pa, moves) = self.vs.take_scratch(&[Gpr::Rax.phys()]);
+        self.apply(moves)?;
+        let gaddr = gpr_of(pa)?;
+        match self.wide_imm(Width::W64, addr, &[pa])? {
+            Rmi::Reg(r) => {
+                if r != gaddr {
+                    self.asm.mov(Width::W64, Rm::Reg(gaddr), Rmi::Reg(r));
+                }
+            }
+            other => self.asm.mov(Width::W64, Rm::Reg(gaddr), other),
+        }
+        let gv = match self.rmi_of(value)? {
+            Rmi::Reg(g) if g != Gpr::Rax && g != gaddr => g,
+            src => {
+                let (p, moves) = self.vs.take_scratch(&[Gpr::Rax.phys(), gaddr.phys()]);
+                self.apply(moves)?;
+                let gv = gpr_of(p)?;
+                let w = if bits == 64 { Width::W64 } else { Width::W32 };
+                self.asm.mov(w, Rm::Reg(gv), src);
+                gv
+            }
+        };
+        self.asm.lock_cmpxchg(bits, gaddr, gv);
+        self.define_atomic_result(bits, signed, dst, Gpr::Rax)
+    }
+
+    /// `xchg [addr], value` (LIR `AtomicXchg`): implicitly locked with a
+    /// memory operand. The old cell value lands in the value register,
+    /// then `dst` takes it (extended per `signed` on the narrow forms —
+    /// xchg writes only the low bytes of the register).
+    fn emit_atomic_xchg(
+        &mut self,
+        bits: u8,
+        signed: bool,
+        dst: Place,
+        addr: Src,
+        value: Src,
+    ) -> CompileResult<()> {
+        let gaddr = self.addr_into(addr)?;
+        let gv = match self.rmi_of(value)? {
+            Rmi::Reg(g) if g != gaddr => g,
+            src => {
+                let (p, moves) = self.vs.take_scratch(&[gaddr.phys()]);
+                self.apply(moves)?;
+                let gv = gpr_of(p)?;
+                let w = if bits == 64 { Width::W64 } else { Width::W32 };
+                self.asm.mov(w, Rm::Reg(gv), src);
+                gv
+            }
+        };
+        self.asm.xchg_mem(bits, gaddr, gv);
+        self.define_atomic_result(bits, signed, dst, gv)
+    }
+
+    /// `lock xadd [addr], value` (LIR `AtomicXadd`): the [`xchg`] shape
+    /// with the add — the old value lands in the value register.
+    fn emit_atomic_xadd(
+        &mut self,
+        bits: u8,
+        signed: bool,
+        dst: Place,
+        addr: Src,
+        value: Src,
+    ) -> CompileResult<()> {
+        let gaddr = self.addr_into(addr)?;
+        let gv = match self.rmi_of(value)? {
+            Rmi::Reg(g) if g != gaddr => g,
+            src => {
+                let (p, moves) = self.vs.take_scratch(&[gaddr.phys()]);
+                self.apply(moves)?;
+                let gv = gpr_of(p)?;
+                let w = if bits == 64 { Width::W64 } else { Width::W32 };
+                self.asm.mov(w, Rm::Reg(gv), src);
+                gv
+            }
+        };
+        self.asm.lock_xadd(bits, gaddr, gv);
+        self.define_atomic_result(bits, signed, dst, gv)
+    }
+
+    /// The old-value move out of the atomic instruction's result
+    /// register: a 32/64-bit result moves plainly (a 32-bit `mov` clears
+    /// the upper half); the narrow forms extend (the instruction wrote
+    /// only the low bytes of the register) — sign-extended for the
+    /// signed cell types (`sbyte`/`short`), zero-extended otherwise
+    /// (RyuJIT's `varTypeIsSigned → INS_movsx`,
+    /// codegenxarch.cpp:4388-4392, 4341-4345).
+    fn define_atomic_result(
+        &mut self,
+        bits: u8,
+        signed: bool,
+        dst: Place,
+        src: Gpr,
+    ) -> CompileResult<()> {
+        let gd = match dst {
+            Place::Val(t) => {
+                let (p, moves) = self.vs.take_scratch(&[src.phys()]);
+                self.apply(moves)?;
+                let gd = gpr_of(p)?;
+                if bits <= 16 {
+                    self.extend_atomic_result(bits, signed, gd, src);
+                } else {
+                    let w = if bits == 64 { Width::W64 } else { Width::W32 };
+                    self.asm.mov(w, Rm::Reg(gd), Rmi::Reg(src));
+                }
+                return self.define_temp_reg(t.0, gd);
+            }
+            Place::Reg(g) => {
+                let moves = self.vs.clobber(g.phys());
+                self.apply(moves)?;
+                g
+            }
+        };
+        if bits <= 16 {
+            self.extend_atomic_result(bits, signed, gd, src);
+        } else {
+            let w = if bits == 64 { Width::W64 } else { Width::W32 };
+            self.asm.mov(w, Rm::Reg(gd), Rmi::Reg(src));
+        }
+        Ok(())
+    }
+
+    /// The narrow old-value extension: `movsx` for the signed cell types,
+    /// `movzx` for the unsigned ones.
+    fn extend_atomic_result(&mut self, bits: u8, signed: bool, dst: Gpr, src: Gpr) {
+        if signed {
+            self.asm.movsx_reg(bits / 8, dst, src);
+        } else {
+            self.asm.movzx_reg(bits / 8, dst, src);
+        }
     }
 
     /// The array bounds check (step_10.8): a 32-bit load of the length at
@@ -3493,6 +3808,10 @@ impl<'a> Emitter<'a> {
             size: 3,
             sig: self.call_sig.clone(),
             method: None,
+            ret_gc_regs: gc_return_regs(self.call_sig.as_ref(), self.layouts)?,
+            // Patched to the statement's end by the caller loop (the
+            // result moves follow the call inside the same statement).
+            ret_home_end: 0,
         });
         Ok(())
     }
@@ -3532,6 +3851,14 @@ impl<'a> Emitter<'a> {
                 None
             },
             method,
+            // The GC-return registers come from the statement's signature
+            // (set for every `Call` statement, helper or managed); helper
+            // calls with ref returns (NEWARR et al.) are covered, and
+            // non-`Call` helpers (throw/overflow/bounds) carry no sig.
+            ret_gc_regs: gc_return_regs(self.call_sig.as_ref(), self.layouts)?,
+            // Patched to the statement's end by the caller loop (the
+            // result moves follow the call inside the same statement).
+            ret_home_end: 0,
         });
         self.relocations.push(Relocation {
             chunk: ChunkRef::HotCode,
