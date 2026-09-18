@@ -1755,6 +1755,9 @@ enum HwLeafOp {
     /// X86Base.X64.DivRem(ulong, ulong, ulong) → (ulong, ulong): the
     /// 128-by-64 hardware divide.
     DivRem64,
+    /// X86Base.CpuId(int, int) → (int Eax, int Ebx, int Ecx, int Edx):
+    /// the `cpuid` instruction, outputs in tuple order.
+    CpuId,
 }
 
 /// Bounds-checked cursor over the IL stream.
@@ -3038,6 +3041,7 @@ fn store_compatible(value: Type, slot: Type) -> bool {
 fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
     match expr {
         hir::Expr::Const(_) | hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => false,
+        hir::Expr::NextCallReturnAddress => false,
         hir::Expr::Local(l) | hir::Expr::LocalAddr(l) => *l == id,
         hir::Expr::Load { addr, .. } => references_local(addr, id),
         hir::Expr::FieldAddr { obj, .. } => references_local(obj, id),
@@ -3090,6 +3094,10 @@ fn must_eval(expr: &hir::Expr) -> bool {
     match expr {
         hir::Expr::Const(_) | hir::Expr::Local(_) | hir::Expr::LocalAddr(_) => false,
         hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => false,
+        // A `lea` of a code address — no memory read, no fault, no
+        // ordering (the pending-call-label binding is codegen's concern
+        // only when the value is actually used).
+        hir::Expr::NextCallReturnAddress => false,
         hir::Expr::Load { .. } => true, // can fault (null byref)
         hir::Expr::FieldAddr { obj, .. } => must_eval(obj),
         hir::Expr::Unary { arg, .. } => must_eval(arg),
@@ -3150,6 +3158,8 @@ fn has_global_effect(expr: &hir::Expr) -> bool {
         hir::Expr::Const(_) | hir::Expr::Local(_) | hir::Expr::LocalAddr(_) => false,
         // An address by itself reads nothing; the consumer does.
         hir::Expr::StaticFieldAddr { .. } | hir::Expr::CatchArg => false,
+        // A `lea` of a code address — no memory read, no effect.
+        hir::Expr::NextCallReturnAddress => false,
         hir::Expr::Load { .. } => true,
         hir::Expr::FieldAddr { obj, .. } => has_global_effect(obj),
         hir::Expr::Unary { arg, .. } => has_global_effect(arg),
@@ -5438,6 +5448,26 @@ impl BlockImport<'_> {
                 "get_call_info returned a null method handle",
             ));
         };
+        // `StubHelpers.NextCallReturnAddress()` (step_11.15): an
+        // "Unconditionally expanded intrinsic" whose CoreLib body is
+        // `throw new UnreachableException()` (StubHelpers.cs:2566), so a
+        // literal compile crashes every reflection invoke stub —
+        // InvokerEmitUtil.cs:217 emits `call NextCallReturnAddress; pop`
+        // ahead of the target call, and the throw surfaced as a
+        // CustomAttributeFormatException out of
+        // Attribute.GetCustomAttribute (Span/Indexer.cs). RyuJIT expands
+        // it unconditionally (importercalls.cpp:3541-3549) to GT_LABEL —
+        // the address after the next call. Zero arguments and the
+        // signature declared IntPtr (the stub call passes nothing).
+        if virtual_kind.is_none()
+            && constrained_resolved.is_none()
+            && !has_this
+            && ret == Type::NativeInt
+            && arg_types.is_empty()
+            && self.is_next_call_return_address_intrinsic(method)
+        {
+            return self.push(Type::NativeInt, hir::Expr::NextCallReturnAddress);
+        }
         // The one named intrinsic tier 0 expands (RyuJIT's impIntrinsic,
         // importercalls.cpp:3930, name-matched at importercalls.cpp:12212):
         // `RuntimeHelpers.GetMethodTable(obj)`. Its CoreLib IL body is
@@ -5572,14 +5602,29 @@ impl BlockImport<'_> {
         // GT_XADD, importercalls.cpp:4506-4560); we expand at every call
         // site — tier 0's only tier. x64: `lock cmpxchg` / `xchg` /
         // `lock xadd`; MemoryBarrier is `lock or dword [rsp], 0`
-        // (codegenxarch.cpp:11552). The object/`T` overloads stay gated:
-        // an atomic ref store's write barrier (on cmpxchg success only)
-        // is a later step — the post-hoc CHECKED_ASSIGN_REF re-store would
-        // race another thread's intervening swap.
+        // (codegenxarch.cpp:11552). The REFERENCE-typed overloads are NOT
+        // expanded (step_11.15): RyuJIT intrinsifies a TYP_REF
+        // CompareExchange/Exchange only when the value is a null or
+        // frozen-object constant — no GC pointer enters the heap — and
+        // otherwise leaves the call at every tier (importercalls.cpp:
+        // 4521-4526, 4570-4573). The VM's FCall owns the atomic AND the
+        // write barrier (comutilnative.cpp:1699-1720: the raw
+        // InterlockedCompareExchangeT/ExchangeT + ErectWriteBarrier —
+        // success-gated for CompareExchange, unconditional for Exchange),
+        // so falling through to the ordinary call path IS the barriered
+        // shape; an inline `lock cmpxchg` without the barrier would be a
+        // silent GC bug (a young reference swapped into an old object,
+        // card unmarked). The generic `CompareExchange<T>`/`Exchange<T>`
+        // over a reference T funnel here as well: the EE substitutes the
+        // generic's IL with a thunk to the object overload
+        // (getILIntrinsicImplementationForInterlocked,
+        // jitinterface.cpp:7298-7387), and the shared-instantiation sig
+        // reports the value as Class.
         if virtual_kind.is_none()
             && constrained_resolved.is_none()
             && !has_this
             && self.is_interlocked_intrinsic(method)
+            && !self.interlocked_ref_overload(method, &call.sig)?
         {
             return self.expand_interlocked(method, args, &call.sig, stmts, il_offset);
         }
@@ -5733,7 +5778,8 @@ impl BlockImport<'_> {
         // Sse/Sse2/Avx/Avx2 leaves expand scalarized
         // (expand_hw_intrinsic_leaf, above this gate); everything else
         // gets the loud poison: the
-        // THROW_NOT_IMPLEMENTED helper call, then the return type's
+        // THROW_PLATFORM_NOT_SUPPORTED helper call (the documented
+        // unsupported-hardware contract), then the return type's
         // default to keep the IL stack balanced — a REACHED leaf throws
         // (never silently wrong) and logs the demand signal the next
         // increment's map step collects. Failing the whole method's
@@ -6102,6 +6148,29 @@ impl BlockImport<'_> {
     }
 
     /// Whether `method` is the
+    /// `System.StubHelpers.StubHelpers.NextCallReturnAddress` intrinsic
+    /// (step_11.15): the [Intrinsic] bit plus the name match (RyuJIT
+    /// name-matches it the same way, importercalls.cpp:12529; see
+    /// `is_get_method_table_intrinsic`) on the declaring class
+    /// `System.StubHelpers.StubHelpers`.
+    fn is_next_call_return_address_intrinsic(&self, method: MethodHandle) -> bool {
+        if !self.ee.is_intrinsic(method) {
+            return false;
+        }
+        if self.ee.get_method_name_from_metadata(method).as_deref() != Some("NextCallReturnAddress")
+        {
+            return false;
+        }
+        let class = self.ee.get_method_class(method);
+        match self.ee.get_class_name_from_metadata(class) {
+            Some((name, ns)) => {
+                name == "StubHelpers" && ns.as_deref() == Some("System.StubHelpers")
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `method` is the
     /// `System.Runtime.CompilerServices.RuntimeHelpers.SetNextCallGenericContext`
     /// intrinsic (step_11.4): the [Intrinsic] bit plus the name match
     /// (RyuJIT name-matches it the same way, namedintrinsiclist.h:162;
@@ -6204,6 +6273,29 @@ impl BlockImport<'_> {
         }
     }
 
+    /// Whether `method` is a reference-typed `Interlocked.CompareExchange`
+    /// /`Exchange` overload — the value parameter (index 1 in both
+    /// signatures) is a reference class. Those must NOT be expanded: the
+    /// call falls through to the VM's FCall, which owns the atomic write
+    /// barrier (the call-site comment above [`Self::expand_interlocked`]'s
+    /// dispatch).
+    fn interlocked_ref_overload(
+        &mut self,
+        method: MethodHandle,
+        sig: &ffi::CORINFO_SIG_INFO,
+    ) -> CompileResult<bool> {
+        let Some(name) = self.ee.get_method_name_from_metadata(method) else {
+            return Ok(false);
+        };
+        if name != "CompareExchange" && name != "Exchange" {
+            return Ok(false);
+        }
+        Ok(matches!(
+            sig_corinfo_types(sig, self.ee)?.get(1),
+            Some(CorInfoType::Class)
+        ))
+    }
+
     /// Whether `method` is a `System.Threading.Interlocked` method — the
     /// [Intrinsic] bit plus the declaring class (the name match happens in
     /// [`Self::expand_interlocked`], which owns the per-overload gates).
@@ -6222,9 +6314,12 @@ impl BlockImport<'_> {
     /// `MemoryBarrier` emits the fence statement and pushes nothing; the
     /// value-producing overloads push the atomic node typed like the IL
     /// stack answer (Int32 for ≤32-bit cells, Int64 for 64-bit). The
-    /// object/`T` (reference) overloads are the named gate: an atomic ref
-    /// store's write barrier — on cmpxchg SUCCESS only — is a later step
-    /// (a post-hoc CHECKED_ASSIGN_REF would race an intervening swap).
+    /// reference-typed overloads never reach here — the call-site
+    /// diversion ([`Self::interlocked_ref_overload`]) lets them fall
+    /// through to the ordinary call (the VM FCall owns the atomic write
+    /// barrier; step_11.15). The remaining gates cover the cell types the
+    /// integer nodes don't carry (float/double/struct — RyuJIT leaves
+    /// those as calls too; zero tests demand them).
     fn expand_interlocked(
         &mut self,
         method: MethodHandle,
@@ -6272,7 +6367,7 @@ impl BlockImport<'_> {
             Some("CompareExchange") if args.len() == 3 => {
                 let Some((bits, signed)) = arg_corinfo.get(1).copied().and_then(shape_of) else {
                     return gate(
-                        "Interlocked.CompareExchange on object references (the atomic write barrier is a later step)",
+                        "Interlocked.CompareExchange outside the integer/reference set (float/double/struct cell)",
                     );
                 };
                 let comparand = args.pop().expect("comparand");
@@ -6292,7 +6387,7 @@ impl BlockImport<'_> {
             Some("Exchange") if args.len() == 2 => {
                 let Some((bits, signed)) = arg_corinfo.get(1).copied().and_then(shape_of) else {
                     return gate(
-                        "Interlocked.Exchange on object references (the atomic write barrier is a later step)",
+                        "Interlocked.Exchange outside the integer/reference set (float/double/struct cell)",
                     );
                 };
                 let value = args.pop().expect("value");
@@ -6507,11 +6602,14 @@ impl BlockImport<'_> {
     /// outside the measured expansion set: not a compile error — a
     /// compiled poison. With the unflipped families' `get_IsSupported`
     /// expanded to `false`, their guarded vector arms are dynamically
-    /// dead, so a REACHED leaf means the guard model broke; throwing
-    /// (CORINFO_HELP_THROW_NOT_IMPLEMENTED, the (void)->Void helper) is
-    /// loud where a compile-time Unsupported only moved the failure to a
-    /// tiering-dependent InvalidProgram-Exception somewhere in the caller
-    /// chain. The callee's argument
+    /// dead; an UNGUARDED call on unsupported hardware has a documented
+    /// managed contract — PlatformNotSupportedException — which RyuJIT
+    /// honors via NI_Throw_PlatformNotSupportedException →
+    /// CORINFO_HELP_THROW_PLATFORM_NOT_SUPPORTED (importercalls.cpp:3416,
+    /// 12689-12691). The poison throws exactly that helper (step_11.15:
+    /// the 11.14 THROW_NOT_IMPLEMENTED broke the HW-intrinsic test
+    /// template's `else { try { leaf(); Fail } catch
+    /// (PlatformNotSupportedException) {} }` shape). The callee's argument
     /// side effects still evaluate first (exception honesty — the
     /// ordering spill's shape), then the return type's default value
     /// keeps the IL stack balanced for the (dead) continuation: a zero
@@ -6584,7 +6682,7 @@ impl BlockImport<'_> {
         stmts.push(hir::Stmt {
             il_offset,
             kind: hir::StmtKind::Eval(hir::Expr::Call {
-                target: CallTarget::Helper(CorInfoHelpFunc::THROW_NOT_IMPLEMENTED),
+                target: CallTarget::Helper(CorInfoHelpFunc::THROW_PLATFORM_NOT_SUPPORTED),
                 sig: CallSig {
                     ret: Type::Void,
                     args: vec![],
@@ -7133,6 +7231,11 @@ impl BlockImport<'_> {
                     && matches!(ret, Type::Struct(_)) =>
             {
                 HwLeafOp::DivRem64
+            }
+            "CpuId"
+                if arg_types == [Type::Int32, Type::Int32] && matches!(ret, Type::Struct(_)) =>
+            {
+                HwLeafOp::CpuId
             }
             "Sqrt" if matches!(arg_types, [Type::Struct(_)]) && vec_ret => {
                 let Some(elem) = elem_arg(0) else {
@@ -8238,6 +8341,49 @@ impl BlockImport<'_> {
                     VecElem::U64.cell(),
                     hir::Expr::Local(r),
                 );
+                self.push(
+                    ret,
+                    hir::Expr::StructVal {
+                        addr: Box::new(dst),
+                        class,
+                    },
+                )?;
+            }
+            HwLeafOp::CpuId => {
+                let Type::Struct(class) = ret else {
+                    return Err(CompileError::Internal("CpuId with a non-struct return"));
+                };
+                layout_of(&mut self.struct_layouts, self.ee, class)?;
+                let eax = self.temp(Type::Int32);
+                let ebx = self.temp(Type::Int32);
+                let ecx = self.temp(Type::Int32);
+                let edx = self.temp(Type::Int32);
+                stmts.push(hir::Stmt {
+                    il_offset,
+                    kind: hir::StmtKind::CpuId {
+                        dst_eax: eax,
+                        dst_ebx: ebx,
+                        dst_ecx: ecx,
+                        dst_edx: edx,
+                        function: vals[0].clone(),
+                        sub_id: vals[1].clone(),
+                    },
+                });
+                // (int Eax, int Ebx, int Ecx, int Edx): the ValueTuple's
+                // four int fields, sequential at 0/4/8/12 (the DivRem
+                // precedent — sequential layout, declaration order).
+                let t = self.temp(ret);
+                let dst = hir::Expr::LocalAddr(t);
+                for (i, v) in [eax, ebx, ecx, edx].into_iter().enumerate() {
+                    store_elem(
+                        stmts,
+                        &dst,
+                        i as u32,
+                        VecElem::I32,
+                        VecElem::I32.cell(),
+                        hir::Expr::Local(v),
+                    );
+                }
                 self.push(
                     ret,
                     hir::Expr::StructVal {
@@ -19991,10 +20137,12 @@ mod tests {
     /// `Interlocked.CompareExchange`/`Exchange`/`ExchangeAdd`/
     /// `MemoryBarrier` (step_11.15's thread-race fix): the self-recursive
     /// [Intrinsic] bodies (Interlocked.CoreCLR.cs:56/120/216,
-    /// Interlocked.cs:322) expand to the atomic nodes; the object
-    /// overload stays gated (the atomic write barrier is a later step).
+    /// Interlocked.cs:322) expand to the atomic nodes; the REFERENCE
+    /// overloads are not expanded — they fall through to the ordinary
+    /// call (the VM's FCall owns the atomic write barrier; the call-site
+    /// diversion comment).
     #[test]
-    fn interlocked_intrinsics_expand_and_refs_gate() {
+    fn interlocked_intrinsics_expand_and_refs_call() {
         let ce_il = [0x02, 0x03, 0x04, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
         fn interlocked_fixture(
             il: &[u8],
@@ -20131,7 +20279,10 @@ mod tests {
             panic!("expected the 64-bit AtomicCmpXchg node")
         };
 
-        // CompareExchange(ref object, object, object): the named gate.
+        // CompareExchange(ref object, object, object): NOT expanded —
+        // the ordinary call, in IL argument order (the VM FCall owns the
+        // atomic write barrier, comutilnative.cpp:1712-1721). No atomic
+        // node may appear anywhere in the method.
         let (ee, info) = interlocked_fixture(
             &ce_il,
             sig(
@@ -20144,10 +20295,31 @@ mod tests {
             ),
             "CompareExchange",
         );
-        assert!(
-            matches!(import(&info, &ee), Err(CompileError::Unsupported(_))),
-            "the object overload is gated"
-        );
+        let m = import(&info, &ee).expect("the object overload imports as a call");
+        let hir::Expr::Call {
+            target: CallTarget::Direct(_),
+            args: call_args,
+            ..
+        } = return_value(&m, 0)
+        else {
+            panic!("expected the ordinary call")
+        };
+        assert_eq!(call_args.len(), 3, "location, value, comparand");
+        assert_eq!(as_local(&call_args[0]), LocalId(0), "location first");
+        assert_eq!(as_local(&call_args[1]), LocalId(1), "value second");
+        assert_eq!(as_local(&call_args[2]), LocalId(2), "comparand third");
+        for block in &m.blocks {
+            for stmt in &block.stmts {
+                assert!(
+                    !matches!(
+                        stmt.kind,
+                        hir::StmtKind::Eval(hir::Expr::AtomicCmpXchg { .. })
+                            | hir::StmtKind::Eval(hir::Expr::AtomicXchg { .. })
+                    ),
+                    "no unbarriered ref atomic"
+                );
+            }
+        }
 
         // Exchange(ref int, int): xchg; ldarg.0; ldarg.1; call; ret.
         let xchg_il = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
@@ -20178,6 +20350,33 @@ mod tests {
         else {
             panic!("expected the signed 8-bit AtomicXchg node")
         };
+
+        // Exchange(ref object, object): also NOT expanded — the ordinary
+        // call (the FCall barriers unconditionally — an xchg always
+        // writes, comutilnative.cpp:1699-1710).
+        let (ee, info) = interlocked_fixture(
+            &xchg_il,
+            sig(
+                CorInfoType::Class,
+                &[CorInfoType::ByRef, CorInfoType::Class],
+            ),
+            sig(
+                CorInfoType::Class,
+                &[CorInfoType::ByRef, CorInfoType::Class],
+            ),
+            "Exchange",
+        );
+        let m = import(&info, &ee).expect("the object Exchange imports as a call");
+        assert!(
+            matches!(
+                return_value(&m, 0),
+                hir::Expr::Call {
+                    target: CallTarget::Direct(_),
+                    ..
+                }
+            ),
+            "the object Exchange stays a call"
+        );
 
         // ExchangeAdd(ref long, long): lock xadd.
         let (ee, info) = interlocked_fixture(
@@ -20282,7 +20481,7 @@ mod tests {
     /// phase 3): the CoreLib bodies are self-recursive [Intrinsic]s with
     /// no software path; an unmeasured or unresolvable leaf (this fixture
     /// cans no class metadata — the classifier can't even name the
-    /// family) imports as the THROW_NOT_IMPLEMENTED helper call plus the
+    /// family) imports as the THROW_PLATFORM_NOT_SUPPORTED helper call plus the
     /// return type's default (a zeroed struct temp here) instead of
     /// failing the whole method's compile. The vector classes directly
     /// under System.Runtime.Intrinsics keep compiling plain calls —
@@ -20328,11 +20527,11 @@ mod tests {
             locals: ee.make_locals_sig(&[]),
         };
         let m = import(&info, &ee).expect("the poisoned call compiles");
-        // The poison statement: Eval(call CORINFO_HELP_THROW_NOT_IMPLEMENTED).
+        // The poison statement: Eval(call CORINFO_HELP_THROW_PLATFORM_NOT_SUPPORTED).
         assert!(m.blocks[0].stmts.iter().any(|s| matches!(
             &s.kind,
             hir::StmtKind::Eval(hir::Expr::Call {
-                target: CallTarget::Helper(CorInfoHelpFunc::THROW_NOT_IMPLEMENTED),
+                target: CallTarget::Helper(CorInfoHelpFunc::THROW_PLATFORM_NOT_SUPPORTED),
                 sig,
                 args,
             }) if sig.ret == Type::Void && sig.args.is_empty() && args.is_empty()
@@ -20398,7 +20597,7 @@ mod tests {
         assert!(m.blocks[0].stmts.iter().any(|s| matches!(
             &s.kind,
             hir::StmtKind::Eval(hir::Expr::Call {
-                target: CallTarget::Helper(CorInfoHelpFunc::THROW_NOT_IMPLEMENTED),
+                target: CallTarget::Helper(CorInfoHelpFunc::THROW_PLATFORM_NOT_SUPPORTED),
                 ..
             })
         )));
@@ -20458,7 +20657,7 @@ mod tests {
                 matches!(
                     &s.kind,
                     hir::StmtKind::Eval(hir::Expr::Call {
-                        target: CallTarget::Helper(CorInfoHelpFunc::THROW_NOT_IMPLEMENTED),
+                        target: CallTarget::Helper(CorInfoHelpFunc::THROW_PLATFORM_NOT_SUPPORTED),
                         ..
                     })
                 )
@@ -21142,6 +21341,81 @@ mod tests {
         assert!(offsets.contains(&0) && offsets.contains(&8), "{offsets:?}");
     }
 
+    /// X86Base.CpuId(int, int) → (int, int, int, int): the four-output
+    /// cpuid statement, the output temps stored into the tuple result in
+    /// register order at 0/4/8/12.
+    #[test]
+    fn x86base_cpuid_expands() {
+        // ldarg.0; ldarg.1; call CpuId; ret.
+        let il = [0x02, 0x03, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let leaf = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::Int, CorInfoType::Int],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![None, None],
+        };
+        let entry = MockSig {
+            ret: CorInfoType::ValueClass,
+            args: vec![CorInfoType::Int, CorInfoType::Int],
+            has_this: false,
+            ret_class: Some(c),
+            arg_classes: vec![None, None],
+        };
+        let handle = ee.add_method(0x0600_0033, leaf);
+        ee.method_name = Some("CpuId".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            (
+                "X86Base".into(),
+                Some("System.Runtime.Intrinsics.X86".into()),
+            ),
+        );
+        ee.method_namespaces.insert(
+            handle.as_raw() as usize,
+            "System.Runtime.Intrinsics.X86".into(),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m));
+        let (dsts, function, sub_id) = m.blocks[0]
+            .stmts
+            .iter()
+            .find_map(|s| match &s.kind {
+                hir::StmtKind::CpuId {
+                    dst_eax,
+                    dst_ebx,
+                    dst_ecx,
+                    dst_edx,
+                    function,
+                    sub_id,
+                } => Some(([*dst_eax, *dst_ebx, *dst_ecx, *dst_edx], function, sub_id)),
+                _ => None,
+            })
+            .expect("the CpuId statement");
+        // The inputs are the two Int32 args, in signature order.
+        assert!(matches!(function, hir::Expr::Local(_)));
+        assert!(matches!(sub_id, hir::Expr::Local(_)));
+        // Eax→Item1 (offset 0), Ebx→Item2 (4), Ecx→Item3 (8), Edx→Item4
+        // (12) — each store's value is the matching output temp.
+        for (i, dst) in dsts.iter().enumerate() {
+            let offset = (i as u32) * 4;
+            assert!(
+                m.blocks[0].stmts.iter().any(|s| matches!(
+                    &s.kind,
+                    hir::StmtKind::StoreInd {
+                        offset: o,
+                        value: hir::Expr::Local(v),
+                        ..
+                    } if *o == offset && v == dst
+                )),
+                "no store of output {i} at offset {offset}"
+            );
+        }
+    }
+
     /// X86Base.Pause(): the spin-wait hint is no code (the FastPollGC
     /// precedent).
     #[test]
@@ -21726,6 +22000,75 @@ mod tests {
         let m = import(&info, &ee).expect("imports");
         let (_, args) = as_call(return_value(&m, 0));
         assert_eq!(as_local(&args[0]), LocalId(0));
+    }
+
+    // --- step_11.15: the StubHelpers.NextCallReturnAddress intrinsic ---
+
+    const NCRA_TOKEN: u32 = 0x0600_0032;
+
+    /// Cans `StubHelpers.NextCallReturnAddress`: sig `() -> Ptr`, the
+    /// [Intrinsic] bit, the name, and the declaring class (the mock's
+    /// declaring-class stand-in is the method handle itself).
+    fn ncra_fixture(ee: &mut MockEe) {
+        let handle = ee.add_method(NCRA_TOKEN, sig(CorInfoType::Ptr, &[]));
+        ee.method_name = Some("NextCallReturnAddress".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            ("StubHelpers".into(), Some("System.StubHelpers".into())),
+        );
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+    }
+
+    /// The `throw UnreachableException` IL body must never compile: the
+    /// importer expands the call to the pending-call-label value
+    /// (RyuJIT's GT_LABEL, importercalls.cpp:3541-3549).
+    #[test]
+    fn next_call_return_address_intrinsic_expands_to_the_label_value() {
+        // call NCRA; ret — in a native-int-returning method.
+        let il = [0x28, 0x32, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::NativeInt, &[]), &[]);
+        ncra_fixture(&mut ee);
+        let m = import(&info, &ee).expect("imports");
+        assert!(
+            matches!(return_value(&m, 0), hir::Expr::NextCallReturnAddress),
+            "the intrinsic value, not a call"
+        );
+    }
+
+    /// The invoke stub's actual shape — `call NCRA; pop` — discards the
+    /// value: a pure `lea`, so nothing emits.
+    #[test]
+    fn next_call_return_address_popped_emits_no_code() {
+        // call NCRA; pop; ret — in a void method.
+        let il = [0x28, 0x32, 0x00, 0x00, 0x06, 0x26, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::Void, &[]), &[]);
+        ncra_fixture(&mut ee);
+        let m = import(&info, &ee).expect("imports");
+        assert!(
+            m.blocks[0].stmts.is_empty(),
+            "the discarded value emits no code"
+        );
+        assert!(matches!(
+            m.blocks[0].terminator,
+            hir::Terminator::Return { value: None }
+        ));
+    }
+
+    /// Without the EE's [Intrinsic] bit the same name+shape is an
+    /// ordinary direct call (the CoreLib body would then legitimately
+    /// run — it is only the marker that makes it unconditional).
+    #[test]
+    fn next_call_return_address_without_the_intrinsic_bit_is_a_plain_call() {
+        let il = [0x28, 0x32, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, info) = fixture(&il, &sig(CorInfoType::NativeInt, &[]), &[]);
+        let handle = ee.add_method(NCRA_TOKEN, sig(CorInfoType::Ptr, &[]));
+        ee.method_name = Some("NextCallReturnAddress".into());
+        ee.class_names.insert(
+            handle.as_raw() as usize,
+            ("StubHelpers".into(), Some("System.StubHelpers".into())),
+        );
+        let m = import(&info, &ee).expect("imports");
+        let _ = as_call(return_value(&m, 0));
     }
 
     /// A value class with a primitive CorInfoType (the IntPtr stand-in):

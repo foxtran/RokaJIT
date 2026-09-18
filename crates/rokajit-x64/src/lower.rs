@@ -866,6 +866,28 @@ rokajit::lower_rules! {
             Inst::Mov { width: Width::W64, dst: Place::Val(Val(*dst_r)), src: Src::Reg(Gpr::Rdx) },
         ];
 
+    /// `eax, ebx, ecx, edx := cpuid(function, sub_id)` — the LIR `CpuId`
+    /// (X86Base.CpuId): the inputs ride `eax`/`ecx` in (the idiv
+    /// fixed-duty precedent), the instruction writes all four output
+    /// registers. ebx's capture lives on the descriptor (the emission
+    /// preserves callee-saved `rbx` inline); the other three outputs
+    /// reach their temps through plain trailing moves.
+    rule cpuid: CpuId { dst_eax, dst_ebx, dst_ecx, dst_edx, function, sub_id }
+        if let (Some(f), Some(s), Some(Width::W32), Some(Width::W32)) = (
+            operand_src(*function),
+            operand_src(*sub_id),
+            operand_width(cx, *function),
+            operand_width(cx, *sub_id),
+        )
+        => |_| vec![
+            Inst::Mov { width: Width::W32, dst: Place::Reg(Gpr::Rax), src: f },
+            Inst::Mov { width: Width::W32, dst: Place::Reg(Gpr::Rcx), src: s },
+            Inst::CpuId { dst_ebx: Place::Val(Val(*dst_ebx)) },
+            Inst::Mov { width: Width::W32, dst: Place::Val(Val(*dst_eax)), src: Src::Reg(Gpr::Rax) },
+            Inst::Mov { width: Width::W32, dst: Place::Val(Val(*dst_ecx)), src: Src::Reg(Gpr::Rcx) },
+            Inst::Mov { width: Width::W32, dst: Place::Val(Val(*dst_edx)), src: Src::Reg(Gpr::Rdx) },
+        ];
+
     /// `conv.i4`/`conv.u4` from a 64-bit operand: a 32-bit `mov` keeps the
     /// low half. (Signedness is unobservable in a truncation, and on the
     /// evaluation stack both forms normalize to Int32.)
@@ -1261,6 +1283,14 @@ rokajit::lower_rules! {
         => |_| vec![Inst::LocAlloc {
             dst: Place::Val(Val(*dst)),
             size: s,
+        }];
+
+    /// The `StubHelpers.NextCallReturnAddress` expansion: one
+    /// descriptor; codegen owns the pending label (bound after the next
+    /// call it emits) and the rip-relative `lea`.
+    rule next_call_return_address: NextCallReturnAddress { dst }
+        => |_| vec![Inst::NextCallReturnAddress {
+            dst: Place::Val(Val(*dst)),
         }];
 
     /// `return <struct>` — a register-passed struct return (step_10.9):
@@ -2266,6 +2296,17 @@ mod tests {
                 dst: val(2),
                 size: Src::Imm(64),
             }])
+        );
+    }
+
+    /// The `StubHelpers.NextCallReturnAddress` statement lowers to one
+    /// descriptor; codegen owns the pending label and the `lea`.
+    #[test]
+    fn next_call_return_address_lowers_to_one_descriptor() {
+        let s = stmt(StmtKind::NextCallReturnAddress { dst: LocalId(2) });
+        assert_eq!(
+            lower_one(&s),
+            Some(vec![Inst::NextCallReturnAddress { dst: val(2) }])
         );
     }
 
@@ -3859,6 +3900,52 @@ mod tests {
                 Inst::Mov {
                     width: Width::W64,
                     dst: Place::Val(Val(LocalId(2))),
+                    src: Src::Reg(Gpr::Rdx),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn cpuid_lowers_to_the_fixed_register_sequence() {
+        // function/sub_id: the fixture's Int32 local 2.
+        let s = stmt(StmtKind::CpuId {
+            dst_eax: LocalId(2),
+            dst_ebx: LocalId(3),
+            dst_ecx: LocalId(4),
+            dst_edx: LocalId(5),
+            function: Operand::Local(LocalId(2)),
+            sub_id: Operand::Local(LocalId(2)),
+        });
+        assert_eq!(
+            lower_f(&s),
+            Some(vec![
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Reg(Gpr::Rax),
+                    src: vsrc(2),
+                },
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Reg(Gpr::Rcx),
+                    src: vsrc(2),
+                },
+                Inst::CpuId {
+                    dst_ebx: Place::Val(Val(LocalId(3))),
+                },
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Val(Val(LocalId(2))),
+                    src: Src::Reg(Gpr::Rax),
+                },
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Val(Val(LocalId(4))),
+                    src: Src::Reg(Gpr::Rcx),
+                },
+                Inst::Mov {
+                    width: Width::W32,
+                    dst: Place::Val(Val(LocalId(5))),
                     src: Src::Reg(Gpr::Rdx),
                 },
             ])

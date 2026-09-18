@@ -68,6 +68,12 @@ pub fn morph(method: hir::Method) -> CompileResult<hir::Method> {
                     certify_expr(hi)?;
                     certify_expr(divisor)?;
                 }
+                hir::StmtKind::CpuId {
+                    function, sub_id, ..
+                } => {
+                    certify_expr(function)?;
+                    certify_expr(sub_id)?;
+                }
                 hir::StmtKind::Eval(expr) => certify_expr(expr)?,
             }
         }
@@ -102,6 +108,7 @@ fn certify_expr(expr: &hir::Expr) -> CompileResult<()> {
         | hir::Expr::Local(_)
         | hir::Expr::LocalAddr(_)
         | hir::Expr::StaticFieldAddr { .. }
+        | hir::Expr::NextCallReturnAddress
         | hir::Expr::CatchArg => {}
         hir::Expr::Load { addr, .. } => certify_expr(addr)?,
         hir::Expr::FieldAddr { obj, .. } => certify_expr(obj)?,

@@ -603,6 +603,16 @@ pub enum Inst {
     /// the next instruction fetches), NOT a no-op. No operands, no
     /// flags, no safepoint.
     Serialize,
+    /// `cpuid` (`0F A2`) — the `X86Base.CpuId` expansion (LIR `CpuId`;
+    /// RyuJIT's genCpuId): the inputs arrived in eax/ecx through the
+    /// lowering's explicit moves (the idiv fixed-duty precedent); the
+    /// instruction writes eax/ebx/ecx/edx. ebx's output is the trap:
+    /// `rbx` is callee-saved and the tier-0 frame contract never touches
+    /// it, so the emission preserves it inline (`push rbx` / capture
+    /// `dst_ebx` / `pop rbx`). eax/ecx/edx's outputs reach their temps
+    /// through the lowering's trailing moves. No memory effect, no
+    /// safepoint.
+    CpuId { dst_ebx: Place },
     /// The array bounds check (step_10.8): the 32-bit length load at
     /// `[array + 8]` doubles as the null check (a null array faults — the
     /// trap model), then `index < length` unsigned decides between
@@ -764,6 +774,13 @@ pub enum Inst {
     /// funclet-exit `ret`; the VM resumes the parent frame there). The
     /// displacement is a label fixup, resolved at finalize.
     LeaLabel { dst: Gpr, target: Label },
+    /// `lea dst, [rip + L]` with `L` a fresh label codegen binds
+    /// immediately after the NEXT call instruction it emits (the
+    /// `StubHelpers.NextCallReturnAddress` expansion; RyuJIT's GT_LABEL
+    /// plus genDefinePendingCallLabel, codegencommon.cpp:6236). The
+    /// value is the next call's return address — a NativeInt code
+    /// address, never a GC root.
+    NextCallReturnAddress { dst: Place },
     /// Funclet epilog: `add rsp, N; ret`. Like [`Inst::AllocFrame`], the
     /// adjustment is codegen's per-funclet fact (the funclet's own
     /// outgoing-argument reservation), not a lowering-time one.
@@ -843,6 +860,11 @@ impl Inst {
             Inst::Idiv { .. } | Inst::Div { .. } => FixedRegs {
                 uses: &[Gpr::Rax, Gpr::Rdx],
                 defs: &[Gpr::Rax, Gpr::Rdx],
+            },
+            // `cpuid`: eax/ecx in, all four output registers written.
+            Inst::CpuId { .. } => FixedRegs {
+                uses: &[Gpr::Rax, Gpr::Rcx],
+                defs: &[Gpr::Rax, Gpr::Rbx, Gpr::Rcx, Gpr::Rdx],
             },
             // The one-operand `mul`/`imul` form works in rdx:rax; every
             // checked op conditionally calls the OVERFLOW helper (the

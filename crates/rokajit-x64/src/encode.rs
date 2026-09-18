@@ -1166,6 +1166,14 @@ impl Asm {
         self.emit_u8(0xE8);
     }
 
+    /// `cpuid` (`0F A2`) — the `X86Base.CpuId` expansion: no explicit
+    /// operands; reads eax/ecx, writes eax/ebx/ecx/edx (verified against
+    /// GNU as).
+    pub fn cpuid(&mut self) {
+        self.emit_u8(0x0F);
+        self.emit_u8(0xA2);
+    }
+
     /// `mov r/m8, r8` (`88 /r`) or `mov r/m16, r16` (`66 89 /r`) — the
     /// narrow block-copy stores (step_10.9). The 8-bit form always carries
     /// a REX prefix so `sil`/`dil` and r8+ stay encodable.
@@ -1308,6 +1316,12 @@ mod tests {
     fn serialize_is_the_fixed_three_byte_encoding() {
         // GNU as: `serialize` → 0F 01 E8 (no prefixes, no ModRM).
         assert_eq!(finish(|a| a.serialize()), [0x0F, 0x01, 0xE8]);
+    }
+
+    #[test]
+    fn cpuid_is_the_fixed_two_byte_encoding() {
+        // GNU as: `cpuid` → 0F A2 (no prefixes, no ModRM).
+        assert_eq!(finish(|a| a.cpuid()), [0x0F, 0xA2]);
     }
 
     #[test]

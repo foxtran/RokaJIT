@@ -633,6 +633,38 @@ impl Flatten<'_> {
                         },
                     );
                 }
+                hir::StmtKind::CpuId {
+                    dst_eax,
+                    dst_ebx,
+                    dst_ecx,
+                    dst_edx,
+                    function,
+                    sub_id,
+                } => {
+                    // Signature order: function, sub_id (same freeze rule
+                    // as DivRem).
+                    let function = self.flatten_expr(function, &mut stmts, stmt.il_offset)?;
+                    let function = if tree_has_effect(sub_id) {
+                        self.freeze_local(function, &mut stmts, stmt.il_offset)
+                    } else {
+                        function
+                    };
+                    let sub_id = self.flatten_expr(sub_id, &mut stmts, stmt.il_offset)?;
+                    let function = self.value_operand(function, &mut stmts, stmt.il_offset);
+                    let sub_id = self.value_operand(sub_id, &mut stmts, stmt.il_offset);
+                    Self::push(
+                        &mut stmts,
+                        stmt.il_offset,
+                        lir::StmtKind::CpuId {
+                            dst_eax: *dst_eax,
+                            dst_ebx: *dst_ebx,
+                            dst_ecx: *dst_ecx,
+                            dst_edx: *dst_edx,
+                            function,
+                            sub_id,
+                        },
+                    );
+                }
                 hir::StmtKind::Eval(expr) => {
                     self.flatten_eval(expr, &mut stmts, stmt.il_offset)?;
                 }
@@ -873,6 +905,14 @@ impl Flatten<'_> {
                 let size = self.flatten_expr(size, out, il)?;
                 let dst = self.temp(Type::NativeInt);
                 Self::push(out, il, lir::StmtKind::LocAlloc { dst, size });
+                Ok(lir::Operand::Temp(dst))
+            }
+            hir::Expr::NextCallReturnAddress => {
+                // The pending-call-label discipline is codegen's (the
+                // label binds after the next call it emits); the value
+                // is a NativeInt code address, never a GC root.
+                let dst = self.temp(Type::NativeInt);
+                Self::push(out, il, lir::StmtKind::NextCallReturnAddress { dst });
                 Ok(lir::Operand::Temp(dst))
             }
             hir::Expr::Load {
@@ -1509,6 +1549,7 @@ fn tree_has_effect(expr: &hir::Expr) -> bool {
         | hir::Expr::Local(_)
         | hir::Expr::LocalAddr(_)
         | hir::Expr::StaticFieldAddr { .. }
+        | hir::Expr::NextCallReturnAddress
         | hir::Expr::CatchArg => false,
         hir::Expr::Load { addr, .. } => tree_has_effect(addr),
         hir::Expr::FieldAddr { obj, .. } => tree_has_effect(obj),
@@ -2681,6 +2722,28 @@ mod tests {
         assert!(matches!(
             m.blocks[0].stmts[0].kind,
             lir::StmtKind::CatchArg { dst: LocalId(0) }
+        ));
+    }
+
+    /// The `StubHelpers.NextCallReturnAddress` value (step_11.15)
+    /// flattens to its own statement defining a NativeInt temp — the
+    /// pending-call-label discipline rides the statement to codegen.
+    #[test]
+    fn next_call_return_address_lowers_to_the_lir_form() {
+        let m = lower_ret(hir::Expr::NextCallReturnAddress);
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2);
+        match &stmts[0].kind {
+            lir::StmtKind::NextCallReturnAddress { dst } => {
+                assert_eq!(m.locals[dst.0 as usize].ty, Type::NativeInt);
+            }
+            _ => panic!("expected NextCallReturnAddress"),
+        }
+        assert!(matches!(
+            stmts[1].kind,
+            lir::StmtKind::Return {
+                value: Some(lir::Operand::Temp(_))
+            }
         ));
     }
 

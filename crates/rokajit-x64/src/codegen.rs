@@ -565,6 +565,12 @@ fn addr_taken_slots(method: &lir::Method) -> Vec<bool> {
                     mark(hi, &mut taken);
                     mark(divisor, &mut taken);
                 }
+                StmtKind::CpuId {
+                    function, sub_id, ..
+                } => {
+                    mark(function, &mut taken);
+                    mark(sub_id, &mut taken);
+                }
                 StmtKind::Load { addr, .. } => mark(addr, &mut taken),
                 StmtKind::Store { addr, src, .. } => {
                     mark(addr, &mut taken);
@@ -649,6 +655,7 @@ fn addr_taken_slots(method: &lir::Method) -> Vec<bool> {
                 StmtKind::Rethrow
                 | StmtKind::Leave { .. }
                 | StmtKind::CatchArg { .. }
+                | StmtKind::NextCallReturnAddress { .. }
                 | StmtKind::CallFinally { .. }
                 | StmtKind::EndFinally
                 | StmtKind::Jump { .. } => {}
@@ -1153,6 +1160,11 @@ struct Emitter<'a> {
     ranges: Vec<(u32, u32)>,
     /// Start offset of the currently open interruptible segment.
     seg_start: u32,
+    /// The label a [`Inst::NextCallReturnAddress`] `lea` referenced,
+    /// awaiting its bind immediately after the next call emitted
+    /// (RyuJIT's genPendingCallLabel, codegenxarch.cpp:2189). `None`
+    /// when no such value is in flight.
+    pending_call_label: Option<Label>,
 }
 
 impl<'a> Emitter<'a> {
@@ -1178,6 +1190,7 @@ impl<'a> Emitter<'a> {
             cur_funclet_sp: None,
             ranges: Vec::new(),
             seg_start: 0,
+            pending_call_label: None,
         }
     }
 
@@ -2393,6 +2406,47 @@ impl<'a> Emitter<'a> {
         self.emit_helper_call(CorInfoHelpFunc::MEMSET)
     }
 
+    /// The `StubHelpers.NextCallReturnAddress` expansion (step_11.15):
+    /// `lea dst, [rip + L]` with `L` pending — bound immediately after
+    /// the next call instruction emitted, so the value is that call's
+    /// return address (RyuJIT's genPendingCallLabel: codegenxarch.cpp:
+    /// 2189's `emitIns_R_L(INS_lea, …, genPendingCallLabel)` and
+    /// genDefinePendingCallLabel, codegencommon.cpp:6236). A second one
+    /// arriving before a call bound the first's label would orphan that
+    /// lea's fixup — an Internal error here (RyuJIT silently overwrites
+    /// genPendingCallLabel and fails later on the undefined label; the
+    /// pattern never occurs in the VM's stubs).
+    fn emit_next_call_return_address(&mut self, dst: Place) -> CompileResult<()> {
+        let Place::Val(t) = dst else {
+            return Err(CompileError::Internal(
+                "NextCallReturnAddress destination is always a value",
+            ));
+        };
+        if self.pending_call_label.is_some() {
+            return Err(CompileError::Internal(
+                "NextCallReturnAddress while a previous one's label is still pending",
+            ));
+        }
+        let label = self.synthetic_label();
+        let exclude = &self.scratch_exclude(&[]);
+        let (p, moves) = self.vs.take_scratch(exclude);
+        self.apply(moves)?;
+        let g = gpr_of(p)?;
+        self.asm.lea_rip(g, label);
+        self.define_temp_reg(t.0, g)?;
+        self.pending_call_label = Some(label);
+        Ok(())
+    }
+
+    /// A call instruction was just emitted: the current offset is its
+    /// return address, so a pending `NextCallReturnAddress` label binds
+    /// here (genDefinePendingCallLabel, codegencommon.cpp:6236).
+    fn bind_pending_call_label(&mut self) {
+        if let Some(label) = self.pending_call_label.take() {
+            self.asm.bind(label);
+        }
+    }
+
     fn emit_inst(&mut self, inst: &Inst) -> CompileResult<()> {
         if std::env::var_os("ROKAJIT_DEBUG_CODEGEN").is_some() {
             let before = self.asm.offset();
@@ -2582,6 +2636,7 @@ impl<'a> Emitter<'a> {
                 self.asm.serialize();
                 Ok(())
             }
+            Inst::CpuId { dst_ebx } => self.emit_cpuid(dst_ebx),
             Inst::BoundsCheck {
                 index,
                 index_wide,
@@ -2670,6 +2725,7 @@ impl<'a> Emitter<'a> {
                 let moves = self.vs.spill_registers();
                 self.apply(moves)?;
                 self.asm.call_label(target);
+                self.bind_pending_call_label();
                 Ok(())
             }
             Inst::LeaLabel { dst, target } => {
@@ -2678,6 +2734,7 @@ impl<'a> Emitter<'a> {
                 self.asm.lea_rip(dst, target);
                 Ok(())
             }
+            Inst::NextCallReturnAddress { dst } => self.emit_next_call_return_address(dst),
             Inst::FuncletEpilog => {
                 let n = self
                     .cur_funclet_sp
@@ -3411,6 +3468,39 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// `cpuid` (LIR `CpuId`): eax/ecx hold the inputs (the lowering's
+    /// explicit moves, the idiv fixed-duty precedent); the instruction
+    /// writes eax/ebx/ecx/edx. The value machine spills whatever temps
+    /// rax/rcx/rdx held; ebx's output is the trap — `rbx` is callee-saved
+    /// and the tier-0 frame contract never allocates it, so the emission
+    /// preserves it inline: `push rbx`, the capture into a scratch
+    /// (excluding the three output registers still live), then `pop rbx`.
+    /// No memory effect, no safepoint.
+    fn emit_cpuid(&mut self, dst_ebx: Place) -> CompileResult<()> {
+        for g in [Gpr::Rax, Gpr::Rcx, Gpr::Rdx] {
+            let moves = self.vs.clobber(g.phys());
+            self.apply(moves)?;
+        }
+        self.asm.push(Gpr::Rbx);
+        self.asm.cpuid();
+        let (p, moves) = self
+            .vs
+            .take_scratch(&[Gpr::Rax.phys(), Gpr::Rcx.phys(), Gpr::Rdx.phys()]);
+        self.apply(moves)?;
+        let g = gpr_of(p)?;
+        self.asm.mov(Width::W32, Rm::Reg(g), Rmi::Reg(Gpr::Rbx));
+        self.asm.pop(Gpr::Rbx);
+        match dst_ebx {
+            Place::Val(v) => self.define_temp_reg(v.0, g),
+            Place::Reg(d) => {
+                let moves = self.vs.clobber(d.phys());
+                self.apply(moves)?;
+                self.asm.mov(Width::W32, Rm::Reg(d), Rmi::Reg(g));
+                Ok(())
+            }
+        }
+    }
+
     /// The array bounds check (step_10.8): a 32-bit load of the length at
     /// `[array + 8]` (corinfo.h's CORINFO_Array layout — a null array
     /// faults here, the 10.4 trap model's NRE; 32-bit so a native index
@@ -3756,7 +3846,9 @@ impl<'a> Emitter<'a> {
         let lookup = self.ee.get_function_entry_point(method);
         let addr = const_lookup_addr(&lookup);
         let slot = const_lookup_slot(&lookup);
-        self.emit_call_lookup(method.into(), addr, slot)
+        self.emit_call_lookup(method.into(), addr, slot)?;
+        self.bind_pending_call_label();
+        Ok(())
     }
 
     /// An EE helper call (float `rem` → `fmod`/`fmodf` via
@@ -3767,7 +3859,15 @@ impl<'a> Emitter<'a> {
         let lookup = self.ee.get_helper_ftn(id).entrypoint;
         let addr = const_lookup_addr(&lookup);
         let slot = const_lookup_slot(&lookup);
-        self.emit_call_lookup(None, addr, slot)
+        self.emit_call_lookup(None, addr, slot)?;
+        // A pending NextCallReturnAddress label binds after the next
+        // call — but the block-operation memory helpers are not a call
+        // semantically (RyuJIT's genDefinePendingCallLabel skips exactly
+        // MEMSET/MEMCPY, codegencommon.cpp:6247-6258).
+        if !matches!(id, CorInfoHelpFunc::MEMSET | CorInfoHelpFunc::MEMCPY) {
+            self.bind_pending_call_label();
+        }
+        Ok(())
     }
 
     /// A computed-target call (step_10.12: `calli`, vtable dispatch):
@@ -3813,6 +3913,7 @@ impl<'a> Emitter<'a> {
             // result moves follow the call inside the same statement).
             ret_home_end: 0,
         });
+        self.bind_pending_call_label();
         Ok(())
     }
 
@@ -3946,6 +4047,14 @@ mod tests {
         CallSig {
             ret: Type::Int32,
             args: vec![Type::Int32],
+            has_this: false,
+        }
+    }
+
+    fn void_sig() -> CallSig {
+        CallSig {
+            ret: Type::Void,
+            args: vec![],
             has_this: false,
         }
     }
@@ -4588,6 +4697,146 @@ mod tests {
         assert_eq!(out.relocations[0].reloc_type, RelocType::RELATIVE32);
     }
 
+    // ---- step_11.15: the StubHelpers.NextCallReturnAddress expansion ----
+
+    /// The `lea` of a pending label whose bind lands immediately after
+    /// the next call — the value IS that call's return address
+    /// (RyuJIT's genPendingCallLabel + genDefinePendingCallLabel,
+    /// codegencommon.cpp:6236).
+    #[test]
+    fn next_call_return_address_binds_after_the_next_call() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let m = method(
+            vec![local(Type::NativeInt, LocalKind::Temp)],
+            0,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::NextCallReturnAddress { dst: LocalId(0) }),
+                    stmt(StmtKind::Call {
+                        dst: None,
+                        target: rokajit::ir::CallTarget::Direct(f),
+                        sig: void_sig(),
+                        args: vec![],
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(0))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &ee);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x10, // subq $16, %rsp
+            // leaq 9(%rip), %rax — rip reads as 15, so the target is
+            // offset 24: one past the call, its return address.
+            0x48, 0x8D, 0x05, 0x09, 0, 0, 0,
+            0x48, 0x89, 0x45, 0xF8, // movq %rax, -8(%rbp) — call spill
+            0xE8, 0, 0, 0, 0, // call rel32 (offset 19..24)
+            0x48, 0x8B, 0x45, 0xF8, // movq -8(%rbp), %rax — return value
+            0xC9, // leave
+            0xC3, // ret
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+        assert_eq!(out.call_sites.len(), 1);
+        assert_eq!(out.call_sites[0].offset, 19, "the E8 opcode offset");
+        assert_eq!(out.call_sites[0].method, Some(f));
+        assert_eq!(out.relocations.len(), 1);
+        assert_eq!(out.relocations[0].offset, 20, "the rel32 field");
+    }
+
+    /// A pending label survives an intervening MEMSET/MEMCPY block-op
+    /// helper — those are not the "next call" (RyuJIT's
+    /// genDefinePendingCallLabel skip list, codegencommon.cpp:
+    /// 6247-6258): the bind lands after the real call.
+    #[test]
+    fn next_call_return_address_skips_the_block_op_helpers() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let m = method(
+            vec![
+                local(Type::NativeInt, LocalKind::IlArg(0)),
+                local(Type::NativeInt, LocalKind::Temp),
+            ],
+            1,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::NextCallReturnAddress { dst: LocalId(1) }),
+                    stmt(StmtKind::BlockFillDyn {
+                        dst_addr: Operand::Local(LocalId(0)),
+                        fill: Operand::Const(Const::Int32(0)),
+                        size: Operand::Const(Const::NativeInt(24)),
+                    }),
+                    stmt(StmtKind::Call {
+                        dst: None,
+                        target: rokajit::ir::CallTarget::Direct(f),
+                        sig: void_sig(),
+                        args: vec![],
+                    }),
+                    stmt(StmtKind::Return { value: None }),
+                ],
+            )],
+        );
+        let out = emit(&m, &ee);
+        // The lea sits right after the 8-byte prolog and the arg spill
+        // (movq %rdi, -8(%rbp)): decode its displacement.
+        let bytes = &out.code.hot.bytes;
+        let lea = bytes
+            .windows(3)
+            .position(|w| w == [0x48, 0x8D, 0x05])
+            .expect("the lea rax, [rip+rel32]");
+        let rel = i32::from_le_bytes(bytes[lea + 3..lea + 7].try_into().unwrap());
+        let target = (lea + 7) as i64 + i64::from(rel);
+        // Two call sites: the MEMSET helper, then the direct call. The
+        // label resolves past the DIRECT call — the memset did not
+        // consume the pending label.
+        assert_eq!(out.call_sites.len(), 2);
+        assert_eq!(out.call_sites[0].method, None, "the MEMSET helper");
+        assert_eq!(out.call_sites[1].method, Some(f));
+        let memset_ret = i64::from(out.call_sites[0].offset + 5);
+        let call_ret = i64::from(out.call_sites[1].offset + 5);
+        assert_eq!(target, call_ret, "the label binds after the real call");
+        assert_ne!(target, memset_ret);
+    }
+
+    /// Two NextCallReturnAddress values with no intervening call would
+    /// orphan the first lea's label — a loud Internal error, not a
+    /// dangling fixup (the VM's stubs never produce the shape).
+    #[test]
+    fn next_call_return_address_twice_without_a_call_is_an_internal_error() {
+        let m = method(
+            vec![
+                local(Type::NativeInt, LocalKind::Temp),
+                local(Type::NativeInt, LocalKind::Temp),
+            ],
+            0,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::NextCallReturnAddress { dst: LocalId(0) }),
+                    stmt(StmtKind::NextCallReturnAddress { dst: LocalId(1) }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(0))),
+                    }),
+                ],
+            )],
+        );
+        assert!(matches!(
+            emit_tier0(&m, &MockEe::default()),
+            Err(CompileError::Internal(_))
+        ));
+    }
+
     /// The step_10.12 computed-target call (`calli` / vtable dispatch):
     /// `int g(int n, native int f) { return f(n); }` — the argument move,
     /// the pointer materialized into r11 (never an argument register),
@@ -4871,6 +5120,62 @@ mod tests {
             0xF7, 0xF1, // divl %ecx                  — the unsigned form
             0x89, 0x45, 0xF8, // movl %eax, -8(%rbp) — rax clobber spill at ret
             0x8B, 0x45, 0xF8, // movl -8(%rbp), %eax
+            0xC9, 0xC3,
+        ];
+        assert_eq!(out.code.hot.bytes, expected);
+    }
+
+    /// `(int eax, _, _, _) = cpuid(a, b)` — the fixed-register sequence:
+    /// inputs to eax/ecx, `push rbx; cpuid; mov ebx->scratch; pop rbx`
+    /// (rbx is callee-saved and tier 0 never allocates it, so the
+    /// preserve is inline), then the four outputs adopted by their temps
+    /// (zero-instruction register adoptions out of rax/rcx/rdx).
+    #[test]
+    fn cpuid_method_bytes() {
+        let m = method(
+            vec![
+                int_arg(0),
+                int_arg(1),
+                int_temp(),
+                int_temp(),
+                int_temp(),
+                int_temp(),
+            ],
+            2,
+            0,
+            vec![block(
+                0,
+                vec![
+                    stmt(StmtKind::CpuId {
+                        dst_eax: LocalId(2),
+                        dst_ebx: LocalId(3),
+                        dst_ecx: LocalId(4),
+                        dst_edx: LocalId(5),
+                        function: Operand::Local(LocalId(0)),
+                        sub_id: Operand::Local(LocalId(1)),
+                    }),
+                    stmt(StmtKind::Return {
+                        value: Some(Operand::Temp(LocalId(2))),
+                    }),
+                ],
+            )],
+        );
+        let out = emit(&m, &MockEe::default());
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x55, // pushq %rbp
+            0x48, 0x89, 0xE5, // movq %rsp, %rbp
+            0x48, 0x83, 0xEC, 0x20, // subq $32, %rsp
+            0x89, 0x7D, 0xFC, // movl %edi, -4(%rbp)  — arg function
+            0x89, 0x75, 0xF8, // movl %esi, -8(%rbp)  — arg sub_id
+            0x8B, 0x45, 0xFC, // movl -4(%rbp), %eax  — function to eax
+            0x8B, 0x4D, 0xF8, // movl -8(%rbp), %ecx  — sub_id to ecx
+            0x53, // pushq %rbx                       — callee-saved preserve
+            0x0F, 0xA2, // cpuid
+            0x89, 0xDE, // movl %ebx, %esi           — ebx out before the restore
+            0x5B, // popq %rbx
+            0x89, 0x45, 0xF4, // movl %eax, -12(%rbp) — rax clobber spill at ret
+            0x8B, 0x45, 0xF4, // movl -12(%rbp), %eax
             0xC9, 0xC3,
         ];
         assert_eq!(out.code.hot.bytes, expected);

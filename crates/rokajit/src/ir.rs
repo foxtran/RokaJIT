@@ -315,6 +315,20 @@ pub mod hir {
             hi: Expr,
             divisor: Expr,
         },
+        /// The `X86Base.CpuId(int, int)` expansion (step_11.15): the
+        /// `cpuid` instruction with `function` in eax and `sub_id` in ecx;
+        /// the four output registers land in `dst_eax`/`dst_ebx`/
+        /// `dst_ecx`/`dst_edx` (the tuple's Item1..Item4 order). Pure —
+        /// no memory effect, same inputs → same outputs. Fields evaluate
+        /// in signature order: function, sub_id.
+        CpuId {
+            dst_eax: LocalId,
+            dst_ebx: LocalId,
+            dst_ecx: LocalId,
+            dst_edx: LocalId,
+            function: Expr,
+            sub_id: Expr,
+        },
         /// The array bounds check (step_10.8: `ldelem`/`stelem`/`ldelema`):
         /// throws `IndexOutOfRangeException` unless `0 <= index < len`
         /// (unsigned — a negative index is huge); a null array faults on
@@ -581,6 +595,24 @@ pub mod hir {
         LocAlloc {
             size: Box<Expr>,
         },
+        /// The `System.StubHelpers.StubHelpers.NextCallReturnAddress`
+        /// intrinsic (step_11.15; RyuJIT's
+        /// NI_System_StubHelpers_NextCallReturnAddress,
+        /// importercalls.cpp:3541-3549): the address immediately
+        /// following the NEXT call instruction emitted for this method —
+        /// a NativeInt. RyuJIT lowers it to a `GT_LABEL` whose temp label
+        /// codegen defines after the next call
+        /// (genDefinePendingCallLabel, codegencommon.cpp:6236); RokaJIT's
+        /// codegen does the same (the pending-call-label mechanism). Its
+        /// CoreLib body is `throw new UnreachableException()` — an
+        /// "Unconditionally expanded intrinsic" (StubHelpers.cs:2566) —
+        /// so compiling it literally crashes the reflection invoke stubs
+        /// (InvokerEmitUtil.cs:217 emits `call NextCallReturnAddress;
+        /// pop` ahead of the target call). The intrinsic's other effect —
+        /// `compHasNextCallRetAddr` barring inlining and fast tail calls
+        /// — is vacuous here: RokaJIT does neither. Pure (a `lea` of a
+        /// code address): a discarded value emits nothing.
+        NextCallReturnAddress,
         /// A function pointer with its method (step_11.8): the value form
         /// of `ldftn`/`ldvirtftn` — a NativeInt. The wrapper is the
         /// provenance a delegate `newobj` needs for the EE's
@@ -764,6 +796,17 @@ pub mod lir {
             hi: Operand,
             divisor: Operand,
         },
+        /// The `cpuid` instruction (HIR [`StmtKind::CpuId`]): eax/ecx in
+        /// (`function`/`sub_id`), the four output registers into
+        /// `dst_eax`/`dst_ebx`/`dst_ecx`/`dst_edx`.
+        CpuId {
+            dst_eax: LocalId,
+            dst_ebx: LocalId,
+            dst_ecx: LocalId,
+            dst_edx: LocalId,
+            function: Operand,
+            sub_id: Operand,
+        },
         /// Load through a byref operand at a constant offset.
         Load {
             dst: LocalId,
@@ -862,6 +905,14 @@ pub mod lir {
         /// [`Expr::Serialize`]): the `serialize` instruction. A statement
         /// (no result value).
         Serialize,
+        /// The `StubHelpers.NextCallReturnAddress` expansion (HIR
+        /// [`Expr::NextCallReturnAddress`]): `dst` receives the address
+        /// immediately following the next call instruction emitted for
+        /// this method (RyuJIT's GT_LABEL + genDefinePendingCallLabel).
+        /// Codegen owns the pending-label discipline.
+        NextCallReturnAddress {
+            dst: LocalId,
+        },
         Cast {
             dst: LocalId,
             src: Operand,
@@ -983,6 +1034,7 @@ pub mod lir {
                 StmtKind::CkFinite { .. } => "CkFinite",
                 StmtKind::ConvRne { .. } => "ConvRne",
                 StmtKind::DivRem { .. } => "DivRem",
+                StmtKind::CpuId { .. } => "CpuId",
                 StmtKind::Load { .. } => "Load",
                 StmtKind::Store { .. } => "Store",
                 StmtKind::Call { .. } => "Call",
@@ -998,6 +1050,7 @@ pub mod lir {
                 StmtKind::AtomicXadd { .. } => "AtomicXadd",
                 StmtKind::MemoryFence => "MemoryFence",
                 StmtKind::Serialize => "Serialize",
+                StmtKind::NextCallReturnAddress { .. } => "NextCallReturnAddress",
                 StmtKind::BlockCopy { .. } => "BlockCopy",
                 StmtKind::BlockZero { .. } => "BlockZero",
                 StmtKind::BlockCopyDyn { .. } => "BlockCopyDyn",
