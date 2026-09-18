@@ -9,8 +9,11 @@
 //!
 //! - **Slim header** (`gcinfoencoder.cpp:945-960`): no vararg, no GS
 //!   cookie, no generics context, no reverse-pinvoke frame, no EnC, no
-//!   interruptible ranges (tier-0 methods are partially interruptible —
-//!   safepoints only), and the stack base register normalizes to 0: every
+//!   interruptible ranges (the ordinary tier-0 method is partially
+//!   interruptible — safepoints only; EH methods and — step_11.6 —
+//!   methods with a safepoint-free loop cycle take the fat
+//!   fully-interruptible path below), and the stack base register
+//!   normalizes to 0: every
 //!   tier-0 frame is rbp-based, and `NORMALIZE_STACK_BASE_REGISTER(rbp) =
 //!   rbp ^ 5 = 0` (`gcinfotypes.h:583`), so the header stays slim with the
 //!   SBR bit set. The decoder (`gcinfodecoder.cpp:294-320`) reads exactly
@@ -57,19 +60,28 @@
 //! gcinfoencoder.h: the first bit written lands in bit 0 of the first
 //! byte), matching `BitStreamReader` in gcinfodecoder.h.
 //!
-//! ## The fat header (10.6 EH methods)
+//! ## The fat header (10.6 EH methods, 11.6 loop safepoints)
 //!
 //! Non-empty [`GcInfoInput::interruptible_ranges`] selects the
 //! fully-interruptible encoding; the slim path above stays byte-identical
-//! for empty ranges. Layout (encoder `Build`, gcinfoencoder.cpp:942-1162;
-//! decoder read order, gcinfodecoder.cpp:294-411):
+//! for empty ranges. Two producers emit ranges: EH methods (10.6) and
+//! methods with a safepoint-free cycle (11.6 — RyuJIT's
+//! `fgSetBlockOrder`/`fgHasCycleWithoutGCSafePoint`,
+//! flowgraph.cpp:4162-4175/4282: a call-free loop never reaches a
+//! safepoint, so the whole method goes fully interruptible at EVERY tier —
+//! the phase runs before the `OptimizationEnabled` gate,
+//! compiler.cpp:4640 vs 4645). Layout (encoder `Build`,
+//! gcinfoencoder.cpp:942-1162; decoder read order, gcinfodecoder.cpp:294-411):
 //!
 //! - Slim bit 1, then the 10-bit fat-flags word
-//!   (`GC_INFO_FLAGS_BIT_SIZE`, gcinfodecoder.h:257) with exactly
-//!   `GC_INFO_HAS_STACK_BASE_REGISTER` (0x40 — rbp, normalized to 0) and
-//!   `GC_INFO_WANTS_REPORT_ONLY_LEAF` (0x80 — RyuJIT sets it for any
-//!   method with funclets, gcencode.cpp:3998-4004, to avoid
-//!   double-reporting the parent frame) set. The macro
+//!   (`GC_INFO_FLAGS_BIT_SIZE`, gcinfodecoder.h:257) with
+//!   `GC_INFO_HAS_STACK_BASE_REGISTER` (0x40 — rbp, normalized to 0)
+//!   always set and `GC_INFO_WANTS_REPORT_ONLY_LEAF` (0x80) set ONLY for
+//!   methods with funclets (RyuJIT: gcencode.cpp:3998-4004's
+//!   `ehAnyFunclets()` — it avoids double-reporting the parent frame; the
+//!   VM consults it only when walking the parent of a funclet frame,
+//!   gcinfodecoder.cpp:744's `ParentOfFuncletStackFrame`, so a funclet-less
+//!   loop method never sets it). The macro
 //!   `GCINFO_WRITE_VARL_U(..., ENCBASE, RangeSize)`'s third parameter is a
 //!   MEASURE_GCINFO size counter only (gcinfoencoder.cpp:47-103) — it does
 //!   not affect the encoding.
@@ -167,7 +179,8 @@ fn context_param_type_bits(kind: rokajit::ir::GenericsContext) -> u64 {
 /// The `Target::encode_gc_info` body for x64.
 pub fn encode(input: &GcInfoInput) -> CompileResult<Vec<u8>> {
     let mut w = BitWriter::new();
-    // Non-empty interruptible ranges ⇒ an EH method; a reported generics
+    // Non-empty interruptible ranges ⇒ a fully-interruptible method (EH,
+    // or a safepoint-free loop cycle — step_11.6); a reported generics
     // context (step_11.3B) also forces the fat header
     // (gcinfoencoder.cpp:940-952's slimHeader condition). The slim path is
     // byte-identical to pre-EH output.
@@ -176,10 +189,12 @@ pub fn encode(input: &GcInfoInput) -> CompileResult<Vec<u8>> {
     if fat {
         // GC_INFO_HAS_STACK_BASE_REGISTER (0x40): rbp normalizes to 0.
         let mut flags = 0x40u64;
-        if fully_interruptible {
+        if fully_interruptible && input.has_funclets {
             // RyuJIT sets WANTS_REPORT_ONLY_LEAF for any method with
-            // funclets (gcencode.cpp:3998-4004) — no double-reporting of
-            // the parent frame.
+            // funclets (gcencode.cpp:3998-4004's ehAnyFunclets) — no
+            // double-reporting of the parent frame. A funclet-less loop
+            // method does NOT set it: the VM consults the flag only when
+            // walking the parent of a funclet (gcinfodecoder.cpp:744).
             flags |= 0x80;
         }
         if let Some(ctx) = &input.generics_context {
@@ -392,9 +407,10 @@ pub fn encode(input: &GcInfoInput) -> CompileResult<Vec<u8>> {
     // register's liveness is exactly its own call's return edge: tier 0
     // homes the result into its frame slot before the next safepoint.
     //
-    // Fully interruptible (EH): the chunk encoding — every instruction is
-    // a potential interrupt point, so the return register's live WINDOW
-    // [return address, homed) becomes two lifetime transitions per call.
+    // Fully interruptible (EH, step_11.6 loops): the chunk encoding —
+    // every instruction is a potential interrupt point, so the return
+    // register's live WINDOW [return address, homed) becomes two lifetime
+    // transitions per call.
     if !reg_roots.is_empty() && !fully_interruptible {
         let mut by_offset: Vec<(u32, u32)> = input
             .safepoints
@@ -433,7 +449,8 @@ const NUM_NORM_CODE_OFFSETS_PER_CHUNK: u32 = 64;
 /// offset's width in bits.
 const NUM_NORM_CODE_OFFSETS_PER_CHUNK_LOG2: u32 = 6;
 
-/// The fully-interruptible live-state section (step_11.15, EH methods):
+/// The fully-interruptible live-state section (step_11.15; EH methods and
+/// step_11.6 safepoint-free-loop methods):
 /// the return-register live windows as lifetime transitions, chunked over
 /// the PSEUDO offset space (the interruptible ranges concatenated —
 /// gcinfodecoder.cpp:794-820's pseudoBreakOffset arithmetic), encoded per
@@ -749,6 +766,7 @@ mod tests {
             reg_live: Vec::new(),
             reg_home_end: Vec::new(),
             interruptible_ranges: Vec::new(),
+            has_funclets: false,
             outgoing_area_size: 0,
             generics_context: None,
         }
@@ -1465,6 +1483,7 @@ mod tests {
         GcInfoInput {
             code_len: 100,
             interruptible_ranges: vec![(8, 73), (84, 96)],
+            has_funclets: true,
             ..input(100, &[37, 56])
         }
     }
@@ -1588,6 +1607,103 @@ mod tests {
         assert_eq!(second, (84, 96), "the handler funclet body");
         let third = read_range(&mut r, second.1);
         assert_eq!(third, (105, 121), "the filter funclet body");
+    }
+
+    /// The step_11.6 loop-safepoint shape: a call-free-loop method (no
+    /// funclets) carries the fat header with HAS_STACK_BASE_REGISTER but
+    /// NOT WANTS_REPORT_ONLY_LEAF (RyuJIT: gcencode.cpp:3998-4004 gates it
+    /// on ehAnyFunclets; the VM reads it only for the parent of a funclet,
+    /// gcinfodecoder.cpp:744), zero safepoints, and the one body range —
+    /// the untracked live-everywhere slot table is valid at EVERY point of
+    /// the range, which is what makes arbitrary interrupt points safe.
+    #[test]
+    fn loop_method_blob_carries_ranges_without_report_only_leaf() {
+        let mut i = input(58, &[40]);
+        i.interruptible_ranges = vec![(8, 42), (44, 58)];
+        i.gc_roots.push(root(16, false, false));
+        let blob = encode(&i).expect("encodes");
+        let mut r = Reader {
+            bytes: &blob,
+            bit: 0,
+        };
+        assert_eq!(r.read(1), 1, "fat header");
+        assert_eq!(
+            r.read(10),
+            0x40,
+            "HAS_STACK_BASE_REGISTER only — no funclets, no report-only-leaf"
+        );
+        assert_eq!(r.read_varl_u(CODE_LENGTH_ENCBASE), 58);
+        assert_eq!(r.read_varl_u(STACK_BASE_REGISTER_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(SIZE_OF_STACK_AREA_ENCBASE), 0);
+        assert_eq!(
+            r.read_varl_u(NUM_SAFE_POINTS_ENCBASE),
+            0,
+            "fully interruptible: the safepoint count is 0 even though the input lists the call"
+        );
+        assert_eq!(r.read_varl_u(NUM_INTERRUPTIBLE_RANGES_ENCBASE), 2);
+        let first = read_range(&mut r, 0);
+        assert_eq!(first, (8, 42), "the body up to the epilog");
+        let second = read_range(&mut r, first.1);
+        assert_eq!(second, (44, 58), "the loop body after the exit block");
+        assert_eq!(r.read(1), 0, "no register slots");
+        assert_eq!(r.read(1), 1, "stack slots follow");
+        assert_eq!(r.read_varl_u(NUM_STACK_SLOTS_ENCBASE), 0);
+        assert_eq!(r.read_varl_u(NUM_UNTRACKED_SLOTS_ENCBASE), 1);
+        assert_eq!(read_untracked_slot(&mut r, None), (-2, 0), "rbp - 16");
+        // No tracked slots: the chunk section collapses to the zero
+        // pointer-size varl (gcinfoencoder.cpp:2089-2098).
+        assert_eq!(r.read_varl_u(POINTER_SIZE_ENCBASE), 0);
+        assert!(blob.len() * 8 - r.bit < 8, "only padding remains");
+    }
+
+    /// The register-root interaction resolved (step_11.6's open question):
+    /// a loop method whose call (outside the loop) returns a byref carries
+    /// the return register as a TRACKED slot whose [return, homed) window
+    /// rides the SAME chunk encoding the EH path proved — the decoder
+    /// reconstructs per-offset liveness at any interrupt point, so an
+    /// arbitrary suspension inside the range reports rax exactly inside
+    /// the window and nowhere else.
+    #[test]
+    fn loop_method_register_root_window_decodes_at_any_offset() {
+        let mut i = input(58, &[40]);
+        i.interruptible_ranges = vec![(8, 42), (44, 58)];
+        i.reg_roots.push(rokajit::artifact::GcReturnReg {
+            reg: 0,
+            interior: true,
+        });
+        i.reg_live = vec![0b1];
+        i.reg_home_end = vec![46]; // homed just into the second range
+        let blob = encode(&i).expect("encodes");
+        let ranges = i.interruptible_ranges.clone();
+        let live_at = |native: u32| {
+            let mut r = Reader {
+                bytes: &blob,
+                bit: 0,
+            };
+            assert_eq!(r.read(1), 1, "fat header");
+            assert_eq!(r.read(10), 0x40, "no report-only-leaf");
+            assert_eq!(r.read_varl_u(CODE_LENGTH_ENCBASE), 58);
+            assert_eq!(r.read_varl_u(STACK_BASE_REGISTER_ENCBASE), 0);
+            assert_eq!(r.read_varl_u(SIZE_OF_STACK_AREA_ENCBASE), 0);
+            assert_eq!(r.read_varl_u(NUM_SAFE_POINTS_ENCBASE), 0);
+            assert_eq!(r.read_varl_u(NUM_INTERRUPTIBLE_RANGES_ENCBASE), 2);
+            let mut last_stop = 0;
+            for _ in 0..ranges.len() {
+                last_stop = read_range(&mut r, last_stop).1;
+            }
+            assert_eq!(r.read(1), 1, "register slots follow");
+            assert_eq!(r.read_varl_u(NUM_REGISTERS_ENCBASE), 1);
+            assert_eq!(r.read(1), 0, "no stack slots");
+            assert_eq!(r.read_varl_u(REGISTER_ENCBASE), 0, "rax");
+            assert_eq!(r.read(2), 1, "interior");
+            decode_eh_live_regs(&mut r, &ranges, 1, native)
+        };
+        assert!(live_at(39).is_empty(), "before the call returns");
+        assert_eq!(live_at(40), vec![0], "at the return address");
+        assert_eq!(live_at(45), vec![0], "inside the window, second range");
+        assert!(live_at(46).is_empty(), "homed: dead from here on");
+        assert!(live_at(57).is_empty(), "dead at the loop's back edge");
+        assert!(live_at(20).is_empty(), "dead mid-loop, before the call");
     }
 
     /// Contract violations in the ranges are upstream bugs, not encodings.

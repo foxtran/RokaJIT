@@ -35,8 +35,8 @@ are counted under COMPILE_FAIL.
 | Category | Tests |
 | --- | ---: |
 | MATCH | 2406 |
-| ARTIFACT | 16 |
-| TIMEOUT | 27 |
+| ARTIFACT | 15 |
+| TIMEOUT | 28 |
 | COMPILE_FAIL | 832 |
 
 Of the MATCHes, 2387 exit 100 (the CoreCLR pass
@@ -76,7 +76,6 @@ verification is a regression, not a fix.
 | `JIT/Performance/CodeQuality/Benchstones/BenchF/Adams/Adams.cs` | timing values in output; both exit 100 |
 | `JIT/Performance/CodeQuality/BilinearInterpol/BilinearInterpol.cs` | timing values in output; both exit 100 |
 | `JIT/Performance/CodeQuality/HWIntrinsic/X86/PacketTracer/Program.cs` | frames/sec timing value in output; both exit 100 |
-| `JIT/Performance/CodeQuality/SIMD/RayTracer/RayTracerBench.cs` | frames/sec timing value in output; both exit 100 |
 | `JIT/Performance/CodeQuality/Span/Indexer.cs` | timing values in output; both exit 100 |
 | `JIT/Performance/CodeQuality/V8/Richards/Richards.cs` | timing values in output; both exit 100 |
 | `JIT/Regression/CLR-x86-JIT/V1-M12-Beta2/b59297/b59297.cs` | timing values in output; both exit 100 |
@@ -117,7 +116,7 @@ entry shapes). Out of scope for triage; listed for the record.
 
 | Which JIT timed out | Tests |
 | --- | ---: |
-| rokajit | 22 |
+| rokajit | 23 |
 | ryujit,rokajit | 5 |
 
 ## Needs investigation

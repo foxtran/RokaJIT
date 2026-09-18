@@ -62,10 +62,17 @@ pub struct GcInfoInput {
     /// Only the fully-interruptible (EH) chunk encoding consumes it.
     pub reg_home_end: Vec<u32>,
     /// Fully-interruptible ranges `[start, end)`, native hot-relative,
-    /// sorted, disjoint. Non-empty ⇒ EH method: fat header, fully
-    /// interruptible, WantsReportOnlyLeaf — and safepoints are NOT emitted.
-    /// Empty ⇒ today's slim partially-interruptible encoding.
+    /// sorted, disjoint. Non-empty ⇒ fully interruptible: fat header and
+    /// safepoints are NOT emitted. Two producers: EH methods (10.6) and
+    /// methods with a safepoint-free loop cycle (11.6 — codegen's
+    /// `has_safepoint_free_cycle`). Empty ⇒ today's slim
+    /// partially-interruptible encoding.
     pub interruptible_ranges: Vec<(u32, u32)>,
+    /// Whether the method has funclets (EH). Gates the fat header's
+    /// WANTS_REPORT_ONLY_LEAF flag — RyuJIT sets it iff
+    /// `ehAnyFunclets()` (gcencode.cpp:3998-4004); a funclet-less loop
+    /// method (11.6) leaves it clear.
+    pub has_funclets: bool,
     /// Frame outgoing-argument area in bytes
     /// (`SizeOfStackOutgoingAndScratchArea`; written only in the fat
     /// header). Codegen's frame layout supplies it.
@@ -262,6 +269,7 @@ impl MetadataBuilder {
             reg_live,
             reg_home_end,
             interruptible_ranges: self.interruptible_ranges,
+            has_funclets: !self.funclets.is_empty(),
             outgoing_area_size: self.outgoing_area_size,
             generics_context: self.generics_context,
         })?;

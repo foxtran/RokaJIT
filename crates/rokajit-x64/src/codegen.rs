@@ -49,7 +49,7 @@ use rokajit::artifact::{
 use rokajit::codegen::{Loc, Move, ReadSrc, ValueState};
 use rokajit::error::{CompileError, CompileResult};
 use rokajit::ir::lir::StmtKind;
-use rokajit::ir::{hir, lir, BinaryOp, CallSig, LocalId, Type, UnaryOp};
+use rokajit::ir::{hir, lir, BinaryOp, BlockId, CallSig, LocalId, Type, UnaryOp};
 use rokajit::lower::{Cx, Label};
 use rokajit::pipeline::{CodegenOutput, FrameInfo, FuncletInfo};
 #[cfg(test)]
@@ -1064,6 +1064,16 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
     if let Some(last) = funclets.last_mut() {
         last.end_offset = total;
     }
+    // Keep the interruptible ranges only when the method needs
+    // fully-interruptible GC reporting: EH methods (step_10.6) and —
+    // step_11.6 — methods with a cycle no GC safepoint sits on (RyuJIT's
+    // fgHasCycleWithoutGCSafePoint, flowgraph.cpp:4282: a call-free loop
+    // starves a requested GC until it exits, since a partially
+    // interruptible method suspends only at call sites). Anything else
+    // discards the segments and keeps the slim header, byte-identical to
+    // pre-EH output.
+    let keep_ranges = !method.eh_regions.is_empty()
+        || has_safepoint_free_cycle(method, &block_offsets, total, &em.call_sites);
 
     let eh_clauses = if plans.is_empty() {
         Vec::new()
@@ -1107,8 +1117,128 @@ pub fn emit_tier0(method: &lir::Method, ee: &dyn EeInfo) -> CompileResult<Codege
         },
         funclets,
         eh_clauses,
-        interruptible_ranges: em.ranges,
+        interruptible_ranges: if keep_ranges { em.ranges } else { Vec::new() },
     })
+}
+
+/// Step_11.6 — RyuJIT's `fgHasCycleWithoutGCSafePoint`
+/// (runtime/src/coreclr/jit/flowgraph.cpp:4282) on the emitted shape: does
+/// the block graph have a cycle no GC safepoint sits on? A block is a
+/// safepoint iff a recorded call site (every emitted managed/helper call
+/// lands in [`Emitter::call_sites`]) falls in its native extent. A
+/// call-free cycle starves a requested GC for the loop's whole duration —
+/// a partially interruptible method suspends only at call sites — so such
+/// a method must be encoded fully interruptible. Running on codegen's
+/// native facts (not an LIR statement-kind list) means a call on any path,
+/// a helper-throw path included, counts; the conservative direction is
+/// more methods fully interruptible, never fewer.
+fn has_safepoint_free_cycle(
+    method: &lir::Method,
+    block_offsets: &[u32],
+    total: u32,
+    call_sites: &[CallSite],
+) -> bool {
+    let n = method.blocks.len();
+    let index_of = |id: BlockId| method.blocks.iter().position(|b| b.id == id);
+    // A block's native extent: its bound offset to the next block's (the
+    // last block runs to the end of the hot code).
+    let safe: Vec<bool> = (0..n)
+        .map(|i| {
+            let start = block_offsets[i];
+            let end = if i + 1 < n {
+                block_offsets[i + 1]
+            } else {
+                total
+            };
+            call_sites
+                .iter()
+                .any(|s| s.offset >= start && s.offset < end)
+        })
+        .collect();
+    // Layout successors from the terminator (the last statement).
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (bi, block) in method.blocks.iter().enumerate() {
+        let push = |id: BlockId, succs: &mut Vec<Vec<usize>>| {
+            if let Some(t) = index_of(id) {
+                succs[bi].push(t);
+            }
+        };
+        match block.stmts.last().map(|s| &s.kind) {
+            Some(StmtKind::Branch { target, .. }) => {
+                push(*target, &mut succs);
+                if bi + 1 < n {
+                    succs[bi].push(bi + 1); // the fallthrough
+                }
+            }
+            Some(StmtKind::Jump { target }) | Some(StmtKind::Leave { target }) => {
+                push(*target, &mut succs)
+            }
+            Some(StmtKind::Switch {
+                targets, default, ..
+            }) => {
+                for &t in targets.iter().chain(std::iter::once(default)) {
+                    push(t, &mut succs);
+                }
+            }
+            Some(StmtKind::CallFinally {
+                funclet,
+                continuation,
+            }) => {
+                push(*funclet, &mut succs);
+                push(*continuation, &mut succs);
+            }
+            // Terminators with no successor (Return, Throw, Rethrow,
+            // EndFinally, EndFilter); anything else falls through.
+            Some(
+                StmtKind::Return { .. }
+                | StmtKind::ReturnStruct { .. }
+                | StmtKind::Throw { .. }
+                | StmtKind::Rethrow
+                | StmtKind::EndFinally
+                | StmtKind::EndFilter { .. },
+            ) => {}
+            _ => {
+                if bi + 1 < n {
+                    succs[bi].push(bi + 1);
+                }
+            }
+        }
+    }
+    // Three-color DFS over the safepoint-free subgraph; a back edge to a
+    // gray node (a self-loop included) is a cycle no safepoint sits on —
+    // the flowgraph.cpp:4282-4350 algorithm.
+    const WHITE: u8 = 0;
+    const GRAY: u8 = 1;
+    const BLACK: u8 = 2;
+    let mut color = vec![WHITE; n];
+    for start in 0..n {
+        if safe[start] || color[start] != WHITE {
+            continue;
+        }
+        color[start] = GRAY;
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        while !stack.is_empty() {
+            let (node, next) = {
+                let top = stack.last_mut().expect("non-empty");
+                let v = (top.0, top.1);
+                top.1 += 1;
+                v
+            };
+            match succs[node].get(next).copied() {
+                Some(s) if safe[s] || color[s] == BLACK => {}
+                Some(s) if color[s] == GRAY => return true,
+                Some(s) => {
+                    color[s] = GRAY;
+                    stack.push((s, 0));
+                }
+                None => {
+                    color[node] = BLACK;
+                    stack.pop();
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The emission state: the assembler, the generic value machine, the
@@ -1145,10 +1275,6 @@ struct Emitter<'a> {
     /// not value-machine-tracked, so `take_scratch` would silently reuse
     /// one).
     fixed_dests: Vec<PhysReg>,
-    /// Whether the method has EH regions (step_10.6) — gates the
-    /// interruptible-range bookkeeping (a non-EH method emits no ranges
-    /// and keeps the slim GC header, byte-identical to pre-EH output).
-    eh: bool,
     /// The current funclet's stack adjustment (its prolog's `sub rsp, N`),
     /// `None` in the main area. `Inst::FuncletEpilog` reads it.
     cur_funclet_sp: Option<u32>,
@@ -1156,7 +1282,12 @@ struct Emitter<'a> {
     /// (`CodegenOutput::interruptible_ranges`): a segment opens after a
     /// prolog and closes at an epilog or a funclet boundary, so no range
     /// covers a prolog or an epilog (a thread observed there has a
-    /// half-torn-down frame — RyuJIT's exclusion policy).
+    /// half-torn-down frame — RyuJIT's exclusion policy). Recorded for
+    /// EVERY method; `emit_tier0` keeps them only when the method needs
+    /// fully-interruptible GC reporting (EH, step_10.6; a safepoint-free
+    /// cycle, step_11.6) and discards them otherwise, so a method that
+    /// stays partially interruptible keeps the slim GC header,
+    /// byte-identical to pre-EH output.
     ranges: Vec<(u32, u32)>,
     /// Start offset of the currently open interruptible segment.
     seg_start: u32,
@@ -1186,7 +1317,6 @@ impl<'a> Emitter<'a> {
             relocations: Vec::new(),
             next_synthetic: FIRST_SYNTHETIC_LABEL,
             fixed_dests: Vec::new(),
-            eh: !method.eh_regions.is_empty(),
             cur_funclet_sp: None,
             ranges: Vec::new(),
             seg_start: 0,
@@ -1195,9 +1325,9 @@ impl<'a> Emitter<'a> {
     }
 
     /// Close the open interruptible segment at `end` (an epilog start or
-    /// a funclet boundary). No-op for non-EH methods; empty segments drop.
+    /// a funclet boundary). Empty segments drop.
     fn range_close_at(&mut self, end: u32) {
-        if self.eh && self.seg_start < end {
+        if self.seg_start < end {
             self.ranges.push((self.seg_start, end));
         }
     }
@@ -1205,9 +1335,7 @@ impl<'a> Emitter<'a> {
     /// Reopen the interruptible segment at the current offset (after the
     /// main frame allocation, an epilog, or a funclet prolog).
     fn range_reopen(&mut self) {
-        if self.eh {
-            self.seg_start = self.asm.offset();
-        }
+        self.seg_start = self.asm.offset();
     }
 
     /// `fixed_dests ∪ extra` — the scratch-allocation exclusion list while
@@ -8075,6 +8203,227 @@ mod tests {
         assert_eq!(out.relocations.len(), 1);
         assert!(out.interruptible_ranges.is_empty(), "no EH regions");
         assert!(out.funclets.is_empty() && out.eh_clauses.is_empty());
+    }
+
+    /// Step_11.6: a call-free loop goes fully interruptible (RyuJIT's
+    /// fgHasCycleWithoutGCSafePoint, flowgraph.cpp:4282) — the
+    /// `while (i < 100) i++;` shape: B0 seeds the counter, B1 (the
+    /// header) branches to the exit B2 or the body B3, B3 increments and
+    /// jumps back. No block on the B1↔B3 cycle holds a call, so the
+    /// emitted segments become the GC info's interruptible ranges: the
+    /// body minus the epilog — [8, B2's leave) and [B3's start, total).
+    #[test]
+    fn call_free_loop_goes_fully_interruptible() {
+        let m = method(
+            vec![local(Type::Int32, LocalKind::IlLocal(0))],
+            0,
+            1,
+            vec![
+                block(
+                    0,
+                    vec![
+                        stmt(StmtKind::Copy {
+                            dst: LocalId(0),
+                            src: Operand::Const(Const::Int32(0)),
+                        }),
+                        stmt(StmtKind::Jump { target: BlockId(1) }),
+                    ],
+                ),
+                block(
+                    1,
+                    vec![stmt(StmtKind::Branch {
+                        cond: BranchCond::Cmp {
+                            op: BinaryOp::Lt,
+                            lhs: Operand::Local(LocalId(0)),
+                            rhs: Operand::Const(Const::Int32(100)),
+                        },
+                        target: BlockId(3),
+                    })],
+                ),
+                block(
+                    2,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(0))),
+                    })],
+                ),
+                block(
+                    3,
+                    vec![
+                        stmt(StmtKind::Binary {
+                            dst: LocalId(0),
+                            op: BinaryOp::Add,
+                            lhs: Operand::Local(LocalId(0)),
+                            rhs: Operand::Const(Const::Int32(1)),
+                        }),
+                        stmt(StmtKind::Jump { target: BlockId(1) }),
+                    ],
+                ),
+            ],
+        );
+        let out = emit(&m, &MockEe::default());
+        assert!(out.call_sites.is_empty(), "the loop is call-free");
+        // Two segments: the main body up to B2's epilog, then B3's body
+        // (emitted after B2's ret) to the end. The epilog's leave/ret is
+        // excluded — a thread observed there has a half-torn-down frame.
+        let bytes = &out.code.hot.bytes;
+        let leave = bytes
+            .windows(2)
+            .position(|w| w == [0xC9, 0xC3])
+            .expect("the epilog");
+        let total = bytes.len() as u32;
+        assert_eq!(
+            out.interruptible_ranges,
+            vec![(8, leave as u32), (leave as u32 + 2, total)],
+            "body minus the epilog: {bytes:02x?}"
+        );
+        // And the ranges really do bound the loop: B1's header (the cmp)
+        // and B3's increment and back-edge jump all lie inside.
+        let second_start = out.interruptible_ranges[1].0;
+        assert!(second_start > 0 && (second_start as usize) < bytes.len());
+    }
+
+    /// The same loop with a call in the body: the call's return address
+    /// is a GC safepoint ON the cycle, so the method stays partially
+    /// interruptible — no ranges, the slim GC header, byte-identical to
+    /// pre-11.6 output.
+    #[test]
+    fn loop_with_a_call_stays_partially_interruptible() {
+        let f = handle(0xF00);
+        let mut ee = MockEe::default();
+        ee.entry_points.insert(0xF00, 0x5000);
+        let m = method(
+            vec![local(Type::Int32, LocalKind::IlLocal(0))],
+            0,
+            1,
+            vec![
+                block(
+                    0,
+                    vec![
+                        stmt(StmtKind::Copy {
+                            dst: LocalId(0),
+                            src: Operand::Const(Const::Int32(0)),
+                        }),
+                        stmt(StmtKind::Jump { target: BlockId(1) }),
+                    ],
+                ),
+                block(
+                    1,
+                    vec![stmt(StmtKind::Branch {
+                        cond: BranchCond::Cmp {
+                            op: BinaryOp::Lt,
+                            lhs: Operand::Local(LocalId(0)),
+                            rhs: Operand::Const(Const::Int32(100)),
+                        },
+                        target: BlockId(3),
+                    })],
+                ),
+                block(
+                    2,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(0))),
+                    })],
+                ),
+                block(
+                    3,
+                    vec![
+                        stmt(StmtKind::Call {
+                            dst: None,
+                            target: rokajit::ir::CallTarget::Direct(f),
+                            sig: void_sig(),
+                            args: vec![],
+                        }),
+                        stmt(StmtKind::Binary {
+                            dst: LocalId(0),
+                            op: BinaryOp::Add,
+                            lhs: Operand::Local(LocalId(0)),
+                            rhs: Operand::Const(Const::Int32(1)),
+                        }),
+                        stmt(StmtKind::Jump { target: BlockId(1) }),
+                    ],
+                ),
+            ],
+        );
+        let out = emit(&m, &ee);
+        assert_eq!(out.call_sites.len(), 1, "the body's call");
+        assert!(
+            out.interruptible_ranges.is_empty(),
+            "a safepoint sits on the cycle"
+        );
+    }
+
+    /// A self-loop (B0 branches to itself) is the minimal safepoint-free
+    /// cycle.
+    #[test]
+    fn self_loop_goes_fully_interruptible() {
+        let m = method(
+            vec![local(Type::Int32, LocalKind::IlLocal(0))],
+            0,
+            1,
+            vec![
+                block(
+                    0,
+                    vec![stmt(StmtKind::Branch {
+                        cond: BranchCond::Cmp {
+                            op: BinaryOp::Lt,
+                            lhs: Operand::Local(LocalId(0)),
+                            rhs: Operand::Const(Const::Int32(100)),
+                        },
+                        target: BlockId(0),
+                    })],
+                ),
+                block(
+                    1,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(0))),
+                    })],
+                ),
+            ],
+        );
+        let out = emit(&m, &MockEe::default());
+        assert_eq!(
+            out.interruptible_ranges.len(),
+            1,
+            "the whole body up to the epilog"
+        );
+    }
+
+    /// No backward branch at all: nothing changes — the segments are
+    /// discarded and the method keeps the slim partially-interruptible
+    /// encoding (the gcinfo.rs slim byte-exact tests pin the blob level).
+    #[test]
+    fn forward_branches_emit_no_ranges() {
+        let m = method(
+            vec![int_arg(0), int_arg(1)],
+            2,
+            0,
+            vec![
+                block(
+                    0,
+                    vec![stmt(StmtKind::Branch {
+                        cond: BranchCond::Cmp {
+                            op: BinaryOp::Lt,
+                            lhs: Operand::Local(LocalId(0)),
+                            rhs: Operand::Local(LocalId(1)),
+                        },
+                        target: BlockId(2),
+                    })],
+                ),
+                block(
+                    1,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(0))),
+                    })],
+                ),
+                block(
+                    2,
+                    vec![stmt(StmtKind::Return {
+                        value: Some(Operand::Local(LocalId(1))),
+                    })],
+                ),
+            ],
+        );
+        let out = emit(&m, &MockEe::default());
+        assert!(out.interruptible_ranges.is_empty(), "no cycle, no ranges");
     }
 
     /// `void bounds(int[] arr, int i)` shape — the step_10.8 bounds
