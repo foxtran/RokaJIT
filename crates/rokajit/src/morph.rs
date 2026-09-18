@@ -118,7 +118,7 @@ fn certify_expr(expr: &hir::Expr) -> CompileResult<()> {
             certify_expr(rhs)?;
         }
         hir::Expr::Conv { arg, .. } => certify_expr(arg)?,
-        hir::Expr::ConvRne { arg, .. } => certify_expr(arg)?,
+        hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => certify_expr(arg)?,
         hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => certify_expr(arg)?,
         hir::Expr::Call { target, sig, args } => {
             if let CallTarget::Indirect(addr) = target {

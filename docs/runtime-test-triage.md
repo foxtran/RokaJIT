@@ -34,13 +34,13 @@ are counted under COMPILE_FAIL.
 
 | Category | Tests |
 | --- | ---: |
-| MATCH | 2396 |
-| CRASH | 12 |
+| MATCH | 2403 |
+| CRASH | 4 |
 | ARTIFACT | 16 |
-| TIMEOUT | 25 |
+| TIMEOUT | 26 |
 | COMPILE_FAIL | 832 |
 
-Of the MATCHes, 2379 exit 100 (the CoreCLR pass
+Of the MATCHes, 2386 exit 100 (the CoreCLR pass
 convention). Categories: COMPILE_FAIL = csc can't build it
 standalone; MATCH = same exit code and stdout under both JITs;
 MISMATCH = both ran, results differ, no named gate in stderr;
@@ -118,7 +118,7 @@ entry shapes). Out of scope for triage; listed for the record.
 
 | Which JIT timed out | Tests |
 | --- | ---: |
-| rokajit | 20 |
+| rokajit | 21 |
 | ryujit,rokajit | 5 |
 
 ## Needs investigation
@@ -132,12 +132,4 @@ error model didn't classify. Each carries its stderr signature.
 | `JIT/Directed/pinvoke/sysinfo.cs` | CRASH | SIGABRT | Unhandled exception. System.DllNotFoundException: Unable to load shared library 'kernel32' or one of its dependencies. In order to help diagnose loading problem |
 | `JIT/Methodical/largeframes/skip6/skippage6.cs` | CRASH | SIGABRT | Stack overflow. |
 | `JIT/Performance/CodeQuality/SIMD/ConsoleMandel/ConsoleMandel.cs` | CRASH | SIGABRT | Fatal error. |
-| `JIT/Regression/CLR-x86-JIT/V1-M09.5-PDC/b11490/b11490.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/Regression/CLR-x86-JIT/V1-M09/b15864/b15864.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/Regression/VS-ia64-JIT/M00/b115253/hello2.cs` | CRASH | SIGSEGV | (no stderr output) |
-| `JIT/Regression/VS-ia64-JIT/M00/b141358/test.cs` | CRASH | SIGABRT | Process terminated. |
 | `JIT/Regression/clr-x64-JIT/v4.0/devdiv374539/DevDiv_374539.cs` | CRASH | SIGABRT | Unhandled exception. System.DllNotFoundException: Unable to load shared library 'kernel32.dll' or one of its dependencies. In order to help diagnose loading pro |
-| `JIT/Regression_o_2/Runtime_116823.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: expected 32767, got -32768 |
-| `JIT/Regression_ro_1/Runtime_125124.cs` | CRASH | SIGABRT | Unhandled exception. System.Exception: Assert: expected True |
-| `JIT/Regression_ro_2/Runtime_132370.cs` | CRASH | SIGABRT | Fatal error. |
-| `JIT/jit64/gc/regress/vswhidbey/143837.cs` | CRASH | SIGSEGV | (no stderr output) |

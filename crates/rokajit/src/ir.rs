@@ -490,6 +490,18 @@ pub mod hir {
             to: Type,
             arg: Box<Expr>,
         },
+        /// Truncating float→integer conversion with RAW hardware
+        /// semantics (`cvttss2si`/`cvttsd2si`): out-of-range/NaN yields
+        /// the integer-indefinite value (`0x8000…`), NOT the .NET 9+
+        /// saturating behavior of an IL-level [`Expr::Conv`]. Only the
+        /// hardware-intrinsic expansions build it — the
+        /// ConvertToInt32/64WithTruncation leaves ARE cvtt
+        /// (hwintrinsiclistxarch.h: `INS_cvttss2si32`/`INS_cvttsd2si64`;
+        /// step_11.5 B1c, the GitHub_23438 fix). `to` is Int32 or Int64.
+        ConvTrunc {
+            to: Type,
+            arg: Box<Expr>,
+        },
         /// `Interlocked.CompareExchange` — the importer's expansion of the
         /// deliberately self-recursive [Intrinsic] bodies
         /// (Interlocked.cs:322's "Must expand intrinsic"; RyuJIT's

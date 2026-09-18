@@ -411,6 +411,131 @@ impl Flatten<'_> {
         Ok(lir::Operand::Temp(dst))
     }
 
+    /// float → signed integer (step_11.5), the .NET 9+ saturating
+    /// semantics — RyuJIT's pre-AVX512 `LowerCast` sequence
+    /// (lowerxarch.cpp:803-853, 1053-1074). Unlike the small-type
+    /// narrows (the importer's `conv_narrow`), the wide targets cannot
+    /// clamp in the float domain: INT32_MAX is not exactly representable
+    /// at f32 width and INT64_MAX at neither, so the positive overflow
+    /// is selected AFTER the conversion, exactly as RyuJIT does:
+    ///
+    /// ```text
+    /// r = cvtt(src)                    // truncating; NaN/out-of-range →
+    ///                                  // INT_MIN (the hardware "integer
+    ///                                  // indefinite") — already the
+    ///                                  // correct NEGATIVE saturation
+    /// movf = clt(src, 2^N) - 1         // all-ones iff src ≥ 2^N (the
+    ///                                  // ordered compare is 0 on NaN)
+    /// mnan = ceq(src, src) - 1         // all-ones iff src is NaN
+    /// r = r ^ ((r ^ MAX) & movf)       // positive overflow → MAX
+    /// result = r ^ (r & mnan)          // NaN → 0
+    /// ```
+    fn lower_conv_f_to_int(
+        &mut self,
+        to: Type,
+        fty: Type,
+        src: lir::Operand,
+        out: &mut Vec<lir::Stmt>,
+        il: IlOffset,
+    ) -> CompileResult<lir::Operand> {
+        let wide = !matches!(to, Type::Int32);
+        let ity = if wide { Type::Int64 } else { Type::Int32 };
+        let fconst = |v: f64| {
+            lir::Operand::Const(match fty {
+                Type::Float => Const::Float(v as f32),
+                _ => Const::Double(v),
+            })
+        };
+        // r = cvtt(src) — the plain truncating conversion.
+        let r = self.temp(ity);
+        Self::push(
+            out,
+            il,
+            lir::StmtKind::Conv {
+                dst: r,
+                to: ity,
+                overflow: false,
+                unsigned: false,
+                src,
+            },
+        );
+        let limit = fconst(if wide {
+            9223372036854775808.0 // 2^63
+        } else {
+            2147483648.0 // 2^31
+        });
+        let one = lir::Operand::Const(Const::Int32(1));
+        let lt = self.push_bin(out, il, BinaryOp::Lt, Type::Int32, src, limit);
+        let movf = self.push_bin(out, il, BinaryOp::Sub, Type::Int32, lt, one);
+        let eq = self.push_bin(out, il, BinaryOp::Eq, Type::Int32, src, src);
+        let mnan = self.push_bin(out, il, BinaryOp::Sub, Type::Int32, eq, one);
+        // The masks widen to the target's width by sign-extension.
+        let (movf, mnan) = if wide {
+            (self.widen_i64(out, il, movf), self.widen_i64(out, il, mnan))
+        } else {
+            (movf, mnan)
+        };
+        let max = lir::Operand::Const(if wide {
+            Const::Int64(i64::MAX)
+        } else {
+            Const::Int32(i32::MAX)
+        });
+        // Positive overflow → MAX; NaN → 0 (in that order).
+        let d = self.push_bin(out, il, BinaryOp::Xor, ity, lir::Operand::Temp(r), max);
+        let d = self.push_bin(out, il, BinaryOp::And, ity, d, movf);
+        let r = self.push_bin(out, il, BinaryOp::Xor, ity, lir::Operand::Temp(r), d);
+        let t = self.push_bin(out, il, BinaryOp::And, ity, r, mnan);
+        let dst = self.temp(to);
+        Self::push(
+            out,
+            il,
+            lir::StmtKind::Binary {
+                dst,
+                op: BinaryOp::Xor,
+                lhs: r,
+                rhs: t,
+            },
+        );
+        Ok(lir::Operand::Temp(dst))
+    }
+
+    /// `t := a op b` into a fresh temp of type `ty`.
+    fn push_bin(
+        &mut self,
+        out: &mut Vec<lir::Stmt>,
+        il: IlOffset,
+        op: BinaryOp,
+        ty: Type,
+        lhs: lir::Operand,
+        rhs: lir::Operand,
+    ) -> lir::Operand {
+        let dst = self.temp(ty);
+        Self::push(out, il, lir::StmtKind::Binary { dst, op, lhs, rhs });
+        lir::Operand::Temp(dst)
+    }
+
+    /// Sign-extend a 32-bit mask temp to 64 bits.
+    fn widen_i64(
+        &mut self,
+        out: &mut Vec<lir::Stmt>,
+        il: IlOffset,
+        m: lir::Operand,
+    ) -> lir::Operand {
+        let dst = self.temp(Type::Int64);
+        Self::push(
+            out,
+            il,
+            lir::StmtKind::Conv {
+                dst,
+                to: Type::Int64,
+                overflow: false,
+                unsigned: false,
+                src: m,
+            },
+        );
+        lir::Operand::Temp(dst)
+    }
+
     fn lower_block(
         &mut self,
         block: &hir::Block,
@@ -984,15 +1109,19 @@ impl Flatten<'_> {
                 }
                 let src = self.flatten_expr(arg, out, il)?;
                 let src = self.value_operand(src, out, il);
-                // A float source with an unsigned integer target is the
-                // saturating conversion (step_10.11) — expanded to a
-                // statement sequence, not a single Conv.
+                // A float source with an integer target is the .NET 9+
+                // saturating conversion — expanded to a statement
+                // sequence, not a single Conv: the unsigned forms
+                // (step_10.11), the signed forms (step_11.5).
                 let src_ty = self.operand_ty(&src)?;
-                if *unsigned
-                    && matches!(src_ty, Type::Float | Type::Double)
+                if matches!(src_ty, Type::Float | Type::Double)
                     && matches!(*to, Type::Int32 | Type::Int64 | Type::NativeInt)
                 {
-                    return self.lower_conv_f_to_uint(*to, src_ty, src, out, il);
+                    return if *unsigned {
+                        self.lower_conv_f_to_uint(*to, src_ty, src, out, il)
+                    } else {
+                        self.lower_conv_f_to_int(*to, src_ty, src, out, il)
+                    };
                 }
                 let dst = self.temp(*to);
                 Self::push(
@@ -1039,6 +1168,27 @@ impl Flatten<'_> {
                 let src = self.value_operand(src, out, il);
                 let dst = self.temp(*to);
                 Self::push(out, il, lir::StmtKind::ConvRne { dst, to: *to, src });
+                Ok(lir::Operand::Temp(dst))
+            }
+            hir::Expr::ConvTrunc { to, arg } => {
+                // The raw cvtt (the WithTruncation intrinsic leaves) —
+                // the LIR Conv IS the plain truncating conversion; the
+                // .NET 9+ saturating expansion lives on the IL-level HIR
+                // Conv arm above.
+                let src = self.flatten_expr(arg, out, il)?;
+                let src = self.value_operand(src, out, il);
+                let dst = self.temp(*to);
+                Self::push(
+                    out,
+                    il,
+                    lir::StmtKind::Conv {
+                        dst,
+                        to: *to,
+                        overflow: false,
+                        unsigned: false,
+                        src,
+                    },
+                );
                 Ok(lir::Operand::Temp(dst))
             }
             hir::Expr::CkFinite { arg } => {
@@ -1554,7 +1704,7 @@ fn tree_has_effect(expr: &hir::Expr) -> bool {
         hir::Expr::Load { addr, .. } => tree_has_effect(addr),
         hir::Expr::FieldAddr { obj, .. } => tree_has_effect(obj),
         hir::Expr::Unary { arg, .. } | hir::Expr::Conv { arg, .. } => tree_has_effect(arg),
-        hir::Expr::ConvRne { arg, .. } => tree_has_effect(arg),
+        hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => tree_has_effect(arg),
         hir::Expr::ConvOvf { arg, .. } => tree_has_effect(arg),
         hir::Expr::CkFinite { arg } => tree_has_effect(arg),
         hir::Expr::Binary { lhs, rhs, .. } | hir::Expr::BinaryOvf { lhs, rhs, .. } => {
@@ -3402,6 +3552,178 @@ mod tests {
         ));
         // No Int64 mask widening on the 32-bit path.
         assert_eq!(m.locals[6].ty, Type::Int32);
+    }
+
+    // --- step_11.5: float -> signed integer (saturating) ---
+
+    #[test]
+    fn conv_i4_from_float_expands_to_the_saturating_select() {
+        // return (int)arg0 — lowerxarch.cpp:803-853/1053-1074: the plain
+        // cvtt, the 2^31 ordered-compare mask, the NaN self-compare mask,
+        // then the two selects (positive overflow → i32::MAX, NaN → 0).
+        let m = lower_ok(method_with_double_arg(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Conv {
+                    to: Type::Int32,
+                    overflow: false,
+                    unsigned: false,
+                    arg: Box::new(hir::Expr::Local(LocalId(0))),
+                }),
+            },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(
+            stmts.len(),
+            11,
+            "cvtt, lt, mask, eq, mask, xor, and, xor, and, xor, return"
+        );
+        // r = cvtt(src): the plain truncating 32-bit conversion.
+        match &stmts[0].kind {
+            lir::StmtKind::Conv {
+                dst,
+                to,
+                unsigned,
+                src,
+                ..
+            } => {
+                assert_eq!(*to, Type::Int32);
+                assert!(!unsigned);
+                assert_eq!(*dst, LocalId(1));
+                assert_eq!(*src, lir::Operand::Local(LocalId(0)));
+            }
+            _ => panic!("expected the plain cvtt"),
+        }
+        // movf = clt(src, 2^31) - 1.
+        match &stmts[1].kind {
+            lir::StmtKind::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::Lt);
+                assert_eq!(*lhs, lir::Operand::Local(LocalId(0)));
+                assert_eq!(*rhs, lir::Operand::Const(Const::Double(2147483648.0)));
+            }
+            _ => panic!("expected the 2^31 compare"),
+        }
+        // mnan = ceq(src, src) - 1.
+        match &stmts[3].kind {
+            lir::StmtKind::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::Eq);
+                assert_eq!(lhs, rhs, "the NaN test is a self-compare");
+            }
+            _ => panic!("expected the NaN self-compare"),
+        }
+        // The positive-overflow select xors against i32::MAX…
+        match &stmts[5].kind {
+            lir::StmtKind::Binary { op, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::Xor);
+                assert_eq!(*rhs, lir::Operand::Const(Const::Int32(i32::MAX)));
+            }
+            _ => panic!("expected the MAX xor"),
+        }
+        // …and the NaN select is the final and/xor pair.
+        assert!(matches!(
+            stmts[8].kind,
+            lir::StmtKind::Binary {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
+        assert!(matches!(
+            stmts[9].kind,
+            lir::StmtKind::Binary {
+                op: BinaryOp::Xor,
+                ..
+            }
+        ));
+        // 32-bit masks: no Int64 widening anywhere.
+        assert!(m.locals[1..].iter().all(|l| l.ty != Type::Int64));
+    }
+
+    #[test]
+    fn conv_i8_from_float_widens_the_masks_and_uses_2_to_the_63() {
+        // return (long)arg0: the 64-bit target converts with the 64-bit
+        // cvtt, thresholds at 2^63, and sign-extends the 32-bit compare
+        // masks before the selects.
+        let m = lower_ok(method_with_double_arg(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::Conv {
+                    to: Type::Int64,
+                    overflow: false,
+                    unsigned: false,
+                    arg: Box::new(hir::Expr::Local(LocalId(0))),
+                }),
+            },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(
+            stmts.len(),
+            13,
+            "cvtt, lt, mask, eq, mask, two mask widenings, xor, and, xor, and, xor, return"
+        );
+        match &stmts[0].kind {
+            lir::StmtKind::Conv { to, .. } => assert_eq!(*to, Type::Int64),
+            _ => panic!("expected the 64-bit cvtt"),
+        }
+        match &stmts[1].kind {
+            lir::StmtKind::Binary { op, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::Lt);
+                assert_eq!(
+                    *rhs,
+                    lir::Operand::Const(Const::Double(9223372036854775808.0))
+                );
+            }
+            _ => panic!("expected the 2^63 compare"),
+        }
+        // The mask widenings are sign-extending Int32 → Int64 Convs.
+        for s in &stmts[5..7] {
+            match &s.kind {
+                lir::StmtKind::Conv { to, unsigned, .. } => {
+                    assert_eq!(*to, Type::Int64);
+                    assert!(!unsigned);
+                }
+                _ => panic!("expected the mask widening"),
+            }
+        }
+        match &stmts[7].kind {
+            lir::StmtKind::Binary { op, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::Xor);
+                assert_eq!(*rhs, lir::Operand::Const(Const::Int64(i64::MAX)));
+            }
+            _ => panic!("expected the MAX xor"),
+        }
+    }
+
+    #[test]
+    fn conv_trunc_lowers_to_the_plain_cvtt() {
+        // The WithTruncation leaves' raw truncation (step_11.5 B1c,
+        // GitHub_23438): a single LIR Conv — NOT the saturating select
+        // sequence of the IL-level conv.
+        let m = lower_ok(method_with_double_arg(block(
+            0,
+            Vec::new(),
+            hir::Terminator::Return {
+                value: Some(hir::Expr::ConvTrunc {
+                    to: Type::Int64,
+                    arg: Box::new(hir::Expr::Local(LocalId(0))),
+                }),
+            },
+        )));
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 2, "the plain cvtt, the return");
+        match &stmts[0].kind {
+            lir::StmtKind::Conv {
+                to,
+                overflow,
+                unsigned,
+                ..
+            } => {
+                assert_eq!(*to, Type::Int64);
+                assert!(!overflow && !unsigned);
+            }
+            _ => panic!("expected the plain cvtt"),
+        }
     }
 
     #[test]

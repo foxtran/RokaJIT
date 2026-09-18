@@ -968,13 +968,14 @@ rokajit::lower_rules! {
 
     /// `conv.i4`/`i8`/`u4` from a float operand: `cvttss2si`/`cvttsd2si`,
     /// truncating toward zero; out-of-range/NaN yields the hardware's
-    /// "integer indefinite" value. (RyuJIT saturates since .NET 9 —
-    /// closing that gap for the *signed* forms is the `convfloat`
-    /// follow-up; the IL-level *unsigned* float conversions never reach
-    /// here, the HIR→LIR lowering expands them — step_10.11.) A 32-bit
-    /// *unsigned* target still converts through the 64-bit form (values
-    /// up to 2³²−1 exact; beyond is ECMA-unspecified), keeping the low
-    /// half. `NativeInt` (conv.i, step_11.9) is the signed 64-bit form.
+    /// "integer indefinite" value. Every IL-level float→int conversion
+    /// saturates since .NET 9 — the HIR→LIR lowering expands them ALL
+    /// (step_10.11 unsigned, step_11.5 signed), so only the expansions'
+    /// own building blocks reach here (they rely on the plain cvtt
+    /// semantics). A 32-bit *unsigned* target still converts through the
+    /// 64-bit form (values up to 2³²−1 exact; beyond is ECMA-
+    /// unspecified), keeping the low half. `NativeInt` (conv.i,
+    /// step_11.9) is the signed 64-bit form.
     rule conv_f_to_i: Conv { dst, to, unsigned, src, .. }
         if let (Some(w64), Some(w), Some(s)) = (
             match to {

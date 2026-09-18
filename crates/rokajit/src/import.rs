@@ -11,8 +11,8 @@
 //! compare-as-value `ceq`/`cgt`/`cgt.un`/`clt`/`clt.un` (integers,
 //! floats, and the reference forms), the integer conversions
 //! `conv.i1`/`i2`/`i4`/`i8`/`u1`/`u2`/`u4`/`u8`/`u`/`i` (float sources
-//! truncate toward zero, saturating for the unsigned targets —
-//! step_10.11) plus
+//! saturate to the target's range — the .NET 9+ semantics, step_10.11
+//! and step_11.5) plus
 //! `conv.r4`/`conv.r8` and `conv.r.un` (unsigned integer → double),
 //! `dup`/`pop`, `ldloca`/`ldarga`/`starg` (short and wide forms),
 //! `ldnull`, `ldstr` (resolved through the EE's `constructStringLiteral`
@@ -1638,7 +1638,9 @@ enum HwLeafOp {
         elem: VecElem,
     },
     /// ConvertToInt32/ConvertToInt64 [WithTruncation] of element 0:
-    /// `rne` selects cvt (round-to-nearest-even) over cvtt.
+    /// `rne` selects cvt (round-to-nearest-even) over cvtt; the cvtt form
+    /// is `hir::Expr::ConvTrunc` — the RAW truncation (integer-indefinite
+    /// on out-of-range/NaN), not the saturating IL `conv.*`.
     ConvertToInt {
         elem: VecElem,
         to64: bool,
@@ -2535,25 +2537,49 @@ struct LeaveChain {
     source: usize,
     /// The finally clauses to invoke, innermost first.
     hops: Vec<usize>,
+    /// The enclosing catch/filter handlers the leave steps out of,
+    /// innermost-first EXCLUDING the innermost handler itself (whose
+    /// exit is the source block's `Leave`). One synthetic step block per
+    /// entry, spliced into that handler's group (step_11.5): when a
+    /// catch funclet nested inside another funclet leaves, the VM
+    /// resumes the ENCLOSING funclet's context at the resume address —
+    /// jumping straight at the final target from the innermost funclet
+    /// strands the enclosing dispatch's ExInfo on the thread's tracker
+    /// stack (the PopExInfos SP bound only reaches below the enclosing
+    /// funclet's frame), poisoning the NEXT exception's stack walk
+    /// (clr-abi.md §Funclet Return Values: the resume address "should be
+    /// somewhere in the parent funclet (or main function if the catch or
+    /// filter-handler is not nested within any other funclet)").
+    exits: Vec<usize>,
     /// The leave's target IL offset (a leader).
     target: u32,
-    /// A leave inside a catch handler keeps its `Leave` terminator —
+    /// The leave EXITS a catch/filter handler (its target lies outside
+    /// it — step_11.5): the source block keeps its `Leave` terminator —
     /// the funclet returns the resume address, which is the first step
-    /// block — where a plain-body leave ends its block in a `Jump`.
+    /// block — where any other leave (plain body, finally funclet, or a
+    /// handler-local target) ends its block in a `Jump`.
     from_catch: bool,
 }
 
-/// One synthetic block of a leave chain: `hop < hops.len()` is a
-/// `CallFinally` step for that hop's clause, `hop == hops.len()` is the
-/// chain's final `Leave { target }` block. Spliced immediately after the
-/// last main block of the try the hop exits, so its native code lands
-/// outside that try but inside the enclosing region (clr-abi.md
-/// §Invoking Finallys: the call's return address must not be in the try
-/// being exited).
+/// One synthetic block of a leave chain. The chain's unified step list
+/// is `hops` then `exits`: `hop < hops.len()` is a `CallFinally` step
+/// for that hop's clause; `hops.len() + e` is the funclet-exit step for
+/// `exits[e]` — a `Leave` aimed at the next exit step, or at the leave's
+/// target for the last one. When `exits` is empty the chain ends in a
+/// final block (`hop == hops.len()`), jumping to the leave's target. A
+/// `CallFinally` step splices immediately after the last main block of
+/// the try the hop exits, so its native code lands outside that try but
+/// inside the enclosing region (clr-abi.md §Invoking Finallys: the
+/// call's return address must not be in the try being exited); a
+/// funclet-exit step splices after the last block of the handler group
+/// it steps out of, and the group's reported region extends over it (the
+/// VM resumes the enclosing funclet's context at the step's address).
 struct Step {
-    /// The pre-rebuild main-area block this step splices after.
+    /// The pre-rebuild block this step splices after.
     anchor: usize,
-    /// Span of the try range the hop exits (ordering: innermost first).
+    /// Span of the try range a `CallFinally` hop exits (ordering:
+    /// innermost first); 0 for funclet-exit steps, so they splice first
+    /// at a shared anchor and the handler-group extension reaches them.
     exit_span: u32,
     chain: usize,
     hop: usize,
@@ -2640,17 +2666,36 @@ fn rebuild_blocks(
                 hop,
             });
         }
-        // The final Leave block rides on the last hop's anchor.
-        let &last = chain
-            .hops
-            .last()
-            .ok_or(CompileError::Internal("leave chain with no hops"))?;
-        steps.push(Step {
-            anchor: anchor_of(&clauses[last])?,
-            exit_span: clauses[last].try_end - clauses[last].try_start,
-            chain: ch,
-            hop: chain.hops.len(),
-        });
+        // The funclet ladder (step_11.5): one exit step per enclosing
+        // catch/filter handler the leave steps out of, spliced after the
+        // last block of THAT handler's group (its reported region
+        // extends over the step below).
+        for (e, &clause) in chain.exits.iter().enumerate() {
+            let anchor = (0..n)
+                .rfind(|&i| owner_of[i] == Some(Area::Handler(clause)))
+                .ok_or(CompileError::Internal("EH handler group has no blocks"))?;
+            steps.push(Step {
+                anchor,
+                exit_span: 0,
+                chain: ch,
+                hop: chain.hops.len() + e,
+            });
+        }
+        if chain.exits.is_empty() {
+            // The final block rides on the last hop's anchor. (With a
+            // ladder, the last exit step ends in the leave's target and
+            // no final block is needed.)
+            let &last = chain
+                .hops
+                .last()
+                .ok_or(CompileError::Internal("leave chain with no hops"))?;
+            steps.push(Step {
+                anchor: anchor_of(&clauses[last])?,
+                exit_span: clauses[last].try_end - clauses[last].try_start,
+                chain: ch,
+                hop: chain.hops.len(),
+            });
+        }
     }
 
     // The new order: the main area, then per clause (handler IL order)
@@ -2778,11 +2823,39 @@ fn rebuild_blocks(
                         funclet: BlockId(new_id[*handler_entry as usize]),
                         continuation: BlockId(step_id[&(ch, hop + 1)]),
                     }
+                } else if hop < chain.hops.len() + chain.exits.len() {
+                    // A funclet-ladder step (step_11.5): spliced into the
+                    // enclosing handler's group and running in that
+                    // funclet's (resumed) context, its `Leave` is that
+                    // funclet's own return — aimed at the next exit step,
+                    // or at the leave's target when this step is the
+                    // outermost funclet's exit.
+                    let e = hop - chain.hops.len();
+                    let target = if e + 1 < chain.exits.len() {
+                        step_id[&(ch, hop + 1)]
+                    } else {
+                        let target = block_of
+                            .get(&chain.target)
+                            .ok_or(CompileError::Internal("leave target is not a block start"))?;
+                        new_id[*target as usize]
+                    };
+                    hir::Terminator::Leave {
+                        target: BlockId(target),
+                    }
                 } else {
+                    // The chain's final block: a plain jump to the
+                    // leave's target. Under the funclet-exit-first
+                    // scheme (from_catch), the catch funclet already
+                    // returned at the chain's SOURCE, so the steps run
+                    // in the resumed parent context — a `Leave` here
+                    // would lower to a second funclet epilog + `ret` in
+                    // a frame the VM already restored (step_11.5). A
+                    // handler-local leave's steps run inside the funclet
+                    // and must not return out of it either.
                     let target = block_of
                         .get(&chain.target)
                         .ok_or(CompileError::Internal("leave target is not a block start"))?;
-                    hir::Terminator::Leave {
+                    hir::Terminator::Jump {
                         target: BlockId(new_id[*target as usize]),
                     }
                 };
@@ -2802,9 +2875,10 @@ fn rebuild_blocks(
             }
         }
     }
-    // The chain source blocks: a plain-body leave ends Jump(first step);
-    // a leave from a catch handler keeps the funclet-returning Leave
-    // form, aimed at the first step block (the VM resumes there).
+    // The chain source blocks: a handler-local leave (or a plain-body
+    // one) ends Jump(first step); a leave EXITING a catch handler keeps
+    // the funclet-returning Leave form, aimed at the first step block
+    // (the VM resumes there).
     for (ch, chain) in chains.iter().enumerate() {
         let first_step = BlockId(step_id[&(ch, 0)]);
         let block = &mut out[new_id[chain.source] as usize];
@@ -2836,7 +2910,12 @@ fn rebuild_blocks(
             + 1;
         while let Some(Item::Step(ch, hop)) = order.get(try_end as usize) {
             let chain = &chains[*ch];
-            let exit_clause = chain.hops[(*hop).min(chain.hops.len() - 1)];
+            // Funclet-ladder steps (step_11.5) exit no try: the
+            // coincident-try-end extension stops at them.
+            if *hop >= chain.hops.len() {
+                break;
+            }
+            let exit_clause = chain.hops[*hop];
             let exit_try = &clauses[exit_clause];
             let strictly_inner = exit_clause != ci
                 && exit_try.try_start >= c.try_start
@@ -2853,12 +2932,33 @@ fn rebuild_blocks(
                 .map(|i| new_id[i])
                 .min()
                 .ok_or(CompileError::Internal("EH region group has no blocks"))?;
-            let end = (0..n)
+            let mut end = (0..n)
                 .filter(|&i| owner_of[i] == Some(area))
                 .map(|i| new_id[i])
                 .max()
                 .expect("non-empty above")
                 + 1;
+            // A handler group's run extends over the funclet-ladder
+            // steps trailing its last own block (step_11.5): each exit
+            // step spliced after the group's last block steps out of
+            // THIS handler's funclet, so it must sit inside the reported
+            // region (the VM resumes the enclosing funclet's context at
+            // the step's address, and the step's `Leave` lowers to this
+            // funclet's epilog only when the block is covered here).
+            if let Area::Handler(hci) = area {
+                while let Some(Item::Step(ch, hop)) = order.get(end as usize) {
+                    let chain = &chains[*ch];
+                    let is_exit_step_here = *hop >= chain.hops.len()
+                        && chain
+                            .exits
+                            .get(*hop - chain.hops.len())
+                            .is_some_and(|&x| x == hci);
+                    if !is_exit_step_here {
+                        break;
+                    }
+                    end += 1;
+                }
+            }
             Ok((start, end))
         };
         let (handler_start, handler_end) = area_run(Area::Handler(ci))?;
@@ -3050,7 +3150,9 @@ fn references_local(expr: &hir::Expr, id: LocalId) -> bool {
             references_local(lhs, id) || references_local(rhs, id)
         }
         hir::Expr::Conv { arg, .. } => references_local(arg, id),
-        hir::Expr::ConvRne { arg, .. } => references_local(arg, id),
+        hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => {
+            references_local(arg, id)
+        }
         hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => references_local(arg, id),
         hir::Expr::Call { target, args, .. } => {
             let target_ref = match target {
@@ -3112,7 +3214,7 @@ fn must_eval(expr: &hir::Expr) -> bool {
         // when the value is discarded.
         hir::Expr::BinaryOvf { .. } => true,
         hir::Expr::Conv { arg, .. } => must_eval(arg),
-        hir::Expr::ConvRne { arg, .. } => must_eval(arg),
+        hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => must_eval(arg),
         // The checked conversion and the finiteness check can throw —
         // observable even when the value is discarded.
         hir::Expr::ConvOvf { .. } | hir::Expr::CkFinite { .. } => true,
@@ -3167,7 +3269,7 @@ fn has_global_effect(expr: &hir::Expr) -> bool {
             has_global_effect(lhs) || has_global_effect(rhs)
         }
         hir::Expr::Conv { arg, .. } => has_global_effect(arg),
-        hir::Expr::ConvRne { arg, .. } => has_global_effect(arg),
+        hir::Expr::ConvRne { arg, .. } | hir::Expr::ConvTrunc { arg, .. } => has_global_effect(arg),
         hir::Expr::ConvOvf { arg, .. } | hir::Expr::CkFinite { arg } => has_global_effect(arg),
         hir::Expr::Call { .. } => true,
         hir::Expr::NullCheck { arg } => has_global_effect(arg),
@@ -4157,8 +4259,10 @@ impl BlockImport<'_> {
     /// `conv.i1`/`conv.i2`/`conv.u1`/`conv.u2` expand to shift pairs
     /// (`conv_narrow`); the rest
     /// become `hir::Expr::Conv` nodes whose `unsigned` flag selects sign-
-    /// vs zero-extension at lowering. Float sources truncate toward zero
-    /// (`cvtt*`); `conv.r4`/`conv.r8` convert from any numeric operand.
+    /// vs zero-extension at lowering. Float sources saturate to the
+    /// target's range (the .NET 9+ semantics; the HIR→LIR lowering owns
+    /// the expansion — step_10.11 unsigned, step_11.5 signed);
+    /// `conv.r4`/`conv.r8` convert from any numeric operand.
     /// A byref operand (step_11.9) is the pointer reinterpretation:
     /// ECMA-335 Table III.8 lists `&` for conv.i/conv.u and RyuJIT's
     /// `_CONV` has no source gate at all (importer.cpp:8452), so every
@@ -4229,8 +4333,8 @@ impl BlockImport<'_> {
             }
             // conv.i: to native int (step_10.11) — sign-extend from
             // Int32, the identity on a 64-bit operand. From a float it
-            // is the truncating signed conversion to a 64-bit slot
-            // (step_11.9 — RyuJIT's TYP_I_IMPL cast target is the LONG
+            // is the saturating signed conversion to a 64-bit slot
+            // (step_11.5 — RyuJIT's TYP_I_IMPL cast target is the LONG
             // cast on x64), the result typed NativeInt.
             ConvKind::I => {
                 if ty == Type::Int64 || ty == Type::NativeInt {
@@ -4348,17 +4452,20 @@ impl BlockImport<'_> {
     /// type vocabulary normalizes sub-Int32 types away (ECMA-335
     /// §III.1.1.1), so the narrowing cannot be a `Conv` node; the shift
     /// expansion is exact. A non-Int32 operand converts to Int32 first —
-    /// for a float source that is the truncating `cvtt*` conversion,
+    /// for a float source that is the saturating float→int conversion
+    /// (the value is already clamped, so only its NaN → 0 matters),
     /// after which the low `bits` behave as for integers.
     ///
-    /// Float source, unsigned narrow (step_10.11): RyuJIT's .NET 9+
-    /// semantics saturate to the small type's range (measured against the
-    /// reference JIT: NaN/negative → 0, above the max → the max), so the
-    /// operand is clamped in the float domain first — `maxs(v, 0)` maps
-    /// negatives *and* NaN to +0 (the second operand wins on NaN), then
-    /// `mins(…, MAX)`. The signed narrows from a float keep the plain
-    /// `cvtt*` pre-conversion: matching RyuJIT's signed clamp is the
-    /// still-open 10.2 follow-up (`convfloat` mismatch).
+    /// Float source: RyuJIT's .NET 9+ semantics saturate to the small
+    /// type's range (morph.cpp:296-360 — `MinNative(smallMax,
+    /// MaxNative(smallMin, x))` in the float domain before the R → int
+    /// conversion), so the operand is clamped in the float domain first.
+    /// The unsigned narrow (step_10.11) maps NaN to 0 outright —
+    /// `maxs(v, 0)` sends negatives *and* NaN to +0 (the SSE second
+    /// operand wins on NaN), then `mins(…, MAX)`. The signed narrow
+    /// (step_11.5) instead lets NaN survive the clamp (maxs with the
+    /// bound first, the value second, so the value wins on NaN); the
+    /// saturating float→Int32 conversion below then maps it to 0.
     fn conv_narrow(
         &mut self,
         bits: u32,
@@ -4367,15 +4474,27 @@ impl BlockImport<'_> {
         value: hir::Expr,
     ) -> CompileResult<()> {
         let fp = matches!(ty, Type::Float | Type::Double);
-        let value = if fp && unsigned {
-            let max = ((1u64 << bits) - 1) as f64;
-            let (zero, limit) = if ty == Type::Float {
-                (Const::Float(0.0), Const::Float(max as f32))
+        let value = if fp {
+            let (lo, hi) = if unsigned {
+                (0.0, ((1u64 << bits) - 1) as f64)
             } else {
-                (Const::Double(0.0), Const::Double(max))
+                (
+                    -((1i64 << (bits - 1)) as f64),
+                    ((1i64 << (bits - 1)) - 1) as f64,
+                )
             };
-            let above_zero = binary(BinaryOp::MaxF, value, hir::Expr::Const(zero));
-            binary(BinaryOp::MinF, above_zero, hir::Expr::Const(limit))
+            let (lo, hi) = if ty == Type::Float {
+                (Const::Float(lo as f32), Const::Float(hi as f32))
+            } else {
+                (Const::Double(lo), Const::Double(hi))
+            };
+            if unsigned {
+                let above_zero = binary(BinaryOp::MaxF, value, hir::Expr::Const(lo));
+                binary(BinaryOp::MinF, above_zero, hir::Expr::Const(hi))
+            } else {
+                let above_min = binary(BinaryOp::MaxF, hir::Expr::Const(lo), value);
+                binary(BinaryOp::MinF, hir::Expr::Const(hi), above_min)
+            }
         } else {
             value
         };
@@ -4427,9 +4546,12 @@ impl BlockImport<'_> {
     /// meaningless on a float source — morph.cpp:411 clears the unsigned
     /// flag), the Float source widening to Double first
     /// (flowgraph.cpp:1334-1340); the small targets convert float→Int32
-    /// with the plain truncating `cvtt*` (NaN/out-of-range → the
-    /// "integer indefinite" INT_MIN, which no small range contains) and
-    /// then run the integer-domain checked narrow (morph.cpp:369-371).
+    /// through the same `DBL2INT_OVF` helper — the morph's intermediate
+    /// CAST(TYP_INT <- float) carries the check (morph.cpp:369-370's
+    /// GTF_OVERFLOW propagation) and `fgCastRequiresHelper` routes every
+    /// checked float→int conversion to the helper
+    /// (flowgraph.cpp:1338-1342) — then run the integer-domain checked
+    /// narrow (morph.cpp:371).
     fn conv_ovf(&mut self, kind: ConvOvfKind, un: bool) -> CompileResult<()> {
         let (ty, value) = self.pop()?;
         let int = matches!(ty, Type::Int32 | Type::Int64 | Type::NativeInt);
@@ -4477,16 +4599,32 @@ impl BlockImport<'_> {
                         },
                     )
                 }
-                // The small targets: plain truncating float→Int32 (of the
-                // ORIGINAL width — no widening, morph.cpp:369-371), then
-                // the integer-domain checked narrow with a signed source
-                // (the `.un` suffix dies with the float source).
+                // The small targets: the checked float→Int32 helper (the
+                // funnel can no longer be the plain truncating `cvtt*` —
+                // an unchecked float→int Conv is the .NET 9+ saturating
+                // conversion since step_11.5, and its NaN → 0 would slip
+                // NaN past the checked narrow without a throw), then the
+                // integer-domain checked narrow with a signed source (the
+                // `.un` suffix dies with the float source).
                 None => {
-                    let as_int = hir::Expr::Conv {
-                        to: Type::Int32,
-                        overflow: false,
-                        unsigned: false,
-                        arg: Box::new(value),
+                    let arg = if ty == Type::Float {
+                        hir::Expr::Conv {
+                            to: Type::Double,
+                            overflow: false,
+                            unsigned: false,
+                            arg: Box::new(value),
+                        }
+                    } else {
+                        value
+                    };
+                    let as_int = hir::Expr::Call {
+                        target: CallTarget::Helper(CorInfoHelpFunc::DBL2INT_OVF),
+                        sig: CallSig {
+                            ret: Type::Int32,
+                            args: vec![Type::Double],
+                            has_this: false,
+                        },
+                        args: vec![arg],
                     };
                     self.push(
                         Type::Int32,
@@ -4733,9 +4871,11 @@ impl BlockImport<'_> {
     /// (ECMA-335 §III.2.38) — pending trees still evaluate first, for
     /// their side effects. A leave whose path crosses finally handlers
     /// records a chain for the layout rebuild (which splices in the
-    /// `CallFinally` step blocks); anything else is the plain `Leave`
-    /// terminator — inside a catch handler, the funclet's
-    /// return-the-resume-address form.
+    /// `CallFinally` step blocks). The terminator is `Leave` — the
+    /// funclet's return-the-resume-address form — only when the leave
+    /// EXITS a catch/filter handler (the target lies outside it); a
+    /// leave that stays inside its handler (or runs in the main body or
+    /// a finally) is a plain `Jump`.
     fn leave(
         &mut self,
         b: usize,
@@ -4752,23 +4892,86 @@ impl BlockImport<'_> {
             return Err(CompileError::BadIl("leave out of an EH filter"));
         }
         let hops = finally_chain(&self.clauses, il_offset.0, target);
-        if !hops.is_empty() {
-            let from_catch = matches!(
-                innermost_handler(&self.clauses, il_offset.0),
-                Some(c) if matches!(self.clauses[c].kind,
+        // The funclet-return form applies only when the leave EXITS a
+        // catch/filter handler (step_11.5): a leave whose target stays
+        // inside the same handler is an ordinary branch within the
+        // funclet — returning to the VM here would resume the parent
+        // frame mid-funclet (the chain's trailing Leave then tears down
+        // a frame the VM already restored: the step_11.5 nested-EH
+        // SIGSEGV/lost-dispatch family).
+        let from_catch = match innermost_handler(&self.clauses, il_offset.0) {
+            Some(c)
+                if matches!(
+                    self.clauses[c].kind,
                     ClauseKind::Catch { .. }
                         | ClauseKind::Filter { .. }
-                        | ClauseKind::FilterSynthesized { .. })
-            );
+                        | ClauseKind::FilterSynthesized { .. }
+                ) =>
+            {
+                let handler = &self.clauses[c];
+                target < handler.handler_start || target >= handler.handler_end
+            }
+            _ => false,
+        };
+        // The funclet ladder (step_11.5): when the leave exits a
+        // catch/filter handler nested inside ANOTHER handler, the VM
+        // resumes the enclosing funclet's context, so the resume address
+        // must be a step block there that performs the enclosing
+        // funclet's own exit, and so on outward. Collect the enclosing
+        // catch/filter handlers to step through, innermost first.
+        // (Stepping out through a finally/funclet of another kind is out
+        // of scope: its exit is `endfinally`, a different protocol.)
+        let mut exits = Vec::new();
+        if from_catch {
+            let mut inner = innermost_handler(&self.clauses, il_offset.0);
+            while let Some(h) = inner {
+                let hosted = &self.clauses[h];
+                let parent = self
+                    .clauses
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, c)| {
+                        i != h
+                            && hosted.handler_start >= c.handler_start
+                            && hosted.handler_end <= c.handler_end
+                    })
+                    .min_by_key(|(_, c)| c.handler_end - c.handler_start)
+                    .map(|(i, _)| i);
+                let Some(p) = parent else { break };
+                let pc = &self.clauses[p];
+                if target >= pc.handler_start && target < pc.handler_end {
+                    break;
+                }
+                if !matches!(
+                    pc.kind,
+                    ClauseKind::Catch { .. }
+                        | ClauseKind::Filter { .. }
+                        | ClauseKind::FilterSynthesized { .. }
+                ) {
+                    break;
+                }
+                exits.push(p);
+                inner = Some(p);
+            }
+        }
+        if !hops.is_empty() || !exits.is_empty() {
             self.chains.push(LeaveChain {
                 source: b,
                 hops,
+                exits,
                 target,
                 from_catch,
             });
         }
-        Ok(hir::Terminator::Leave {
-            target: self.block_id(target)?,
+        let target = self.block_id(target)?;
+        let in_handler = innermost_handler(&self.clauses, il_offset.0).is_some();
+        Ok(if in_handler && !from_catch {
+            // A handler-local leave: an ordinary branch within the
+            // funclet (a `Leave` terminator would lower to the funclet
+            // return inside a catch region).
+            hir::Terminator::Jump { target }
+        } else {
+            hir::Terminator::Leave { target }
         })
     }
 
@@ -7164,6 +7367,16 @@ impl BlockImport<'_> {
                     _ => return Ok(None),
                 }
             }
+            // Sse2.ConvertToUInt32(Vector128<uint>): movd xmm→r32 — lane 0,
+            // zero-extended (hwintrinsiclistxarch.h:88, INS_movd32); the
+            // Int32 stack type is the same 32 bits (CoreLib's Ascii
+            // narrowing reaches it at tier-1 — ReadUtf8, step_11.5 B1d).
+            "ConvertToUInt32" if matches!(arg_types, [Type::Struct(_)]) && ret == Type::Int32 => {
+                match elem_arg(0) {
+                    Some(VecElem::U32) => HwLeafOp::ExtractScalar,
+                    _ => return Ok(None),
+                }
+            }
             "ConvertToVector128Single" if matches!(arg_types, [Type::Struct(_)]) && vec_ret => {
                 let (Some(from), Some(VecElem::F32)) = (elem_arg(0), self.vector_elem_of(&ret))
                 else {
@@ -7384,8 +7597,8 @@ impl BlockImport<'_> {
                 }
             }
             // vcvttpd2dq (xmm, ymm): four doubles → four int32, truncation
-            // (the `Conv` node IS cvtt — the WithTruncation suffix is the
-            // only form measured).
+            // (the `ConvTrunc` node IS cvtt — the WithTruncation suffix is
+            // the only form measured).
             "ConvertToVector128Int32WithTruncation"
                 if matches!(arg_types, [Type::Struct(_)]) && vec_ret =>
             {
@@ -8158,10 +8371,13 @@ impl BlockImport<'_> {
                         arg: Box::new(v),
                     }
                 } else {
-                    hir::Expr::Conv {
+                    // The WithTruncation leaf IS raw cvtt (out-of-range/
+                    // NaN → the integer-indefinite 0x8000…,
+                    // hwintrinsiclistxarch.h INS_cvttsd2si64 & co.) — NOT
+                    // the .NET 9+ saturating IL conv (GitHub_23438,
+                    // step_11.5 B1c).
+                    hir::Expr::ConvTrunc {
                         to,
-                        overflow: false,
-                        unsigned: false,
                         arg: Box::new(v),
                     }
                 };
@@ -8207,10 +8423,11 @@ impl BlockImport<'_> {
                             arg: Box::new(v),
                         }
                     } else {
-                        hir::Expr::Conv {
+                        // cvttpd2dq & co.: the raw truncating conversion,
+                        // integer-indefinite on out-of-range lanes (same
+                        // split as the scalar ConvertToInt leaves).
+                        hir::Expr::ConvTrunc {
                             to: out_cell.0,
-                            overflow: false,
-                            unsigned: false,
                             arg: Box::new(v),
                         }
                     };
@@ -9613,22 +9830,23 @@ impl BlockImport<'_> {
     /// `cmp byte ptr [rax], al` on the pointer — a null `S*` throws the
     /// NRE at the field access, not wherever the derived address later
     /// faults); a byref or a value is never null-checked. Returns the
-    /// receiver (an address expression for the value/byref/pointer forms)
-    /// and whether it needs the explicit null check.
+    /// receiver's type, the receiver (an address expression for the
+    /// value/byref/pointer forms) and whether it needs the explicit null
+    /// check.
     fn pop_field_receiver(
         &mut self,
         byref_ok: bool,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
-    ) -> CompileResult<(hir::Expr, bool)> {
+    ) -> CompileResult<(Type, hir::Expr, bool)> {
         let (ty, obj) = self.pop()?;
         match ty {
-            Type::Ref => Ok((obj, true)),
-            Type::ByRef if byref_ok => Ok((obj, false)),
-            Type::NativeInt if byref_ok => Ok((obj, true)),
+            Type::Ref => Ok((ty, obj, true)),
+            Type::ByRef if byref_ok => Ok((ty, obj, false)),
+            Type::NativeInt if byref_ok => Ok((ty, obj, true)),
             Type::Struct(class) if byref_ok => {
                 let addr = self.struct_addr_of(obj, class, stmts, il_offset);
-                Ok((addr, false))
+                Ok((Type::ByRef, addr, false))
             }
             _ => Err(CompileError::Unsupported(
                 "field access on a non-class receiver (value types)",
@@ -9650,7 +9868,7 @@ impl BlockImport<'_> {
     ) -> CompileResult<()> {
         let (field, offset, byref_ok) = self.resolve_instance_field(token)?;
         let (ty, access) = self.field_mem_type(field)?;
-        let (obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
+        let (_obj_ty, obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
         let obj = if null_check {
             hir::Expr::NullCheck { arg: Box::new(obj) }
         } else {
@@ -9690,7 +9908,7 @@ impl BlockImport<'_> {
         il_offset: IlOffset,
     ) -> CompileResult<()> {
         let (field, offset, byref_ok) = self.resolve_instance_field(token)?;
-        let (obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
+        let (_obj_ty, obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
         let obj = if null_check {
             hir::Expr::NullCheck { arg: Box::new(obj) }
         } else {
@@ -9704,6 +9922,26 @@ impl BlockImport<'_> {
                 offset,
             },
         )
+    }
+
+    /// Spills one already-popped tree into a fresh temp, returning a read
+    /// of the temp — `spill_stack`'s per-entry mechanics for a tree that
+    /// is no longer on the stack (`stfld`'s store-order spill).
+    fn spill_tree(
+        &mut self,
+        ty: Type,
+        value: hir::Expr,
+        stmts: &mut Vec<hir::Stmt>,
+        il_offset: IlOffset,
+    ) -> hir::Expr {
+        let tmp = self.temp(ty);
+        self.note_ftn_store(tmp, &value);
+        stmts.push(hir::Stmt {
+            il_offset,
+            kind: hir::StmtKind::Store { dst: tmp, value },
+        });
+        let (_, expr) = self.local_value_expr(tmp);
+        expr
     }
 
     /// `stfld` (0x7D): an indirect store for a non-reference field. A
@@ -9738,7 +9976,22 @@ impl BlockImport<'_> {
         if !store_compatible(vt, ty) {
             return Err(CompileError::BadIl("stfld value type mismatch"));
         }
-        let (obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
+        let (obj_ty, obj, null_check) = self.pop_field_receiver(byref_ok, stmts, il_offset)?;
+        // The receiver's null check is the STORE's check: the IL evaluates
+        // the receiver, then the value, and only then the checked store —
+        // a value whose own evaluation is observable must complete before
+        // the check's NRE (Runtime_125124: `Get().Field = Bar()` runs
+        // Bar() first). Spill receiver and value into temps in IL order
+        // so the `NullCheck` inside the store tree reads a
+        // side-effect-free temp.
+        let (obj, value) = if null_check && must_eval(&value) {
+            self.spill_stack(stmts, il_offset)?;
+            let obj = self.spill_tree(obj_ty, obj, stmts, il_offset);
+            let value = self.spill_tree(vt, value, stmts, il_offset);
+            (obj, value)
+        } else {
+            (obj, value)
+        };
         let obj = if null_check {
             hir::Expr::NullCheck { arg: Box::new(obj) }
         } else {
@@ -11860,7 +12113,7 @@ impl BlockImport<'_> {
     ) -> CompileResult<()> {
         match elem {
             ElemKind::Cell(ty, access, elem_size) => {
-                let addr = self.bounds_checked_addr(ty, elem_size, stmts, il_offset)?;
+                let (addr, _) = self.bounds_checked_addr(ty, elem_size, None, stmts, il_offset)?;
                 self.push(
                     ty,
                     hir::Expr::Load {
@@ -11873,8 +12126,13 @@ impl BlockImport<'_> {
             }
             ElemKind::Struct(class) => {
                 let elem_size = self.struct_layouts[&class].size;
-                let addr =
-                    self.bounds_checked_addr(Type::Struct(class), elem_size, stmts, il_offset)?;
+                let (addr, _) = self.bounds_checked_addr(
+                    Type::Struct(class),
+                    elem_size,
+                    None,
+                    stmts,
+                    il_offset,
+                )?;
                 self.push(
                     Type::Struct(class),
                     hir::Expr::StructVal {
@@ -11928,7 +12186,9 @@ impl BlockImport<'_> {
                 if vt != ty {
                     return Err(CompileError::BadIl("stelem value type mismatch"));
                 }
-                let addr = self.bounds_checked_addr(ty, elem_size, stmts, il_offset)?;
+                let (addr, value) =
+                    self.bounds_checked_addr(ty, elem_size, Some((vt, value)), stmts, il_offset)?;
+                let value = value.expect("stelem's value passes through the bounds-checked store");
                 stmts.push(hir::Stmt {
                     il_offset,
                     kind: hir::StmtKind::StoreInd {
@@ -11946,8 +12206,14 @@ impl BlockImport<'_> {
                     return Err(CompileError::BadIl("stelem value type mismatch"));
                 }
                 let elem_size = self.struct_layouts[&class].size;
-                let addr =
-                    self.bounds_checked_addr(Type::Struct(class), elem_size, stmts, il_offset)?;
+                let (addr, value) = self.bounds_checked_addr(
+                    Type::Struct(class),
+                    elem_size,
+                    Some((vt, value)),
+                    stmts,
+                    il_offset,
+                )?;
+                let value = value.expect("stelem's value passes through the bounds-checked store");
                 self.store_struct_through(addr, class, value, stmts, il_offset)
             }
         }
@@ -11975,7 +12241,8 @@ impl BlockImport<'_> {
         let (elem, _elem_class, mut resolved) = self.elem_kind_of(token)?;
         match elem {
             ElemKind::Cell(Type::Ref, _, elem_size) if readonly => {
-                let addr = self.bounds_checked_addr(Type::Ref, elem_size, stmts, il_offset)?;
+                let (addr, _) =
+                    self.bounds_checked_addr(Type::Ref, elem_size, None, stmts, il_offset)?;
                 self.push(Type::ByRef, addr)
             }
             ElemKind::Cell(Type::Ref, _, _) => {
@@ -11998,13 +12265,18 @@ impl BlockImport<'_> {
                 )
             }
             ElemKind::Cell(ty, _, elem_size) => {
-                let addr = self.bounds_checked_addr(ty, elem_size, stmts, il_offset)?;
+                let (addr, _) = self.bounds_checked_addr(ty, elem_size, None, stmts, il_offset)?;
                 self.push(Type::ByRef, addr)
             }
             ElemKind::Struct(class) => {
                 let elem_size = self.struct_layouts[&class].size;
-                let addr =
-                    self.bounds_checked_addr(Type::Struct(class), elem_size, stmts, il_offset)?;
+                let (addr, _) = self.bounds_checked_addr(
+                    Type::Struct(class),
+                    elem_size,
+                    None,
+                    stmts,
+                    il_offset,
+                )?;
                 self.push(Type::ByRef, addr)
             }
         }
@@ -12078,18 +12350,32 @@ impl BlockImport<'_> {
     /// non-trivial tree (one containing a call) materializes into a temp
     /// first — it must evaluate exactly once, array before index (the IL
     /// push order).
+    ///
+    /// `stelem` also passes its `value`: the strict order is array,
+    /// index, value, THEN the range check and the store (importer.cpp's
+    /// ARR_ST, :7564-7571 — "the tree we create does the range-check
+    /// before evaluating 'value'. So to maintain strict ordering, we
+    /// spill the stack": impSpillSideEffects, GTF_SIDE_EFFECT-gated), so
+    /// an observable value tree spills into a temp ahead of the check.
+    /// The (possibly spilled-back) value is returned alongside the
+    /// address; loads pass `None`.
     fn bounds_checked_addr(
         &mut self,
         elem: Type,
         elem_size: u32,
+        value: Option<(Type, hir::Expr)>,
         stmts: &mut Vec<hir::Stmt>,
         il_offset: IlOffset,
-    ) -> CompileResult<hir::Expr> {
+    ) -> CompileResult<(hir::Expr, Option<hir::Expr>)> {
         let (it, index) = self.pop_index()?;
         let array = self.pop_array()?;
         self.spill_stack(stmts, il_offset)?;
         let (array, check_array) = self.duplicate(Type::Ref, array, stmts, il_offset);
         let (index, check_index) = self.duplicate(it, index, stmts, il_offset);
+        let value = match value {
+            Some((vt, v)) if must_eval(&v) => Some(self.spill_tree(vt, v, stmts, il_offset)),
+            other => other.map(|(_, v)| v),
+        };
         stmts.push(hir::Stmt {
             il_offset,
             kind: hir::StmtKind::BoundsCheck {
@@ -12097,12 +12383,15 @@ impl BlockImport<'_> {
                 index: check_index,
             },
         });
-        Ok(hir::Expr::ArrElemAddr {
-            array: Box::new(array),
-            index: Box::new(index),
-            elem,
-            elem_size,
-        })
+        Ok((
+            hir::Expr::ArrElemAddr {
+                array: Box::new(array),
+                index: Box::new(index),
+                elem,
+                elem_size,
+            },
+            value,
+        ))
     }
 
     /// Pops the array operand of an element access: a reference (null
@@ -14932,7 +15221,7 @@ mod tests {
             m.blocks[1].stmts.is_empty() && m.blocks[2].stmts.is_empty(),
             "step blocks carry no statements"
         );
-        assert_eq!(as_leave(&m.blocks[2].terminator), BlockId(3));
+        assert_eq!(as_jump(&m.blocks[2].terminator), BlockId(3));
         assert!(matches!(
             m.blocks[3].terminator,
             hir::Terminator::Return { value: None }
@@ -15151,14 +15440,14 @@ mod tests {
             as_call_finally(&m.blocks[4].terminator),
             (BlockId(10), BlockId(5))
         );
-        assert_eq!(as_leave(&m.blocks[5].terminator), BlockId(8));
+        assert_eq!(as_jump(&m.blocks[5].terminator), BlockId(8));
         // b3 -> S1' (id 6) -> L' (id 7) -> b5.
         assert_eq!(as_jump(&m.blocks[3].terminator), BlockId(6));
         assert_eq!(
             as_call_finally(&m.blocks[6].terminator),
             (BlockId(10), BlockId(7))
         );
-        assert_eq!(as_leave(&m.blocks[7].terminator), BlockId(8));
+        assert_eq!(as_jump(&m.blocks[7].terminator), BlockId(8));
         // The funclets.
         assert!(matches!(
             m.blocks[9].terminator,
@@ -15229,14 +15518,14 @@ mod tests {
             as_call_finally(&m.blocks[3].terminator),
             (BlockId(9), BlockId(4))
         );
-        assert_eq!(as_leave(&m.blocks[4].terminator), BlockId(7));
+        assert_eq!(as_jump(&m.blocks[4].terminator), BlockId(7));
         // b3's own chain: Jump to S' (id 5).
         assert_eq!(as_jump(&m.blocks[2].terminator), BlockId(5));
         assert_eq!(
             as_call_finally(&m.blocks[5].terminator),
             (BlockId(9), BlockId(6))
         );
-        assert_eq!(as_leave(&m.blocks[6].terminator), BlockId(7));
+        assert_eq!(as_jump(&m.blocks[6].terminator), BlockId(7));
         // The inner try body leave crosses nothing (its target is inside
         // the outer try): a plain Leave to b3 (id 2).
         assert_eq!(as_leave(&m.blocks[1].terminator), BlockId(2));
@@ -15316,7 +15605,7 @@ mod tests {
         let (funclet, continuation) = as_call_finally(&m.blocks[1].terminator);
         assert_eq!(funclet, BlockId(4), "the outer finally group");
         assert_eq!(continuation, BlockId(2));
-        assert_eq!(as_leave(&m.blocks[2].terminator), BlockId(3));
+        assert_eq!(as_jump(&m.blocks[2].terminator), BlockId(3));
         // The inner catch entry block sits in its own tail funclet and
         // receives the throwable; its leave resumes inside the outer
         // finally's body (block 6 — the leave target at IL 11).
@@ -15345,6 +15634,220 @@ mod tests {
             (outer.handler_start, outer.handler_end),
             (BlockId(4), BlockId(7))
         );
+    }
+
+    #[test]
+    fn handler_local_leave_in_a_catch_is_a_jump() {
+        // step_11.5: a leave whose target stays INSIDE the same catch
+        // handler is an ordinary branch within the funclet, not the
+        // funclet's return-the-resume-address form (which would resume
+        // the parent frame mid-funclet). IL:
+        // 0: nop; 1: leave.s +10 (-> 13); | 3: pop; 4: nop; | 5: nop;
+        // 6: leave.s +2 (-> 10); | 8: endfinally; | 9: nop;
+        // 10: leave.s +1 (-> 13); | 12: nop; 13: ret — a finally clause
+        // (try [5,8), handler [8,9)) nested in a catch handler [3,12)
+        // whose try is [0,3).
+        let il = [
+            0x00, 0xDE, 0x0A, 0x26, 0x00, 0x00, 0xDE, 0x02, 0xDC, 0x00, 0xDE, 0x01, 0x00, 0x2A,
+        ];
+        let (ee, info) = eh_fixture(
+            &il,
+            &[],
+            &[
+                finally_clause(5, 3, 8, 1),
+                catch_clause(0, 3, 3, 9, 0x0200_0042),
+            ],
+        );
+        let m = import(&info, &ee).expect("imports");
+        // Original blocks (a block runs to its terminator; bare nops
+        // merge): b0 [0,3) (nop; leave -> 13), b1 [3,5) (catch entry),
+        // b2 [5,8) (nested try: nop; handler-local leave -> 10), b3
+        // [8,9) (finally), b4 [9,10), b5 [10,12) (leave out), b6
+        // [12,13), b7 [13,14) (ret). Layout: the main run (b0, b6, b7),
+        // then the catch group (b1, b2, S, L, b4, b5 — the chain's steps
+        // splice after b2), then the finally group (b3).
+        assert_eq!(m.blocks.len(), 10);
+        // The nested-try leave's chain does NOT return out of the
+        // funclet: the source jumps to the first step, and the chain's
+        // final block is a plain jump back into the handler.
+        assert_eq!(as_jump(&m.blocks[4].terminator), BlockId(5));
+        assert_eq!(
+            as_call_finally(&m.blocks[5].terminator),
+            (BlockId(9), BlockId(6))
+        );
+        assert_eq!(as_jump(&m.blocks[6].terminator), BlockId(8));
+        // The leave at IL 10 exits the catch handler (target 13 outside
+        // [3,12)): the funclet-return Leave form, unchanged.
+        assert_eq!(as_leave(&m.blocks[8].terminator), BlockId(2));
+        // The main-body leave at IL 1 keeps its Leave form (the plain
+        // jump lowering outside funclets).
+        assert_eq!(as_leave(&m.blocks[0].terminator), BlockId(2));
+        // The region table: the nested try's range lives inside the
+        // catch handler's block run; the trailing step blocks exit the
+        // nested try ITSELF, so no coincident-try-end extension.
+        let (nested, catch) = (&m.eh_regions[0], &m.eh_regions[1]);
+        assert!(matches!(nested.kind, hir::EhRegionKind::Finally));
+        assert_eq!((nested.try_start, nested.try_end), (BlockId(4), BlockId(5)));
+        assert_eq!(
+            (nested.handler_start, nested.handler_end),
+            (BlockId(9), BlockId(10))
+        );
+        assert!(matches!(catch.kind, hir::EhRegionKind::Catch { .. }));
+        assert_eq!((catch.try_start, catch.try_end), (BlockId(0), BlockId(1)));
+        assert_eq!(
+            (catch.handler_start, catch.handler_end),
+            (BlockId(3), BlockId(9))
+        );
+    }
+
+    #[test]
+    fn handler_local_leave_without_a_finally_is_a_jump() {
+        // step_11.5: the no-chain case — a leave inside a catch handler
+        // to a target inside the same handler, crossing no finallys.
+        // IL: 0: nop; 1: leave.s +10 (-> 13); | 3: pop; 4: leave.s +0
+        // (-> 6); 6: nop; 7: leave.s +4 (-> 13); | 9: nop; 10: nop;
+        // 11: nop; 12: nop; 13: ret — one catch clause, try [0,3),
+        // handler [3,9).
+        let il = [
+            0x00, 0xDE, 0x0A, 0x26, 0xDE, 0x00, 0x00, 0xDE, 0x04, 0x00, 0x00, 0x00, 0x00, 0x2A,
+        ];
+        let (ee, info) = eh_fixture(&il, &[], &[catch_clause(0, 3, 3, 6, 0x0200_0042)]);
+        let m = import(&info, &ee).expect("imports");
+        // Blocks (b0 [0,3): nop; leave; b1 [3,6): pop; handler-local
+        // leave; b2 [6,9): nop; leave out; b3 [9,13): nops; b4 [13,14):
+        // ret). Layout: main (b0, b3, b4), then the handler group (b1,
+        // b2).
+        assert_eq!(m.blocks.len(), 5);
+        // The handler-local leave at IL 4 jumps to b2 (id 4) instead of
+        // returning out of the funclet; the leave at IL 7 exits the
+        // handler and keeps the funclet-return Leave form.
+        assert_eq!(as_jump(&m.blocks[3].terminator), BlockId(4));
+        assert_eq!(as_leave(&m.blocks[4].terminator), BlockId(2));
+        assert_eq!(as_leave(&m.blocks[0].terminator), BlockId(2));
+        let catch = &m.eh_regions[0];
+        assert_eq!((catch.try_start, catch.try_end), (BlockId(0), BlockId(1)));
+        assert_eq!(
+            (catch.handler_start, catch.handler_end),
+            (BlockId(3), BlockId(5))
+        );
+    }
+
+    #[test]
+    fn leave_out_of_a_nested_catch_ladders_through_the_enclosing_catch() {
+        // step_11.5: a catch handler nested inside another catch's
+        // handler; the inner handler's leave targets the main body. The
+        // inner funclet must NOT return the target directly — the VM
+        // resumes the ENCLOSING funclet's context, so the leave returns
+        // a step block in the outer handler's group, which performs the
+        // outer funclet's own exit (clr-abi.md §Funclet Return Values).
+        // IL: 0: nop; 1: leave.s +13 (-> 16); | 3: pop; | 4: nop; 5:
+        // leave.s +4 (-> 11); | 7: pop; 8: leave.s +6 (-> 16); 10: nop; |
+        // 11: nop; 12: leave.s +2 (-> 16); | 14: nop; 15: nop; 16: ret —
+        // C2: catch try [4,7) handler [7,11), nested in C1's handler:
+        // C1: catch try [0,3) handler [3,14).
+        let il = [
+            0x00, 0xDE, 0x0D, 0x26, 0x00, 0xDE, 0x04, 0x26, 0xDE, 0x06, 0x00, 0x00, 0xDE, 0x02,
+            0x00, 0x00, 0x2A,
+        ];
+        let (ee, info) = eh_fixture(
+            &il,
+            &[],
+            &[
+                catch_clause(0, 3, 3, 11, 0x0200_0042),
+                catch_clause(4, 3, 7, 4, 0x0200_0043),
+            ],
+        );
+        let m = import(&info, &ee).expect("imports");
+        // Original blocks (a block runs to its terminator; the
+        // unreachable nop after a leave merges away): b0 [0,3) (nop;
+        // leave), b1 [3,4) (C1 entry), b2 [4,7) (C2's try: nop;
+        // handler-local leave -> 11), b3 [7,10) (C2's handler: pop;
+        // ladder leave -> 16), b5 [10,14) (nops; leave out of C1), b6
+        // [14,16), b7 [16,17) (ret). Layout: main (b0, b6, b7), then
+        // C1's group (b1, b2, b5, then the ladder step X), then C2's
+        // group (b3).
+        assert_eq!(m.blocks.len(), 8);
+        // The ladder: C2's funclet returns the step block's address;
+        // the step (running in C1's resumed context) performs C1's
+        // funclet exit to the leave's target.
+        assert_eq!(as_leave(&m.blocks[7].terminator), BlockId(6));
+        assert_eq!(as_leave(&m.blocks[6].terminator), BlockId(2));
+        // C1's own handler-end leave is unnested: straight at the target.
+        assert_eq!(as_leave(&m.blocks[5].terminator), BlockId(2));
+        // C2's try-end leave stays inside C1's handler: a plain jump.
+        assert_eq!(as_jump(&m.blocks[4].terminator), BlockId(5));
+        // The region table: C1's handler region EXTENDS over the ladder
+        // step (the VM resume address must be inside it); C2's try lives
+        // inside C1's group.
+        let (c1, c2) = (&m.eh_regions[0], &m.eh_regions[1]);
+        assert_eq!((c1.try_start, c1.try_end), (BlockId(0), BlockId(1)));
+        assert_eq!(
+            (c1.handler_start, c1.handler_end),
+            (BlockId(3), BlockId(7)),
+            "the outer handler's region covers the ladder step"
+        );
+        assert_eq!((c2.try_start, c2.try_end), (BlockId(4), BlockId(5)));
+        assert_eq!((c2.handler_start, c2.handler_end), (BlockId(7), BlockId(8)));
+    }
+
+    #[test]
+    fn leave_out_of_a_twice_nested_catch_ladders_twice() {
+        // step_11.5: the two-level ladder. IL: 0: nop; 1: leave.s +19
+        // (-> 22); | 3: pop; | 4: nop; 5: leave.s +10 (-> 17); | 7: pop;
+        // | 8: nop; 9: leave.s +3 (-> 14); | 11: pop; 12: leave.s +8
+        // (-> 22); | 14: nop; 15: leave.s +0 (-> 17); | 17: nop; 18:
+        // nop; 19: leave.s +1 (-> 22); | 21: nop; 22: ret — C3 (try
+        // [8,11), handler [11,14)) nested in C2's handler (try [4,7),
+        // handler [7,17)) nested in C1's handler (try [0,3), handler
+        // [3,21)).
+        let il = [
+            0x00, 0xDE, 0x13, 0x26, 0x00, 0xDE, 0x0A, 0x26, 0x00, 0xDE, 0x03, 0x26, 0xDE, 0x08,
+            0x00, 0xDE, 0x00, 0x00, 0x00, 0xDE, 0x01, 0x00, 0x2A,
+        ];
+        let (ee, info) = eh_fixture(
+            &il,
+            &[],
+            &[
+                catch_clause(0, 3, 3, 18, 0x0200_0042),
+                catch_clause(4, 3, 7, 10, 0x0200_0043),
+                catch_clause(8, 3, 11, 3, 0x0200_0044),
+            ],
+        );
+        let m = import(&info, &ee).expect("imports");
+        // Original blocks (adjacent non-terminator runs merge): b0
+        // [0,3), b1 [3,4), b2 [4,7), b3 [7,8), b4 [8,11), b5 [11,14)
+        // (the ladder leave), b6b7 [14,17), b8b9 [17,21), b10 [21,22),
+        // b11 [22,23). Layout: main (b0, b10, b11), then C1's group (b1,
+        // b2, b8b9, X1), then C2's group (b3, b4, b6b7, X0), then C3's
+        // group (b5).
+        assert_eq!(m.blocks.len(), 12);
+        // The ladder: C3's funclet (id 11) returns X0's address (id 10,
+        // in C2's group); X0 is C2's funclet exit aimed at X1 (id 6, in
+        // C1's group); X1 is C1's funclet exit aimed at the target (id
+        // 2).
+        assert_eq!(as_leave(&m.blocks[11].terminator), BlockId(10));
+        assert_eq!(as_leave(&m.blocks[10].terminator), BlockId(6));
+        assert_eq!(as_leave(&m.blocks[6].terminator), BlockId(2));
+        // C2's handler-end leave exits only C2 (its target is inside
+        // C1's handler): straight at the target, no chain.
+        assert_eq!(as_leave(&m.blocks[9].terminator), BlockId(5));
+        // The handler-local leaves are plain jumps.
+        assert_eq!(as_jump(&m.blocks[8].terminator), BlockId(9));
+        assert_eq!(as_jump(&m.blocks[4].terminator), BlockId(5));
+        // The reported handler regions cover their ladder steps.
+        let (c1, c2, c3) = (&m.eh_regions[0], &m.eh_regions[1], &m.eh_regions[2]);
+        assert_eq!((c1.handler_start, c1.handler_end), (BlockId(3), BlockId(7)));
+        assert_eq!(
+            (c2.handler_start, c2.handler_end),
+            (BlockId(7), BlockId(11))
+        );
+        assert_eq!(
+            (c3.handler_start, c3.handler_end),
+            (BlockId(11), BlockId(12))
+        );
+        assert_eq!((c1.try_start, c1.try_end), (BlockId(0), BlockId(1)));
+        assert_eq!((c2.try_start, c2.try_end), (BlockId(4), BlockId(5)));
+        assert_eq!((c3.try_start, c3.try_end), (BlockId(8), BlockId(9)));
     }
 
     #[test]
@@ -15930,6 +16433,56 @@ mod tests {
     }
 
     #[test]
+    fn conv_i1_i2_from_a_float_clamp_to_the_signed_range() {
+        // conv.i2 of a double (step_11.5): the .NET 9+ saturating
+        // small-type semantics clamp the float source to [-32768, 32767]
+        // BEFORE the conversion — RyuJIT's MinNative(smallMax,
+        // MaxNative(smallMin, x)) (morph.cpp:348-351), with the constants
+        // as the FIRST operand so NaN propagates through the clamp (the
+        // SSE second operand wins on NaN) and cvtt's "integer indefinite"
+        // 0x8000_0000 narrows to exactly 0 in the shift pair.
+        let (ee, info) = fixture(
+            &[0x02, 0x68, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Double]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (op, shl, count) = as_binary(return_value(&m, 0));
+        assert_eq!(op, BinaryOp::Shr);
+        assert_eq!(as_i32(count), 16);
+        let (op, value, _) = as_binary(shl);
+        assert_eq!(op, BinaryOp::Shl);
+        let (to, _, _, arg) = as_conv(value);
+        assert_eq!(to, Type::Int32);
+        // The Conv's operand is mins(32767.0, maxs(-32768.0, d)).
+        let (op, hi, clamped) = as_binary(arg);
+        assert_eq!(op, BinaryOp::MinF);
+        assert!(matches!(hi, hir::Expr::Const(Const::Double(v)) if *v == 32767.0));
+        let (op, lo, value) = as_binary(clamped);
+        assert_eq!(op, BinaryOp::MaxF);
+        assert!(matches!(lo, hir::Expr::Const(Const::Double(v)) if *v == -32768.0));
+        assert_eq!(as_local(value), LocalId(0));
+
+        // conv.i1 of a float32: the constants take the source's width.
+        let (ee, info) = fixture(
+            &[0x02, 0x67, 0x2A],
+            &sig(CorInfoType::Int, &[CorInfoType::Float]),
+            &[],
+        );
+        let m = import(&info, &ee).expect("imports");
+        let (_, shl, count) = as_binary(return_value(&m, 0));
+        assert_eq!(as_i32(count), 24);
+        let (_, value, _) = as_binary(shl);
+        let (_, _, _, arg) = as_conv(value);
+        let (op, hi, clamped) = as_binary(arg);
+        assert_eq!(op, BinaryOp::MinF);
+        assert!(matches!(hi, hir::Expr::Const(Const::Float(v)) if *v == 127.0));
+        let (op, lo, _) = as_binary(clamped);
+        assert_eq!(op, BinaryOp::MaxF);
+        assert!(matches!(lo, hir::Expr::Const(Const::Float(v)) if *v == -128.0));
+    }
+
+    #[test]
     fn conv_i_sign_extends_to_native_int() {
         // conv.i of an i32 arg (step_10.11): a SIGNED Conv node to
         // NativeInt — the conv.u twin zero-extends.
@@ -16379,10 +16932,10 @@ mod tests {
 
     #[test]
     fn conv_ovf_small_target_from_a_float_converts_then_checks() {
-        // conv.ovf.u1 of a double (RyuJIT morph.cpp:347-371): the plain
-        // truncating double→Int32 conversion (NaN/out-of-range → the
-        // integer-indefinite INT_MIN, outside every small range), then
-        // the integer-domain checked narrow with a SIGNED source (the
+        // conv.ovf.u1 of a double: the checked float→Int32 helper
+        // (RyuJIT morph.cpp:369-370 — the intermediate CAST(TYP_INT)
+        // carries GTF_OVERFLOW and becomes DBL2INT_OVF), then the
+        // integer-domain checked narrow with a SIGNED source (the
         // .un-ness dies with the float source).
         let (ee, info) = fixture(
             &[0x02, 0xB4, 0x2A],
@@ -16393,13 +16946,14 @@ mod tests {
         let (to, bits, signed_dst, unsigned_src, arg) = as_conv_ovf(return_value(&m, 0));
         assert_eq!((to, bits), (Type::Int32, 8));
         assert!(!signed_dst && !unsigned_src);
-        let (to, overflow, unsigned, arg) = as_conv(arg);
-        assert_eq!(to, Type::Int32);
-        assert!(!overflow && !unsigned);
-        assert_eq!(as_local(arg), LocalId(0));
+        let (helper, csig, args) = as_helper_call(arg);
+        assert_eq!(helper, CorInfoHelpFunc::DBL2INT_OVF);
+        assert_eq!(csig.ret, Type::Int32);
+        assert_eq!(as_local(&args[0]), LocalId(0));
 
         // conv.ovf.i1.un of a float32: same shape (still signed source
-        // after the cvtt), the float NOT widened for the cvtt.
+        // after the helper), the float widened to Double for it
+        // (flowgraph.cpp:1334-1340).
         let (ee, info) = fixture(
             &[0x02, 0x82, 0x2A],
             &sig(CorInfoType::Int, &[CorInfoType::Float]),
@@ -16409,8 +16963,10 @@ mod tests {
         let (_, bits, signed_dst, unsigned_src, arg) = as_conv_ovf(return_value(&m, 0));
         assert_eq!(bits, 8);
         assert!(signed_dst && !unsigned_src);
-        let (to, _, _, arg) = as_conv(arg);
-        assert_eq!(to, Type::Int32);
+        let (helper, _, args) = as_helper_call(arg);
+        assert_eq!(helper, CorInfoHelpFunc::DBL2INT_OVF);
+        let (to, _, _, arg) = as_conv(&args[0]);
+        assert_eq!(to, Type::Double);
         assert_eq!(as_local(arg), LocalId(0));
     }
 
@@ -18186,6 +18742,42 @@ mod tests {
                 assert_eq!(*offset, 16);
                 assert_eq!(as_local(as_null_check(addr)), LocalId(0));
                 assert_eq!(as_local(value), LocalId(1));
+            }
+            _ => panic!("expected StmtKind::StoreInd"),
+        }
+    }
+
+    #[test]
+    fn stfld_evaluates_the_value_before_the_null_check() {
+        // ldarg.0 (this); call int fib(); stfld int@16; ldc.i4.0; ret —
+        // Runtime_125124 (`Get().Field = Bar()`): the value's evaluation
+        // is observable, so it runs BEFORE the receiver's null check —
+        // both spill to temps in IL order and the store's NullCheck reads
+        // the receiver temp.
+        let il = [
+            0x02, 0x28, 0x01, 0x00, 0x00, 0x06, 0x7D, 0x01, 0x00, 0x00, 0x04, 0x16, 0x2A,
+        ];
+        let (mut ee, info) = object_fixture(&il);
+        ee.add_method(FIB_TOKEN, sig(CorInfoType::Int, &[]));
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 3, "receiver spill, value spill, store");
+        let (obj_t, obj_v) = store(&stmts[0]);
+        assert_eq!(as_local(obj_v), LocalId(0));
+        let (val_t, val_v) = store(&stmts[1]);
+        let (sig, args) = as_call(val_v);
+        assert_eq!(sig.ret, Type::Int32);
+        assert!(args.is_empty());
+        match &stmts[2].kind {
+            hir::StmtKind::StoreInd {
+                addr,
+                offset,
+                value,
+                ..
+            } => {
+                assert_eq!(*offset, 16);
+                assert_eq!(as_local(as_null_check(addr)), obj_t);
+                assert_eq!(as_local(value), val_t);
             }
             _ => panic!("expected StmtKind::StoreInd"),
         }
@@ -21341,6 +21933,145 @@ mod tests {
         assert!(offsets.contains(&0) && offsets.contains(&8), "{offsets:?}");
     }
 
+    /// Sse2.X64.ConvertToInt64WithTruncation(Vector128<double>) /
+    /// Sse2.ConvertToInt32WithTruncation(Vector128<double>): the RAW cvtt
+    /// — `ConvTrunc` (integer-indefinite on out-of-range/NaN), NOT the
+    /// .NET 9+ saturating IL conv (GitHub_23438, step_11.5 B1c).
+    #[test]
+    fn convert_to_int_with_truncation_leaves_are_raw_cvtt() {
+        // ldarg.0; call ConvertToInt64WithTruncation; ret.
+        let il = [0x02, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let sig = MockSig {
+            ret: CorInfoType::Long,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c)],
+        };
+        let handle = ee.add_method(0x0600_0033, sig);
+        ee.method_name = Some("ConvertToInt64WithTruncation".into());
+        // The nested X64 class: empty class namespace; the family comes
+        // from the enclosing-class walk.
+        ee.class_names
+            .insert(handle.as_raw() as usize, ("X64".into(), None));
+        ee.method_namespaces.insert(
+            handle.as_raw() as usize,
+            "System.Runtime.Intrinsics.X86".into(),
+        );
+        ee.method_enclosing_classes
+            .insert(handle.as_raw() as usize, "Sse2".into());
+        ee.intrinsic_methods.insert(handle.as_raw() as usize);
+        // The vector class's instantiation element type is double.
+        let elem_class = ee.add_class(8, 8, &[], None);
+        ee.class_cor_info_types
+            .insert(elem_class.as_raw() as usize, CorInfoType::Double);
+        ee.type_inst_args
+            .insert((c.as_raw() as usize, 0), elem_class);
+        let entry = MockSig {
+            ret: CorInfoType::Long,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c)],
+        };
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m));
+        assert!(
+            matches!(
+                return_value(&m, 0),
+                hir::Expr::ConvTrunc {
+                    to: Type::Int64,
+                    ..
+                }
+            ),
+            "the leaf is raw cvtt, not the saturating conv"
+        );
+
+        // The 32-bit twin: Sse2.ConvertToInt32WithTruncation.
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let sig = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c)],
+        };
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            sig,
+            "ConvertToInt32WithTruncation",
+            "Sse2",
+            CorInfoType::Double,
+        );
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c)],
+        };
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(matches!(
+            return_value(&m, 0),
+            hir::Expr::ConvTrunc {
+                to: Type::Int32,
+                ..
+            }
+        ));
+    }
+
+    /// Sse2.ConvertToUInt32(Vector128<uint>): movd xmm→r32 — the lane-0
+    /// extraction (a 32-bit load at offset 0), NOT the poison (CoreLib's
+    /// Ascii narrowing reaches it at tier-1 — ReadUtf8, step_11.5 B1d).
+    #[test]
+    fn sse2_convert_to_uint32_extracts_lane_zero() {
+        // ldarg.0; call ConvertToUInt32; ret.
+        let il = [0x02, 0x28, 0x33, 0x00, 0x00, 0x06, 0x2A];
+        let (mut ee, c) = struct_ee(16, &[], None);
+        let sig = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c)],
+        };
+        hw_leaf_fixture(
+            &mut ee,
+            c,
+            0x0600_0033,
+            sig,
+            "ConvertToUInt32",
+            "Sse2",
+            CorInfoType::UInt,
+        );
+        let entry = MockSig {
+            ret: CorInfoType::Int,
+            args: vec![CorInfoType::ValueClass],
+            has_this: false,
+            ret_class: None,
+            arg_classes: vec![Some(c)],
+        };
+        let info = struct_info(&mut ee, &il, &entry, &[], &[]);
+        let m = import(&info, &ee).expect("imports");
+        assert!(!has_poison(&m));
+        assert!(
+            matches!(
+                return_value(&m, 0),
+                hir::Expr::Load {
+                    offset: 0,
+                    ty: Type::Int32,
+                    ..
+                }
+            ),
+            "lane-0 extraction, not the poison"
+        );
+    }
+
     /// X86Base.CpuId(int, int) → (int, int, int, int): the four-output
     /// cpuid statement, the output temps stored into the tuple result in
     /// register order at 0/4/8/12.
@@ -23529,6 +24260,42 @@ mod tests {
                 }
                 _ => panic!("expected StmtKind::StoreInd"),
             }
+        }
+    }
+
+    #[test]
+    fn stelem_evaluates_the_value_before_the_bounds_check() {
+        // ldarg.0 (array); ldarg.1 (index); call int fib(); stelem.i4;
+        // ldc.i4.0; ret — the strict order is array, index, value, THEN
+        // the range check (importer.cpp:7564-7571's ARR_ST spill): the
+        // value's call spills into a temp BEFORE the BoundsCheck
+        // statement, and the store reads the temp.
+        let il = [0x02, 0x03, 0x28, 0x01, 0x00, 0x00, 0x06, 0x9E, 0x16, 0x2A];
+        let (mut ee, info) = array_fixture(
+            &il,
+            &sig(CorInfoType::Int, &[CorInfoType::Class, CorInfoType::Int]),
+            &[],
+        );
+        ee.add_method(FIB_TOKEN, sig(CorInfoType::Int, &[]));
+        let m = import(&info, &ee).expect("imports");
+        let stmts = &m.blocks[0].stmts;
+        assert_eq!(stmts.len(), 3, "value spill, bounds check, store");
+        let (val_t, val_v) = store(&stmts[0]);
+        let (sig, args) = as_call(val_v);
+        assert_eq!(sig.ret, Type::Int32);
+        assert!(args.is_empty());
+        let (array, index) = as_bounds_check(&stmts[1]);
+        assert_eq!(as_local(array), LocalId(0));
+        assert_eq!(as_local(index), LocalId(1));
+        match &stmts[2].kind {
+            hir::StmtKind::StoreInd { addr, value, .. } => {
+                let (a, idx, elem, _) = as_arr_elem_addr(addr);
+                assert_eq!(as_local(a), LocalId(0));
+                assert_eq!(as_local(idx), LocalId(1));
+                assert_eq!(elem, Type::Int32);
+                assert_eq!(as_local(value), val_t);
+            }
+            _ => panic!("expected StmtKind::StoreInd"),
         }
     }
 
